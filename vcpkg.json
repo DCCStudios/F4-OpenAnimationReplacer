@@ -1,0 +1,22 @@
+{
+  "name": "openanimationreplacer",
+  "version-string": "1.0.0",
+  "description": "Runtime animation replacement framework for Fallout 4",
+  "license": "GPL-3.0-or-later",
+  "dependencies": [
+    "boost-stl-interfaces",
+    "boost-iostreams",
+    "boost-iterator",
+    "boost-predef",
+    "fmt",
+    "frozen",
+    {
+      "name": "imgui",
+      "features": [ "dx11-binding", "win32-binding" ]
+    },
+    "nlohmann-json",
+    "rsm-mmio",
+    "spdlog",
+    "xbyak"
+  ]
+}
