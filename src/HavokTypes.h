@@ -494,6 +494,25 @@ namespace RE
 	};
 	static_assert(sizeof(BSAnimationGraphVariableCache) == 0x40);
 
+	struct BSAnimationGraphEvent
+	{
+		TESObjectREFR* refr;
+		BSFixedString animEvent;
+		BSFixedString argument;
+	};
+
+	namespace BGSAnimationSystemUtils
+	{
+		inline bool GetEventSourcePointersFromGraph(
+			const TESObjectREFR* a_refr,
+			BSScrapArray<BSTEventSource<BSAnimationGraphEvent>*>& a_sourcesOut)
+		{
+			using func_t = decltype(&GetEventSourcePointersFromGraph);
+			REL::Relocation<func_t> func{ REL::ID(897074) };
+			return func(a_refr, a_sourcesOut);
+		}
+	}
+
 	class BSAnimationGraphManager :
 		public BSTEventSink<BSAnimationGraphEvent>,
 		public BSIntrusiveRefCounted

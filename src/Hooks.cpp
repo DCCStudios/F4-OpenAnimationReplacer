@@ -83,6 +83,98 @@ namespace
 	static std::shared_mutex s_activeReplacementSuffixMutex;
 	static std::unordered_set<std::string> s_activeReplacementSuffixes;
 
+	// Per-actor set of original-animation annotation strings to suppress while replacement active
+	static std::shared_mutex s_origAnnotSetMutex;
+	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_origAnnotByActor; // actorFormID -> set of annotation text
+
+	// Thread-local flag: set to true while OAR is firing replacement annotations via dual-path.
+	// The event sink uses this to let our events through and only suppress engine-sourced ones.
+	static thread_local bool s_oarFiringAnnotations = false;
+
+	// Dual-path emission: Phase 1 = behavior graph, Phase 2 = BSTEventSource sinks (audio, etc.)
+	static void NotifyEventSinks(RE::TESObjectREFR* a_refr, const RE::BSFixedString& a_evt)
+	{
+		RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
+		if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(a_refr, sources)) return;
+		static const RE::BSFixedString emptyArg{ "" };
+		for (auto* src : sources) {
+			if (!src) continue;
+			RE::BSAnimationGraphEvent ge{};
+			ge.refr = a_refr;
+			ge.animEvent = a_evt;
+			ge.argument = emptyArg;
+			src->Notify(ge);
+		}
+	}
+
+	// Event sink that suppresses original animation events while a replacement is active.
+	// Registered on the player's BSAnimationGraphEvent sources.
+	class OARAnnotationSuppressionSink : public RE::BSTEventSink<RE::BSAnimationGraphEvent>
+	{
+	public:
+		RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override
+		{
+			// Always let our own manually-fired events through
+			if (s_oarFiringAnnotations) {
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Only suppress when we have active replacements
+			{
+				std::shared_lock slock(s_activeReplacementSuffixMutex);
+				if (s_activeReplacementSuffixes.empty()) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+			}
+
+			// Check if this event is from the original animation set for the actor
+			const char* evtStr = a_event.animEvent.c_str();
+			if (!evtStr || !evtStr[0]) return RE::BSEventNotifyControl::kContinue;
+
+			uint32_t actorID = 0;
+			if (a_event.refr) actorID = a_event.refr->GetFormID();
+
+			{
+				std::shared_lock olock(s_origAnnotSetMutex);
+				auto it = s_origAnnotByActor.find(actorID);
+				if (it != s_origAnnotByActor.end()) {
+					if (it->second.contains(std::string(evtStr))) {
+						static int s_suppressLog = 0;
+						if (s_suppressLog < 30) {
+							logger::info("[OAR-Annot] Suppressed original event '{}' for actor {:X}",
+								evtStr, actorID);
+							s_suppressLog++;
+						}
+						return RE::BSEventNotifyControl::kStop;
+					}
+				}
+			}
+
+			return RE::BSEventNotifyControl::kContinue;
+		}
+
+		bool registered{ false };
+	};
+
+	static OARAnnotationSuppressionSink s_suppressionSink;
+
+	void RegisterSuppressionSink()
+	{
+		if (s_suppressionSink.registered) return;
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) return;
+
+		RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
+		if (RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(player, sources)) {
+			for (auto* src : sources) {
+				if (src) src->RegisterSink(&s_suppressionSink);
+			}
+			s_suppressionSink.registered = true;
+			logger::info("[OAR-Annot] Registered annotation suppression sink ({} sources)", sources.size());
+		}
+	}
+
 }
 
 void ClearClipRuntimeState()
@@ -102,6 +194,10 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_activeReplacementSuffixMutex);
 		s_activeReplacementSuffixes.clear();
+	}
+	{
+		std::unique_lock lock(s_origAnnotSetMutex);
+		s_origAnnotByActor.clear();
 	}
 	{
 		std::unique_lock lock(s_loadClipsPathMutex);
@@ -515,6 +611,58 @@ namespace
 			}
 		}
 
+		// Cache original animation's annotation strings for suppression (Step 2).
+		// Parse the original hkaAnimation's annotationTracks and store event text per actor.
+		RE::TESObjectREFR* activateRefr = GetRefrFromContext(a_context);
+		if (!activateRefr) activateRefr = RE::PlayerCharacter::GetSingleton();
+		if (activateRefr && animSlot && *animSlot) {
+			auto* origAnim = *animSlot;
+			auto* origBytes = reinterpret_cast<uint8_t*>(origAnim);
+			auto* annotTrackPtr = *reinterpret_cast<uint8_t**>(origBytes + 0x28);
+			int32_t annotTrackCount = *reinterpret_cast<int32_t*>(origBytes + 0x30);
+
+			if (annotTrackPtr && annotTrackCount > 0 && reinterpret_cast<uintptr_t>(annotTrackPtr) > 0x10000) {
+				uint32_t actorID = activateRefr->GetFormID();
+				std::unordered_set<std::string> origAnnots;
+
+				constexpr size_t kAnnotTrackSize = 0x18;
+				constexpr size_t kAnnotationSize = 0x10;
+
+				for (int32_t t = 0; t < annotTrackCount; ++t) {
+					auto* trackBase = annotTrackPtr + (t * kAnnotTrackSize);
+					auto* annots = *reinterpret_cast<uint8_t**>(trackBase + 0x08);
+					int32_t annotCount = *reinterpret_cast<int32_t*>(trackBase + 0x10);
+					if (!annots || annotCount <= 0 || reinterpret_cast<uintptr_t>(annots) < 0x10000) continue;
+
+					for (int32_t a = 0; a < annotCount; ++a) {
+						auto* annBase = annots + (a * kAnnotationSize);
+						auto* txtPtr = *reinterpret_cast<const char**>(annBase + 0x08);
+						auto rawTxt = reinterpret_cast<uintptr_t>(txtPtr) & ~uintptr_t(1);
+						auto* txt = reinterpret_cast<const char*>(rawTxt);
+						if (txt && rawTxt > 0x10000 && txt[0] != '\0') {
+							origAnnots.insert(std::string(txt));
+						}
+					}
+				}
+
+				if (!origAnnots.empty()) {
+					std::unique_lock olock(s_origAnnotSetMutex);
+					auto& existing = s_origAnnotByActor[actorID];
+					existing.insert(origAnnots.begin(), origAnnots.end());
+
+					static int s_origAnnotLog = 0;
+					if (s_origAnnotLog < 10) {
+						logger::info("[OAR-Annot] Cached {} original annotations for actor {:X}",
+							origAnnots.size(), actorID);
+						s_origAnnotLog++;
+					}
+				}
+			}
+		}
+
+		// Ensure the suppression sink is registered
+		RegisterSuppressionSink();
+
 	}
 
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
@@ -715,12 +863,6 @@ namespace
 						static int s_swapLog = 0;
 						if (s_swapLog < 50) {
 							logger::info("[OAR] Swapping clip '{}' -> replacement (conditions passed)", suffix);
-							// Verify annotation tracks on the replacement animation
-							auto* repBytes = reinterpret_cast<uint8_t*>(replacement);
-							auto* annotPtr = *reinterpret_cast<void**>(repBytes + 0x28);
-							int32_t annotCount = *reinterpret_cast<int32_t*>(repBytes + 0x30);
-							logger::info("[OAR-Annot] Swap verify: replacement annotationTracks ptr={:X} count={}",
-								reinterpret_cast<uintptr_t>(annotPtr), annotCount);
 							s_swapLog++;
 						}
 						*animSlot = replacement;
@@ -762,63 +904,76 @@ namespace
 			s_activeReplacementSuffixes.insert(suffix);
 		}
 
-		// Fire replacement annotations manually based on local time progression.
-		// The game's annotation map (from LoadClips) fires ORIGINAL annotations;
-		// we fire REPLACEMENT annotations here via NotifyAnimationGraphImpl.
+		// Fire replacement annotations manually with dual-path emission.
+		// Collect events under lock, then fire AFTER releasing to avoid deadlock.
+		// Phase 1: NotifyAnimationGraphImpl (behavior graph state transitions)
+		// Phase 2: BSTEventSource::Notify (audio SoundPlay.*, plugin sinks)
 		{
 			const auto& annotSuffix = resolvedSuffix.empty() ? suffix : resolvedSuffix;
 			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix);
 			if (annotations && !annotations->empty() && refr) {
 				float localTime = a_this->GetLocalTime();
-				std::unique_lock alock(s_annotStateMutex);
-				auto& astate = s_annotStateMap[a_this];
+				std::vector<std::string> toFire;
 
-				if (astate.activeSuffix != annotSuffix) {
-					astate.activeSuffix = annotSuffix;
-					astate.prevLocalTime = 0.f;
-					astate.lastFiredIndex = -1;
-					static int s_annotInitLog = 0;
-					if (s_annotInitLog < 30) {
-						logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f})",
-							annotSuffix, annotations->size(), localTime);
-						s_annotInitLog++;
+				{
+					std::unique_lock alock(s_annotStateMutex);
+					auto& astate = s_annotStateMap[a_this];
+
+					if (astate.activeSuffix != annotSuffix) {
+						astate.activeSuffix = annotSuffix;
+						astate.prevLocalTime = 0.f;
+						astate.lastFiredIndex = -1;
+						static int s_annotInitLog = 0;
+						if (s_annotInitLog < 30) {
+							logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f})",
+								annotSuffix, annotations->size(), localTime);
+							s_annotInitLog++;
+						}
 					}
-				}
 
-				if (localTime >= 0.f) {
-					float prevT = astate.prevLocalTime;
-					float curT = localTime;
+					if (localTime >= 0.f) {
+						float prevT = astate.prevLocalTime;
+						float curT = localTime;
 
-					bool looped = (curT < prevT - 0.01f);
-					if (looped) {
+						bool looped = (curT < prevT - 0.01f);
+						if (looped) {
+							for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
+								auto& ann = (*annotations)[i];
+								if (ann.time >= prevT) {
+									toFire.push_back(ann.text);
+								}
+							}
+							astate.lastFiredIndex = -1;
+							prevT = 0.f;
+						}
+
 						for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
 							auto& ann = (*annotations)[i];
+							if (ann.time > curT) break;
 							if (ann.time >= prevT) {
-								RE::BSFixedString evtName(ann.text.c_str());
-								refr->NotifyAnimationGraphImpl(evtName);
-							}
-						}
-						astate.lastFiredIndex = -1;
-						prevT = 0.f;
-					}
-
-					for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
-						auto& ann = (*annotations)[i];
-						if (ann.time > curT) break;
-						if (ann.time >= prevT) {
-							RE::BSFixedString evtName(ann.text.c_str());
-							refr->NotifyAnimationGraphImpl(evtName);
-							astate.lastFiredIndex = i;
-							static int s_annotFireLog = 0;
-							if (s_annotFireLog < 50) {
-								logger::info("[OAR-Annot] Fired '{}' at t={:.3f} (clip '{}' localTime={:.3f})",
-									ann.text, ann.time, suffix, curT);
-								s_annotFireLog++;
+								toFire.push_back(ann.text);
+								astate.lastFiredIndex = i;
 							}
 						}
 					}
+					astate.prevLocalTime = localTime;
 				}
-				astate.prevLocalTime = localTime;
+				// Lock released — now fire on both paths
+				if (!toFire.empty()) {
+					s_oarFiringAnnotations = true;
+					for (auto& text : toFire) {
+						RE::BSFixedString evtName(text.c_str());
+						refr->NotifyAnimationGraphImpl(evtName);
+						NotifyEventSinks(refr, evtName);
+						static int s_annotFireLog = 0;
+						if (s_annotFireLog < 50) {
+							logger::info("[OAR-Annot] Fired '{}' (dual-path, clip '{}')",
+								text, suffix);
+							s_annotFireLog++;
+						}
+					}
+					s_oarFiringAnnotations = false;
+				}
 			}
 		}
 
@@ -827,11 +982,6 @@ namespace
 			static int s_restoreLog = 0;
 			if (s_restoreLog < 50) {
 				logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
-				auto* origBytes = reinterpret_cast<uint8_t*>(originalAnim);
-				auto* origAnnotPtr = *reinterpret_cast<void**>(origBytes + 0x28);
-				int32_t origAnnotCount = *reinterpret_cast<int32_t*>(origBytes + 0x30);
-				logger::info("[OAR-Annot] Restore verify: original annotationTracks ptr={:X} count={}",
-					reinterpret_cast<uintptr_t>(origAnnotPtr), origAnnotCount);
 				s_restoreLog++;
 			}
 			*animSlot = originalAnim;
