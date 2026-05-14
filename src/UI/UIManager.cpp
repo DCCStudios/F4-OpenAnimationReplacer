@@ -307,6 +307,13 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 		}
 	}
 
+	// Aggressively release cursor constraint on EVERY WndProc dispatch while menu is open.
+	// WndProc fires many times per frame (once per Windows message), so this reliably
+	// overrides the game's own ClipCursor calls even when the IAT hook fails.
+	if (ui->menuOpen.load()) {
+		::ClipCursor(nullptr);
+	}
+
 	if (anyUIOpen) {
 		ImGui_ImplWin32_WndProcHandler(a_hwnd, a_msg, a_wParam, a_lParam);
 

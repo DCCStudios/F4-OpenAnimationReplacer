@@ -92,11 +92,280 @@ namespace
 	static std::shared_mutex s_activeReplacementActorMutex;
 	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_activeReplacementByActor;
 
+	// Backup of hkbClipGenerator::triggers/originalTriggers we replaced during swap, so we can
+	// restore them when conditions stop matching. Without this, the engine's native annotation
+	// processor fires the ORIGINAL animation's annotations (e.g., 44pistol sounds) regardless
+	// of which hkaAnimation we swapped in — because triggers are keyed by binding, not anim.
+	struct TriggersBackup
+	{
+		void* triggers{ nullptr };          // raw hkRefPtr value (stored as void* — lifetime managed by Havok refcount)
+		void* originalTriggers{ nullptr };
+		bool nulled{ false };
+	};
+	static std::shared_mutex s_triggersBackupMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, TriggersBackup> s_triggersBackup;
+
+	static constexpr size_t kClipGenTriggersOffset = 0x98;
+	static constexpr size_t kClipGenOriginalTriggersOffset = 0xD8;
+
+	// =================== REPLACEMENT TRIGGER BUILDER ===================
+	// Vtables resolved from REL::ID at init time (reliable — no dependency on encountering annotation triggers)
+	static std::atomic<uintptr_t> s_vtableClipTriggerArray{ 0 };
+	static std::atomic<uintptr_t> s_vtableStringEventPayload{ 0 };
+
+	static void ResolveHavokVtables()
+	{
+		if (s_vtableClipTriggerArray.load() != 0 && s_vtableStringEventPayload.load() != 0)
+			return;
+
+		// REL::ID values from CommonLibF4 VTABLE_IDs.h
+		REL::Relocation<uintptr_t> vtbl_ClipTriggerArray{ REL::ID(264032) };
+		REL::Relocation<uintptr_t> vtbl_StringEventPayload{ REL::ID(1288131) };
+
+		uintptr_t arrVtbl = vtbl_ClipTriggerArray.address();
+		uintptr_t payVtbl = vtbl_StringEventPayload.address();
+
+		s_vtableClipTriggerArray.store(arrVtbl);
+		s_vtableStringEventPayload.store(payVtbl);
+
+		logger::info("[OAR-TrigBuild] Resolved vtables from REL::ID — hkbClipTriggerArray={:X}, hkbStringEventPayload={:X}",
+			arrVtbl, payVtbl);
+	}
+
+	// A built replacement trigger array that we manage ourselves.
+	// All memory is heap-allocated and stable (no reallocation).
+	struct OARBuiltTriggerArray
+	{
+		uint8_t* arrayHeader{ nullptr };        // 0x20 bytes: fake hkbClipTriggerArray
+		uint8_t* triggerEntries{ nullptr };      // N * 0x20 bytes: array of hkbClipTrigger
+		std::vector<uint8_t*> payloads;         // per-trigger hkbStringEventPayload (0x18 bytes each)
+		std::vector<std::string> strings;       // keep strings alive (payloads point into these)
+
+		RE::hkbClipTriggerArray* GetTriggerArray() const
+		{
+			return reinterpret_cast<RE::hkbClipTriggerArray*>(arrayHeader);
+		}
+
+		~OARBuiltTriggerArray()
+		{
+			delete[] arrayHeader;
+			delete[] triggerEntries;
+			for (auto* p : payloads) delete[] p;
+		}
+	};
+
+	static std::shared_mutex s_builtTriggersMutex;
+	static std::unordered_map<std::string, std::unique_ptr<OARBuiltTriggerArray>> s_builtTriggers; // suffix -> built array
+
+	static RE::hkbClipTriggerArray* GetOrBuildReplacementTriggers(const std::string& a_suffix)
+	{
+		{
+			std::shared_lock rlock(s_builtTriggersMutex);
+			auto it = s_builtTriggers.find(a_suffix);
+			if (it != s_builtTriggers.end() && it->second)
+				return it->second->GetTriggerArray();
+		}
+
+		uintptr_t arrVtbl = s_vtableClipTriggerArray.load();
+		uintptr_t payVtbl = s_vtableStringEventPayload.load();
+		if (!arrVtbl || !payVtbl) return nullptr;
+
+		auto* cache = AnimationCache::GetSingleton();
+		auto* annotations = cache->GetAnnotations(a_suffix);
+		if (!annotations || annotations->empty()) return nullptr;
+
+		const size_t trigCount = annotations->size();
+		const size_t kTriggerSize = 0x20;
+		const size_t kArrayHeaderSize = 0x20;
+		const size_t kPayloadSize = 0x18;
+
+		auto built = std::make_unique<OARBuiltTriggerArray>();
+		built->strings.resize(trigCount);
+		built->payloads.resize(trigCount);
+
+		built->triggerEntries = new uint8_t[trigCount * kTriggerSize]();
+		built->arrayHeader = new uint8_t[kArrayHeaderSize]();
+
+		for (size_t i = 0; i < trigCount; ++i) {
+			auto& annot = (*annotations)[i];
+			built->strings[i] = annot.text;
+
+			auto* pMem = new uint8_t[kPayloadSize]();
+			built->payloads[i] = pMem;
+
+			*reinterpret_cast<uintptr_t*>(pMem + 0x00) = payVtbl;
+			*reinterpret_cast<uint32_t*>(pMem + 0x08) = 0x80000000u | 0x7FFF;
+			*reinterpret_cast<const char**>(pMem + 0x10) = built->strings[i].c_str();
+
+			uint8_t* tMem = built->triggerEntries + i * kTriggerSize;
+			*reinterpret_cast<float*>(tMem + 0x00) = annot.time;
+			*reinterpret_cast<int32_t*>(tMem + 0x08) = -1;
+			*reinterpret_cast<RE::hkbEventPayload**>(tMem + 0x10) = reinterpret_cast<RE::hkbEventPayload*>(pMem);
+			tMem[0x18] = 0;
+			tMem[0x19] = 0;
+			tMem[0x1A] = 1;
+		}
+
+		uint8_t* aMem = built->arrayHeader;
+		*reinterpret_cast<uintptr_t*>(aMem + 0x00) = arrVtbl;
+		*reinterpret_cast<uint32_t*>(aMem + 0x08) = 0x80000000u | 0x7FFF;
+		*reinterpret_cast<uint8_t**>(aMem + 0x10) = built->triggerEntries;
+		*reinterpret_cast<int32_t*>(aMem + 0x18) = static_cast<int32_t>(trigCount);
+		*reinterpret_cast<uint32_t*>(aMem + 0x1C) = static_cast<uint32_t>(trigCount) | 0x80000000u;
+
+		logger::info("[OAR-TrigBuild] Built replacement triggers for '{}': {} entries", a_suffix, trigCount);
+		for (size_t i = 0; i < trigCount && i < 5; ++i) {
+			logger::info("[OAR-TrigBuild]   t={:.4f}s '{}'", (*annotations)[i].time, (*annotations)[i].text);
+		}
+
+		auto* result = built->GetTriggerArray();
+		std::unique_lock wlock(s_builtTriggersMutex);
+		s_builtTriggers[a_suffix] = std::move(built);
+		return result;
+	}
+
+	// Back up original triggers and NULL them so the engine's native annotation processor
+	// can't fire the ORIGINAL animation's events. NULL'd every frame because the engine
+	// may restore triggers between Activate/Update cycles.
+	static void InstallReplacementTriggers(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
+	{
+		if (!a_clipGen) return;
+		auto* bytes = reinterpret_cast<uint8_t*>(a_clipGen);
+		auto* triggersPtr = reinterpret_cast<void**>(bytes + kClipGenTriggersOffset);
+		auto* origTriggersPtr = reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset);
+
+		std::unique_lock lock(s_triggersBackupMutex);
+		auto& backup = s_triggersBackup[a_clipGen];
+		if (!backup.nulled) {
+			backup.triggers = *triggersPtr;
+			backup.originalTriggers = *origTriggersPtr;
+			backup.nulled = true;
+			static int s_installLog = 0;
+			if (s_installLog < 30) {
+				logger::info("[OAR-Triggers] NULL'd clipGen={:X} orig triggers={:X}/{:X}",
+					reinterpret_cast<uintptr_t>(a_clipGen),
+					reinterpret_cast<uintptr_t>(backup.triggers),
+					reinterpret_cast<uintptr_t>(backup.originalTriggers));
+				s_installLog++;
+			}
+		}
+
+		*triggersPtr = nullptr;
+		*origTriggersPtr = nullptr;
+	}
+
+	// Every frame: ensure triggers stay NULL'd (engine may restore originals between frames)
+	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
+	{
+		if (!a_clipGen) return;
+		auto* bytes = reinterpret_cast<uint8_t*>(a_clipGen);
+		auto* triggersPtr = reinterpret_cast<void**>(bytes + kClipGenTriggersOffset);
+		auto* origTriggersPtr = reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset);
+
+		if (!*triggersPtr && !*origTriggersPtr) return;
+
+		std::unique_lock lock(s_triggersBackupMutex);
+		auto& backup = s_triggersBackup[a_clipGen];
+		if (!backup.nulled) {
+			backup.triggers = *triggersPtr;
+			backup.originalTriggers = *origTriggersPtr;
+			backup.nulled = true;
+		}
+		*triggersPtr = nullptr;
+		*origTriggersPtr = nullptr;
+		static int s_reNullLog = 0;
+		if (s_reNullLog < 10) {
+			logger::info("[OAR-Triggers] Re-NULL'd clipGen={:X} (engine restored between frames)",
+				reinterpret_cast<uintptr_t>(a_clipGen));
+			s_reNullLog++;
+		}
+	}
+
+	static void RestoreClipTriggers(RE::hkbClipGenerator* a_clipGen)
+	{
+		if (!a_clipGen) return;
+		auto* bytes = reinterpret_cast<uint8_t*>(a_clipGen);
+		auto* triggersPtr = reinterpret_cast<void**>(bytes + kClipGenTriggersOffset);
+		auto* origTriggersPtr = reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset);
+
+		std::unique_lock lock(s_triggersBackupMutex);
+		auto it = s_triggersBackup.find(a_clipGen);
+		if (it != s_triggersBackup.end() && it->second.nulled) {
+			*triggersPtr = it->second.triggers;
+			*origTriggersPtr = it->second.originalTriggers;
+			static int s_restoreLog = 0;
+			if (s_restoreLog < 30) {
+				logger::info("[OAR-Triggers] Restored clipGen={:X} triggers={:X} originalTriggers={:X}",
+					reinterpret_cast<uintptr_t>(a_clipGen),
+					reinterpret_cast<uintptr_t>(it->second.triggers),
+					reinterpret_cast<uintptr_t>(it->second.originalTriggers));
+				s_restoreLog++;
+			}
+			s_triggersBackup.erase(it);
+		}
+	}
+
 	static bool ActorHasActiveReplacement(uint32_t a_actorID)
 	{
 		std::shared_lock slock(s_activeReplacementActorMutex);
 		auto it = s_activeReplacementByActor.find(a_actorID);
 		return it != s_activeReplacementByActor.end() && !it->second.empty();
+	}
+
+	// =================== DIRECT AUDIO PLAYBACK ===================
+	// Plays sounds directly through BSAudioManager, bypassing the behavior graph trigger system.
+	// This is necessary because our replacement annotations contain event names that don't exist
+	// in the host behavior graph's event table (they belong to the weapon subgraph).
+
+	struct OARSoundHandle
+	{
+		uint32_t soundID{ 0 };
+		bool assumeSuccess{ false };
+		int8_t state{ 0 };
+	};
+	static_assert(sizeof(OARSoundHandle) == 0x8);
+
+	static void PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr)
+	{
+		if (!a_soundName || !a_soundName[0]) return;
+
+		// BSAudioManager singleton: REL::ID(1321158) → pointer to BSAudioManager*
+		static REL::Relocation<void**> s_audioMgrPtr{ REL::ID(1321158) };
+		void* audioMgr = *s_audioMgrPtr;
+		if (!audioMgr) return;
+
+		// BSAudioManager::GetSoundHandleByName(this, handle&, name, distance, flags, extraData*)
+		// REL::ID(196484) — resolves sound name (EditorID) through BSAudioCallbacks::NameCallback
+		using GetSoundByName_t = void(*)(void* mgr, OARSoundHandle* handle, const char* name,
+			float distance, uint32_t usageFlags, void* extraData);
+		static REL::Relocation<GetSoundByName_t> GetSoundByName{ REL::ID(196484) };
+
+		// BSSoundHandle::FadeInPlay(this, milliseconds) — starts playback with optional fade
+		// REL::ID(353528) — calling with 0ms = instant play
+		using FadeInPlay_t = bool(*)(OARSoundHandle* handle, uint16_t ms);
+		static REL::Relocation<FadeInPlay_t> FadeInPlay{ REL::ID(353528) };
+
+		OARSoundHandle handle{};
+		GetSoundByName(audioMgr, &handle, a_soundName, 0.f, 0x1A, nullptr);
+
+		if (handle.soundID == 0 && !handle.assumeSuccess) {
+			static int s_failLog = 0;
+			if (s_failLog < 30) {
+				logger::info("[OAR-Audio] GetSoundHandleByName('{}') failed — no sound descriptor found", a_soundName);
+				s_failLog++;
+			}
+			return;
+		}
+
+		FadeInPlay(&handle, 0);
+
+		static int s_playLog = 0;
+		if (s_playLog < 50) {
+			logger::info("[OAR-Audio] Played sound '{}' (id={:X}) on {:X}",
+				a_soundName, handle.soundID,
+				a_refr ? a_refr->GetFormID() : 0u);
+			s_playLog++;
+		}
 	}
 
 	// Thread-local flag: set to true while OAR is firing replacement annotations via dual-path.
@@ -137,6 +406,14 @@ namespace
 
 			uint32_t actorID = 0;
 			if (a_event.refr) actorID = a_event.refr->GetFormID();
+
+			// Diagnostic: log every animation event so we can confirm the sink routes events
+			static int s_sinkCallLog = 0;
+			if (s_sinkCallLog < 200) {
+				logger::info("[OAR-Sink] event='{}' actorID={:X} hasActive={}",
+					evtStr, actorID, ActorHasActiveReplacement(actorID));
+				s_sinkCallLog++;
+			}
 
 			// Only suppress when this actor has an active replacement
 			if (!ActorHasActiveReplacement(actorID)) {
@@ -232,6 +509,14 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_activeReplacementActorMutex);
 		s_activeReplacementByActor.clear();
+	}
+	{
+		std::unique_lock lock(s_triggersBackupMutex);
+		s_triggersBackup.clear();
+	}
+	{
+		std::unique_lock lock(s_builtTriggersMutex);
+		s_builtTriggers.clear();
 	}
 	{
 		std::unique_lock lock(s_loadClipsPathMutex);
@@ -590,6 +875,9 @@ namespace
 			logger::info("[OAR] Captured game hkaAnimation vtable: {:X}", vtbl);
 		}
 
+		// Resolve Havok vtables from REL::ID for building replacement trigger arrays
+		ResolveHavokVtables();
+
 		// Cache the clip suffix (animationName is valid at Activate time but may be cleared later)
 		auto suffix = GetClipSuffixFromContext(a_this, a_context);
 		bool suffixChanged = false;
@@ -923,6 +1211,10 @@ namespace
 						}
 						*animSlot = replacement;
 
+						// Install replacement trigger array (contains our annotations),
+						// backing up originals so they can be restored later.
+						InstallReplacementTriggers(a_this, cacheSuffix);
+
 						if (AnimationLog::GetSingleton()->IsEnabled() && winningInfo) {
 							std::string subModName = winningInfo->parentSubMod ?
 								winningInfo->parentSubMod->GetName() : "";
@@ -931,6 +1223,8 @@ namespace
 								refr, suffix, winningInfo->replacementPath, subModName);
 						}
 					}
+					// Every frame: ensure replacement triggers stay installed (engine may restore originals)
+					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
 				}
 			}
 
@@ -1019,16 +1313,30 @@ namespace
 					}
 					astate.prevLocalTime = localTime;
 				}
-				// Lock released — now fire on both paths
+				// Lock released — now fire annotations
 				if (!toFire.empty()) {
 					s_oarFiringAnnotations = true;
 					for (auto& text : toFire) {
-						RE::BSFixedString evtName(text.c_str());
-						refr->NotifyAnimationGraphImpl(evtName);
-						NotifyEventSinks(refr, evtName);
+						static constexpr const char* kSoundPlayPrefix = "SoundPlay.";
+						static constexpr size_t kSoundPlayLen = 10;
+
+						if (text.size() > kSoundPlayLen &&
+							_strnicmp(text.c_str(), kSoundPlayPrefix, kSoundPlayLen) == 0)
+						{
+							// SoundPlay annotations: play directly through BSAudioManager
+							const char* soundName = text.c_str() + kSoundPlayLen;
+							PlaySoundDirect(soundName, refr);
+						} else {
+							// Non-sound annotations (reloadComplete, initiateStart, etc.):
+							// fire via behavior graph for state transitions
+							RE::BSFixedString evtName(text.c_str());
+							refr->NotifyAnimationGraphImpl(evtName);
+							NotifyEventSinks(refr, evtName);
+						}
+
 						static int s_annotFireLog = 0;
 						if (s_annotFireLog < 50) {
-							logger::info("[OAR-Annot] Fired '{}' (dual-path, clip '{}')",
+							logger::info("[OAR-Annot] Fired '{}' (clip '{}')",
 								text, suffix);
 							s_annotFireLog++;
 						}
@@ -1047,6 +1355,10 @@ namespace
 			}
 			*animSlot = originalAnim;
 		}
+		// Restore the engine's trigger arrays so the original animation's annotations
+		// resume firing natively.
+		RestoreClipTriggers(a_this);
+
 		uint32_t actorID = refr ? refr->GetFormID() : 0;
 		ActiveReplacementTracker::GetSingleton()->Remove(actorID, suffix);
 
