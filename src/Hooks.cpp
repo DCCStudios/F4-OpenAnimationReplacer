@@ -79,13 +79,25 @@ namespace
 	static std::shared_mutex s_annotStateMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, ClipAnnotationState> s_annotStateMap;
 
-	// Track which suffixes currently have active replacements (for event suppression)
+	// Track which suffixes currently have active replacements globally
 	static std::shared_mutex s_activeReplacementSuffixMutex;
 	static std::unordered_set<std::string> s_activeReplacementSuffixes;
 
 	// Per-actor set of original-animation annotation strings to suppress while replacement active
 	static std::shared_mutex s_origAnnotSetMutex;
 	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_origAnnotByActor; // actorFormID -> set of annotation text
+
+	// Per-actor active replacement set: actorFormID -> set of (clipGen, suffix) keys.
+	// Suppression sink consults this to decide whether to suppress engine annotations.
+	static std::shared_mutex s_activeReplacementActorMutex;
+	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_activeReplacementByActor;
+
+	static bool ActorHasActiveReplacement(uint32_t a_actorID)
+	{
+		std::shared_lock slock(s_activeReplacementActorMutex);
+		auto it = s_activeReplacementByActor.find(a_actorID);
+		return it != s_activeReplacementByActor.end() && !it->second.empty();
+	}
 
 	// Thread-local flag: set to true while OAR is firing replacement annotations via dual-path.
 	// The event sink uses this to let our events through and only suppress engine-sourced ones.
@@ -120,21 +132,18 @@ namespace
 				return RE::BSEventNotifyControl::kContinue;
 			}
 
-			// Only suppress when we have active replacements
-			{
-				std::shared_lock slock(s_activeReplacementSuffixMutex);
-				if (s_activeReplacementSuffixes.empty()) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-			}
-
-			// Check if this event is from the original animation set for the actor
 			const char* evtStr = a_event.animEvent.c_str();
 			if (!evtStr || !evtStr[0]) return RE::BSEventNotifyControl::kContinue;
 
 			uint32_t actorID = 0;
 			if (a_event.refr) actorID = a_event.refr->GetFormID();
 
+			// Only suppress when this actor has an active replacement
+			if (!ActorHasActiveReplacement(actorID)) {
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Policy 1: exact match against cached original-annotation set (when available)
 			{
 				std::shared_lock olock(s_origAnnotSetMutex);
 				auto it = s_origAnnotByActor.find(actorID);
@@ -142,12 +151,33 @@ namespace
 					if (it->second.contains(std::string(evtStr))) {
 						static int s_suppressLog = 0;
 						if (s_suppressLog < 30) {
-							logger::info("[OAR-Annot] Suppressed original event '{}' for actor {:X}",
+							logger::info("[OAR-Annot] Suppressed (cached) '{}' for actor {:X}",
 								evtStr, actorID);
 							s_suppressLog++;
 						}
 						return RE::BSEventNotifyControl::kStop;
 					}
+				}
+			}
+
+			// Policy 2 (fallback): suppress clip-driven annotation prefixes the engine fires from
+			// the original animation. These events are *almost always* annotation-driven and the
+			// replacement supplies its own version via the dual-path emission.
+			static const char* const kSuppressPrefixes[] = {
+				"SoundPlay.",   // weapon/clip sounds
+				"VoicePlay.",   // voice annotations
+				"Foley.",       // foley sounds
+			};
+			for (const char* prefix : kSuppressPrefixes) {
+				size_t plen = std::strlen(prefix);
+				if (std::strncmp(evtStr, prefix, plen) == 0) {
+					static int s_suppressPrefixLog = 0;
+					if (s_suppressPrefixLog < 30) {
+						logger::info("[OAR-Annot] Suppressed (prefix) '{}' for actor {:X}",
+							evtStr, actorID);
+						s_suppressPrefixLog++;
+					}
+					return RE::BSEventNotifyControl::kStop;
 				}
 			}
 
@@ -198,6 +228,10 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_origAnnotSetMutex);
 		s_origAnnotByActor.clear();
+	}
+	{
+		std::unique_lock lock(s_activeReplacementActorMutex);
+		s_activeReplacementByActor.clear();
 	}
 	{
 		std::unique_lock lock(s_loadClipsPathMutex);
@@ -558,6 +592,7 @@ namespace
 
 		// Cache the clip suffix (animationName is valid at Activate time but may be cleared later)
 		auto suffix = GetClipSuffixFromContext(a_this, a_context);
+		bool suffixChanged = false;
 		if (!suffix.empty()) {
 			// Log first few cached suffixes for diagnostics
 			static int s_cacheLogCount = 0;
@@ -568,8 +603,29 @@ namespace
 				logger::info("[OAR-Activate] Cached suffix='{}' match={}", suffix, hasMatch);
 				s_cacheLogCount++;
 			}
-			std::unique_lock lock(s_clipSuffixMutex);
-			s_clipSuffixCache[a_this] = std::move(suffix);
+			{
+				std::unique_lock lock(s_clipSuffixMutex);
+				auto it = s_clipSuffixCache.find(a_this);
+				if (it == s_clipSuffixCache.end() || it->second != suffix) {
+					suffixChanged = true;
+					s_clipSuffixCache[a_this] = suffix;
+				}
+			}
+			// If the suffix changed for this clipGen pointer (engine reused the slot for a
+			// different logical clip), the cached "original" is now stale — clear it so the
+			// new original gets captured below.
+			if (suffixChanged) {
+				std::unique_lock olock(s_originalAnimMutex);
+				s_originalAnimMap.erase(a_this);
+				std::unique_lock alock(s_annotStateMutex);
+				s_annotStateMap.erase(a_this);
+				static int s_resetLog = 0;
+				if (s_resetLog < 30) {
+					logger::info("[OAR-Activate] ClipGen {} reused for new suffix '{}' — reset original/annot state",
+						reinterpret_cast<uintptr_t>(a_this), suffix);
+					s_resetLog++;
+				}
+			}
 		} else {
 			// Log failure to read animation name
 			static int s_failLogCount = 0;
@@ -903,6 +959,11 @@ namespace
 			std::unique_lock slock(s_activeReplacementSuffixMutex);
 			s_activeReplacementSuffixes.insert(suffix);
 		}
+		// Track per-actor active replacements
+		{
+			std::unique_lock alock(s_activeReplacementActorMutex);
+			s_activeReplacementByActor[actorID].insert(suffix);
+		}
 
 		// Fire replacement annotations manually with dual-path emission.
 		// Collect events under lock, then fire AFTER releasing to avoid deadlock.
@@ -997,6 +1058,16 @@ namespace
 		{
 			std::unique_lock slock(s_activeReplacementSuffixMutex);
 			s_activeReplacementSuffixes.erase(suffix);
+		}
+		{
+			std::unique_lock alock(s_activeReplacementActorMutex);
+			auto it = s_activeReplacementByActor.find(actorID);
+			if (it != s_activeReplacementByActor.end()) {
+				it->second.erase(suffix);
+				if (it->second.empty()) {
+					s_activeReplacementByActor.erase(it);
+				}
+			}
 		}
 	}
 	}
