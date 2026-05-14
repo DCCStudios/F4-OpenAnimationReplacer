@@ -9,6 +9,7 @@ enum class WindowID : int32_t
 	kAnimationEventLog,
 	kWelcomeBanner,
 	kAnimationQueue,
+	kDebugOverlay,
 	kErrorBanner,
 	kCount
 };

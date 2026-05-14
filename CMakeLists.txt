@@ -76,6 +76,7 @@ set(SOURCES
 	src/UI/UIAnimationEventLog.cpp
 	src/UI/UIWelcomeBanner.cpp
 	src/UI/UIAnimationQueue.cpp
+	src/UI/UIDebugOverlay.cpp
 	src/API/OpenAnimationReplacerAPI.cpp
 )
 
@@ -108,6 +109,8 @@ set(HEADERS
 	src/UI/UIAnimationEventLog.h
 	src/UI/UIWelcomeBanner.h
 	src/UI/UIAnimationQueue.h
+	src/UI/UIDebugOverlay.h
+	src/ActiveReplacementTracker.h
 	src/API/OpenAnimationReplacerAPI.h
 )
 

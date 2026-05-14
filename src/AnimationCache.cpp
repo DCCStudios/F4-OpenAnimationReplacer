@@ -192,6 +192,64 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	*reinterpret_cast<int32_t*>(cloneBase + 0x70) = *reinterpret_cast<int32_t*>(ourBytes + 0x70);
 	*reinterpret_cast<uint32_t*>(cloneBase + 0x74) = *reinterpret_cast<uint32_t*>(ourBytes + 0x74);
 
+	// Parse annotation tracks from the replacement animation BEFORE clearing them.
+	// hkaAnimation layout: +0x28 = hkArray<hkaAnnotationTrack> annotationTracks
+	//   hkArray layout: +0x00 = data ptr, +0x08 = size (int32), +0x0C = capacityAndFlags
+	// hkaAnnotationTrack layout: +0x00 = trackName (hkStringPtr, 8 bytes)
+	//                            +0x08 = hkArray<Annotation> annotations
+	// Annotation layout: +0x00 = time (float), +0x04 = pad, +0x08 = text (hkStringPtr)
+	if (entry.annotations.empty()) {
+		auto* annotTrackPtr = *reinterpret_cast<uint8_t**>(ourBytes + 0x28);
+		int32_t annotTrackCount = *reinterpret_cast<int32_t*>(ourBytes + 0x30);
+
+		if (annotTrackPtr && annotTrackCount > 0 &&
+			reinterpret_cast<uintptr_t>(annotTrackPtr) > 0x10000) {
+
+			constexpr size_t kAnnotTrackSize = 0x18; // hkStringPtr(8) + hkArray(16)
+			constexpr size_t kAnnotationSize = 0x10; // float(4) + pad(4) + hkStringPtr(8)
+
+			for (int32_t t = 0; t < annotTrackCount; ++t) {
+				auto* trackBase = annotTrackPtr + (t * kAnnotTrackSize);
+				// annotations hkArray at trackBase + 0x08
+				auto* annots = *reinterpret_cast<uint8_t**>(trackBase + 0x08);
+				int32_t annotCount = *reinterpret_cast<int32_t*>(trackBase + 0x10);
+				if (!annots || annotCount <= 0 ||
+					reinterpret_cast<uintptr_t>(annots) < 0x10000) continue;
+
+				for (int32_t a = 0; a < annotCount; ++a) {
+					auto* annBase = annots + (a * kAnnotationSize);
+					float annTime = *reinterpret_cast<float*>(annBase + 0x00);
+					auto* txtPtr = *reinterpret_cast<const char**>(annBase + 0x08);
+					// hkStringPtr stores the pointer with bit 0 as a flag
+					auto rawTxt = reinterpret_cast<uintptr_t>(txtPtr) & ~uintptr_t(1);
+					auto* txt = reinterpret_cast<const char*>(rawTxt);
+					if (txt && rawTxt > 0x10000 && txt[0] != '\0') {
+						entry.annotations.push_back({ annTime, std::string(txt) });
+					}
+				}
+			}
+			if (!entry.annotations.empty()) {
+				std::ranges::sort(entry.annotations,
+					[](const auto& a, const auto& b) { return a.time < b.time; });
+				logger::info("[OAR-Cache] Parsed {} annotations from replacement '{}'",
+					entry.annotations.size(), entry.filePath);
+				for (auto& pa : entry.annotations) {
+					logger::info("[OAR-Cache]   t={:.4f}s  '{}'", pa.time, pa.text);
+				}
+			}
+		}
+	}
+
+	// Zero clone's annotationTracks — the game uses a separate annotation map (from LoadClips)
+	// for runtime event dispatch, not the hkaAnimation::annotationTracks field. We fire
+	// replacement annotations manually via NotifyAnimationGraphImpl in the Update hook.
+	*reinterpret_cast<uintptr_t*>(cloneBase + 0x28) = 0;
+	*reinterpret_cast<int32_t*>(cloneBase + 0x30) = 0;
+	*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = 0x80000000u;
+
+	logger::info("[OAR-Annot] Clone '{}': annotationTracks zeroed (manual firing active, {} parsed annotations)",
+		entry.filePath, entry.annotations.size());
+
 	// Clear m_transformOffsets (let game compute at runtime - game knows its own format)
 	*reinterpret_cast<uintptr_t*>(cloneBase + 0x78) = 0;
 	*reinterpret_cast<int32_t*>(cloneBase + 0x80) = 0;
@@ -215,6 +273,7 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	*reinterpret_cast<float*>(cloneBase + 0x50) = *reinterpret_cast<float*>(ourBytes + 0x50);     // frameDuration
 
 	entry.runtimeAnimation = reinterpret_cast<RE::hkaAnimation*>(cloneBase);
+	entry.gameOriginal = a_gameAnim;
 
 	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X}",
 		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim));
@@ -222,10 +281,58 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	return entry.runtimeAnimation;
 }
 
+const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotations(const std::string& a_suffix) const
+{
+	std::shared_lock lock(m_mutex);
+	auto it = m_cache.find(a_suffix);
+	if (it != m_cache.end() && it->second && !it->second->annotations.empty()) {
+		return &it->second->annotations;
+	}
+	return nullptr;
+}
+
 size_t AnimationCache::GetCacheSize() const
 {
 	std::shared_lock lock(m_mutex);
 	return m_cache.size();
+}
+
+bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
+{
+	if (!a_anim) return false;
+	std::shared_lock lock(m_mutex);
+	for (auto& [key, entry] : m_cache) {
+		if (entry && entry->runtimeAnimation == a_anim) return true;
+	}
+	return false;
+}
+
+RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const
+{
+	if (!a_replacement) return nullptr;
+	std::shared_lock lock(m_mutex);
+	for (auto& [key, entry] : m_cache) {
+		if (entry && entry->runtimeAnimation == a_replacement && entry->gameOriginal) {
+			return entry->gameOriginal;
+		}
+	}
+	return nullptr;
+}
+
+void AnimationCache::InvalidateRuntimeClones()
+{
+	std::unique_lock lock(m_mutex);
+	int count = 0;
+	for (auto& [key, entry] : m_cache) {
+		if (entry && entry->runtimeAnimation) {
+			entry->runtimeAnimation = nullptr;
+			entry->runtimeStruct.clear();
+			count++;
+		}
+	}
+	if (count > 0) {
+		logger::info("[OAR-Cache] Invalidated {} runtime clones", count);
+	}
 }
 
 void AnimationCache::Clear()

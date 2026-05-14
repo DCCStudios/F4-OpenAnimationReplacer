@@ -54,6 +54,6 @@ private:
 	mutable std::mutex animEventMutex;
 	std::deque<Entry> animEventEntries;
 
-	int maxEntries{ 100 };
+	int maxEntries{ 500 };
 	bool enabled{ true };
 };

@@ -4,7 +4,9 @@
 #include "UI/UIAnimationEventLog.h"
 #include "UI/UIWelcomeBanner.h"
 #include "UI/UIAnimationQueue.h"
+#include "UI/UIDebugOverlay.h"
 #include "UI/UICommon.h"
+#include "Jobs.h"
 #include "Offsets.h"
 #include "Settings.h"
 
@@ -29,6 +31,7 @@ void UIManager::InitWindows()
 	windows[static_cast<size_t>(WindowID::kAnimationEventLog)] = std::make_unique<UIAnimationEventLog>();
 	windows[static_cast<size_t>(WindowID::kWelcomeBanner)] = std::make_unique<UIWelcomeBanner>();
 	windows[static_cast<size_t>(WindowID::kAnimationQueue)] = std::make_unique<UIAnimationQueue>();
+	windows[static_cast<size_t>(WindowID::kDebugOverlay)] = std::make_unique<UIDebugOverlay>();
 
 	windowsInitialized = true;
 }
@@ -188,6 +191,9 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 
 void UIManager::RenderFrame()
 {
+	// Process pending background jobs (config saves, reloads, etc.)
+	JobQueue::GetSingleton()->ProcessAll();
+
 	bool mainOpen = menuOpen.load();
 
 	bool anyIndependentOpen = false;
@@ -199,6 +205,14 @@ void UIManager::RenderFrame()
 	}
 
 	if (!mainOpen && !anyIndependentOpen) return;
+
+	// Force-release cursor clip EVERY frame while menu is open.
+	// The ClipCursor IAT hook often fails (another plugin hooks it first),
+	// so we cannot rely on it. Brute-force release ensures the game's
+	// per-frame ClipCursor calls are always overridden.
+	if (mainOpen) {
+		::ClipCursor(nullptr);
+	}
 
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
@@ -243,6 +257,21 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 		ImGui::GetIO().ClearInputKeys();
 	}
 
+	// Consume the WM_CHAR that follows a consumed WM_KEYDOWN (TranslateMessage queues it)
+	if (a_msg == WM_CHAR && s_consumeNextChar) {
+		s_consumeNextChar = false;
+		return 0;
+	}
+
+	// Consume the WM_KEYUP for the toggle key so the game never sees the full press cycle
+	if (a_msg == WM_KEYUP && s_consumeKeyUpScanCode != 0) {
+		auto scanCode = (a_lParam >> 16) & 0xFF;
+		if (scanCode == s_consumeKeyUpScanCode) {
+			s_consumeKeyUpScanCode = 0;
+			return 0;
+		}
+	}
+
 	if (a_msg == WM_KEYDOWN) {
 		auto scanCode = (a_lParam >> 16) & 0xFF;
 		bool isFirstPress = (a_lParam & 0x40000000) == 0;
@@ -251,7 +280,19 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 
 		if (isFirstPress && scanCode == settings->iToggleKey &&
 			(!settings->bRequireShift || shiftHeld)) {
+			bool willBeOpen = !ui->menuOpen.load();
+
+			// Pre-set ignoreKeyboardMouse BEFORE toggling so the game's
+			// input pipeline sees the flag this frame (DirectInput reads happen
+			// after WndProc dispatch on the same thread)
+			auto* controlMap = RE::ControlMap::GetSingleton();
+			if (controlMap) {
+				controlMap->ignoreKeyboardMouse = willBeOpen;
+			}
+
 			ui->ToggleMenu();
+			s_consumeNextChar = true;
+			s_consumeKeyUpScanCode = scanCode;
 			return 0;
 		}
 	}
@@ -318,13 +359,18 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 BOOL WINAPI UIManager::HookedClipCursor(const RECT* a_rect)
 {
 	auto* ui = UIManager::GetSingleton();
+
 	if (ui->menuOpen.load()) {
 		return TRUE;
 	}
 	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
 		return TRUE;
 	}
-	return OriginalClipCursor(a_rect);
+
+	if (OriginalClipCursor) {
+		return OriginalClipCursor(a_rect);
+	}
+	return TRUE;
 }
 
 void UIManager::ToggleMenu()
@@ -342,9 +388,21 @@ void UIManager::SetMenuOpen(bool a_open)
 	}
 
 	if (a_open) {
-		if (OriginalClipCursor) {
-			OriginalClipCursor(nullptr);
+		// Always release cursor constraint using the raw Win32 API.
+		// The IAT hook may or may not be installed; this guarantees release.
+		::ClipCursor(nullptr);
+
+		// Move OS cursor to screen center so it's immediately visible and usable.
+		// Without this, the cursor can be stuck at the last game-warped position.
+		if (gameWindow) {
+			RECT rc;
+			if (GetClientRect(gameWindow, &rc)) {
+				POINT center = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
+				ClientToScreen(gameWindow, &center);
+				::SetCursorPos(center.x, center.y);
+			}
 		}
+
 		auto& io = ImGui::GetIO();
 		io.MouseDrawCursor = true;
 		UIMain::GetSingleton()->SetOpen(true);

@@ -81,6 +81,8 @@ class IsFemaleCondition : public ConditionBase
 public:
 	std::string GetName() const override { return "IsFemale"; }
 	std::string GetDescription() const override { return "Is the actor female?"; }
+	bool IsStub() const override { return true; }
+	std::string GetStubReason() const override { return "TESNPC class not fully defined in CommonLibF4"; }
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
 	void InitializeImpl(const nlohmann::json&) override {}
@@ -183,6 +185,8 @@ class LevelCondition : public ConditionBase
 public:
 	std::string GetName() const override { return "Level"; }
 	std::string GetDescription() const override { return "Compare actor level"; }
+	bool IsStub() const override { return true; }
+	std::string GetStubReason() const override { return "No reliable level accessor without TESNPC class definition"; }
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
 	void InitializeImpl(const nlohmann::json& a_json) override;
@@ -265,6 +269,8 @@ class CurrentWeatherCondition : public ConditionBase
 public:
 	std::string GetName() const override { return "CurrentWeather"; }
 	std::string GetDescription() const override { return "Is the current weather a specific form?"; }
+	bool IsStub() const override { return true; }
+	std::string GetStubReason() const override { return "Sky singleton not exposed in CommonLibF4"; }
 	std::string GetParameterString() const override { return form.GetDisplayString(); }
 	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Weather", a_dirty); }
 protected:
@@ -301,6 +307,56 @@ private:
 	std::string actorValueName;
 	ComparisonOperator comparison{ ComparisonOperator::kEqual };
 	NumericComponent numericValue;
+	mutable RE::ActorValueInfo* cachedAVInfo{ nullptr };
+	mutable bool avInfoResolved{ false };
+};
+
+class CurrentMagazineAmmoCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "CurrentMagazineAmmo"; }
+	std::string GetDescription() const override { return "Compare current magazine ammo count of equipped weapon"; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kEqual };
+	NumericComponent numericValue;
+};
+
+class IsEquippedHasKeywordCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsEquippedHasKeyword"; }
+	std::string GetDescription() const override { return "Does the equipped weapon have a specific keyword?"; }
+	std::string GetParameterString() const override { return editorID.empty() ? keywordForm.GetDisplayString() : editorID; }
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	FormComponent keywordForm;
+	std::string editorID;
+	RE::BGSKeyword* cachedKeyword{ nullptr };
+};
+
+class IsEquippedCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsEquipped"; }
+	std::string GetDescription() const override { return "Is a specific weapon/item equipped?"; }
+	std::string GetParameterString() const override { return form.GetDisplayString(); }
+	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Form", a_dirty); }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	FormComponent form;
 };
 
 void RegisterAllConditions();

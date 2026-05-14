@@ -65,6 +65,9 @@ private:
 	using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
 	static inline ClipCursorFn OriginalClipCursor{ nullptr };
 
+	static inline bool s_consumeNextChar{ false };
+	static inline uint32_t s_consumeKeyUpScanCode{ 0 };
+
 	using D3D11CreateFn = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
 		const D3D_FEATURE_LEVEL*, UINT, UINT, const DXGI_SWAP_CHAIN_DESC*,
 		IDXGISwapChain**, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);

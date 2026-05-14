@@ -4,6 +4,7 @@
 
 void RegisterActorCharacter(RE::TESObjectREFR* a_refr);
 void ClearCharacterCache();
+void ClearClipRuntimeState();
 void SetGameFullyLoaded(bool a_loaded);
 void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();

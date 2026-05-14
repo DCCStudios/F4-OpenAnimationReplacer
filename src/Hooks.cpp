@@ -4,7 +4,10 @@
 #include "Settings.h"
 #include "ActiveClip.h"
 #include "OpenAnimationReplacer.h"
+#include "ReplacerMods.h"
 #include "AnimationCache.h"
+#include "AnimationLog.h"
+#include "ActiveReplacementTracker.h"
 #include <set>
 #include <unordered_map>
 
@@ -24,6 +27,15 @@ static std::string s_capturedAnimPath;
 static std::mutex s_capturedMutex;
 static std::vector<void*> s_capturedGraphs;
 static std::mutex s_capturedGraphsMutex;
+
+// Source 1: LoadClips animation path map (stringData* -> animationPath prefix)
+static std::shared_mutex s_loadClipsPathMutex;
+static std::unordered_map<RE::hkbCharacterStringData*, std::string> s_loadClipsPathMap;
+
+// Source 2: LoadedIdleAnimData reverse map (clipGenerator* -> animFile)
+static std::shared_mutex s_idleAnimReverseMutex;
+static std::unordered_map<RE::hkbClipGenerator*, std::string> s_idleAnimReverseMap;
+static std::atomic<bool> s_idleAnimReverseBuilt{ false };
 
 void RegisterActorCharacter(RE::TESObjectREFR* a_refr)
 {
@@ -49,30 +61,186 @@ void ClearCharacterCache()
 
 namespace
 {
+	// Forward-declared — defined below, cleared from ClearClipRuntimeState
+	static std::shared_mutex s_originalAnimMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, RE::hkaAnimation*> s_originalAnimMap;
+
+	// Cache clip suffixes from Activate (animationName may be cleared by Update time)
+	static std::shared_mutex s_clipSuffixMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipSuffixCache;
+
+	// Manual annotation firing state — tracks localTime progression per clip
+	struct ClipAnnotationState
+	{
+		float prevLocalTime{ -1.f };
+		std::string activeSuffix;
+		int32_t lastFiredIndex{ -1 };
+	};
+	static std::shared_mutex s_annotStateMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, ClipAnnotationState> s_annotStateMap;
+
+	// Track which suffixes currently have active replacements (for event suppression)
+	static std::shared_mutex s_activeReplacementSuffixMutex;
+	static std::unordered_set<std::string> s_activeReplacementSuffixes;
+
+}
+
+void ClearClipRuntimeState()
+{
+	{
+		std::unique_lock lock(s_originalAnimMutex);
+		s_originalAnimMap.clear();
+	}
+	{
+		std::unique_lock lock(s_clipSuffixMutex);
+		s_clipSuffixCache.clear();
+	}
+	{
+		std::unique_lock lock(s_annotStateMutex);
+		s_annotStateMap.clear();
+	}
+	{
+		std::unique_lock lock(s_activeReplacementSuffixMutex);
+		s_activeReplacementSuffixes.clear();
+	}
+	{
+		std::unique_lock lock(s_loadClipsPathMutex);
+		s_loadClipsPathMap.clear();
+	}
+	{
+		std::unique_lock lock(s_idleAnimReverseMutex);
+		s_idleAnimReverseMap.clear();
+	}
+	s_idleAnimReverseBuilt.store(false);
+	ActiveReplacementTracker::GetSingleton()->Clear();
+	logger::info("[OAR] Cleared clip runtime state (all maps including LoadClips path + IdleAnim reverse)");
+}
+
+namespace
+{
 	RE::TESObjectREFR* GetRefrFromContext(const RE::hkbContext* a_context)
 	{
 		if (!a_context) return nullptr;
 		auto* character = a_context->character;
 		if (!character) return nullptr;
 
-		std::shared_lock lock(s_characterCacheMutex);
+		// Fast path: check existing cache (without the mainBodyCharacters filter)
+		{
+			std::shared_lock lock(s_characterCacheMutex);
+			auto it = s_characterCache.find(character);
+			if (it != s_characterCache.end()) {
+				auto* refr = it->second;
+				if (refr && refr->As<RE::Actor>()) return refr;
+			}
+		}
 
-		if (s_mainBodyCharacters.find(character) == s_mainBodyCharacters.end())
-			return nullptr;
-
-		auto it = s_characterCache.find(character);
-		if (it != s_characterCache.end()) {
-			auto* refr = it->second;
-			if (refr && refr->As<RE::Actor>()) return refr;
+		// Cache miss: try to register the player (most common case for missing characters)
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player) {
+			RegisterActorCharacter(player);
+			std::shared_lock lock(s_characterCacheMutex);
+			auto it = s_characterCache.find(character);
+			if (it != s_characterCache.end()) return it->second;
 		}
 
 		return nullptr;
 	}
 
+	// LoadedIdleAnimData: mirrors engine struct at REL::ID(762973)
+	struct LoadedIdleAnimDataRaw
+	{
+		RE::BSFixedString animFile;
+		uint64_t          unk2;
+		void*             binding;
+		void*             clipGenerator;
+		void*             animationGraph;
+	};
+	static_assert(sizeof(LoadedIdleAnimDataRaw) == 40);
+
+	struct BSTArrayHeaderRaw
+	{
+		void*    data;
+		uint32_t size;
+		uint32_t capacity;
+	};
+	static_assert(sizeof(BSTArrayHeaderRaw) == 16);
+
+	static void BuildIdleAnimReverseMap()
+	{
+		if (s_idleAnimReverseBuilt.load()) return;
+
+		REL::Relocation<BSTArrayHeaderRaw*> arrReloc{ REL::ID(762973) };
+		auto* arrHeader = arrReloc.get();
+		if (!arrHeader) {
+			logger::warn("[OAR-IdleAnim] Array relocation returned null");
+			return;
+		}
+		if (IsBadReadPtr(arrHeader, sizeof(BSTArrayHeaderRaw))) {
+			logger::warn("[OAR-IdleAnim] Array header not readable");
+			return;
+		}
+		if (!arrHeader->data || arrHeader->size == 0 || arrHeader->size > 100000) {
+			logger::warn("[OAR-IdleAnim] Array not ready (size={}, data={:X})",
+				arrHeader->size, reinterpret_cast<uintptr_t>(arrHeader->data));
+			return;
+		}
+		if (IsBadReadPtr(arrHeader->data, sizeof(LoadedIdleAnimDataRaw))) {
+			logger::warn("[OAR-IdleAnim] Array data pointer invalid");
+			return;
+		}
+
+		auto* entries = reinterpret_cast<LoadedIdleAnimDataRaw*>(arrHeader->data);
+		int captured = 0;
+		int skipped = 0;
+		{
+			std::unique_lock lock(s_idleAnimReverseMutex);
+			for (uint32_t i = 0; i < arrHeader->size; i++) {
+				auto& e = entries[i];
+				if (!e.clipGenerator) continue;
+
+				// BSFixedString stores a pointer at offset 0; validate before calling c_str()
+				auto rawStrPtr = *reinterpret_cast<const uintptr_t*>(&e.animFile);
+				if (rawStrPtr == 0 || rawStrPtr < 0x10000 || rawStrPtr > 0x7FFFFFFFFFFFull) {
+					skipped++;
+					continue;
+				}
+				if (IsBadReadPtr(reinterpret_cast<void*>(rawStrPtr), 8)) {
+					skipped++;
+					continue;
+				}
+
+				const char* fileName = e.animFile.c_str();
+				if (!fileName || reinterpret_cast<uintptr_t>(fileName) < 0x10000 || !fileName[0]) continue;
+				auto* clipGen = reinterpret_cast<RE::hkbClipGenerator*>(e.clipGenerator);
+				s_idleAnimReverseMap[clipGen] = std::string(fileName);
+				captured++;
+			}
+		}
+
+		s_idleAnimReverseBuilt.store(true);
+		logger::info("[OAR-IdleAnim] Built reverse map: {} entries ({} skipped) from {} total",
+			captured, skipped, arrHeader->size);
+
+		int logged = 0;
+		std::shared_lock lock(s_idleAnimReverseMutex);
+		for (auto& [clipPtr, name] : s_idleAnimReverseMap) {
+			if (logged >= 10) break;
+			logger::info("[OAR-IdleAnim]   clip={:X} -> '{}'",
+				reinterpret_cast<uintptr_t>(clipPtr), name);
+			logged++;
+		}
+	}
+
 	static std::shared_mutex s_nameLookupMutex;
 	static std::unordered_map<std::string, std::string> s_suffixToReplacementPath;
+	// Sorted replacement info per suffix (highest priority first)
+	static std::unordered_map<std::string, std::vector<ReplacementAnimFileInfo*>> s_suffixToInfos;
+	// Leaf-name fallback: maps "wpnreload" -> ["scar\wpnreload", "scar\60rddrum\wpnreload", ...]
+	static std::unordered_map<std::string, std::vector<std::string>> s_leafToFullSuffixes;
 	static std::vector<std::unique_ptr<std::string>> s_persistentStrings;
 	static bool s_lookupBuilt = false;
+
+	// s_originalAnimMap declared above ClearClipRuntimeState()
 
 	static std::string ExtractAnimSuffix(const std::string& a_path)
 	{
@@ -111,15 +279,37 @@ namespace
 			auto suffix = ExtractAnimSuffix(mapKey);
 			if (suffix.empty()) continue;
 
+			auto& infoVec = s_suffixToInfos[suffix];
 			for (auto& info : replacementInfos) {
 				s_suffixToReplacementPath[suffix] = info.replacementPath;
-				logger::info("[OAR] NameLookup: suffix='{}' -> '{}'", suffix, info.replacementPath);
-				break;
+				infoVec.push_back(const_cast<ReplacementAnimFileInfo*>(&info));
+			}
+
+			// Sort by priority (highest first)
+			std::ranges::sort(infoVec, [](const auto* a, const auto* b) {
+				int pa = a->parentSubMod ? a->parentSubMod->GetPriority() : 0;
+				int pb = b->parentSubMod ? b->parentSubMod->GetPriority() : 0;
+				return pa > pb;
+			});
+
+			if (!infoVec.empty()) {
+				logger::info("[OAR] NameLookup: suffix='{}' -> '{}' ({} candidates)",
+					suffix, infoVec[0]->replacementPath, infoVec.size());
+			}
+		}
+
+		// Build leaf-name fallback index: extract leaf (last path component) from each suffix
+		for (auto& [suffix, infos] : s_suffixToInfos) {
+			auto lastSep = suffix.rfind('\\');
+			std::string leaf = (lastSep != std::string::npos) ? suffix.substr(lastSep + 1) : suffix;
+			if (!leaf.empty()) {
+				s_leafToFullSuffixes[leaf].push_back(suffix);
 			}
 		}
 
 		s_lookupBuilt = true;
-		logger::info("[OAR] Built name lookup with {} entries", s_suffixToReplacementPath.size());
+		logger::info("[OAR] Built name lookup with {} entries, {} leaf keys",
+			s_suffixToReplacementPath.size(), s_leafToFullSuffixes.size());
 	}
 
 	static void PreloadReplacementAnimations()
@@ -155,6 +345,101 @@ namespace
 			loaded, failed, cache->GetCacheSize());
 	}
 
+	static std::string GetClipSuffixFromContext(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
+	{
+		static int s_sourceLogCount = 0;
+
+		// Source 1: LoadClips path + stringData animationNames[bindIdx]
+		// This gives us the REAL file path (weapon-specific, e.g. "SCAR\wpnreload")
+		if (a_context && a_context->character) {
+			auto* character = a_context->character;
+			auto* setup = character->setup._ptr;
+			if (setup) {
+				auto* data = setup->data._ptr;
+				if (data) {
+					auto* stringData = data->stringData._ptr;
+					if (stringData) {
+						// Check if we have a captured animationPath for this stringData
+						std::string animPath;
+						{
+							std::shared_lock lock(s_loadClipsPathMutex);
+							auto it = s_loadClipsPathMap.find(stringData);
+							if (it != s_loadClipsPathMap.end()) {
+								animPath = it->second;
+							}
+						}
+
+						int16_t bindIdx = a_this->animationBindingIndex;
+						auto& animNames = stringData->animationNames;
+						auto* arrBase = reinterpret_cast<const uint8_t*>(&animNames);
+						auto* nameData = *reinterpret_cast<RE::hkbCharacterStringData::FileNameMeshNamePair* const*>(arrBase);
+						int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
+
+						if (nameData && bindIdx >= 0 && bindIdx < nameSize) {
+							const char* fileName = nameData[bindIdx].fileName.data();
+							if (fileName && reinterpret_cast<uintptr_t>(fileName) > 0x10000 && fileName[0] != '\0') {
+								if (!animPath.empty()) {
+									// Reconstruct full path: animPath + fileName
+									std::string fullPath = animPath + fileName;
+									auto suffix = ExtractAnimSuffix(fullPath);
+									if (!suffix.empty()) {
+										if (s_sourceLogCount < 20) {
+											logger::info("[OAR-Suffix] Source1: animPath='{}' + fileName='{}' -> suffix='{}'",
+												animPath, fileName, suffix);
+											s_sourceLogCount++;
+										}
+										return suffix;
+									}
+								}
+								// animPath not captured yet, but fileName itself might contain path info
+								auto suffix = ExtractAnimSuffix(std::string(fileName));
+								if (!suffix.empty()) {
+									if (s_sourceLogCount < 20) {
+										logger::info("[OAR-Suffix] Source1b: fileName='{}' -> suffix='{}'",
+											fileName, suffix);
+										s_sourceLogCount++;
+									}
+									return suffix;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Source 2: LoadedIdleAnimData reverse lookup (real file -> clipGenerator)
+		if (s_idleAnimReverseBuilt.load()) {
+			std::shared_lock lock(s_idleAnimReverseMutex);
+			auto it = s_idleAnimReverseMap.find(a_this);
+			if (it != s_idleAnimReverseMap.end()) {
+				auto suffix = ExtractAnimSuffix(it->second);
+				if (!suffix.empty()) {
+					if (s_sourceLogCount < 20) {
+						logger::info("[OAR-Suffix] Source2: idleAnimData='{}' -> suffix='{}'",
+							it->second, suffix);
+						s_sourceLogCount++;
+					}
+					return suffix;
+				}
+			}
+		}
+
+		// Source 3: animationName field (behavior template name, e.g. "44pistol\wpnreload")
+		const char* clipName = a_this->animationName.data();
+		if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
+			auto suffix = ExtractAnimSuffix(std::string(clipName));
+			if (s_sourceLogCount < 20) {
+				logger::info("[OAR-Suffix] Source3: animationName='{}' -> suffix='{}'",
+					clipName, suffix);
+				s_sourceLogCount++;
+			}
+			return suffix;
+		}
+
+		return {};
+	}
+
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		Hooks::ClipGeneratorHooks::_Activate(a_this, a_context);
@@ -164,11 +449,7 @@ namespace
 		}
 
 		if (!s_lookupBuilt) BuildNameLookup();
-
-		const char* clipName = a_this->animationName.data();
-		if (!clipName || reinterpret_cast<uintptr_t>(clipName) < 0x10000) {
-			return;
-		}
+		if (!s_idleAnimReverseBuilt.load()) BuildIdleAnimReverseMap();
 
 		auto* cache = AnimationCache::GetSingleton();
 
@@ -179,39 +460,71 @@ namespace
 			logger::info("[OAR] Captured game hkaAnimation vtable: {:X}", vtbl);
 		}
 
-		auto suffix = ExtractAnimSuffix(std::string(clipName));
-
-		std::shared_lock lock(s_nameLookupMutex);
-		auto it = s_suffixToReplacementPath.find(suffix);
-		if (it == s_suffixToReplacementPath.end()) {
-			lock.unlock();
-			return;
+		// Cache the clip suffix (animationName is valid at Activate time but may be cleared later)
+		auto suffix = GetClipSuffixFromContext(a_this, a_context);
+		if (!suffix.empty()) {
+			// Log first few cached suffixes for diagnostics
+			static int s_cacheLogCount = 0;
+			if (s_cacheLogCount < 30) {
+				std::shared_lock rlock(s_nameLookupMutex);
+				bool hasMatch = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
+				rlock.unlock();
+				logger::info("[OAR-Activate] Cached suffix='{}' match={}", suffix, hasMatch);
+				s_cacheLogCount++;
+			}
+			std::unique_lock lock(s_clipSuffixMutex);
+			s_clipSuffixCache[a_this] = std::move(suffix);
+		} else {
+			// Log failure to read animation name
+			static int s_failLogCount = 0;
+			if (s_failLogCount < 10) {
+				const char* rawName = a_this->animationName.data();
+				uintptr_t rawPtr = reinterpret_cast<uintptr_t>(a_this->animationName.stringAndFlag);
+				logger::warn("[OAR-Activate] Failed to get suffix: rawPtr={:X}, bindIdx={}",
+					rawPtr, static_cast<int>(a_this->animationBindingIndex));
+				s_failLogCount++;
+			}
 		}
-		lock.unlock();
 
-		auto* replacement = cache->GetCachedAnimation(suffix);
-		if (!replacement) return;
+		// Log this activation to the Animation Log for the UI
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
+			RE::TESObjectREFR* refr = GetRefrFromContext(a_context);
+			if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+			std::string suffixCopy;
+			{
+				std::shared_lock rlock(s_clipSuffixMutex);
+				auto sit = s_clipSuffixCache.find(a_this);
+				if (sit != s_clipSuffixCache.end()) suffixCopy = sit->second;
+			}
+			if (!suffixCopy.empty()) {
+				AnimationLog::GetSingleton()->AddEntry(
+					AnimationLog::EventType::kActivate,
+					refr, suffixCopy, "", "");
+			}
+		}
 
-		auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
-		if (repVtbl < 0x7FF000000000ull || repVtbl > 0x7FFF00000000ull) return;
-
+		// Store the original animation pointer ONLY on the first activation of a clip.
+		// During state transitions, the game may temporarily assign a shared/transit
+		// animation to the binding, so we must not overwrite a known-good original.
 		auto** animSlot = a_this->GetAnimationSlot();
-		if (!animSlot || !*animSlot) return;
-
-		static int s_matchLog = 0;
-		if (s_matchLog < 20) {
-			logger::info("[OAR] ClipGen Activate (SWAP): clip='{}' suffix='{}'", clipName, suffix);
-			s_matchLog++;
+		if (animSlot && *animSlot) {
+			auto* cache = AnimationCache::GetSingleton();
+			if (!cache->IsOurReplacement(*animSlot)) {
+				std::unique_lock lock(s_originalAnimMutex);
+				s_originalAnimMap.try_emplace(a_this, *animSlot);
+			}
 		}
 
-		*animSlot = replacement;
 	}
 
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
 	{
+		// Call original Update first — variable bindings must process before any animation swap
 		Hooks::ClipGeneratorHooks::_Update(a_this, a_context, a_timestep);
 
-		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this) return;
+		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
+			return;
+		}
 
 		auto* cache = AnimationCache::GetSingleton();
 
@@ -222,136 +535,342 @@ namespace
 			logger::info("[OAR] Captured game hkaAnimation vtable: {:X} (from Update)", vtbl);
 		}
 
-		if (!s_lookupBuilt) return;
+		// Look up the cached suffix (cached during Activate when animationName is still valid)
+		std::string suffix;
+		{
+			std::shared_lock lock(s_clipSuffixMutex);
+			auto it = s_clipSuffixCache.find(a_this);
+			if (it != s_clipSuffixCache.end()) {
+				suffix = it->second;
+			}
+		}
 
-		const char* clipName = a_this->animationName.data();
-		if (!clipName || reinterpret_cast<uintptr_t>(clipName) < 0x10000) return;
+		if (suffix.empty()) {
+			const char* clipName = a_this->animationName.data();
+			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
+				suffix = ExtractAnimSuffix(std::string(clipName));
+			}
+		}
 
-		auto suffix = ExtractAnimSuffix(std::string(clipName));
+		if (suffix.empty()) return;
 
+		// Diagnostic: log unique suffixes
+		{
+			static std::unordered_set<std::string> s_loggedSuffixes;
+			static std::shared_mutex s_loggedSuffixMutex;
+			std::shared_lock slock(s_loggedSuffixMutex);
+			bool isNew = s_loggedSuffixes.find(suffix) == s_loggedSuffixes.end();
+			slock.unlock();
+			if (isNew) {
+				std::unique_lock ulock(s_loggedSuffixMutex);
+				if (s_loggedSuffixes.insert(suffix).second) {
+					bool found = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
+					logger::info("[OAR-Match] suffix='{}' match={}", suffix, found);
+				}
+			}
+		}
+
+		// Check if this suffix has a match via direct or leaf lookup
 		std::shared_lock lock(s_nameLookupMutex);
-		auto it = s_suffixToReplacementPath.find(suffix);
-		if (it == s_suffixToReplacementPath.end()) return;
+		auto infoIt = s_suffixToInfos.find(suffix);
+		std::string resolvedSuffix;
+		std::vector<ReplacementAnimFileInfo*> mergedCandidates;
+		if (infoIt == s_suffixToInfos.end()) {
+			auto lastSep = suffix.rfind('\\');
+			std::string leaf = (lastSep != std::string::npos) ? suffix.substr(lastSep + 1) : suffix;
+			if (!leaf.empty()) {
+				auto leafIt = s_leafToFullSuffixes.find(leaf);
+				if (leafIt != s_leafToFullSuffixes.end() && !leafIt->second.empty()) {
+					for (auto& fullSuffix : leafIt->second) {
+						auto it2 = s_suffixToInfos.find(fullSuffix);
+						if (it2 != s_suffixToInfos.end()) {
+							for (auto* info : it2->second) {
+								mergedCandidates.push_back(info);
+							}
+							if (resolvedSuffix.empty())
+								resolvedSuffix = fullSuffix;
+						}
+					}
+					if (!mergedCandidates.empty()) {
+						infoIt = s_suffixToInfos.find(resolvedSuffix);
+					}
+					static std::unordered_set<std::string> s_leafLoggedOnce;
+					if (s_leafLoggedOnce.insert(suffix).second) {
+						logger::info("[OAR-LeafMatch] '{}' -> {} candidates via leaf '{}' (first='{}')",
+							suffix, mergedCandidates.size(), leaf, resolvedSuffix);
+					}
+				}
+			}
+		}
 		lock.unlock();
+
+		if (infoIt == s_suffixToInfos.end() && mergedCandidates.empty()) return;
+		const auto& candidates = mergedCandidates.empty() ?
+			infoIt->second : mergedCandidates;
 
 		auto** animSlot = a_this->GetAnimationSlot();
 		if (!animSlot || !*animSlot) return;
 
-		auto* gameAnim = *animSlot;
-
-		// Build (or get cached) runtime clone: game struct layout + our data
-		auto* replacement = cache->GetOrBuildRuntimeAnim(suffix, gameAnim);
-		if (!replacement) {
-			// Fallback to direct parsed animation (old path)
-			replacement = cache->GetCachedAnimation(suffix);
+		// Read original animation from map (stored in Activate or first safe Update)
+		RE::hkaAnimation* originalAnim = nullptr;
+		{
+			std::shared_lock olock(s_originalAnimMutex);
+			auto oit = s_originalAnimMap.find(a_this);
+			if (oit != s_originalAnimMap.end()) {
+				originalAnim = oit->second;
+			}
 		}
-		if (!replacement) return;
-
-		// Validate vtable
-		auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
-		if (repVtbl < 0x7FF000000000ull || repVtbl > 0x7FFF00000000ull) return;
-
-		// Validate critical data pointer
-		auto* repBytes = reinterpret_cast<uint8_t*>(replacement);
-		auto ptrData = *reinterpret_cast<uintptr_t*>(repBytes + 0x98);
-		if (ptrData == 0) {
-			static int s_nullLog = 0;
-			if (s_nullLog < 5) {
-				logger::error("[OAR] BLOCKED SWAP: replacement has NULL m_data! +0x98={:X}", ptrData);
-				s_nullLog++;
+		// If not stored yet, capture it now — but ONLY if it's not one of our replacements
+		if (!originalAnim) {
+			auto* cache = AnimationCache::GetSingleton();
+			RE::hkaAnimation* current = *animSlot;
+			if (!cache->IsOurReplacement(current)) {
+				originalAnim = current;
+				std::unique_lock olock(s_originalAnimMutex);
+				// Only insert if still missing (avoid race overwrite)
+				auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, originalAnim);
+				if (!inserted) {
+					originalAnim = it->second;
+				}
+			} else {
+				// Slot holds our replacement but we lost track of the original.
+				// Reverse-lookup from cache to recover it — use as fallback only,
+				// do NOT overwrite any existing entry.
+				RE::hkaAnimation* recovered = cache->GetOriginalFromReplacement(current);
+				if (recovered) {
+					originalAnim = recovered;
+					std::unique_lock olock(s_originalAnimMutex);
+					auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, recovered);
+					if (!inserted) {
+						originalAnim = it->second;
+					}
+				} else {
+					return;
+				}
 			}
-			return;
-		}
-
-		if (*animSlot == replacement) return;
-
-		// Extensive diagnostic logging to verify struct layout correctness
-		static int s_swapLog = 0;
-		if (s_swapLog < 3) {
-			auto* origBytes = reinterpret_cast<uint8_t*>(*animSlot);
-			logger::info("[OAR] Swapping clip '{}' (suffix='{}') slot={:X} -> {:X}",
-				clipName, suffix,
-				reinterpret_cast<uintptr_t>(*animSlot),
-				reinterpret_cast<uintptr_t>(replacement));
-
-			// Dump scalar fields from GAME animation to verify layout
-			logger::info("[OAR]   GAME scalars: +0x10(type)={} +0x14(dur)={:.3f} +0x18(trk)={} +0x1C(flt)={}",
-				*reinterpret_cast<int32_t*>(origBytes + 0x10),
-				*reinterpret_cast<float*>(origBytes + 0x14),
-				*reinterpret_cast<int32_t*>(origBytes + 0x18),
-				*reinterpret_cast<int32_t*>(origBytes + 0x1C));
-			logger::info("[OAR]   GAME scalars: +0x38(frames)={} +0x3C(blocks)={} +0x44(maskSz)={}",
-				*reinterpret_cast<int32_t*>(origBytes + 0x38),
-				*reinterpret_cast<int32_t*>(origBytes + 0x3C),
-				*reinterpret_cast<int32_t*>(origBytes + 0x44));
-			logger::info("[OAR]   GAME ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
-				*reinterpret_cast<uintptr_t*>(origBytes + 0x58),
-				*reinterpret_cast<uintptr_t*>(origBytes + 0x68),
-				*reinterpret_cast<uintptr_t*>(origBytes + 0x78),
-				*reinterpret_cast<uintptr_t*>(origBytes + 0x88),
-				*reinterpret_cast<uintptr_t*>(origBytes + 0x98));
-			logger::info("[OAR]   GAME sizes: +0x60(blkSz)={} +0x70(fblkSz)={} +0x80(xfSz)={} +0x90(flSz)={} +0xA0(dataSz)={}",
-				*reinterpret_cast<int32_t*>(origBytes + 0x60),
-				*reinterpret_cast<int32_t*>(origBytes + 0x70),
-				*reinterpret_cast<int32_t*>(origBytes + 0x80),
-				*reinterpret_cast<int32_t*>(origBytes + 0x90),
-				*reinterpret_cast<int32_t*>(origBytes + 0xA0));
-
-			// Dump scalar fields from OUR animation
-			logger::info("[OAR]   OURS scalars: +0x10(type)={} +0x14(dur)={:.3f} +0x18(trk)={} +0x1C(flt)={}",
-				*reinterpret_cast<int32_t*>(repBytes + 0x10),
-				*reinterpret_cast<float*>(repBytes + 0x14),
-				*reinterpret_cast<int32_t*>(repBytes + 0x18),
-				*reinterpret_cast<int32_t*>(repBytes + 0x1C));
-			logger::info("[OAR]   OURS scalars: +0x38(frames)={} +0x3C(blocks)={} +0x44(maskSz)={}",
-				*reinterpret_cast<int32_t*>(repBytes + 0x38),
-				*reinterpret_cast<int32_t*>(repBytes + 0x3C),
-				*reinterpret_cast<int32_t*>(repBytes + 0x44));
-			logger::info("[OAR]   OURS ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
-				*reinterpret_cast<uintptr_t*>(repBytes + 0x58),
-				*reinterpret_cast<uintptr_t*>(repBytes + 0x68),
-				*reinterpret_cast<uintptr_t*>(repBytes + 0x78),
-				*reinterpret_cast<uintptr_t*>(repBytes + 0x88),
-				*reinterpret_cast<uintptr_t*>(repBytes + 0x98));
-			logger::info("[OAR]   OURS sizes: +0x60(blkSz)={} +0x70(fblkSz)={} +0x80(xfSz)={} +0x90(flSz)={} +0xA0(dataSz)={}",
-				*reinterpret_cast<int32_t*>(repBytes + 0x60),
-				*reinterpret_cast<int32_t*>(repBytes + 0x70),
-				*reinterpret_cast<int32_t*>(repBytes + 0x80),
-				*reinterpret_cast<int32_t*>(repBytes + 0x90),
-				*reinterpret_cast<int32_t*>(repBytes + 0xA0));
-
-			// Verify actual data at pointer targets
-			auto* blkOff = *reinterpret_cast<uint32_t**>(repBytes + 0x58);
-			auto* dataP = *reinterpret_cast<uint8_t**>(repBytes + 0x98);
-			if (blkOff) {
-				logger::info("[OAR]   OURS blockOffsets[0]={}", blkOff[0]);
-			}
-			if (dataP) {
-				logger::info("[OAR]   OURS data first 16 bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-					dataP[0], dataP[1], dataP[2], dataP[3], dataP[4], dataP[5], dataP[6], dataP[7],
-					dataP[8], dataP[9], dataP[10], dataP[11], dataP[12], dataP[13], dataP[14], dataP[15]);
-			}
-
-			// Also check GAME's blockOffsets[0] and data bytes for comparison
-			auto* gBlkOff = *reinterpret_cast<uint32_t**>(origBytes + 0x58);
-			auto* gDataP = *reinterpret_cast<uint8_t**>(origBytes + 0x98);
-			if (gBlkOff) {
-				logger::info("[OAR]   GAME blockOffsets[0]={}", gBlkOff[0]);
-			}
-			if (gDataP) {
-				logger::info("[OAR]   GAME data first 16 bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-					gDataP[0], gDataP[1], gDataP[2], gDataP[3], gDataP[4], gDataP[5], gDataP[6], gDataP[7],
-					gDataP[8], gDataP[9], gDataP[10], gDataP[11], gDataP[12], gDataP[13], gDataP[14], gDataP[15]);
-			}
-
-			s_swapLog++;
 		}
 
-		*animSlot = replacement;
+		// Evaluate conditions
+		RE::TESObjectREFR* refr = GetRefrFromContext(a_context);
+		if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+
+		bool shouldReplace = false;
+		ReplacementAnimFileInfo* winningInfo = nullptr;
+		int totalCands = 0, disabledCands = 0, evalFalseCands = 0;
+		for (auto* info : candidates) {
+			if (!info || !info->parentSubMod) continue;
+			++totalCands;
+			if (info->parentSubMod->IsDisabled()) { ++disabledCands; continue; }
+			if (!info->parentSubMod->GetConditionSet()) { shouldReplace = true; winningInfo = info; break; }
+			if (!refr) continue;
+			try {
+				if (info->parentSubMod->EvaluateConditions(refr, a_this)) { shouldReplace = true; winningInfo = info; break; }
+				++evalFalseCands;
+			} catch (...) { continue; }
+		}
+
+		// Per-clip transition logging: log whenever shouldReplace flips for this clip
+		{
+			static std::shared_mutex s_lastShouldReplaceMutex;
+			static std::unordered_map<RE::hkbClipGenerator*, bool> s_lastShouldReplace;
+			bool prevKnown = false;
+			bool prev = false;
+			{
+				std::shared_lock slock(s_lastShouldReplaceMutex);
+				auto it = s_lastShouldReplace.find(a_this);
+				if (it != s_lastShouldReplace.end()) { prevKnown = true; prev = it->second; }
+			}
+			if (!prevKnown || prev != shouldReplace) {
+				std::unique_lock ulock(s_lastShouldReplaceMutex);
+				s_lastShouldReplace[a_this] = shouldReplace;
+				ulock.unlock();
+				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} (cands total={} disabled={} evalFalse={})",
+					suffix, prevKnown ? (prev ? "true" : "false") : "?",
+					shouldReplace ? "true" : "false",
+					totalCands, disabledCands, evalFalseCands);
+			}
+		}
+
+		// Periodic diagnostic for weapon clips: log every ~300 calls to confirm Update is running
+		{
+			static std::atomic<int> s_updateDiagCounter{ 0 };
+			int count = s_updateDiagCounter.fetch_add(1);
+			if (count % 300 == 0) {
+				logger::info("[OAR-Diag] Update running for '{}': shouldReplace={} animSlot={:X} original={:X} current={:X}",
+					suffix, shouldReplace,
+					reinterpret_cast<uintptr_t>(animSlot),
+					reinterpret_cast<uintptr_t>(originalAnim),
+					reinterpret_cast<uintptr_t>(*animSlot));
+			}
+		}
+
+		if (shouldReplace) {
+			auto* cache = AnimationCache::GetSingleton();
+			const auto& cacheSuffix = resolvedSuffix.empty() ? suffix : resolvedSuffix;
+			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim);
+			if (replacement) {
+				auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
+				if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
+					if (*animSlot != replacement) {
+						static int s_swapLog = 0;
+						if (s_swapLog < 50) {
+							logger::info("[OAR] Swapping clip '{}' -> replacement (conditions passed)", suffix);
+							// Verify annotation tracks on the replacement animation
+							auto* repBytes = reinterpret_cast<uint8_t*>(replacement);
+							auto* annotPtr = *reinterpret_cast<void**>(repBytes + 0x28);
+							int32_t annotCount = *reinterpret_cast<int32_t*>(repBytes + 0x30);
+							logger::info("[OAR-Annot] Swap verify: replacement annotationTracks ptr={:X} count={}",
+								reinterpret_cast<uintptr_t>(annotPtr), annotCount);
+							s_swapLog++;
+						}
+						*animSlot = replacement;
+
+						if (AnimationLog::GetSingleton()->IsEnabled() && winningInfo) {
+							std::string subModName = winningInfo->parentSubMod ?
+								winningInfo->parentSubMod->GetName() : "";
+							AnimationLog::GetSingleton()->AddEntry(
+								AnimationLog::EventType::kReplace,
+								refr, suffix, winningInfo->replacementPath, subModName);
+						}
+					}
+				}
+			}
+
+		ActiveReplacementEntry entry;
+		entry.clipSuffix = suffix;
+		entry.conditionsPassed = true;
+		if (winningInfo) {
+			entry.replacementPath = winningInfo->replacementPath;
+			if (winningInfo->parentSubMod)
+				entry.subModName = winningInfo->parentSubMod->GetName();
+		}
+		uint32_t actorID = 0;
+		if (refr) {
+			actorID = refr->GetFormID();
+			entry.actorFormID = actorID;
+			auto name = RE::TESFullName::GetFullName(*refr);
+			if (!name.empty())
+				entry.actorName = std::string(name);
+			else if (actorID == 0x14)
+				entry.actorName = "Player";
+		}
+		ActiveReplacementTracker::GetSingleton()->Update(actorID, suffix, entry);
+
+		// Register this suffix as having an active replacement (for event suppression)
+		{
+			std::unique_lock slock(s_activeReplacementSuffixMutex);
+			s_activeReplacementSuffixes.insert(suffix);
+		}
+
+		// Fire replacement annotations manually based on local time progression.
+		// The game's annotation map (from LoadClips) fires ORIGINAL annotations;
+		// we fire REPLACEMENT annotations here via NotifyAnimationGraphImpl.
+		{
+			const auto& annotSuffix = resolvedSuffix.empty() ? suffix : resolvedSuffix;
+			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix);
+			if (annotations && !annotations->empty() && refr) {
+				float localTime = a_this->GetLocalTime();
+				std::unique_lock alock(s_annotStateMutex);
+				auto& astate = s_annotStateMap[a_this];
+
+				if (astate.activeSuffix != annotSuffix) {
+					astate.activeSuffix = annotSuffix;
+					astate.prevLocalTime = 0.f;
+					astate.lastFiredIndex = -1;
+					static int s_annotInitLog = 0;
+					if (s_annotInitLog < 30) {
+						logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f})",
+							annotSuffix, annotations->size(), localTime);
+						s_annotInitLog++;
+					}
+				}
+
+				if (localTime >= 0.f) {
+					float prevT = astate.prevLocalTime;
+					float curT = localTime;
+
+					bool looped = (curT < prevT - 0.01f);
+					if (looped) {
+						for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
+							auto& ann = (*annotations)[i];
+							if (ann.time >= prevT) {
+								RE::BSFixedString evtName(ann.text.c_str());
+								refr->NotifyAnimationGraphImpl(evtName);
+							}
+						}
+						astate.lastFiredIndex = -1;
+						prevT = 0.f;
+					}
+
+					for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
+						auto& ann = (*annotations)[i];
+						if (ann.time > curT) break;
+						if (ann.time >= prevT) {
+							RE::BSFixedString evtName(ann.text.c_str());
+							refr->NotifyAnimationGraphImpl(evtName);
+							astate.lastFiredIndex = i;
+							static int s_annotFireLog = 0;
+							if (s_annotFireLog < 50) {
+								logger::info("[OAR-Annot] Fired '{}' at t={:.3f} (clip '{}' localTime={:.3f})",
+									ann.text, ann.time, suffix, curT);
+								s_annotFireLog++;
+							}
+						}
+					}
+				}
+				astate.prevLocalTime = localTime;
+			}
+		}
+
+	} else {
+		if (*animSlot != originalAnim) {
+			static int s_restoreLog = 0;
+			if (s_restoreLog < 50) {
+				logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
+				auto* origBytes = reinterpret_cast<uint8_t*>(originalAnim);
+				auto* origAnnotPtr = *reinterpret_cast<void**>(origBytes + 0x28);
+				int32_t origAnnotCount = *reinterpret_cast<int32_t*>(origBytes + 0x30);
+				logger::info("[OAR-Annot] Restore verify: original annotationTracks ptr={:X} count={}",
+					reinterpret_cast<uintptr_t>(origAnnotPtr), origAnnotCount);
+				s_restoreLog++;
+			}
+			*animSlot = originalAnim;
+		}
+		uint32_t actorID = refr ? refr->GetFormID() : 0;
+		ActiveReplacementTracker::GetSingleton()->Remove(actorID, suffix);
+
+		// Clear annotation state and active suffix tracking
+		{
+			std::unique_lock alock(s_annotStateMutex);
+			s_annotStateMap.erase(a_this);
+		}
+		{
+			std::unique_lock slock(s_activeReplacementSuffixMutex);
+			s_activeReplacementSuffixes.erase(suffix);
+		}
+	}
 	}
 
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		if (a_this) {
+			// Restore original animation pointer only if we previously swapped it
+			{
+				std::shared_lock lock(s_originalAnimMutex);
+				auto oit = s_originalAnimMap.find(a_this);
+				if (oit != s_originalAnimMap.end()) {
+					auto** animSlot = a_this->GetAnimationSlot();
+					if (animSlot && *animSlot != oit->second) {
+						auto* cache = AnimationCache::GetSingleton();
+						if (cache->IsOurReplacement(*animSlot)) {
+							*animSlot = oit->second;
+						}
+					}
+				}
+			}
+			// Tracker cleanup is handled by TTL expiry (entries not touched for >2s auto-expire)
+		}
+
 		Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
 	}
 
@@ -540,6 +1059,51 @@ namespace
 		return nullptr;
 	}
 
+	static void CaptureLoadClipsPath(const char* a_hookName, RE::hkbCharacterStringData* a_stringData, const char* a_animationPath)
+	{
+		if (!a_stringData || !a_animationPath) return;
+		if (reinterpret_cast<uintptr_t>(a_stringData) < 0x10000) return;
+		if (reinterpret_cast<uintptr_t>(a_animationPath) < 0x10000) return;
+		if (IsBadReadPtr(a_animationPath, 1)) return;
+		if (a_animationPath[0] == '\0') return;
+
+		// Verify stringData vtable matches expected
+		uintptr_t sdVtbl = Offsets::hkbCharacterStringData_vtbl.address();
+		if (IsBadReadPtr(a_stringData, sizeof(uintptr_t))) return;
+		uintptr_t actualVtbl = *reinterpret_cast<uintptr_t*>(a_stringData);
+		if (actualVtbl != sdVtbl) return;
+
+		std::string pathStr(a_animationPath);
+		{
+			std::unique_lock lock(s_loadClipsPathMutex);
+			s_loadClipsPathMap[a_stringData] = pathStr;
+		}
+
+		static int s_loadClipsLogCount = 0;
+		if (s_loadClipsLogCount < 20) {
+			logger::info("[OAR-LoadClips] {}: stringData={:X} animPath='{}'",
+				a_hookName, reinterpret_cast<uintptr_t>(a_stringData), pathStr);
+
+			auto* arrBase = reinterpret_cast<const uint8_t*>(&a_stringData->animationNames);
+			auto* nameData = *reinterpret_cast<RE::hkbCharacterStringData::FileNameMeshNamePair* const*>(arrBase);
+			int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
+			if (nameData && nameSize > 0 && nameSize < 10000 && !IsBadReadPtr(nameData, sizeof(void*))) {
+				int logMax = std::min(nameSize, (int32_t)5);
+				for (int i = 0; i < logMax; i++) {
+					const char* fn = nameData[i].fileName.data();
+					if (fn && reinterpret_cast<uintptr_t>(fn) > 0x10000 && fn[0] != '\0') {
+						logger::info("[OAR-LoadClips]   animNames[{}]='{}' -> full='{}{}'",
+							i, fn, pathStr, fn);
+					}
+				}
+				if (nameSize > logMax) {
+					logger::info("[OAR-LoadClips]   ... ({} total animation names)", nameSize);
+				}
+			}
+			s_loadClipsLogCount++;
+		}
+	}
+
 	void HookedLoadClips(RE::hkbCharacterStringData* a_stringData, void* a_bindingSet,
 		void* a_assetLoader, RE::hkbBehaviorGraph* a_rootBehavior,
 		const char* a_animationPath, void* a_annotationMap)
@@ -553,6 +1117,8 @@ namespace
 
 		Hooks::LoadClipsHooks::_LoadClips(a_stringData, a_bindingSet, a_assetLoader,
 			a_rootBehavior, a_animationPath, a_annotationMap);
+
+		CaptureLoadClipsPath("LoadClips1", a_stringData, a_animationPath);
 	}
 
 	void HookedLoadClips2(RE::hkbCharacterStringData* a_stringData, void* a_bindingSet,
@@ -568,6 +1134,8 @@ namespace
 
 		Hooks::LoadClipsHooks::_LoadClips2(a_stringData, a_bindingSet, a_assetLoader,
 			a_rootBehavior, a_animationPath, a_annotationMap);
+
+		CaptureLoadClipsPath("LoadClips2", a_stringData, a_animationPath);
 	}
 }
 

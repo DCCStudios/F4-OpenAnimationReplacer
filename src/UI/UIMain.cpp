@@ -25,6 +25,7 @@ void UIMain::DrawContents()
 			auto* uiMgr = UIManager::GetSingleton();
 			if (ImGui::MenuItem("Animation Log")) uiMgr->ToggleWindow(WindowID::kAnimationLog);
 			if (ImGui::MenuItem("Event Log")) uiMgr->ToggleWindow(WindowID::kAnimationEventLog);
+			if (ImGui::MenuItem("Active Replacements")) uiMgr->ToggleWindow(WindowID::kDebugOverlay);
 			ImGui::EndMenu();
 		}
 		if (ImGui::BeginMenu("Actions")) {
@@ -262,6 +263,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		if (ImGui::Checkbox("Disabled", &isDisabled)) {
 			a_subMod->SetDisabled(isDisabled);
 			a_subMod->SetDirty(true);
+			logger::info("[OAR-UI] SubMod '{}' Disabled toggled -> {}", a_subMod->GetName(), isDisabled);
 		}
 
 		int priority = a_subMod->GetPriority();
@@ -429,10 +431,20 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 			auto* factory = ConditionFactory::GetSingleton();
 			for (const auto& [name, fn] : factory->GetAllFactories()) {
 				if (condFilter[0] != '\0' && !UICommon::FuzzyMatch(condFilter, name.c_str())) continue;
-				if (ImGui::MenuItem(name.c_str())) {
+				auto tempCond = fn();
+				bool condIsStub = tempCond && tempCond->IsStub();
+				std::string displayName = condIsStub ? name + "  [N/A]" : name;
+				if (condIsStub) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.1f, 1.0f));
+				if (ImGui::MenuItem(displayName.c_str())) {
 					a_condSet->AddCondition(fn());
 					a_subMod->SetDirty(true);
 					condFilter[0] = '\0';
+				}
+				if (condIsStub) {
+					ImGui::PopStyleColor();
+					if (ImGui::IsItemHovered()) {
+						ImGui::SetTooltip("%s", tempCond->GetStubReason().c_str());
+					}
 				}
 			}
 			ImGui::EndPopup();
@@ -497,15 +509,30 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 			if (ImGui::Checkbox("##toggleCond", &bEnabled)) {
 				a_condition->SetDisabled(!bEnabled);
 				a_subMod->SetDirty(true);
+				logger::info("[OAR-UI] Condition '{}' on SubMod '{}' enabled toggled -> {}",
+					a_condition->GetName(), a_subMod->GetName(), bEnabled);
 			}
 		}
 
 		ImGui::SameLine();
-		ImVec4 textColor = isNegated ? UICommon::Colors::CondNegated :
+		bool isStub = a_condition->IsStub();
+		ImVec4 textColor = isStub ? ImVec4(0.6f, 0.4f, 0.1f, 1.0f) :
+		                   isNegated ? UICommon::Colors::CondNegated :
 		                   ImGui::GetStyleColorVec4(ImGuiCol_Text);
 		ImGui::PushStyleColor(ImGuiCol_Text, textColor);
 		ImGui::TextUnformatted(condName.c_str());
 		ImGui::PopStyleColor();
+
+		if (isStub) {
+			ImGui::SameLine();
+			ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.1f, 1.0f), "[NOT IMPLEMENTED]");
+			if (ImGui::IsItemHovered()) {
+				std::string reason = a_condition->GetStubReason();
+				if (!reason.empty()) {
+					ImGui::SetTooltip("%s", reason.c_str());
+				}
+			}
+		}
 
 		float secondColX = (ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX()) * firstColumnPercent;
 		ImGui::SameLine(secondColX);

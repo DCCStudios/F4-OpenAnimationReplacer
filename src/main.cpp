@@ -2,6 +2,7 @@
 #include "Hooks.h"
 #include "OpenAnimationReplacer.h"
 #include "ActiveClip.h"
+#include "AnimationCache.h"
 #include "Parsing.h"
 #include "UI/UIManager.h"
 #include "Offsets.h"
@@ -343,6 +344,8 @@ namespace
 			SetGameFullyLoaded(false);
 			ActiveClipManager::GetSingleton()->ClearAll();
 			ClearCharacterCache();
+			ClearClipRuntimeState();
+			AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 			break;
 
 		case F4SE::MessagingInterface::kPostLoadGame:
@@ -364,6 +367,7 @@ namespace
 			ActiveClipManager::GetSingleton()->ClearAll();
 			Settings::GetSingleton()->Load();
 			ClearCharacterCache();
+			ClearClipRuntimeState();
 			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
 				RegisterActorCharacter(player);
 			}

@@ -39,6 +39,8 @@ public:
 	virtual std::string GetDescription() const = 0;
 	virtual std::string GetParameterString() const { return ""; }
 	virtual void DrawEditWidgets(bool& a_dirty) { (void)a_dirty; }
+	virtual bool IsStub() const { return false; }
+	virtual std::string GetStubReason() const { return ""; }
 
 	bool IsDisabled() const { return disabled; }
 	void SetDisabled(bool a_val) { disabled = a_val; }

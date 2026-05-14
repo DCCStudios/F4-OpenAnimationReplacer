@@ -16,6 +16,12 @@ public:
 		return &singleton;
 	}
 
+	struct ParsedAnnotation
+	{
+		float time{ 0.f };
+		std::string text;
+	};
+
 	struct CachedAnimation
 	{
 		RE::hkaAnimation* animation{ nullptr };
@@ -29,18 +35,23 @@ public:
 		std::unique_ptr<uint32_t[]> computedTransformOffsets;
 		std::unique_ptr<uint32_t[]> computedFloatOffsets;
 
-		// Clone of the game's animation struct with our data pointers patched in.
-		// This ensures the struct layout matches what the game's runtime expects.
+		std::vector<ParsedAnnotation> annotations;
+
 		std::vector<uint8_t> runtimeStruct;
 		RE::hkaAnimation* runtimeAnimation{ nullptr };
+		RE::hkaAnimation* gameOriginal{ nullptr };
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath);
 	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix) const;
 	RE::hkaAnimation* GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim);
+	const std::vector<ParsedAnnotation>* GetAnnotations(const std::string& a_suffix) const;
 	void SetVtableFromGame(uintptr_t a_vtable);
 	uintptr_t GetGameAnimVtable() const { return m_gameAnimVtable.load(); }
 	size_t GetCacheSize() const;
+	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
+	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
+	void InvalidateRuntimeClones();
 	void Clear();
 
 private:

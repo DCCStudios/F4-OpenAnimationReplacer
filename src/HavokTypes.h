@@ -272,12 +272,28 @@ namespace RE
 		MODE_COUNT = 4,
 	};
 
+	struct hkaAnnotationTrack
+	{
+		struct Annotation
+		{
+			float time;          // +0x00
+			uint32_t pad04;      // +0x04
+			hkStringPtr text;    // +0x08
+		};
+		static_assert(sizeof(Annotation) == 0x10);
+
+		hkStringPtr trackName;
+		hkArray<Annotation, hkContainerHeapAllocator> annotations;
+	};
+
 	struct hkaAnimation : public hkReferencedObject
 	{
 		int32_t type;                    // +0x10 AnimationType (1..5)
 		float duration;                  // +0x14
 		int32_t numberOfTransformTracks; // +0x18
 		int32_t numberOfFloatTracks;     // +0x1C
+		// +0x20: extractedMotion (hkRefPtr)
+		// +0x28: annotationTracks (hkArray<hkaAnnotationTrack>)
 	};
 	static_assert(offsetof(hkaAnimation, type) == 0x10);
 	static_assert(offsetof(hkaAnimation, duration) == 0x14);
@@ -329,6 +345,12 @@ namespace RE
 			auto bind = *reinterpret_cast<uintptr_t*>(ctrl + 0x38);
 			if (!bind) return nullptr;
 			return reinterpret_cast<hkaAnimation**>(bind + 0x18);
+		}
+
+		float GetLocalTime() const
+		{
+			return *reinterpret_cast<const float*>(
+				reinterpret_cast<const uint8_t*>(this) + 0x140);
 		}
 	};
 
