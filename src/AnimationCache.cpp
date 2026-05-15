@@ -157,6 +157,18 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	if (it == m_cache.end() || !it->second) return nullptr;
 
 	auto& entry = *it->second;
+
+	// If clone exists but was built from a DIFFERENT game animation, the game reloaded
+	// animations (weapon switch). Rebuild from fresh data to avoid stale struct fields.
+	if (entry.runtimeAnimation && entry.gameOriginal != a_gameAnim && a_gameAnim != nullptr) {
+		logger::info("[OAR-Cache] Game animation changed for '{}': old={:X} new={:X} — rebuilding clone",
+			a_suffix, reinterpret_cast<uintptr_t>(entry.gameOriginal),
+			reinterpret_cast<uintptr_t>(a_gameAnim));
+		entry.runtimeAnimation = nullptr;
+		entry.runtimeStruct.clear();
+		entry.gameOriginal = nullptr;
+	}
+
 	if (entry.runtimeAnimation) return entry.runtimeAnimation;
 
 	if (!a_gameAnim || !entry.animation) return nullptr;
@@ -286,6 +298,13 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	*reinterpret_cast<float*>(cloneBase + 0x4C) = *reinterpret_cast<float*>(ourBytes + 0x4C);     // blockInverseDuration
 	*reinterpret_cast<float*>(cloneBase + 0x50) = *reinterpret_cast<float*>(ourBytes + 0x50);     // frameDuration
 
+	// Zero all unknown pointer fields beyond patched regions (0xA8-0xFF range).
+	// The clone was memcpy'd from the game animation, so these hold pointers into game
+	// memory that gets freed on weapon switch. Zeroing prevents stale-pointer traversal.
+	// m_data ends at 0xA8 (ptr+size+cap = 0x98+0x10). Everything from 0xA8 onward is
+	// uncharted territory in the struct — zero it all to be safe.
+	std::memset(cloneBase + 0xA8, 0, kStructSize - 0xA8);
+
 	entry.runtimeAnimation = reinterpret_cast<RE::hkaAnimation*>(cloneBase);
 	entry.gameOriginal = a_gameAnim;
 
@@ -341,11 +360,12 @@ void AnimationCache::InvalidateRuntimeClones()
 		if (entry && entry->runtimeAnimation) {
 			entry->runtimeAnimation = nullptr;
 			entry->runtimeStruct.clear();
+			entry->gameOriginal = nullptr;
 			count++;
 		}
 	}
 	if (count > 0) {
-		logger::info("[OAR-Cache] Invalidated {} runtime clones", count);
+		logger::info("[OAR-Cache] Invalidated {} runtime clones (gameOriginal reset)", count);
 	}
 }
 

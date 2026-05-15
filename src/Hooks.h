@@ -10,6 +10,7 @@ void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();
 void PopulateKnownStringData();
 void RefreshWeaponAnimFolder();
+void RegisterWeaponEquipListener();
 
 namespace Hooks
 {

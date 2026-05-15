@@ -14,6 +14,12 @@
 static std::atomic<bool> s_gameFullyLoaded{ false };
 static std::atomic<bool> s_hasActiveReplacements{ false };
 
+// Per-clip bypass set: clips that failed pre-swap in Activate are skipped in Update
+// to prevent partial-state corruption when the animation control was built from a
+// different animation than what OAR would try to swap in.
+static std::shared_mutex s_bypassMutex;
+static std::unordered_set<RE::hkbClipGenerator*> s_bypassSet;
+
 void SetGameFullyLoaded(bool a_loaded) { s_gameFullyLoaded.store(a_loaded); }
 void SetHasActiveReplacements(bool a_has) { s_hasActiveReplacements.store(a_has); }
 bool HasActiveReplacements() { return s_hasActiveReplacements.load(); }
@@ -268,6 +274,72 @@ namespace
 	// Forward-declared — defined below, cleared from ClearClipRuntimeState
 	static std::shared_mutex s_originalAnimMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, RE::hkaAnimation*> s_originalAnimMap;
+
+	// Validated access to s_originalAnimMap — returns nullptr and erases entry if the
+	// stored pointer is freed/stale (IsBadReadPtr or vtable mismatch). This prevents
+	// the crash scenario where weapon switch frees old animations but the map still
+	// holds dangling pointers.
+	static RE::hkaAnimation* GetValidOriginal(RE::hkbClipGenerator* a_clip)
+	{
+		std::shared_lock olock(s_originalAnimMutex);
+		auto oit = s_originalAnimMap.find(a_clip);
+		if (oit == s_originalAnimMap.end()) return nullptr;
+
+		auto* candidate = oit->second;
+		if (!candidate) {
+			olock.unlock();
+			std::unique_lock wlock(s_originalAnimMutex);
+			s_originalAnimMap.erase(a_clip);
+			return nullptr;
+		}
+
+		// Guard against freed memory — IsBadReadPtr returns TRUE if unreadable
+		if (IsBadReadPtr(candidate, sizeof(uintptr_t))) {
+			static int s_ibrLog = 0;
+			if (s_ibrLog < 30) {
+				logger::warn("[OAR-ValidOrig] originalAnim={:X} unreadable for clipGen={:X} — erasing",
+					reinterpret_cast<uintptr_t>(candidate), reinterpret_cast<uintptr_t>(a_clip));
+				s_ibrLog++;
+			}
+			olock.unlock();
+			std::unique_lock wlock(s_originalAnimMutex);
+			s_originalAnimMap.erase(a_clip);
+			return nullptr;
+		}
+
+		// Verify vtable matches the game's known hkaAnimation vtable (exact match, not range)
+		auto vtbl = *reinterpret_cast<uintptr_t*>(candidate);
+		auto expectedVtbl = AnimationCache::GetSingleton()->GetGameAnimVtable();
+		if (expectedVtbl != 0 && vtbl != expectedVtbl) {
+			static int s_vtblLog = 0;
+			if (s_vtblLog < 30) {
+				logger::warn("[OAR-ValidOrig] originalAnim={:X} vtbl={:X} != expected={:X} for clipGen={:X} — erasing",
+					reinterpret_cast<uintptr_t>(candidate), vtbl, expectedVtbl,
+					reinterpret_cast<uintptr_t>(a_clip));
+				s_vtblLog++;
+			}
+			olock.unlock();
+			std::unique_lock wlock(s_originalAnimMutex);
+			s_originalAnimMap.erase(a_clip);
+			return nullptr;
+		}
+
+		// Fallback range check when exact vtable not yet captured
+		if (expectedVtbl == 0 && (vtbl < 0x7FF000000000ull || vtbl > 0x7FFF00000000ull)) {
+			static int s_rangeLog = 0;
+			if (s_rangeLog < 30) {
+				logger::warn("[OAR-ValidOrig] originalAnim={:X} vtbl={:X} out of range for clipGen={:X} — erasing",
+					reinterpret_cast<uintptr_t>(candidate), vtbl, reinterpret_cast<uintptr_t>(a_clip));
+				s_rangeLog++;
+			}
+			olock.unlock();
+			std::unique_lock wlock(s_originalAnimMutex);
+			s_originalAnimMap.erase(a_clip);
+			return nullptr;
+		}
+
+		return candidate;
+	}
 
 	// Cache clip suffixes from Activate (animationName may be cleared by Update time)
 	static std::shared_mutex s_clipSuffixMutex;
@@ -623,6 +695,48 @@ namespace
 
 }
 
+// Weapon change detection — called from Activate hook when we notice the weapon
+// animation folder has changed. Proactively invalidates clones so they rebuild
+// from fresh game animation data on next access.
+static std::string s_lastKnownWeaponFolder;
+static std::shared_mutex s_lastKnownWeaponMutex;
+
+static void CheckAndInvalidateOnWeaponChange()
+{
+	std::string currentFolder;
+	{
+		std::shared_lock lock(s_graphAnimPathMutex);
+		currentFolder = s_weaponAnimFolder;
+	}
+
+	std::unique_lock lock(s_lastKnownWeaponMutex);
+	if (!currentFolder.empty() && currentFolder != s_lastKnownWeaponFolder) {
+		logger::info("[OAR-WeaponChange] Weapon folder changed: '{}' -> '{}' — invalidating clones+state",
+			s_lastKnownWeaponFolder, currentFolder);
+		s_lastKnownWeaponFolder = currentFolder;
+		lock.unlock();
+
+		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
+		ClearClipRuntimeState();
+	} else if (currentFolder.empty() && !s_lastKnownWeaponFolder.empty()) {
+		// Weapon unequipped (holstered or no weapon) — also invalidate
+		logger::info("[OAR-WeaponChange] Weapon folder cleared (was '{}') — invalidating clones+state",
+			s_lastKnownWeaponFolder);
+		s_lastKnownWeaponFolder.clear();
+		lock.unlock();
+
+		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
+		ClearClipRuntimeState();
+	}
+}
+
+void RegisterWeaponEquipListener()
+{
+	// No-op: weapon change detection is handled inline via CheckAndInvalidateOnWeaponChange()
+	// which is called from the Activate hook. CommonLibF4 for FO4 doesn't expose TESEquipEvent.
+	logger::info("[OAR-Equip] Using inline weapon-change detection in Activate hook");
+}
+
 void ClearClipRuntimeState()
 {
 	{
@@ -652,6 +766,10 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_triggersBackupMutex);
 		s_triggersBackup.clear();
+	}
+	{
+		std::unique_lock lock(s_bypassMutex);
+		s_bypassSet.clear();
 	}
 	{
 		std::unique_lock lock(s_builtTriggersMutex);
@@ -1350,40 +1468,70 @@ namespace
 		// is built from our clone (which has NULLed annotationTracks), preventing
 		// stale pointer crashes in computeMotion/clearAndDeallocate.
 		RE::hkaAnimation* preSwapOriginal = nullptr;
+		bool preSwapAttempted = false;
+		bool preSwapSucceeded = false;
 		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt) {
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
 				std::string activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
 				if (!activeSuffix.empty()) {
-					auto** animSlotPre = a_this->GetAnimationSlot();
-					if (animSlotPre && *animSlotPre) {
-						auto* cachePre = AnimationCache::GetSingleton();
-						RE::hkaAnimation* replacement = nullptr;
-
+					// Check if this suffix has a registered replacement at all
+					bool hasRegistered = false;
+					{
+						std::shared_lock rlock(s_nameLookupMutex);
 						if (activeSuffix.size() > 6 && activeSuffix.substr(0, 6) == "multi:") {
-							std::string leafName = activeSuffix.substr(6);
-							std::shared_lock rlock(s_nameLookupMutex);
-							auto leafIt = s_leafToFullSuffixes.find(leafName);
-							if (leafIt != s_leafToFullSuffixes.end()) {
-								for (const auto& fullSuffix : leafIt->second) {
-									replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
-									if (replacement) break;
-								}
-							}
+							std::string leaf = activeSuffix.substr(6);
+							hasRegistered = s_leafToFullSuffixes.find(leaf) != s_leafToFullSuffixes.end();
 						} else {
-							replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre);
+							hasRegistered = s_suffixToInfos.find(activeSuffix) != s_suffixToInfos.end();
 						}
+					}
 
-						if (replacement) {
-							auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
-							if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
-								preSwapOriginal = *animSlotPre;
-								*animSlotPre = replacement;
+					if (hasRegistered) {
+						preSwapAttempted = true;
+						auto** animSlotPre = a_this->GetAnimationSlot();
+						if (animSlotPre && *animSlotPre) {
+							auto* cachePre = AnimationCache::GetSingleton();
+							RE::hkaAnimation* replacement = nullptr;
+
+							if (activeSuffix.size() > 6 && activeSuffix.substr(0, 6) == "multi:") {
+								std::string leafName = activeSuffix.substr(6);
+								std::shared_lock rlock(s_nameLookupMutex);
+								auto leafIt = s_leafToFullSuffixes.find(leafName);
+								if (leafIt != s_leafToFullSuffixes.end()) {
+									for (const auto& fullSuffix : leafIt->second) {
+										replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
+										if (replacement) break;
+									}
+								}
+							} else {
+								replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre);
+							}
+
+							if (replacement) {
+								auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
+								if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
+									preSwapOriginal = *animSlotPre;
+									*animSlotPre = replacement;
+									preSwapSucceeded = true;
+								}
 							}
 						}
 					}
 				}
 			}
+		}
+
+		// If pre-swap was attempted but failed, add to bypass set so Update won't
+		// try to swap a clone into a slot whose animation control was built from
+		// a different animation — that mismatch causes crashes.
+		if (preSwapAttempted && !preSwapSucceeded && a_this) {
+			std::unique_lock lock(s_bypassMutex);
+			s_bypassSet.insert(a_this);
+		} else if (preSwapSucceeded && a_this) {
+			// Pre-swap worked, ensure this clip is NOT in bypass
+			std::unique_lock lock(s_bypassMutex);
+			s_bypassSet.erase(a_this);
 		}
 
 		Hooks::ClipGeneratorHooks::_Activate(a_this, a_context);
@@ -1413,6 +1561,8 @@ namespace
 			}
 		}
 
+		// Detect weapon folder changes and proactively invalidate stale clones
+		CheckAndInvalidateOnWeaponChange();
 		auto* cache = AnimationCache::GetSingleton();
 
 		auto* currentAnim = a_this->GetAnimation();
@@ -1613,6 +1763,31 @@ namespace
 		}
 	}
 
+	// SEH wrapper for NotifyAnimationGraphImpl — the crash in this session occurred
+	// here at line 2156 when HaBCR traversed stale animation data during event broadcast.
+	static bool SafeNotifyAnimGraph(RE::TESObjectREFR* a_refr, RE::BSFixedString& a_evtName)
+	{
+		__try {
+			a_refr->NotifyAnimationGraphImpl(a_evtName);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// SEH wrapper for NotifyEventSinks — also traverses the behavior graph event system
+	static void SafeNotifyEventSinks(RE::TESObjectREFR* a_refr, RE::BSFixedString& a_evtName)
+	{
+		__try {
+			NotifyEventSinks(a_refr, a_evtName);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			static int s_sinkFailLog = 0;
+			if (s_sinkFailLog < 10) {
+				s_sinkFailLog++;
+			}
+		}
+	}
+
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
 	{
 		// Call original Update first — variable bindings must process before any animation swap.
@@ -1631,6 +1806,16 @@ namespace
 
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
+		}
+
+		// Per-clip bypass: if pre-swap failed in Activate, the animation control was
+		// built from a different animation than what we'd swap in. Skip all OAR logic
+		// to prevent struct mismatch crashes.
+		{
+			std::shared_lock lock(s_bypassMutex);
+			if (s_bypassSet.find(a_this) != s_bypassSet.end()) {
+				return;
+			}
 		}
 
 		auto* cache = AnimationCache::GetSingleton();
@@ -1728,32 +1913,19 @@ namespace
 				if (animSlot && *animSlot) {
 					auto* cache = AnimationCache::GetSingleton();
 					if (cache->IsOurReplacement(*animSlot)) {
-						RE::hkaAnimation* originalToRestore = nullptr;
+						// Use validated access — returns nullptr if pointer is stale/freed.
+						// This is the fix for the crash where weapon switch freed the old
+						// animation but we still tried to write the dangling pointer into the slot.
+						RE::hkaAnimation* originalToRestore = GetValidOriginal(a_this);
 
-						// Try finding original for this clip pointer first
-						{
-							std::shared_lock olock(s_originalAnimMutex);
-							auto oit = s_originalAnimMap.find(a_this);
-							if (oit != s_originalAnimMap.end()) {
-								originalToRestore = oit->second;
-							}
-						}
-
-						// Fallback: ask the cache what original this replacement was built from
+						// Fallback: ask the cache (gameOriginal may also be stale after weapon switch)
 						if (!originalToRestore) {
-							originalToRestore = cache->GetOriginalFromReplacement(*animSlot);
-						}
-
-						// Last resort: scan all originalAnimMap entries for one that shares
-						// this same animSlot address (different clip, same binding index)
-						if (!originalToRestore) {
-							std::shared_lock olock(s_originalAnimMutex);
-							for (auto& [clipPtr, origAnim] : s_originalAnimMap) {
-								if (clipPtr == a_this) continue;
-								auto** otherSlot = clipPtr->GetAnimationSlot();
-								if (otherSlot == animSlot) {
-									originalToRestore = origAnim;
-									break;
+							auto* recovered = cache->GetOriginalFromReplacement(*animSlot);
+							if (recovered && !IsBadReadPtr(recovered, sizeof(uintptr_t))) {
+								auto vtbl = *reinterpret_cast<uintptr_t*>(recovered);
+								auto expected = cache->GetGameAnimVtable();
+								if (expected != 0 && vtbl == expected) {
+									originalToRestore = recovered;
 								}
 							}
 						}
@@ -1761,15 +1933,24 @@ namespace
 						if (originalToRestore) {
 							*animSlot = originalToRestore;
 							RestoreClipTriggers(a_this);
-							// Also store the original for this clip so future evals work
 							{
 								std::unique_lock olock(s_originalAnimMutex);
 								s_originalAnimMap[a_this] = originalToRestore;
 							}
 							static int s_multiRestoreLog = 0;
 							if (s_multiRestoreLog < 30) {
-								logger::info("[OAR-MultiMatch] leaf='{}' - restoring original (conditions no longer met)", leafName);
+								logger::info("[OAR-MultiMatch] leaf='{}' - restoring validated original (conditions no longer met)", leafName);
 								s_multiRestoreLog++;
+							}
+						} else {
+							// Cannot restore safely — leave our clone in the slot.
+							// The clone's memory is heap-stable (never freed until cache clear),
+							// so it's always safe even if the animation doesn't match the weapon.
+							// This is much better than writing a stale pointer and crashing.
+							static int s_leaveLog = 0;
+							if (s_leaveLog < 30) {
+								logger::warn("[OAR-MultiMatch] leaf='{}' - original stale, leaving clone in slot (safe fallback)", leafName);
+								s_leaveLog++;
 							}
 						}
 					}
@@ -1825,51 +2006,49 @@ namespace
 			return;
 		}
 
-		// Read original animation from map (stored in Activate or first safe Update)
-		RE::hkaAnimation* originalAnim = nullptr;
-		{
-			std::shared_lock olock(s_originalAnimMutex);
-			auto oit = s_originalAnimMap.find(a_this);
-			if (oit != s_originalAnimMap.end()) {
-				auto vtbl = *reinterpret_cast<uintptr_t*>(oit->second);
-				if (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull) {
-					originalAnim = oit->second;
-				} else {
-					static int s_vtblRejectLog = 0;
-					if (s_vtblRejectLog < 30) {
-						logger::warn("[OAR-VtblCheck] Rejected originalAnim={:X} vtbl={:X} for clip '{}' — out of range",
-							reinterpret_cast<uintptr_t>(oit->second), vtbl, suffix);
-						s_vtblRejectLog++;
-					}
-					olock.unlock();
-					std::unique_lock wlock(s_originalAnimMutex);
-					s_originalAnimMap.erase(a_this);
-				}
-			}
-		}
+		// Read original animation from map — uses GetValidOriginal which validates
+		// IsBadReadPtr + exact vtable match before returning the pointer.
+		RE::hkaAnimation* originalAnim = GetValidOriginal(a_this);
 		if (!originalAnim) {
 			auto* cache = AnimationCache::GetSingleton();
 			RE::hkaAnimation* current = *animSlot;
 			if (!cache->IsOurReplacement(current)) {
-				originalAnim = current;
-				std::unique_lock olock(s_originalAnimMutex);
-				auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, originalAnim);
-				if (!inserted) {
-					originalAnim = it->second;
+				// Current slot holds a game animation — validate before storing
+				if (!IsBadReadPtr(current, sizeof(uintptr_t))) {
+					auto vtbl = *reinterpret_cast<uintptr_t*>(current);
+					auto expected = cache->GetGameAnimVtable();
+					bool vtblOk = (expected != 0) ? (vtbl == expected)
+						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
+					if (vtblOk) {
+						originalAnim = current;
+						std::unique_lock olock(s_originalAnimMutex);
+						auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, originalAnim);
+						if (!inserted) {
+							originalAnim = it->second;
+						}
+					}
 				}
 			} else {
+				// Slot has our replacement — recover the true original, but validate it
 				RE::hkaAnimation* recovered = cache->GetOriginalFromReplacement(current);
-				if (recovered) {
-					originalAnim = recovered;
-					std::unique_lock olock(s_originalAnimMutex);
-					auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, recovered);
-					if (!inserted) {
-						originalAnim = it->second;
+				if (recovered && !IsBadReadPtr(recovered, sizeof(uintptr_t))) {
+					auto vtbl = *reinterpret_cast<uintptr_t*>(recovered);
+					auto expected = cache->GetGameAnimVtable();
+					bool vtblOk = (expected != 0) ? (vtbl == expected)
+						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
+					if (vtblOk) {
+						originalAnim = recovered;
+						std::unique_lock olock(s_originalAnimMutex);
+						auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, recovered);
+						if (!inserted) {
+							originalAnim = it->second;
+						}
 					}
-				} else {
+				}
+				if (!originalAnim) {
 					static int s_recoveryFailLog = 0;
 					if (s_recoveryFailLog < 20) {
-						logger::warn("[OAR-RecoveryFail] Can't recover original for '{}' clipGen={:X} current={:X}",
+						logger::warn("[OAR-RecoveryFail] Can't recover valid original for '{}' clipGen={:X} current={:X}",
 							resolvedSuffix, reinterpret_cast<uintptr_t>(a_this),
 							reinterpret_cast<uintptr_t>(current));
 						s_recoveryFailLog++;
@@ -2150,10 +2329,21 @@ namespace
 							PlaySoundDirect(soundName, refr);
 						} else {
 							// Behavior events (weaponFire, reloadComplete, etc.):
-							// fire via both behavior graph AND event sinks
+							// fire via both behavior graph AND event sinks.
+							// Wrapped in SEH because NotifyAnimationGraphImpl triggers
+							// event broadcast which can traverse stale animation data
+							// in other plugins (HaBCR, etc.) if a weapon switch freed
+							// the old animations between frames.
 							RE::BSFixedString evtName(text.c_str());
-							refr->NotifyAnimationGraphImpl(evtName);
-							NotifyEventSinks(refr, evtName);
+							if (!SafeNotifyAnimGraph(refr, evtName)) {
+								static int s_notifyFailLog = 0;
+								if (s_notifyFailLog < 10) {
+									logger::error("[OAR-SEH] NotifyAnimationGraphImpl crash caught for event '{}' — stale graph data",
+										text);
+									s_notifyFailLog++;
+								}
+							}
+							SafeNotifyEventSinks(refr, evtName);
 						}
 
 						static int s_annotFireLog = 0;
@@ -2169,13 +2359,37 @@ namespace
 		}
 
 	} else {
-		if (*animSlot != originalAnim) {
-			static int s_restoreLog = 0;
-			if (s_restoreLog < 50) {
-				logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
-				s_restoreLog++;
+		// Conditions failed — restore original. Since originalAnim was validated via
+		// GetValidOriginal, it should be safe. But add a final defensive check in case
+		// the pointer was freed between validation and this point (race condition).
+		if (originalAnim && *animSlot != originalAnim) {
+			if (!IsBadReadPtr(originalAnim, sizeof(uintptr_t))) {
+				auto vtbl = *reinterpret_cast<uintptr_t*>(originalAnim);
+				auto expected = cache->GetGameAnimVtable();
+				bool ok = (expected != 0) ? (vtbl == expected)
+					: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
+				if (ok) {
+					static int s_restoreLog = 0;
+					if (s_restoreLog < 50) {
+						logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
+						s_restoreLog++;
+					}
+					*animSlot = originalAnim;
+				} else {
+					// Original became stale between validation and now — leave clone in slot
+					static int s_staleRestoreLog = 0;
+					if (s_staleRestoreLog < 20) {
+						logger::warn("[OAR] Original stale at restore for '{}' — leaving clone in slot (safe)", suffix);
+						s_staleRestoreLog++;
+					}
+				}
+			} else {
+				static int s_ibrRestoreLog = 0;
+				if (s_ibrRestoreLog < 20) {
+					logger::warn("[OAR] Original unreadable at restore for '{}' — leaving clone in slot", suffix);
+					s_ibrRestoreLog++;
+				}
 			}
-			*animSlot = originalAnim;
 		}
 		// Restore the engine's trigger arrays so the original animation's annotations
 		// resume firing natively.
@@ -2221,7 +2435,6 @@ namespace
 				std::unique_lock lock(s_originalAnimMutex);
 				s_originalAnimMap.erase(a_this);
 			}
-			// Also clean up clip suffix cache and annotation state
 			{
 				std::unique_lock lock(s_clipSuffixMutex);
 				s_clipSuffixCache.erase(a_this);
@@ -2229,6 +2442,10 @@ namespace
 			{
 				std::unique_lock lock(s_annotStateMutex);
 				s_annotStateMap.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_bypassMutex);
+				s_bypassSet.erase(a_this);
 			}
 		}
 

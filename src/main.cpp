@@ -340,6 +340,10 @@ namespace
 				StructProbe::ScanForLoadClipsCallSite();
 			}
 
+			// BSInputDevice::Poll hooks require BSInputDeviceManager to be valid,
+			// which is only guaranteed after game data is ready (not during F4SEPlugin_Load)
+			UIManager::InstallDevicePollHooks();
+
 			UIManager::GetSingleton()->ShowWelcomeBanner();
 			logger::info("[OAR] Initialization complete");
 			break;
@@ -365,6 +369,7 @@ namespace
 			}
 			PopulateKnownStringData();
 			RefreshWeaponAnimFolder();
+			RegisterWeaponEquipListener();
 			if (!HasActiveReplacements()) {
 				Hooks::LoadClipsHooks::TryDeferredInjection();
 			}
@@ -384,6 +389,7 @@ namespace
 			}
 			PopulateKnownStringData();
 			RefreshWeaponAnimFolder();
+			RegisterWeaponEquipListener();
 			SetGameFullyLoaded(true);
 			logger::info("[OAR] New game started, clip hooks active");
 			break;
