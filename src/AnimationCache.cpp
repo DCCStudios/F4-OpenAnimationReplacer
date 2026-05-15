@@ -240,20 +240,28 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		}
 	}
 
-	// Zero the clone's annotationTracks SIZE so the engine doesn't process the ORIGINAL
-	// animation's annotation events.  We keep the data pointer valid (still pointing at the
-	// original's track memory) to avoid crashes — only the count is zeroed.
-	// We then INSTALL replacement triggers on the clip generator at runtime (see Hooks.cpp)
-	// which contain the REPLACEMENT animation's annotation events with correct timings.
-	// This ensures the engine natively fires the replacement's events (sounds, weaponFire, etc.)
-	// instead of the original's.
+	// Patch ALL stale pointers on the clone. The clone was memcpy'd from the game's
+	// original animation, so any pointer fields reference game memory that gets freed
+	// on weapon switch. We must eliminate all stale references.
+
+	// 1. m_extractedMotion at +0x20: points to game's hkaAnimatedReferenceFrame.
+	//    NULL it out — weapon animations don't use root motion extraction, and our packfile
+	//    data has unfixed local pointers that can't be used directly.
+	*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = 0;
+
+	// 2. annotationTracks at +0x28: points to game's annotation data.
+	//    Use a safe dummy pointer with size=0 and DONT_DEALLOCATE.
 	{
-		*reinterpret_cast<int32_t*>(cloneBase + 0x30) = 0;   // annotationTracks.size = 0
-		uint32_t origCap = *reinterpret_cast<uint32_t*>(cloneBase + 0x34);
-		*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = origCap | 0x80000000u; // non-owning
+		static uint8_t* s_dummyAnnotData = nullptr;
+		if (!s_dummyAnnotData) {
+			s_dummyAnnotData = new uint8_t[64]();
+		}
+		*reinterpret_cast<uintptr_t*>(cloneBase + 0x28) = reinterpret_cast<uintptr_t>(s_dummyAnnotData);
+		*reinterpret_cast<int32_t*>(cloneBase + 0x30) = 0;            // size = 0
+		*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = 0x80000000u; // DONT_DEALLOCATE
 	}
 
-	logger::info("[OAR-Annot] Clone '{}': zeroed annotationTracks count, {} parsed replacement annotations (will use replacement triggers)",
+	logger::info("[OAR-Annot] Clone '{}': patched extractedMotion+annotationTracks, {} parsed replacement annotations (using trigger NULLing + manual firing)",
 		entry.filePath, entry.annotations.size());
 
 	// Clear m_transformOffsets (let game compute at runtime - game knows its own format)

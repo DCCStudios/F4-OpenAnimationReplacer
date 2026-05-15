@@ -156,6 +156,10 @@ void PopulateKnownStringData()
 // NOT through the broken a_context->character (which points to a static dummy character).
 void RefreshWeaponAnimFolder()
 {
+	static std::atomic<int> s_refreshCallCount{ 0 };
+	int callNum = s_refreshCallCount.fetch_add(1);
+	bool verbose = (callNum < 3);
+
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	if (!player) return;
 
@@ -167,73 +171,51 @@ void RefreshWeaponAnimFolder()
 	s_weaponAnimFolder.clear();
 	s_weaponAnimFolderValid.store(false);
 
-	logger::info("[OAR-WeaponPath] Scanning {} player graphs for projectData->stringData->animationPath...",
-		manager->graph.size());
-
 	for (uint32_t i = 0; i < manager->graph.size(); i++) {
 		auto* character = &manager->graph[i]->character;
 		if (!character || IsBadReadPtr(character, sizeof(void*))) continue;
 
-		const char* charName = character->name.data();
-		std::string nameStr = (charName && reinterpret_cast<uintptr_t>(charName) > 0x10000 &&
-			!IsBadReadPtr(charName, 1)) ? charName : "(null)";
-
 		auto* projData = character->projectData._ptr;
 		if (!projData || reinterpret_cast<uintptr_t>(projData) < 0x10000 ||
 			IsBadReadPtr(projData, sizeof(RE::hkbProjectData))) {
-			logger::info("[OAR-WeaponPath]   graph[{}] name='{}' projectData=NULL/invalid", i, nameStr);
 			continue;
 		}
 
 		auto* projStrData = projData->stringData._ptr;
 		if (!projStrData || reinterpret_cast<uintptr_t>(projStrData) < 0x10000 ||
 			IsBadReadPtr(projStrData, sizeof(RE::hkbProjectStringData))) {
-			logger::info("[OAR-WeaponPath]   graph[{}] name='{}' projStringData=NULL/invalid", i, nameStr);
 			continue;
 		}
 
 		const char* rawPath = projStrData->animationPath.data();
-		std::string pathStr = "(empty)";
+		std::string pathStr;
 		if (rawPath && reinterpret_cast<uintptr_t>(rawPath) > 0x10000 &&
 			!IsBadReadPtr(rawPath, 1) && rawPath[0] != '\0') {
 			pathStr = rawPath;
 		}
 
-		logger::info("[OAR-WeaponPath]   graph[{}] name='{}' animationPath='{}'", i, nameStr, pathStr);
-
-		// Also dump animationFilenames from the project string data
-		auto* afBase = reinterpret_cast<uint8_t*>(&projStrData->animationFilenames);
-		auto* afData = *reinterpret_cast<RE::hkStringPtr**>(afBase);
-		int32_t afCount = *reinterpret_cast<int32_t*>(afBase + 8);
-		logger::info("[OAR-WeaponPath]     animationFilenames: count={}", afCount);
-		if (afData && !IsBadReadPtr(afData, sizeof(void*)) && afCount > 0) {
-			int dump = (afCount > 10) ? 10 : afCount;
-			for (int j = 0; j < dump; j++) {
-				const char* fn = afData[j].data();
-				if (fn && reinterpret_cast<uintptr_t>(fn) > 0x10000 && !IsBadReadPtr(fn, 1)) {
-					logger::info("[OAR-WeaponPath]       [{}] '{}'", j, fn);
-				}
-			}
+		if (verbose) {
+			const char* charName = character->name.data();
+			std::string nameStr = (charName && reinterpret_cast<uintptr_t>(charName) > 0x10000 &&
+				!IsBadReadPtr(charName, 1)) ? charName : "(null)";
+			logger::info("[OAR-WeaponPath]   graph[{}] name='{}' animationPath='{}'",
+				i, nameStr, pathStr.empty() ? "(empty)" : pathStr);
 		}
 
-		if (pathStr != "(empty)") {
-			// Normalize: lowercase, replace / with backslash, extract last folder component
+		if (!pathStr.empty()) {
 			std::string normalized = pathStr;
 			std::ranges::transform(normalized, normalized.begin(),
 				[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 			std::ranges::replace(normalized, '/', '\\');
 
-			// Remove trailing backslash for extraction
 			while (!normalized.empty() && normalized.back() == '\\')
 				normalized.pop_back();
 
-			// Extract the folder name after "animations\" if present
 			std::string folderPrefix;
 			auto animPos = normalized.find("animations\\");
 			if (animPos != std::string::npos) {
-				folderPrefix = normalized.substr(animPos + 11); // everything after "animations\"
+				folderPrefix = normalized.substr(animPos + 11);
 			} else {
-				// Use the last path component as the folder
 				auto lastSlash = normalized.rfind('\\');
 				if (lastSlash != std::string::npos) {
 					folderPrefix = normalized.substr(lastSlash + 1);
@@ -244,79 +226,41 @@ void RefreshWeaponAnimFolder()
 
 			if (!folderPrefix.empty()) {
 				s_graphAnimPathByIndex[i] = folderPrefix;
-				logger::info("[OAR-WeaponPath]   graph[{}] -> folder prefix='{}'", i, folderPrefix);
-
-				// graph[1] (or higher) is typically the weapon graph
 				if (i >= 1) {
 					s_weaponAnimFolder = folderPrefix;
 					s_weaponAnimFolderValid.store(true);
-					logger::info("[OAR-WeaponPath] *** Weapon animation folder = '{}' ***", folderPrefix);
+					logger::info("[OAR-WeaponPath] Weapon animation folder = '{}'", folderPrefix);
 				}
 			}
 		}
-
 	}
 
-	// ============ Option 3: Read currentWeaponSubGraphID + SubGraphIdleRootData ============
+	// Update subgraph ID -> folder mappings
 	if (auto* actor = static_cast<RE::Actor*>(player)) {
 		auto* process = actor->currentProcess;
 		if (process && process->middleHigh) {
 			auto* mh = process->middleHigh;
 
 			auto& weapSubIDs = mh->currentWeaponSubGraphID;
-			logger::info("[OAR-SubGraphID] currentWeaponSubGraphID count={}",
-				weapSubIDs.size());
 			for (uint32_t idx = 0; idx < weapSubIDs.size(); idx++) {
 				uint64_t id = weapSubIDs[idx].identifier;
-				logger::info("[OAR-SubGraphID]   [{}] identifier={:X} ({})", idx, id, id);
 				s_lastWeaponSubGraphID.store(id);
 
 				if (s_weaponAnimFolderValid.load()) {
 					std::unique_lock sgLock(s_subGraphToFolderMutex);
-					s_subGraphIDToFolder[id] = s_weaponAnimFolder;
-					logger::info("[OAR-SubGraphID]   Mapped subgraphID {:X} -> folder '{}'",
-						id, s_weaponAnimFolder);
-				}
-			}
-
-			auto& reqSubIDs = mh->requestedWeaponSubGraphID;
-			for (uint32_t idx = 0; idx < reqSubIDs.size(); idx++) {
-				logger::info("[OAR-SubGraphID]   requested[{}] identifier={:X}", idx,
-					reqSubIDs[idx].identifier);
-			}
-
-			// Dump SubGraphIdleRootData entries
-			auto& sgRoots = mh->subGraphIdleManagerRoots;
-			logger::info("[OAR-SubGraphRoots] subGraphIdleManagerRoots count={}", sgRoots.size());
-			for (uint32_t idx = 0; idx < sgRoots.size(); idx++) {
-				auto& root = sgRoots[idx];
-				const char* rootName = root.idleRootName.c_str();
-				logger::info("[OAR-SubGraphRoots]   [{}] subGraphID={:X} idleRootName='{}' count={} active={} 1stPerson={}",
-					idx, root.subGraphID.identifier,
-					rootName ? rootName : "(null)",
-					static_cast<int>(root.count),
-					static_cast<int>(root.activeCount),
-					root.forFirstPerson);
-			}
-
-			// Dump equipped items for weapon info
-			auto& equippedItems = mh->equippedItems;
-			logger::info("[OAR-Equipped] equippedItems count={}", equippedItems.size());
-			for (uint32_t idx = 0; idx < equippedItems.size(); idx++) {
-				auto& eq = equippedItems[idx];
-				auto* form = eq.item.object;
-				if (form) {
-					logger::info("[OAR-Equipped]   [{}] formID={:08X} type={} name='{}'",
-						idx, form->GetFormID(),
-						static_cast<int>(form->GetFormType()),
-						RE::TESFullName::GetFullName(*form));
+					if (s_subGraphIDToFolder.find(id) == s_subGraphIDToFolder.end()) {
+						s_subGraphIDToFolder[id] = s_weaponAnimFolder;
+						logger::info("[OAR-SubGraphID] Mapped {:X} -> '{}'", id, s_weaponAnimFolder);
+					}
 				}
 			}
 		}
 	}
 
-	logger::info("[OAR-WeaponPath] Refresh complete. weaponFolder='{}' valid={}",
-		s_weaponAnimFolder, s_weaponAnimFolderValid.load());
+	if (verbose) {
+		logger::info("[OAR-WeaponPath] Refresh complete. weaponFolder='{}' valid={}",
+			s_weaponAnimFolder, s_weaponAnimFolderValid.load());
+	}
 }
 
 namespace
@@ -516,7 +460,8 @@ namespace
 	}
 
 	// Every frame: ensure triggers stay NULL'd (engine may restore originals between frames,
-	// though with zeroed annotationTracks this should not happen)
+	// The engine may rebuild triggers from the clone's annotationTracks on reactivation.
+	// This function re-NULLs them every frame to keep original events suppressed.
 	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
 	{
 		if (!a_clipGen) return;
@@ -891,6 +836,43 @@ namespace
 		return lower;
 	}
 
+	// Given a raw suffix, check if it's directly registered. If so, return it.
+	// If not, extract the leaf name and check the multi-leaf lookup table.
+	// Returns "multi:<leaf>" if multiple candidates exist, the single candidate
+	// if only one exists, or the original suffix if no leaf match is found.
+	// Caller must hold NO locks on s_nameLookupMutex.
+	static std::string ResolveOrLeafFallback(const std::string& a_suffix)
+	{
+		if (a_suffix.empty()) return a_suffix;
+
+		{
+			std::shared_lock rlock(s_nameLookupMutex);
+			if (s_suffixToInfos.find(a_suffix) != s_suffixToInfos.end()) {
+				return a_suffix;
+			}
+		}
+
+		std::string leaf = a_suffix;
+		auto lastSlash = a_suffix.rfind('\\');
+		if (lastSlash != std::string::npos) {
+			leaf = a_suffix.substr(lastSlash + 1);
+		}
+
+		if (leaf == a_suffix) return a_suffix;
+
+		std::shared_lock rlock(s_nameLookupMutex);
+		auto leafIt = s_leafToFullSuffixes.find(leaf);
+		if (leafIt == s_leafToFullSuffixes.end() || leafIt->second.empty()) {
+			return a_suffix;
+		}
+
+		if (leafIt->second.size() == 1) {
+			return leafIt->second[0];
+		}
+
+		return std::string("multi:") + leaf;
+	}
+
 	static void BuildNameLookup()
 	{
 		std::unique_lock lock(s_nameLookupMutex);
@@ -1201,28 +1183,28 @@ namespace
 									(fileName && reinterpret_cast<uintptr_t>(fileName) > 0x10000 && !IsBadReadPtr(fileName, 1)) ? fileName : "(bad)");
 							}
 							if (fileName && reinterpret_cast<uintptr_t>(fileName) > 0x10000 && fileName[0] != '\0') {
-								// Combine animPath + fileName if we have animPath
 								if (!animPath.empty()) {
 									std::string fullPath = animPath + fileName;
 									auto suffix = ExtractAnimSuffix(fullPath);
 									if (!suffix.empty()) {
+										auto resolved = ResolveOrLeafFallback(suffix);
 										if (s_sourceLogCount < 40) {
-											logger::info("[OAR-Suffix] Source1-Combined: animPath='{}' + fileName='{}' -> suffix='{}'",
-												animPath, fileName, suffix);
+											logger::info("[OAR-Suffix] Source1-Combined: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
+												animPath, fileName, suffix, resolved);
 											s_sourceLogCount++;
 										}
-										return suffix;
+										return resolved;
 									}
 								}
-								// Use fileName alone (it may already contain folder like "SCAR\wpnidleready.hkx")
 								auto suffix = ExtractAnimSuffix(std::string(fileName));
 								if (!suffix.empty()) {
+									auto resolved = ResolveOrLeafFallback(suffix);
 									if (s_sourceLogCount < 40) {
-										logger::info("[OAR-Suffix] Source1b-FileName: fileName='{}' -> suffix='{}'",
-											fileName, suffix);
+										logger::info("[OAR-Suffix] Source1b-FileName: fileName='{}' -> '{}' resolved='{}'",
+											fileName, suffix, resolved);
 										s_sourceLogCount++;
 									}
-									return suffix;
+									return resolved;
 								}
 							}
 						}
@@ -1298,24 +1280,25 @@ namespace
 						std::string fullPath = animPath + fileName;
 						auto suffix = ExtractAnimSuffix(fullPath);
 						if (!suffix.empty()) {
+							auto resolved = ResolveOrLeafFallback(suffix);
 							if (s_sourceLogCount < 40) {
-								logger::info("[OAR-Suffix] Source1d-KnownSD: animPath='{}' + fileName='{}' -> suffix='{}'",
-									animPath, fileName, suffix);
+								logger::info("[OAR-Suffix] Source1d-KnownSD: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
+									animPath, fileName, suffix, resolved);
 								s_sourceLogCount++;
 							}
-							return suffix;
+							return resolved;
 						}
 					}
 
-					// Use fileName alone
 					auto suffix = ExtractAnimSuffix(std::string(fileName));
 					if (!suffix.empty()) {
+						auto resolved = ResolveOrLeafFallback(suffix);
 						if (s_sourceLogCount < 40) {
-							logger::info("[OAR-Suffix] Source1d-KnownSD: fileName='{}' -> suffix='{}'",
-								fileName, suffix);
+							logger::info("[OAR-Suffix] Source1d-KnownSD: fileName='{}' -> '{}' resolved='{}'",
+								fileName, suffix, resolved);
 							s_sourceLogCount++;
 						}
-						return suffix;
+						return resolved;
 					}
 				}
 			}
@@ -1328,82 +1311,33 @@ namespace
 			if (it != s_idleAnimReverseMap.end()) {
 				auto suffix = ExtractAnimSuffix(it->second);
 				if (!suffix.empty()) {
+					auto resolved = ResolveOrLeafFallback(suffix);
 					if (s_sourceLogCount < 20) {
-						logger::info("[OAR-Suffix] Source2: idleAnimData='{}' -> suffix='{}'",
-							it->second, suffix);
+						logger::info("[OAR-Suffix] Source2: idleAnimData='{}' -> '{}' resolved='{}'",
+							it->second, suffix, resolved);
 						s_sourceLogCount++;
 					}
-					return suffix;
+					return resolved;
 				}
 			}
 		}
 
 		// Source 3: animationName field (behavior template name, e.g. "44pistol\wpnreload")
-		// First try the full suffix (for direct matches), then fall back to leaf name
+		// Uses ResolveOrLeafFallback to handle multi-leaf matching automatically.
 		const char* clipName = a_this->animationName.data();
 		if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
 			std::string clipStr(clipName);
 			auto fullSuffix = ExtractAnimSuffix(clipStr);
 
-			// Try full suffix first (direct match like "44pistol\wpnreload")
 			if (!fullSuffix.empty()) {
-				std::shared_lock rlock(s_nameLookupMutex);
-				if (s_suffixToInfos.find(fullSuffix) != s_suffixToInfos.end()) {
-					if (s_sourceLogCount < 20) {
-						logger::info("[OAR-Suffix] Source3: animationName='{}' -> suffix='{}' (direct match)",
-							clipName, fullSuffix);
-						s_sourceLogCount++;
-					}
-					return fullSuffix;
+				auto resolved = ResolveOrLeafFallback(fullSuffix);
+				if (s_sourceLogCount < 40) {
+					logger::info("[OAR-Suffix] Source3: animationName='{}' -> '{}' resolved='{}'",
+						clipName, fullSuffix, resolved);
+					s_sourceLogCount++;
 				}
+				return resolved;
 			}
-
-		// Source 4: Multi-match leaf lookup - extract leaf name and find all registered
-		// suffixes that share it. Returns the most specific match (longest path).
-		// E.g. "44pistol\wpnreload" -> leaf "wpnreload" -> candidates ["scar\wpnreload", "wpnreload"]
-		if (!fullSuffix.empty()) {
-			std::string leafSuffix = fullSuffix;
-			auto lastSlash = fullSuffix.rfind('\\');
-			if (lastSlash != std::string::npos) {
-				leafSuffix = fullSuffix.substr(lastSlash + 1);
-			}
-
-			if (leafSuffix != fullSuffix) {
-				std::shared_lock rlock(s_nameLookupMutex);
-				auto leafIt = s_leafToFullSuffixes.find(leafSuffix);
-				if (leafIt != s_leafToFullSuffixes.end() && !leafIt->second.empty()) {
-					// If only one candidate, use it directly
-					if (leafIt->second.size() == 1) {
-						if (s_sourceLogCount < 40) {
-							logger::info("[OAR-Suffix] Source4-LeafMulti: leaf='{}' -> single match '{}'",
-								leafSuffix, leafIt->second[0]);
-							s_sourceLogCount++;
-						}
-						return leafIt->second[0];
-					}
-
-					// Multiple candidates: return a special "multi:" prefix so the
-					// Update hook can evaluate conditions for each.
-					// For now, return all candidates joined — the Update hook will parse them.
-					// Actually, just return the leaf and let the Update hook handle multi-match.
-					if (s_sourceLogCount < 40) {
-						logger::info("[OAR-Suffix] Source4-LeafMulti: leaf='{}' -> {} candidates",
-							leafSuffix, leafIt->second.size());
-						s_sourceLogCount++;
-					}
-					// Return the leaf with a "multi:" prefix to signal multi-match mode
-					return std::string("multi:") + leafSuffix;
-				}
-			}
-
-			// Return full suffix even without match (for logging/caching)
-			if (s_sourceLogCount < 40) {
-				logger::info("[OAR-Suffix] Source3: animationName='{}' -> suffix='{}' (no match)",
-					clipName, fullSuffix);
-				s_sourceLogCount++;
-			}
-			return fullSuffix;
-		}
 		}
 
 		return {};
@@ -1411,7 +1345,58 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
+		// the original _Activate runs. This ensures the hkaDefaultAnimationControl
+		// is built from our clone (which has NULLed annotationTracks), preventing
+		// stale pointer crashes in computeMotion/clearAndDeallocate.
+		RE::hkaAnimation* preSwapOriginal = nullptr;
+		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt) {
+			const char* clipName = a_this->animationName.data();
+			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
+				std::string activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+				if (!activeSuffix.empty()) {
+					auto** animSlotPre = a_this->GetAnimationSlot();
+					if (animSlotPre && *animSlotPre) {
+						auto* cachePre = AnimationCache::GetSingleton();
+						RE::hkaAnimation* replacement = nullptr;
+
+						if (activeSuffix.size() > 6 && activeSuffix.substr(0, 6) == "multi:") {
+							std::string leafName = activeSuffix.substr(6);
+							std::shared_lock rlock(s_nameLookupMutex);
+							auto leafIt = s_leafToFullSuffixes.find(leafName);
+							if (leafIt != s_leafToFullSuffixes.end()) {
+								for (const auto& fullSuffix : leafIt->second) {
+									replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
+									if (replacement) break;
+								}
+							}
+						} else {
+							replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre);
+						}
+
+						if (replacement) {
+							auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
+							if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
+								preSwapOriginal = *animSlotPre;
+								*animSlotPre = replacement;
+							}
+						}
+					}
+				}
+			}
+		}
+
 		Hooks::ClipGeneratorHooks::_Activate(a_this, a_context);
+
+		// If we pre-swapped, restore the original in the slot so the Update hook
+		// can properly evaluate conditions and decide whether to keep the replacement.
+		// The animation control has already been built with empty annotationTracks.
+		if (preSwapOriginal) {
+			auto** animSlotPost = a_this->GetAnimationSlot();
+			if (animSlotPost) {
+				*animSlotPost = preSwapOriginal;
+			}
+		}
 
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this) {
 			return;
@@ -1420,12 +1405,10 @@ namespace
 		if (!s_lookupBuilt) BuildNameLookup();
 		if (!s_idleAnimReverseBuilt.load()) BuildIdleAnimReverseMap();
 
-		// Refresh weapon animation folder if not yet valid (first clip activation)
-		// or periodically (weapon may have changed)
 		{
 			static std::atomic<int> s_refreshCounter{ 0 };
 			int count = s_refreshCounter.fetch_add(1);
-			if (!s_weaponAnimFolderValid.load() || (count % 500 == 0)) {
+			if (!s_weaponAnimFolderValid.load() || (count % 2000 == 0)) {
 				RefreshWeaponAnimFolder();
 			}
 		}
@@ -1618,10 +1601,33 @@ namespace
 
 	}
 
+	// SEH wrapper for _Update — catches crashes in computeMotion due to stale annotation data.
+	// Must be in its own function because __try cannot coexist with C++ exception handling.
+	static bool SafeCallOriginalUpdate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
+	{
+		__try {
+			Hooks::ClipGeneratorHooks::_Update(a_this, a_context, a_timestep);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
 	{
-		// Call original Update first — variable bindings must process before any animation swap
-		Hooks::ClipGeneratorHooks::_Update(a_this, a_context, a_timestep);
+		// Call original Update first — variable bindings must process before any animation swap.
+		if (!SafeCallOriginalUpdate(a_this, a_context, a_timestep)) {
+			static int s_sehLog = 0;
+			if (s_sehLog < 20) {
+				auto** slot = a_this ? a_this->GetAnimationSlot() : nullptr;
+				logger::error("[OAR-SEH] computeMotion crash caught! clipGen={:X} animSlot={:X} anim={:X}",
+					reinterpret_cast<uintptr_t>(a_this),
+					reinterpret_cast<uintptr_t>(slot),
+					slot ? reinterpret_cast<uintptr_t>(*slot) : 0);
+				s_sehLog++;
+			}
+			return;
+		}
 
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
@@ -1649,7 +1655,7 @@ namespace
 		if (suffix.empty()) {
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
-				suffix = ExtractAnimSuffix(std::string(clipName));
+				suffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
 			}
 		}
 
@@ -1808,7 +1814,16 @@ namespace
 		const auto& candidates = *candidatesPtr;
 
 		auto** animSlot = a_this->GetAnimationSlot();
-		if (!animSlot || !*animSlot) return;
+		if (!animSlot || !*animSlot) {
+			static int s_slotNullLog = 0;
+			if (s_slotNullLog < 20) {
+				logger::warn("[OAR-SlotNull] animSlot null for '{}' clipGen={:X} ctrl={:X}",
+					resolvedSuffix, reinterpret_cast<uintptr_t>(a_this),
+					reinterpret_cast<uintptr_t>(a_this->GetAnimationControlRaw()));
+				s_slotNullLog++;
+			}
+			return;
+		}
 
 		// Read original animation from map (stored in Activate or first safe Update)
 		RE::hkaAnimation* originalAnim = nullptr;
@@ -1816,25 +1831,33 @@ namespace
 			std::shared_lock olock(s_originalAnimMutex);
 			auto oit = s_originalAnimMap.find(a_this);
 			if (oit != s_originalAnimMap.end()) {
-				originalAnim = oit->second;
+				auto vtbl = *reinterpret_cast<uintptr_t*>(oit->second);
+				if (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull) {
+					originalAnim = oit->second;
+				} else {
+					static int s_vtblRejectLog = 0;
+					if (s_vtblRejectLog < 30) {
+						logger::warn("[OAR-VtblCheck] Rejected originalAnim={:X} vtbl={:X} for clip '{}' — out of range",
+							reinterpret_cast<uintptr_t>(oit->second), vtbl, suffix);
+						s_vtblRejectLog++;
+					}
+					olock.unlock();
+					std::unique_lock wlock(s_originalAnimMutex);
+					s_originalAnimMap.erase(a_this);
+				}
 			}
 		}
-		// If not stored yet, capture it now — but ONLY if it's not one of our replacements
 		if (!originalAnim) {
 			auto* cache = AnimationCache::GetSingleton();
 			RE::hkaAnimation* current = *animSlot;
 			if (!cache->IsOurReplacement(current)) {
 				originalAnim = current;
 				std::unique_lock olock(s_originalAnimMutex);
-				// Only insert if still missing (avoid race overwrite)
 				auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, originalAnim);
 				if (!inserted) {
 					originalAnim = it->second;
 				}
 			} else {
-				// Slot holds our replacement but we lost track of the original.
-				// Reverse-lookup from cache to recover it — use as fallback only,
-				// do NOT overwrite any existing entry.
 				RE::hkaAnimation* recovered = cache->GetOriginalFromReplacement(current);
 				if (recovered) {
 					originalAnim = recovered;
@@ -1844,6 +1867,13 @@ namespace
 						originalAnim = it->second;
 					}
 				} else {
+					static int s_recoveryFailLog = 0;
+					if (s_recoveryFailLog < 20) {
+						logger::warn("[OAR-RecoveryFail] Can't recover original for '{}' clipGen={:X} current={:X}",
+							resolvedSuffix, reinterpret_cast<uintptr_t>(a_this),
+							reinterpret_cast<uintptr_t>(current));
+						s_recoveryFailLog++;
+					}
 					return;
 				}
 			}
@@ -1852,6 +1882,17 @@ namespace
 		// Evaluate conditions
 		RE::TESObjectREFR* refr = GetRefrFromContext(a_context);
 		if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+
+		{
+			static std::atomic<int> s_condEvalReachCount{ 0 };
+			int reachCount = s_condEvalReachCount.fetch_add(1);
+			if (reachCount < 5) {
+				logger::info("[OAR-CondEval] Reached condition eval for '{}' (count={}, original={:X}, animSlot={:X})",
+					resolvedSuffix, reachCount,
+					reinterpret_cast<uintptr_t>(originalAnim),
+					reinterpret_cast<uintptr_t>(*animSlot));
+			}
+		}
 
 		bool shouldReplace = false;
 		ReplacementAnimFileInfo* winningInfo = nullptr;
@@ -1953,11 +1994,10 @@ namespace
 			}
 		}
 
-		// Periodic diagnostic for weapon clips: log every ~300 calls to confirm Update is running
 		{
 			static std::atomic<int> s_updateDiagCounter{ 0 };
 			int count = s_updateDiagCounter.fetch_add(1);
-			if (count % 300 == 0) {
+			if (count < 5 || count % 3000 == 0) {
 				logger::info("[OAR-Diag] Update running for '{}': shouldReplace={} animSlot={:X} original={:X} current={:X}",
 					resolvedSuffix, shouldReplace,
 					reinterpret_cast<uintptr_t>(animSlot),
@@ -2169,21 +2209,27 @@ namespace
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		if (a_this) {
-			// Restore original animation pointer and triggers if we previously swapped them
+			// Do NOT restore the original animation or triggers during deactivation.
+			// The clip is being freed and ALL backed-up pointers (animation, triggers)
+			// will become stale. If the address is recycled by a new clip, stale entries
+			// would cause crashes. Erase everything for this clip.
 			{
-				std::shared_lock lock(s_originalAnimMutex);
-				auto oit = s_originalAnimMap.find(a_this);
-				if (oit != s_originalAnimMap.end()) {
-					auto** animSlot = a_this->GetAnimationSlot();
-					if (animSlot && *animSlot != oit->second) {
-						auto* cache = AnimationCache::GetSingleton();
-						if (cache->IsOurReplacement(*animSlot)) {
-							*animSlot = oit->second;
-						}
-					}
-				}
+				std::unique_lock lock(s_triggersBackupMutex);
+				s_triggersBackup.erase(a_this);
 			}
-			RestoreClipTriggers(a_this);
+			{
+				std::unique_lock lock(s_originalAnimMutex);
+				s_originalAnimMap.erase(a_this);
+			}
+			// Also clean up clip suffix cache and annotation state
+			{
+				std::unique_lock lock(s_clipSuffixMutex);
+				s_clipSuffixCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_annotStateMutex);
+				s_annotStateMap.erase(a_this);
+			}
 		}
 
 		Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
