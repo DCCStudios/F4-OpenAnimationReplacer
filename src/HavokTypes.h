@@ -354,6 +354,26 @@ namespace RE
 		}
 	};
 
+	struct hkbProjectStringData : public hkReferencedObject
+	{
+		hkArray<hkStringPtr, hkContainerHeapAllocator> animationFilenames;   // +0x10
+		hkArray<hkStringPtr, hkContainerHeapAllocator> behaviorFilenames;    // +0x20
+		hkArray<hkStringPtr, hkContainerHeapAllocator> characterFilenames;   // +0x30
+		hkArray<hkStringPtr, hkContainerHeapAllocator> eventNames;           // +0x40
+		hkStringPtr animationPath;    // +0x50
+		hkStringPtr behaviorPath;     // +0x58
+		hkStringPtr characterPath;    // +0x60
+		hkStringPtr scriptsPath;      // +0x68
+		hkStringPtr fullPathToSource; // +0x70
+		hkStringPtr rootPath;         // +0x78
+	};
+
+	struct hkbProjectData : public hkReferencedObject
+	{
+		uint8_t worldUpWS[16];                         // +0x10 (hkVector4f)
+		hkRefPtr<hkbProjectStringData> stringData;     // +0x20
+	};
+
 	struct __declspec(novtable) hkbCharacter : public hkReferencedObject
 	{
 		virtual void getNearbyCharacters(float, hkArray<hkbCharacter*, hkContainerHeapAllocator>*) {}

@@ -240,14 +240,20 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		}
 	}
 
-	// Zero clone's annotationTracks — the game uses a separate annotation map (from LoadClips)
-	// for runtime event dispatch, not the hkaAnimation::annotationTracks field. We fire
-	// replacement annotations manually via NotifyAnimationGraphImpl in the Update hook.
-	*reinterpret_cast<uintptr_t*>(cloneBase + 0x28) = 0;
-	*reinterpret_cast<int32_t*>(cloneBase + 0x30) = 0;
-	*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = 0x80000000u;
+	// Zero the clone's annotationTracks SIZE so the engine doesn't process the ORIGINAL
+	// animation's annotation events.  We keep the data pointer valid (still pointing at the
+	// original's track memory) to avoid crashes — only the count is zeroed.
+	// We then INSTALL replacement triggers on the clip generator at runtime (see Hooks.cpp)
+	// which contain the REPLACEMENT animation's annotation events with correct timings.
+	// This ensures the engine natively fires the replacement's events (sounds, weaponFire, etc.)
+	// instead of the original's.
+	{
+		*reinterpret_cast<int32_t*>(cloneBase + 0x30) = 0;   // annotationTracks.size = 0
+		uint32_t origCap = *reinterpret_cast<uint32_t*>(cloneBase + 0x34);
+		*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = origCap | 0x80000000u; // non-owning
+	}
 
-	logger::info("[OAR-Annot] Clone '{}': annotationTracks zeroed (manual firing active, {} parsed annotations)",
+	logger::info("[OAR-Annot] Clone '{}': zeroed annotationTracks count, {} parsed replacement annotations (will use replacement triggers)",
 		entry.filePath, entry.annotations.size());
 
 	// Clear m_transformOffsets (let game compute at runtime - game knows its own format)

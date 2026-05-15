@@ -267,6 +267,7 @@ namespace Parsing
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("keepRandomResultsOnLoop")) a_subMod->SetKeepRandomResultsOnLoop(json["keepRandomResultsOnLoop"].get<bool>());
 		if (json.contains("shareRandomResults")) a_subMod->SetShareRandomResults(json["shareRandomResults"].get<bool>());
+		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
 
 		if (json.contains("customBlendTimeOnInterrupt"))
 			a_subMod->customBlendTimeOnInterrupt = json["customBlendTimeOnInterrupt"].get<float>();
@@ -300,6 +301,7 @@ namespace Parsing
 		if (json.contains("interruptible")) a_subMod->SetInterruptible(json["interruptible"].get<bool>());
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
+		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
 
 		if (json.contains("conditions") && json["conditions"].is_array()) {
 			auto condSet = std::make_unique<ConditionSet>();

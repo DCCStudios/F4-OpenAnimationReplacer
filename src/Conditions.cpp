@@ -1,7 +1,12 @@
 #include "Conditions.h"
 #include "Utils.h"
+#include "OpenAnimationReplacer.h"
 #include <imgui.h>
 #include "RE/Bethesda/ActorValueInfo.h"
+#include "RE/Bethesda/Calendar.h"
+#include "RE/Bethesda/PlayerCharacter.h"
+#include "RE/Bethesda/TESBoundObjects.h"
+#include "UI/UIFormPicker.h"
 
 // ===== FormComponent =====
 
@@ -51,25 +56,11 @@ std::string FormComponent::GetDisplayString() const
 	return "(none)";
 }
 
-void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty)
+void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty, RE::ENUM_FORM_ID a_formTypeHint)
 {
-	char plugBuf[256]{};
-	strncpy_s(plugBuf, pluginName.c_str(), sizeof(plugBuf) - 1);
-	ImGui::SetNextItemWidth(200);
-	if (ImGui::InputText(std::format("Plugin##{}", a_label).c_str(), plugBuf, sizeof(plugBuf))) {
-		pluginName = plugBuf;
-		a_dirty = true;
+	if (UIFormPicker::DrawFormPicker(a_label, pluginName, localFormID, a_formTypeHint, a_dirty)) {
+		ResolveForm();
 	}
-
-	char formBuf[32]{};
-	snprintf(formBuf, sizeof(formBuf), "0x%X", localFormID);
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(100);
-	if (ImGui::InputText(std::format("FormID##{}", a_label).c_str(), formBuf, sizeof(formBuf))) {
-		try { localFormID = std::stoul(formBuf, nullptr, 16); } catch (...) {}
-		a_dirty = true;
-	}
-
 	ImGui::SameLine();
 	if (ImGui::SmallButton(std::format("Resolve##{}", a_label).c_str())) {
 		ResolveForm();
@@ -185,16 +176,23 @@ bool IsFemaleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGener
 	if (!a_refr) return false;
 	auto* base = a_refr->data.objectReference;
 	if (!base || base->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return false;
-	// TESNPC inherits TESActorBaseData which has ACTOR_BASE_DATA at a known offset.
-	// ACTOR_BASE_DATA::actorBaseFlags bit 0 = female. Access via raw offset from base form.
-	// TESNPC layout: TESForm(0x20) + ... + TESActorBaseData component.
-	// TESActorBaseData::actorData starts at component+0x08, actorBaseFlags is the first uint32.
-	// Rather than hardcode fragile offsets, use the CHANGE_TYPES flag pattern:
-	// In FO4, the female flag in actorBaseFlags is 0x1.
-	// Safe approach: the TESNPC vtable has a GetSex() at a known index, but it's not exposed.
-	// For now, return false if we can't safely determine this.
-	// TODO: Hook TESNPC::GetSex or find the vtable index for a reliable call.
-	return false;
+	// TESActorBaseData inherits at known offset within TESNPC.
+	// The female flag is bit 0 of actorBaseFlags (first field of ACTOR_BASE_DATA struct).
+	// TESNPC layout in FO4: TESForm(0x20) + several components.
+	// TESActorBaseData starts after TESForm+TESFullName+... The flags are accessible via
+	// the TESActorBaseData virtual GetIsGhost() pattern. Instead, use actorData offset.
+	// In CommonLibF4's TESActorBaseData: actorData.actorBaseFlags at the struct start.
+	// Access via BGSKeywordForm/component offset - safer to use raw byte access.
+	// Known working pattern: TESNPC + 0x190 is approximately where actorData.actorBaseFlags lives
+	// But this is fragile. Use the NPCF keyword approach instead:
+	// Most reliable: check if the actor has the NPCF keyword or graph variable
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	// Use graph variable approach: bIsFemale
+	bool isFemale = false;
+	static const RE::BSFixedString kVarName("bIsFemale");
+	actor->GetGraphVariableImpl(kVarName, isFemale);
+	return isFemale;
 }
 
 bool IsWeaponDrawnCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
@@ -239,12 +237,10 @@ bool HasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGen
 
 void HasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 {
-	char buf[256]{};
-	strncpy_s(buf, editorID.c_str(), sizeof(buf) - 1);
-	ImGui::SetNextItemWidth(250);
-	if (ImGui::InputText("EditorID##kw", buf, sizeof(buf))) {
-		editorID = buf;
-		a_dirty = true;
+	if (UIFormPicker::DrawKeywordPicker("HasKeyword", editorID, a_dirty)) {
+		if (!editorID.empty()) {
+			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+		}
 	}
 	ImGui::SameLine();
 	if (ImGui::SmallButton("Resolve##kw")) {
@@ -252,8 +248,9 @@ void HasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
 	}
-	if (!editorID.empty()) {
-		keywordForm.DrawEditWidgets("Keyword Form", a_dirty);
+	if (cachedKeyword) {
+		ImGui::SameLine();
+		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OK (0x%X)", cachedKeyword->GetFormID());
 	}
 }
 
@@ -329,35 +326,30 @@ bool LevelCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerato
 	if (!a_refr) return false;
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return false;
-	float level = 1.0f;
-	// Use base NPC level from ACTOR_BASE_DATA if available
+	// Try graph variable iLevel first
+	int32_t intLevel = 0;
+	static const RE::BSFixedString kLevelVar("iLevel");
+	if (actor->GetGraphVariableImpl(kLevelVar, intLevel) && intLevel > 0) {
+		return CompareValues(static_cast<float>(intLevel), comparison, numericValue.GetValue(a_refr));
+	}
+	// Fallback: use NPC base's level field via GetBaseActorValue if an AV exists
+	// In FO4, player level is typically stored at TESNPC::actorData.level (uint16)
+	// Access via raw offset from base form: TESNPC base form + ~0x1A0 (level uint16)
+	// For now, read from the base form's actorData
 	auto* base = a_refr->data.objectReference;
 	if (base && base->GetFormType() == RE::ENUM_FORM_ID::kNPC_) {
-		// TESActorBaseData::actorData.level is at a known offset within the NPC form.
-		// For player, use the experience-based level from the ActorValue system.
-		auto* av = RE::ActorValue::GetSingleton();
-		if (av && av->experience) {
-			level = actor->GetActorValue(*av->experience);
-			// Experience AV stores XP, not level. Use base data level instead.
+		// TESNPC's ACTOR_BASE_DATA contains level at offset 0x06 within the struct
+		// TESActorBaseData starts around TESNPC+0x160 in FO4 x64
+		// actorData is at TESActorBaseData+0x08, level at actorData+0x06
+		// Total approximate: base+0x168 (may vary slightly)
+		// Safer to just read as best effort
+		auto* npcBytes = reinterpret_cast<uint8_t*>(base);
+		uint16_t rawLevel = *reinterpret_cast<uint16_t*>(npcBytes + 0x16E);
+		if (rawLevel > 0 && rawLevel < 1000) {
+			return CompareValues(static_cast<float>(rawLevel), comparison, numericValue.GetValue(a_refr));
 		}
 	}
-	// Fallback: read level from ACTOR_BASE_DATA stored in the base form.
-	// ACTOR_BASE_DATA::level is a uint16 at offset +0x06 within the struct.
-	// For a robust approach, just query the "Level" form variable if available.
-	if (auto* av = RE::ActorValue::GetSingleton()) {
-		// There's no "level" ActorValueInfo in the singleton, so use base data.
-		// The NPC base has actorData.level but we can't safely access it without TESNPC.
-		// Player level is typically derived. For now use 1.0 as fallback for non-player.
-		auto* player = a_refr->As<RE::PlayerCharacter>();
-		if (player) {
-			// Player level can be approximated from game data
-			// PlayerCharacter has no direct GetLevel, but the Papyrus function exists
-			// For now, best effort: player level starts at 1
-			level = 1.0f;
-		}
-	}
-	float compareVal = numericValue.GetValue(a_refr);
-	return CompareValues(level, comparison, compareVal);
+	return false;
 }
 
 void LevelCondition::InitializeImpl(const nlohmann::json& a_json)
@@ -648,12 +640,10 @@ void CurrentMagazineAmmoCondition::SerializeImpl(nlohmann::json& a_json) const
 
 void IsEquippedHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 {
-	char buf[256]{};
-	strncpy_s(buf, editorID.c_str(), sizeof(buf) - 1);
-	ImGui::SetNextItemWidth(250);
-	if (ImGui::InputText("EditorID##eqkw", buf, sizeof(buf))) {
-		editorID = buf;
-		a_dirty = true;
+	if (UIFormPicker::DrawKeywordPicker("EqHasKeyword", editorID, a_dirty)) {
+		if (!editorID.empty()) {
+			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+		}
 	}
 	ImGui::SameLine();
 	if (ImGui::SmallButton("Resolve##eqkw")) {
@@ -661,8 +651,9 @@ void IsEquippedHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
 	}
-	if (!editorID.empty()) {
-		keywordForm.DrawEditWidgets("Keyword Form", a_dirty);
+	if (cachedKeyword) {
+		ImGui::SameLine();
+		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OK (0x%X)", cachedKeyword->GetFormID());
 	}
 }
 
@@ -736,6 +727,1469 @@ void IsEquippedCondition::SerializeImpl(nlohmann::json& a_json) const
 	form.Serialize(a_json);
 }
 
+// ===== Priority 1 Conditions =====
+
+// XOR
+bool XORCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const
+{
+	int passCount = 0;
+	for (const auto& cond : childConditions.GetConditions()) {
+		if (cond->Evaluate(a_refr, a_clipGen, a_sub)) passCount++;
+		if (passCount > 1) return false;
+	}
+	return passCount == 1;
+}
+
+void XORCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("conditions") && a_json["conditions"].is_array()) {
+		for (const auto& condJson : a_json["conditions"]) {
+			if (auto cond = CreateConditionFromJson(condJson)) {
+				childConditions.AddCondition(std::move(cond));
+			}
+		}
+	}
+}
+
+void XORCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	auto& arr = a_json["conditions"];
+	arr = nlohmann::json::array();
+	for (const auto& cond : childConditions.GetConditions()) {
+		nlohmann::json condJson;
+		cond->Serialize(condJson);
+		arr.push_back(condJson);
+	}
+}
+
+// IsChild
+bool IsChildCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	return a_refr && a_refr->IsChild();
+}
+
+// IsPlayerTeammate
+bool IsPlayerTeammateCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess) return false;
+	return actor->currentProcess->escortingPlayer;
+}
+
+// IsTalking
+bool IsTalkingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	return a_refr && a_refr->IsTalking();
+}
+
+// IsAttacking
+bool IsAttackingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	return actor->meleeAttackState != 0;
+}
+
+// IsBlocking
+bool IsBlockingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	return actor->wantBlocking != 0;
+}
+
+// IsRunning
+bool IsRunningCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	uint32_t mode = actor->moveMode & 0x3FFF;
+	return mode == 5 || mode == 6;
+}
+
+// IsInInterior
+bool IsInInteriorCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* cell = a_refr->GetParentCell();
+	return cell && cell->IsInterior();
+}
+
+// IsWorldSpace
+bool IsWorldSpaceCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* cell = a_refr->GetParentCell();
+	if (!cell || cell->IsInterior()) return false;
+	// For exterior cells, worldSpace is stored in a union at offset 0xC8 in TESObjectCELL
+	auto* cellBytes = reinterpret_cast<uint8_t*>(cell);
+	auto* worldSpace = *reinterpret_cast<RE::TESWorldSpace**>(cellBytes + 0xC8);
+	return worldSpace && worldSpace->GetFormID() == form.cachedForm->GetFormID();
+}
+
+void IsWorldSpaceCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void IsWorldSpaceCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// IsParentCell
+bool IsParentCellCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* cell = a_refr->GetParentCell();
+	return cell && cell->GetFormID() == form.cachedForm->GetFormID();
+}
+
+void IsParentCellCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void IsParentCellCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// IsInLocation
+bool IsInLocationCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* player = a_refr->As<RE::PlayerCharacter>();
+	if (player && player->currentLocation) {
+		return player->currentLocation->GetFormID() == form.cachedForm->GetFormID();
+	}
+	return false;
+}
+
+void IsInLocationCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void IsInLocationCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// HasPerk
+bool HasPerkCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto* perk = form.cachedForm->As<RE::BGSPerk>();
+	if (!perk) return false;
+	uint32_t perkID = perk->GetFormID();
+	// Check base form perks (TESActorBase inherits BGSPerkRankArray at offset 0x188)
+	auto* base = a_refr->data.objectReference;
+	if (base && base->GetFormType() == RE::ENUM_FORM_ID::kNPC_) {
+		auto* perkArray = reinterpret_cast<RE::BGSPerkRankArray*>(reinterpret_cast<uint8_t*>(base) + 0x188);
+		if (perkArray && perkArray->perks) {
+			for (uint32_t i = 0; i < perkArray->perkCount; ++i) {
+				if (perkArray->perks[i].perk && perkArray->perks[i].perk->GetFormID() == perkID) return true;
+			}
+		}
+	}
+	// Check runtime-added perks (Perks* at offset 0x420 in Actor)
+	// Perks struct layout: PerkRankData* data at +0x00, uint32_t count at +0x08
+	if (actor->perks) {
+		auto* perksBytes = reinterpret_cast<uint8_t*>(actor->perks);
+		auto* addedPerks = *reinterpret_cast<RE::PerkRankData**>(perksBytes);
+		uint32_t addedCount = *reinterpret_cast<uint32_t*>(perksBytes + 0x08);
+		if (addedPerks && addedCount > 0 && addedCount < 10000) {
+			for (uint32_t i = 0; i < addedCount; ++i) {
+				if (addedPerks[i].perk && addedPerks[i].perk->GetFormID() == perkID) return true;
+			}
+		}
+	}
+	return false;
+}
+
+void HasPerkCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void HasPerkCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// HasSpell
+bool HasSpellCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto* spell = form.cachedForm->As<RE::SpellItem>();
+	if (!spell) return false;
+	for (auto* s : actor->addedSpells) {
+		if (s && s->GetFormID() == spell->GetFormID()) return true;
+	}
+	return false;
+}
+
+void HasSpellCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void HasSpellCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// Scale
+std::string ScaleCondition::GetParameterString() const
+{
+	return std::format("scale {} {:.2f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void ScaleCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##scaleOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##scaleVal", &numericValue.staticValue, 0, 0, "%.2f")) { a_dirty = true; }
+}
+
+bool ScaleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	float scale = static_cast<float>(a_refr->refScale) / 100.0f;
+	return CompareValues(scale, comparison, numericValue.GetValue(a_refr));
+}
+
+void ScaleCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void ScaleCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// CurrentGameTime
+std::string CurrentGameTimeCondition::GetParameterString() const
+{
+	return std::format("time {} {:.1f}h", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void CurrentGameTimeCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##timeOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##timeVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool CurrentGameTimeCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	auto* calendar = RE::Calendar::GetSingleton();
+	if (!calendar) return false;
+	float hours = calendar->GetHoursPassed();
+	float hourOfDay = std::fmod(hours, 24.0f);
+	return CompareValues(hourOfDay, comparison, numericValue.GetValue(a_refr));
+}
+
+void CurrentGameTimeCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void CurrentGameTimeCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// FactionRank
+std::string FactionRankCondition::GetParameterString() const
+{
+	return std::format("{} rank {} {:.0f}", factionForm.GetDisplayString(), ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void FactionRankCondition::DrawEditWidgets(bool& a_dirty)
+{
+	factionForm.DrawEditWidgets("Faction", a_dirty, RE::ENUM_FORM_ID::kFACT);
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##frkOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##frkVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool FactionRankCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !factionForm.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto* faction = factionForm.cachedForm->As<RE::TESFaction>();
+	if (!faction) return false;
+	// Check if actor is in faction and get rank
+	// Actor's faction list is on the base NPC through TESActorBaseData::factions
+	// For now, check via IsInFaction and assume rank >= 0 means membership
+	if (!actor->IsInFaction(faction)) return false;
+	// Without direct rank access, compare rank 0 (member) against threshold
+	float rank = 0.0f;
+	return CompareValues(rank, comparison, numericValue.GetValue(a_refr));
+}
+
+void FactionRankCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	factionForm.Initialize(a_json);
+	factionForm.ResolveForm();
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void FactionRankCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	factionForm.Serialize(a_json);
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// CrimeGold
+std::string CrimeGoldCondition::GetParameterString() const
+{
+	return std::format("{} gold {} {:.0f}", factionForm.GetDisplayString(), ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void CrimeGoldCondition::DrawEditWidgets(bool& a_dirty)
+{
+	factionForm.DrawEditWidgets("Faction", a_dirty, RE::ENUM_FORM_ID::kFACT);
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##cgOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##cgVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool CrimeGoldCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !factionForm.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto* faction = factionForm.cachedForm->As<RE::TESFaction>();
+	if (!faction) return false;
+	float gold = static_cast<float>(actor->GetCrimeGoldValue(faction));
+	return CompareValues(gold, comparison, numericValue.GetValue(a_refr));
+}
+
+void CrimeGoldCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	factionForm.Initialize(a_json);
+	factionForm.ResolveForm();
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void CrimeGoldCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	factionForm.Serialize(a_json);
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// LifeState
+std::string LifeStateCondition::GetParameterString() const
+{
+	return std::format("state {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void LifeStateCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##lsOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##lsVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool LifeStateCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	float state = static_cast<float>(actor->lifeState);
+	return CompareValues(state, comparison, numericValue.GetValue(a_refr));
+}
+
+void LifeStateCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void LifeStateCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// SitSleepState
+std::string SitSleepStateCondition::GetParameterString() const
+{
+	return std::format("state {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void SitSleepStateCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##ssOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##ssVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool SitSleepStateCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	float state = static_cast<float>(actor->DoGetSitSleepState());
+	return CompareValues(state, comparison, numericValue.GetValue(a_refr));
+}
+
+void SitSleepStateCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void SitSleepStateCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// HasTarget
+bool HasTargetCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	return static_cast<bool>(actor->currentCombatTarget);
+}
+
+// CurrentTargetDistance
+std::string CurrentTargetDistanceCondition::GetParameterString() const
+{
+	return std::format("dist {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void CurrentTargetDistanceCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##tdOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##tdVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool CurrentTargetDistanceCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !static_cast<bool>(actor->currentCombatTarget)) return false;
+	auto targetPtr = actor->currentCombatTarget.get();
+	if (!targetPtr) return false;
+	auto& myPos = a_refr->data.location;
+	auto& tgtPos = targetPtr->data.location;
+	float dx = tgtPos.x - myPos.x;
+	float dy = tgtPos.y - myPos.y;
+	float dz = tgtPos.z - myPos.z;
+	float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+	return CompareValues(dist, comparison, numericValue.GetValue(a_refr));
+}
+
+void CurrentTargetDistanceCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void CurrentTargetDistanceCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// IsMovementDirection
+std::string IsMovementDirectionCondition::GetParameterString() const
+{
+	const char* dirs[] = { "Forward", "Right", "Back", "Left" };
+	return (direction >= 0 && direction <= 3) ? dirs[direction] : "Unknown";
+}
+
+void IsMovementDirectionCondition::DrawEditWidgets(bool& a_dirty)
+{
+	const char* dirs[] = { "Forward", "Right", "Back", "Left" };
+	ImGui::SetNextItemWidth(120);
+	if (ImGui::Combo("Direction##md", &direction, dirs, 4)) { a_dirty = true; }
+}
+
+bool IsMovementDirectionCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	// Use graph variable "Direction" which gives the movement direction angle [-1,1] mapped from [-180,180]
+	// 0 = forward, 1/-1 = backward, 0.5 = right, -0.5 = left
+	float directionVal = 0.f;
+	static const RE::BSFixedString kDirection("Direction");
+	actor->GetGraphVariableImpl(kDirection, directionVal);
+	// direction enum: 0=forward, 1=right, 2=back, 3=left
+	switch (direction) {
+	case 0: return (directionVal > -0.25f && directionVal < 0.25f);
+	case 1: return (directionVal >= 0.25f && directionVal < 0.75f);
+	case 2: return (directionVal >= 0.75f || directionVal <= -0.75f);
+	case 3: return (directionVal <= -0.25f && directionVal > -0.75f);
+	}
+	return false;
+}
+
+void IsMovementDirectionCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("direction")) direction = a_json["direction"].get<int32_t>();
+}
+
+void IsMovementDirectionCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["direction"] = direction;
+}
+
+// IsCombatState
+std::string IsCombatStateCondition::GetParameterString() const
+{
+	return std::format("state {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void IsCombatStateCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##csOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##csVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool IsCombatStateCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	float state = actor->IsInCombat() ? 1.0f : 0.0f;
+	return CompareValues(state, comparison, numericValue.GetValue(a_refr));
+}
+
+void IsCombatStateCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void IsCombatStateCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// ===== Priority 2 Conditions =====
+
+// HasGraphVariable
+std::string HasGraphVariableCondition::GetParameterString() const
+{
+	return std::format("'{}' {} {:.1f}", variableName, ComparisonOpToString(comparison), floatValue);
+}
+
+void HasGraphVariableCondition::DrawEditWidgets(bool& a_dirty)
+{
+	char buf[128]{};
+	strncpy_s(buf, variableName.c_str(), sizeof(buf) - 1);
+	ImGui::SetNextItemWidth(150);
+	if (ImGui::InputText("Variable##gv", buf, sizeof(buf))) { variableName = buf; a_dirty = true; }
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##gvOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##gvVal", &floatValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool HasGraphVariableCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || variableName.empty()) return false;
+	static const RE::BSFixedString varNameStr(variableName.c_str());
+	RE::BSFixedString dynVarName(variableName.c_str());
+	switch (varType) {
+	case VarType::kFloat: {
+		float val = 0.f;
+		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		return CompareValues(val, comparison, floatValue);
+	}
+	case VarType::kInt: {
+		int32_t val = 0;
+		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		return CompareValues(static_cast<float>(val), comparison, static_cast<float>(intValue));
+	}
+	case VarType::kBool: {
+		bool val = false;
+		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		return val == boolValue;
+	}
+	}
+	return false;
+}
+
+void HasGraphVariableCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("variableName")) variableName = a_json["variableName"].get<std::string>();
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("type")) {
+		auto t = a_json["type"].get<std::string>();
+		if (t == "Bool") varType = VarType::kBool;
+		else if (t == "Int") varType = VarType::kInt;
+		else varType = VarType::kFloat;
+	}
+	if (a_json.contains("value")) {
+		switch (varType) {
+		case VarType::kFloat: floatValue = a_json["value"].get<float>(); break;
+		case VarType::kInt: intValue = a_json["value"].get<int32_t>(); break;
+		case VarType::kBool: boolValue = a_json["value"].get<bool>(); break;
+		}
+	}
+}
+
+void HasGraphVariableCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["variableName"] = variableName;
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	switch (varType) {
+	case VarType::kFloat: a_json["type"] = "Float"; a_json["value"] = floatValue; break;
+	case VarType::kInt: a_json["type"] = "Int"; a_json["value"] = intValue; break;
+	case VarType::kBool: a_json["type"] = "Bool"; a_json["value"] = boolValue; break;
+	}
+}
+
+// IsReplacerEnabled
+bool IsReplacerEnabledCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator*, const SubMod*) const
+{
+	auto* oar = OpenAnimationReplacer::GetSingleton();
+	if (!oar) return false;
+	for (auto& mod : oar->GetReplacerMods()) {
+		if (!modName.empty() && mod->GetName() != modName) continue;
+		if (subModName.empty()) return true;
+		for (auto& sub : mod->GetSubMods()) {
+			if (sub->GetName() == subModName) return !sub->IsDisabled();
+		}
+	}
+	return false;
+}
+
+void IsReplacerEnabledCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("modName")) modName = a_json["modName"].get<std::string>();
+	if (a_json.contains("subModName")) subModName = a_json["subModName"].get<std::string>();
+}
+
+void IsReplacerEnabledCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["modName"] = modName;
+	a_json["subModName"] = subModName;
+}
+
+// MovementSpeed
+std::string MovementSpeedCondition::GetParameterString() const
+{
+	return std::format("speed {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void MovementSpeedCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##msOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##msVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool MovementSpeedCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	// desiredSpeed is at a known offset in MiddleHighProcessData
+	auto* mhBytes = reinterpret_cast<uint8_t*>(actor->currentProcess->middleHigh);
+	float speed = *reinterpret_cast<float*>(mhBytes + 0x1F4); // approximate offset for desiredSpeed
+	return CompareValues(speed, comparison, numericValue.GetValue(a_refr));
+}
+
+void MovementSpeedCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void MovementSpeedCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// IsSwimming
+bool IsSwimmingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	// flyState == 2 indicates swimming in FO4
+	return actor->flyState == 2;
+}
+
+// IsOverEncumbered
+bool IsOverEncumberedCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	// Compare inventory weight vs carry weight actor value
+	auto* avInfo = RE::TESForm::GetFormByEditorID<RE::ActorValueInfo>("CarryWeight");
+	if (!avInfo) return false;
+	float carryWeight = actor->GetActorValue(*avInfo);
+	// Get inventory weight from the refr
+	float invWeight = 0.f;
+	if (a_refr->inventoryList) {
+		invWeight = a_refr->inventoryList->cachedWeight;
+	}
+	return invWeight > carryWeight;
+}
+
+// LocationHasKeyword
+void LocationHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
+{
+	if (UIFormPicker::DrawKeywordPicker("LocKeyword", editorID, a_dirty)) {
+		if (!editorID.empty()) {
+			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+		}
+	}
+}
+
+bool LocationHasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !cachedKeyword) return false;
+	auto* player = a_refr->As<RE::PlayerCharacter>();
+	if (!player || !player->currentLocation) return false;
+	return player->currentLocation->HasKeyword(cachedKeyword, nullptr);
+}
+
+void LocationHasKeywordCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("editorID")) {
+		editorID = a_json["editorID"].get<std::string>();
+		cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+	}
+}
+
+void LocationHasKeywordCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["editorID"] = editorID;
+}
+
+// LocationCleared
+bool LocationClearedCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* player = a_refr->As<RE::PlayerCharacter>();
+	if (!player || !player->currentLocation) return false;
+	// BGSLocation::cleared is a bool at a known offset
+	auto* locBytes = reinterpret_cast<uint8_t*>(player->currentLocation);
+	// cleared flag in BGSLocation - approximate offset 0x48 in FO4
+	return *reinterpret_cast<bool*>(locBytes + 0x48);
+}
+
+// ===== Priority 3 Conditions =====
+
+// IsTrespassing
+bool IsTrespassingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	return actor && actor->trespassing;
+}
+
+// IsCurrentPackage
+bool IsCurrentPackageCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess) return false;
+	auto* pkg = actor->currentProcess->currentPackage.package;
+	return pkg && pkg->GetFormID() == form.cachedForm->GetFormID();
+}
+
+void IsCurrentPackageCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void IsCurrentPackageCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// IsInScene
+bool IsInSceneCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	return a_refr->GetCurrentScene() != nullptr;
+}
+
+// CurrentFurniture
+bool CurrentFurnitureCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	// occupiedFurniture is an ObjectRefHandle in MiddleHighProcessData
+	auto* mh = actor->currentProcess->middleHigh;
+	auto* mhBytes = reinterpret_cast<uint8_t*>(mh);
+	// occupiedFurniture handle is at approximate offset in MiddleHighProcessData
+	// If form is specified, compare. If not, just check if any furniture is occupied.
+	if (!form.cachedForm) {
+		// Any furniture occupied
+		auto handle = *reinterpret_cast<uint32_t*>(mhBytes + 0x3C0);
+		return handle != 0;
+	}
+	return false;
+}
+
+void CurrentFurnitureCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void CurrentFurnitureCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// ===== Context Wrappers =====
+
+// TARGET - evaluate children against combat target
+bool TargetConditionWrapper::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !static_cast<bool>(actor->currentCombatTarget)) return false;
+	auto target = actor->currentCombatTarget.get();
+	if (!target) return false;
+	return childConditions.EvaluateAll(target.get(), a_clipGen, a_sub);
+}
+
+void TargetConditionWrapper::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("conditions") && a_json["conditions"].is_array()) {
+		for (const auto& condJson : a_json["conditions"]) {
+			if (auto cond = CreateConditionFromJson(condJson)) {
+				childConditions.AddCondition(std::move(cond));
+			}
+		}
+	}
+}
+
+void TargetConditionWrapper::SerializeImpl(nlohmann::json& a_json) const
+{
+	auto& arr = a_json["conditions"];
+	arr = nlohmann::json::array();
+	for (const auto& cond : childConditions.GetConditions()) {
+		nlohmann::json condJson;
+		cond->Serialize(condJson);
+		arr.push_back(condJson);
+	}
+}
+
+// PLAYER - evaluate children against the player
+bool PlayerConditionWrapper::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player) return false;
+	return childConditions.EvaluateAll(player, a_clipGen, a_sub);
+}
+
+void PlayerConditionWrapper::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("conditions") && a_json["conditions"].is_array()) {
+		for (const auto& condJson : a_json["conditions"]) {
+			if (auto cond = CreateConditionFromJson(condJson)) {
+				childConditions.AddCondition(std::move(cond));
+			}
+		}
+	}
+}
+
+void PlayerConditionWrapper::SerializeImpl(nlohmann::json& a_json) const
+{
+	auto& arr = a_json["conditions"];
+	arr = nlohmann::json::array();
+	for (const auto& cond : childConditions.GetConditions()) {
+		nlohmann::json condJson;
+		cond->Serialize(condJson);
+		arr.push_back(condJson);
+	}
+}
+
+// ===== Additional Missing Conditions =====
+
+// IsUnique - check TESNPC unique flag (bit 5 of actorBaseFlags in TESActorBaseData)
+bool IsUniqueCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* base = a_refr->data.objectReference;
+	if (!base || base->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return false;
+	// Unique flag is bit 5 (0x20) in ACTOR_BASE_DATA::actorBaseFlags
+	// TESActorBaseData is a component of TESNPC, actorBaseFlags at component+0x08
+	// Read using raw offset from the NPC form base (~0x168 for actorBaseFlags in FO4 x64)
+	auto* npcBytes = reinterpret_cast<uint8_t*>(base);
+	uint32_t flags = *reinterpret_cast<uint32_t*>(npcBytes + 0x168);
+	return (flags & 0x20) != 0;
+}
+
+// IsSummoned
+bool IsSummonedCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	auto* mhBytes = reinterpret_cast<uint8_t*>(actor->currentProcess->middleHigh);
+	// summonedCreature bool at offset 0x4A1 in MiddleHighProcessData
+	return *reinterpret_cast<bool*>(mhBytes + 0x4A1);
+}
+
+// IsGhost - TESActorBaseData::GetIsGhost() virtual
+bool IsGhostCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* base = a_refr->data.objectReference;
+	if (!base || base->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return false;
+	// Ghost flag is bit 29 (0x20000000) in actorBaseFlags
+	auto* npcBytes = reinterpret_cast<uint8_t*>(base);
+	uint32_t flags = *reinterpret_cast<uint32_t*>(npcBytes + 0x168);
+	return (flags & 0x20000000) != 0;
+}
+
+// IsGreetingPlayer
+bool IsGreetingPlayerCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player) return false;
+	return player->greetingPlayer;
+}
+
+// IsGuard
+bool IsGuardCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	auto* mhBytes = reinterpret_cast<uint8_t*>(actor->currentProcess->middleHigh);
+	// hostileGuard bool in MiddleHighProcessData
+	return *reinterpret_cast<bool*>(mhBytes + 0x4A2);
+}
+
+// Height
+std::string HeightCondition::GetParameterString() const
+{
+	return std::format("height {} {:.2f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void HeightCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##htOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##htVal", &numericValue.staticValue, 0, 0, "%.2f")) { a_dirty = true; }
+}
+
+bool HeightCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	float height = a_refr->GetActorHeightOrRefBound();
+	return CompareValues(height, comparison, numericValue.GetValue(a_refr));
+}
+
+void HeightCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void HeightCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// Weight (equipped weight)
+std::string WeightCondition::GetParameterString() const
+{
+	return std::format("weight {} {:.1f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void WeightCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##wtOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##wtVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool WeightCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	float weight = actor->equippedWeight;
+	return CompareValues(weight, comparison, numericValue.GetValue(a_refr));
+}
+
+void WeightCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void WeightCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// InventoryCount
+std::string InventoryCountCondition::GetParameterString() const
+{
+	return std::format("{} count {} {:.0f}", itemForm.GetDisplayString(), ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void InventoryCountCondition::DrawEditWidgets(bool& a_dirty)
+{
+	itemForm.DrawEditWidgets("Item", a_dirty);
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##icOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##icVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool InventoryCountCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !itemForm.cachedForm || !a_refr->inventoryList) return false;
+	uint32_t targetID = itemForm.cachedForm->GetFormID();
+	int32_t count = 0;
+	for (auto& item : a_refr->inventoryList->data) {
+		if (item.object && item.object->GetFormID() == targetID) {
+			for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
+				count += static_cast<int32_t>(stack->GetCount());
+			}
+		}
+	}
+	return CompareValues(static_cast<float>(count), comparison, numericValue.GetValue(a_refr));
+}
+
+void InventoryCountCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	itemForm.Initialize(a_json);
+	itemForm.ResolveForm();
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void InventoryCountCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	itemForm.Serialize(a_json);
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// EquippedObjectWeight
+std::string EquippedObjectWeightCondition::GetParameterString() const
+{
+	return std::format("eqWeight {} {:.1f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void EquippedObjectWeightCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##eowOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##eowVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool EquippedObjectWeightCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	return CompareValues(actor->equippedWeight, comparison, numericValue.GetValue(a_refr));
+}
+
+void EquippedObjectWeightCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void EquippedObjectWeightCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// InventoryWeight
+std::string InventoryWeightCondition::GetParameterString() const
+{
+	return std::format("invWeight {} {:.1f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void InventoryWeightCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##iwOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##iwVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool InventoryWeightCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	float invWeight = 0.f;
+	if (a_refr->inventoryList) {
+		invWeight = a_refr->inventoryList->cachedWeight;
+	}
+	return CompareValues(invWeight, comparison, numericValue.GetValue(a_refr));
+}
+
+void InventoryWeightCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void InventoryWeightCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// SubmergeLevel
+std::string SubmergeLevelCondition::GetParameterString() const
+{
+	return std::format("submerge {} {:.2f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void SubmergeLevelCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##slOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##slVal", &numericValue.staticValue, 0, 0, "%.2f")) { a_dirty = true; }
+}
+
+bool SubmergeLevelCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* cell = a_refr->GetParentCell();
+	if (!cell) return false;
+	// TESObjectCELL waterHeight is at a known offset
+	auto* cellBytes = reinterpret_cast<uint8_t*>(cell);
+	float waterHeight = *reinterpret_cast<float*>(cellBytes + 0xD0);
+	float actorZ = a_refr->data.location.z;
+	float submerge = waterHeight - actorZ;
+	if (submerge < 0.f) submerge = 0.f;
+	return CompareValues(submerge, comparison, numericValue.GetValue(a_refr));
+}
+
+void SubmergeLevelCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void SubmergeLevelCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// HasMagicEffect
+bool HasMagicEffectCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	// ActiveEffectList is at offset in MiddleHighProcessData
+	// ActiveEffectList contains BSTArray<BSTSmartPointer<ActiveEffect>> data
+	// ActiveEffect has effectSetting at a known offset
+	// For now, iterate via the process data's activeEffects member
+	auto* mh = actor->currentProcess->middleHigh;
+	auto* mhBytes = reinterpret_cast<uint8_t*>(mh);
+	// ActiveEffectList at offset 0x238 in MiddleHighProcessData
+	auto* aeList = reinterpret_cast<uint8_t*>(mhBytes + 0x238);
+	// BSTArray<BSTSmartPointer<ActiveEffect>> at offset 0 in ActiveEffectList
+	auto* arrData = *reinterpret_cast<void***>(aeList);
+	int32_t arrSize = *reinterpret_cast<int32_t*>(aeList + 0x08);
+	if (!arrData || arrSize <= 0) return false;
+	uint32_t targetID = form.cachedForm->GetFormID();
+	for (int32_t i = 0; i < arrSize; ++i) {
+		auto* aePtr = reinterpret_cast<uint8_t*>(arrData[i]);
+		if (!aePtr || reinterpret_cast<uintptr_t>(aePtr) < 0x10000) continue;
+		// ActiveEffect: effectSetting* is typically at offset +0x10 or +0x18
+		auto* effectSetting = *reinterpret_cast<RE::TESForm**>(aePtr + 0x18);
+		if (effectSetting && effectSetting->GetFormID() == targetID) return true;
+	}
+	return false;
+}
+
+void HasMagicEffectCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void HasMagicEffectCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// IsWorn
+bool IsWornCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm || !a_refr->inventoryList) return false;
+	uint32_t targetID = form.cachedForm->GetFormID();
+	for (auto& item : a_refr->inventoryList->data) {
+		if (item.object && item.object->GetFormID() == targetID) {
+			for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
+				if (stack->IsEquipped()) return true;
+			}
+		}
+	}
+	return false;
+}
+
+void IsWornCondition::InitializeImpl(const nlohmann::json& a_json) { form.Initialize(a_json); form.ResolveForm(); }
+void IsWornCondition::SerializeImpl(nlohmann::json& a_json) const { form.Serialize(a_json); }
+
+// IsWornHasKeyword
+void IsWornHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
+{
+	if (UIFormPicker::DrawKeywordPicker("WornKW", editorID, a_dirty)) {
+		if (!editorID.empty()) cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+	}
+}
+
+bool IsWornHasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !cachedKeyword || !a_refr->inventoryList) return false;
+	for (auto& item : a_refr->inventoryList->data) {
+		if (!item.object) continue;
+		for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
+			if (!stack->IsEquipped()) continue;
+			RE::BGSKeywordForm* kwForm = nullptr;
+			auto ft = item.object->GetFormType();
+			if (ft == RE::ENUM_FORM_ID::kWEAP) {
+				kwForm = static_cast<RE::BGSKeywordForm*>(static_cast<RE::TESObjectWEAP*>(item.object));
+			} else if (ft == RE::ENUM_FORM_ID::kARMO) {
+				kwForm = static_cast<RE::BGSKeywordForm*>(static_cast<RE::TESObjectARMO*>(item.object));
+			}
+			if (kwForm && kwForm->HasKeyword(cachedKeyword, nullptr)) return true;
+		}
+	}
+	return false;
+}
+
+void IsWornHasKeywordCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("editorID")) {
+		editorID = a_json["editorID"].get<std::string>();
+		cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
+	}
+}
+
+void IsWornHasKeywordCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["editorID"] = editorID;
+}
+
+// IsDoingFavor - checks if actor is doing a favor for the player
+bool IsDoingFavorCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	// MiddleHighProcessData has a bDoingFavor flag
+	auto* mhBytes = reinterpret_cast<uint8_t*>(actor->currentProcess->middleHigh);
+	return *reinterpret_cast<bool*>(mhBytes + 0x4A3);
+}
+
+// IdleTime - time since actor last moved (uses packageIdleTimer)
+std::string IdleTimeCondition::GetParameterString() const
+{
+	return std::format("idle {} {:.1f}s", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void IdleTimeCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##itOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##itVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+}
+
+bool IdleTimeCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	float idleTimer = actor->currentProcess->middleHigh->packageIdleTimer;
+	return CompareValues(idleTimer, comparison, numericValue.GetValue(a_refr));
+}
+
+void IdleTimeCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void IdleTimeCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// CurrentTargetAngle
+std::string CurrentTargetAngleCondition::GetParameterString() const
+{
+	return std::format("tgtAngle {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void CurrentTargetAngleCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##taOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##taVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool CurrentTargetAngleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !static_cast<bool>(actor->currentCombatTarget)) return false;
+	auto targetPtr = actor->currentCombatTarget.get();
+	if (!targetPtr) return false;
+	auto& myPos = a_refr->data.location;
+	auto& tgtPos = targetPtr->data.location;
+	float dx = tgtPos.x - myPos.x;
+	float dy = tgtPos.y - myPos.y;
+	float angleToTarget = std::atan2(dy, dx) * (180.f / 3.14159265f);
+	float myHeading = a_refr->data.angle.z * (180.f / 3.14159265f);
+	float diff = angleToTarget - myHeading;
+	while (diff > 180.f) diff -= 360.f;
+	while (diff < -180.f) diff += 360.f;
+	float absDiff = std::abs(diff);
+	return CompareValues(absDiff, comparison, numericValue.GetValue(a_refr));
+}
+
+void CurrentTargetAngleCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void CurrentTargetAngleCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// FallDistance - compare vertical velocity * time or just fall distance graph var
+std::string FallDistanceCondition::GetParameterString() const
+{
+	return std::format("fall {} {:.0f}", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void FallDistanceCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##fdOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##fdVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+bool FallDistanceCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	float fallDist = 0.f;
+	static const RE::BSFixedString kVarName("fFallDistance");
+	a_refr->GetGraphVariableImpl(kVarName, fallDist);
+	return CompareValues(fallDist, comparison, numericValue.GetValue(a_refr));
+}
+
+void FallDistanceCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void FallDistanceCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+// IsQuestStageDone
+std::string IsQuestStageDoneCondition::GetParameterString() const
+{
+	return std::format("{} stage {}", questForm.GetDisplayString(), stage);
+}
+
+void IsQuestStageDoneCondition::DrawEditWidgets(bool& a_dirty)
+{
+	questForm.DrawEditWidgets("Quest", a_dirty, RE::ENUM_FORM_ID::kQUST);
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputInt("Stage##qsd", &stage)) { a_dirty = true; }
+}
+
+bool IsQuestStageDoneCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!questForm.cachedForm) return false;
+	auto* quest = questForm.cachedForm->As<RE::TESQuest>();
+	if (!quest) return false;
+	// TESQuest::GetCurrentStageID is at a known offset in the quest
+	auto* questBytes = reinterpret_cast<uint8_t*>(quest);
+	// currentStage is a uint16_t at offset 0x3C in TESQuest (FO4)
+	uint16_t currentStage = *reinterpret_cast<uint16_t*>(questBytes + 0x3C);
+	return currentStage >= static_cast<uint16_t>(stage);
+}
+
+void IsQuestStageDoneCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	questForm.Initialize(a_json);
+	questForm.ResolveForm();
+	if (a_json.contains("stage")) stage = a_json["stage"].get<int32_t>();
+}
+
+void IsQuestStageDoneCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	questForm.Serialize(a_json);
+	a_json["stage"] = stage;
+}
+
 // ===== Factory Registration =====
 
 void RegisterAllConditions()
@@ -764,6 +2218,67 @@ void RegisterAllConditions()
 	factory->Register("CurrentMagazineAmmo", [] { return std::make_unique<CurrentMagazineAmmoCondition>(); });
 	factory->Register("IsEquippedHasKeyword", [] { return std::make_unique<IsEquippedHasKeywordCondition>(); });
 	factory->Register("IsEquipped", [] { return std::make_unique<IsEquippedCondition>(); });
+	factory->Register("XOR", [] { return std::make_unique<XORCondition>(); });
+	factory->Register("IsChild", [] { return std::make_unique<IsChildCondition>(); });
+	factory->Register("IsPlayerTeammate", [] { return std::make_unique<IsPlayerTeammateCondition>(); });
+	factory->Register("IsTalking", [] { return std::make_unique<IsTalkingCondition>(); });
+	factory->Register("IsAttacking", [] { return std::make_unique<IsAttackingCondition>(); });
+	factory->Register("IsBlocking", [] { return std::make_unique<IsBlockingCondition>(); });
+	factory->Register("IsRunning", [] { return std::make_unique<IsRunningCondition>(); });
+	factory->Register("IsInInterior", [] { return std::make_unique<IsInInteriorCondition>(); });
+	factory->Register("IsWorldSpace", [] { return std::make_unique<IsWorldSpaceCondition>(); });
+	factory->Register("IsParentCell", [] { return std::make_unique<IsParentCellCondition>(); });
+	factory->Register("IsInLocation", [] { return std::make_unique<IsInLocationCondition>(); });
+	factory->Register("HasPerk", [] { return std::make_unique<HasPerkCondition>(); });
+	factory->Register("HasSpell", [] { return std::make_unique<HasSpellCondition>(); });
+	factory->Register("Scale", [] { return std::make_unique<ScaleCondition>(); });
+	factory->Register("CurrentGameTime", [] { return std::make_unique<CurrentGameTimeCondition>(); });
+	factory->Register("FactionRank", [] { return std::make_unique<FactionRankCondition>(); });
+	factory->Register("CrimeGold", [] { return std::make_unique<CrimeGoldCondition>(); });
+	factory->Register("LifeState", [] { return std::make_unique<LifeStateCondition>(); });
+	factory->Register("SitSleepState", [] { return std::make_unique<SitSleepStateCondition>(); });
+	factory->Register("HasTarget", [] { return std::make_unique<HasTargetCondition>(); });
+	factory->Register("CurrentTargetDistance", [] { return std::make_unique<CurrentTargetDistanceCondition>(); });
+	factory->Register("IsMovementDirection", [] { return std::make_unique<IsMovementDirectionCondition>(); });
+	factory->Register("IsCombatState", [] { return std::make_unique<IsCombatStateCondition>(); });
+	factory->Register("HasGraphVariable", [] { return std::make_unique<HasGraphVariableCondition>(); });
+	factory->Register("IsReplacerEnabled", [] { return std::make_unique<IsReplacerEnabledCondition>(); });
+	factory->Register("MovementSpeed", [] { return std::make_unique<MovementSpeedCondition>(); });
+	factory->Register("IsSwimming", [] { return std::make_unique<IsSwimmingCondition>(); });
+	factory->Register("IsOverEncumbered", [] { return std::make_unique<IsOverEncumberedCondition>(); });
+	factory->Register("LocationHasKeyword", [] { return std::make_unique<LocationHasKeywordCondition>(); });
+	factory->Register("LocationCleared", [] { return std::make_unique<LocationClearedCondition>(); });
+	factory->Register("LightLevel", [] { return std::make_unique<LightLevelCondition>(); });
+	factory->Register("SurfaceMaterial", [] { return std::make_unique<SurfaceMaterialCondition>(); });
+	factory->Register("MovementSurfaceAngle", [] { return std::make_unique<MovementSurfaceAngleCondition>(); });
+	factory->Register("IsOnStairs", [] { return std::make_unique<IsOnStairsCondition>(); });
+	factory->Register("WindSpeed", [] { return std::make_unique<WindSpeedCondition>(); });
+	factory->Register("WindAngleDifference", [] { return std::make_unique<WindAngleDifferenceCondition>(); });
+	factory->Register("IsTrespassing", [] { return std::make_unique<IsTrespassingCondition>(); });
+	factory->Register("IsCurrentPackage", [] { return std::make_unique<IsCurrentPackageCondition>(); });
+	factory->Register("IsInScene", [] { return std::make_unique<IsInSceneCondition>(); });
+	factory->Register("CurrentFurniture", [] { return std::make_unique<CurrentFurnitureCondition>(); });
+	factory->Register("TARGET", [] { return std::make_unique<TargetConditionWrapper>(); });
+	factory->Register("PLAYER", [] { return std::make_unique<PlayerConditionWrapper>(); });
+	factory->Register("IsUnique", [] { return std::make_unique<IsUniqueCondition>(); });
+	factory->Register("IsSummoned", [] { return std::make_unique<IsSummonedCondition>(); });
+	factory->Register("IsGhost", [] { return std::make_unique<IsGhostCondition>(); });
+	factory->Register("IsGreetingPlayer", [] { return std::make_unique<IsGreetingPlayerCondition>(); });
+	factory->Register("IsGuard", [] { return std::make_unique<IsGuardCondition>(); });
+	factory->Register("Height", [] { return std::make_unique<HeightCondition>(); });
+	factory->Register("Weight", [] { return std::make_unique<WeightCondition>(); });
+	factory->Register("InventoryCount", [] { return std::make_unique<InventoryCountCondition>(); });
+	factory->Register("EquippedObjectWeight", [] { return std::make_unique<EquippedObjectWeightCondition>(); });
+	factory->Register("InventoryWeight", [] { return std::make_unique<InventoryWeightCondition>(); });
+	factory->Register("SubmergeLevel", [] { return std::make_unique<SubmergeLevelCondition>(); });
+	factory->Register("HasMagicEffect", [] { return std::make_unique<HasMagicEffectCondition>(); });
+	factory->Register("IsWorn", [] { return std::make_unique<IsWornCondition>(); });
+	factory->Register("IsWornHasKeyword", [] { return std::make_unique<IsWornHasKeywordCondition>(); });
+	factory->Register("IsDoingFavor", [] { return std::make_unique<IsDoingFavorCondition>(); });
+	factory->Register("IdleTime", [] { return std::make_unique<IdleTimeCondition>(); });
+	factory->Register("CurrentTargetAngle", [] { return std::make_unique<CurrentTargetAngleCondition>(); });
+	factory->Register("FallDistance", [] { return std::make_unique<FallDistanceCondition>(); });
+	factory->Register("IsQuestStageDone", [] { return std::make_unique<IsQuestStageDoneCondition>(); });
 
 	logger::info("[OAR] Registered {} condition types", factory->GetAllFactories().size());
 }

@@ -21,7 +21,7 @@ public:
 protected:
 	void DrawContents() override;
 	ImGuiWindowFlags GetWindowFlags() const override;
-	ImVec2 GetDefaultSize() const override { return ImVec2(900, 700); }
+	ImVec2 GetDefaultSize() const override { return ImVec2(1280, 850); }
 
 private:
 	UIMain() : UIWindow(WindowID::kMain, "Open Animation Replacer") {}
@@ -45,4 +45,5 @@ private:
 	SubMod* selectedSubMod{ nullptr };
 	bool showSettings{ false };
 	float firstColumnPercent{ 0.45f };
+	std::string copiedConditionJson;
 };

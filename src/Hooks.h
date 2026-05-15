@@ -8,6 +8,8 @@ void ClearClipRuntimeState();
 void SetGameFullyLoaded(bool a_loaded);
 void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();
+void PopulateKnownStringData();
+void RefreshWeaponAnimFolder();
 
 namespace Hooks
 {

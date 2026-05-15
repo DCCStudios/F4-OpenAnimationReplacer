@@ -20,7 +20,7 @@ class Variants
 {
 public:
 	void AddVariant(VariantEntry a_entry);
-	int16_t SelectVariant(uint32_t a_refrFormID);
+	int16_t SelectVariant(uint32_t a_refrFormID, bool a_keepOnLoop = false, bool a_shareResults = false);
 	void ResetState(uint32_t a_refrFormID);
 
 	VariantMode GetMode() const { return mode; }
@@ -36,4 +36,6 @@ private:
 
 	mutable std::shared_mutex stateMutex;
 	std::unordered_map<uint32_t, uint32_t> sequentialIndices;
+	std::unordered_map<uint32_t, int16_t> lastRandomResult;
+	int16_t sharedResult{ -1 };
 };

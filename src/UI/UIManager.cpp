@@ -69,6 +69,7 @@ void UIManager::InstallHooks()
 	logger::info("[OAR] D3D11CreateDeviceAndSwapChain hook installed");
 
 	HookClipCursor();
+	HookSetCursorPos();
 }
 
 void UIManager::HookClipCursor()
@@ -175,12 +176,18 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 	auto& io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 	io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+	io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
 	io.IniFilename = nullptr;
 	io.MouseDrawCursor = false;
 	io.ConfigWindowsMoveFromTitleBarOnly = true;
 
 	if (!ImGui_ImplWin32_Init(gameWindow)) return;
 	if (!ImGui_ImplDX11_Init(device.Get(), context.Get())) return;
+
+	// Save the full window rect for ClipCursor override (mirrors F4SE-Menu-Framework-3)
+	if (gameWindow) {
+		GetWindowRect(gameWindow, &savedWindowRect);
+	}
 
 	originalWndProc = reinterpret_cast<WNDPROC>(
 		SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&HookedWndProc)));
@@ -194,6 +201,9 @@ void UIManager::RenderFrame()
 	// Process pending background jobs (config saves, reloads, etc.)
 	JobQueue::GetSingleton()->ProcessAll();
 
+	// Transition lock state (mirrors F4SE-Menu-Framework-3 GameLock pattern)
+	UpdateLockState();
+
 	bool mainOpen = menuOpen.load();
 
 	bool anyIndependentOpen = false;
@@ -206,28 +216,23 @@ void UIManager::RenderFrame()
 
 	if (!mainOpen && !anyIndependentOpen) return;
 
-	// Force-release cursor clip EVERY frame while menu is open.
-	// The ClipCursor IAT hook often fails (another plugin hooks it first),
-	// so we cannot rely on it. Brute-force release ensures the game's
-	// per-frame ClipCursor calls are always overridden.
-	if (mainOpen) {
-		::ClipCursor(nullptr);
-	}
-
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
-	ImGui::NewFrame();
 
-	bool anyInteractiveOpen = false;
-	for (auto& win : windows) {
-		if (win && win->IsIndependent() && win->IsOpen()) {
-			anyInteractiveOpen = true;
-			break;
+	if (mainOpen && gameWindow) {
+		RECT clientRect;
+		if (GetClientRect(gameWindow, &clientRect)) {
+			auto& io = ImGui::GetIO();
+			io.DisplaySize = ImVec2(
+				static_cast<float>(clientRect.right - clientRect.left),
+				static_cast<float>(clientRect.bottom - clientRect.top));
 		}
 	}
 
+	ImGui::NewFrame();
+
 	auto& io = ImGui::GetIO();
-	io.MouseDrawCursor = mainOpen || anyInteractiveOpen;
+	io.MouseDrawCursor = mainOpen;
 
 	if (mainOpen) {
 		UIMain::GetSingleton()->TryDraw();
@@ -272,6 +277,7 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 		}
 	}
 
+	// Handle toggle hotkey - always process this regardless of menu state
 	if (a_msg == WM_KEYDOWN) {
 		auto scanCode = (a_lParam >> 16) & 0xFF;
 		bool isFirstPress = (a_lParam & 0x40000000) == 0;
@@ -280,16 +286,6 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 
 		if (isFirstPress && scanCode == settings->iToggleKey &&
 			(!settings->bRequireShift || shiftHeld)) {
-			bool willBeOpen = !ui->menuOpen.load();
-
-			// Pre-set ignoreKeyboardMouse BEFORE toggling so the game's
-			// input pipeline sees the flag this frame (DirectInput reads happen
-			// after WndProc dispatch on the same thread)
-			auto* controlMap = RE::ControlMap::GetSingleton();
-			if (controlMap) {
-				controlMap->ignoreKeyboardMouse = willBeOpen;
-			}
-
 			ui->ToggleMenu();
 			s_consumeNextChar = true;
 			s_consumeKeyUpScanCode = scanCode;
@@ -297,51 +293,31 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 		}
 	}
 
-	bool anyUIOpen = ui->menuOpen.load();
-	if (!anyUIOpen) {
-		for (auto& win : ui->windows) {
-			if (win && win->IsOpen() && win->IsIndependent()) {
-				anyUIOpen = true;
-				break;
-			}
+	// When blocking (main menu open): route ALL messages to ImGui and
+	// do NOT forward to the game's window procedure at all.
+	// This mirrors F4SE-Menu-Framework-3's approach.
+	if (ui->menuOpen.load()) {
+		if (a_msg == WM_SETCURSOR) {
+			::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
+			return TRUE;
+		}
+		ImGui_ImplWin32_WndProcHandler(a_hwnd, a_msg, a_wParam, a_lParam);
+		return true;
+	}
+
+	// When only independent windows are open (anim log, debug overlay),
+	// let ImGui handle input it wants but still forward to the game.
+	bool anyIndependentOpen = false;
+	for (auto& win : ui->windows) {
+		if (win && win->IsOpen() && win->IsIndependent()) {
+			anyIndependentOpen = true;
+			break;
 		}
 	}
 
-	// Aggressively release cursor constraint on EVERY WndProc dispatch while menu is open.
-	// WndProc fires many times per frame (once per Windows message), so this reliably
-	// overrides the game's own ClipCursor calls even when the IAT hook fails.
-	if (ui->menuOpen.load()) {
-		::ClipCursor(nullptr);
-	}
-
-	if (anyUIOpen) {
+	if (anyIndependentOpen) {
 		ImGui_ImplWin32_WndProcHandler(a_hwnd, a_msg, a_wParam, a_lParam);
-
-		if (ui->menuOpen.load()) {
-			switch (a_msg) {
-			case WM_MOUSEMOVE:
-			case WM_LBUTTONDOWN:
-			case WM_LBUTTONUP:
-			case WM_LBUTTONDBLCLK:
-			case WM_RBUTTONDOWN:
-			case WM_RBUTTONUP:
-			case WM_RBUTTONDBLCLK:
-			case WM_MBUTTONDOWN:
-			case WM_MBUTTONUP:
-			case WM_MBUTTONDBLCLK:
-			case WM_MOUSEWHEEL:
-			case WM_MOUSEHWHEEL:
-			case WM_XBUTTONDOWN:
-			case WM_XBUTTONUP:
-			case WM_INPUT:
-			case WM_KEYDOWN:
-			case WM_KEYUP:
-			case WM_CHAR:
-			case WM_SYSKEYDOWN:
-			case WM_SYSKEYUP:
-				return 0;
-			}
-		} else if (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard) {
+		if (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard) {
 			switch (a_msg) {
 			case WM_LBUTTONDOWN:
 			case WM_LBUTTONUP:
@@ -367,17 +343,85 @@ BOOL WINAPI UIManager::HookedClipCursor(const RECT* a_rect)
 {
 	auto* ui = UIManager::GetSingleton();
 
+	// When the menu is blocking, pass NULL to completely remove any clip
+	// constraint so the cursor can reach the full screen/window edges.
+	if (ui->menuOpen.load()) {
+		return OriginalClipCursor(nullptr);
+	}
+
+	return OriginalClipCursor(a_rect);
+}
+
+void UIManager::HookSetCursorPos()
+{
+	auto user32 = GetModuleHandleA("user32.dll");
+	if (!user32) return;
+
+	OriginalSetCursorPos = reinterpret_cast<SetCursorPosFn>(
+		GetProcAddress(user32, "SetCursorPos"));
+
+	if (!OriginalSetCursorPos) {
+		logger::warn("[OAR] Could not resolve SetCursorPos from user32.dll, skipping hook");
+		return;
+	}
+
+	// IAT hook: find the game's import of SetCursorPos and redirect it
+	auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(GetModuleHandleA(nullptr));
+	auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(
+		reinterpret_cast<uint8_t*>(dosHeader) + dosHeader->e_lfanew);
+	auto& importDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+	if (!importDir.VirtualAddress) {
+		logger::warn("[OAR] No import directory found for SetCursorPos hook");
+		return;
+	}
+
+	auto* importDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+		reinterpret_cast<uint8_t*>(dosHeader) + importDir.VirtualAddress);
+
+	bool hooked = false;
+	for (; importDesc->Name; importDesc++) {
+		auto* dllName = reinterpret_cast<const char*>(
+			reinterpret_cast<uint8_t*>(dosHeader) + importDesc->Name);
+
+		if (_stricmp(dllName, "user32.dll") != 0 && _stricmp(dllName, "USER32.dll") != 0 &&
+			_stricmp(dllName, "USER32.DLL") != 0)
+			continue;
+
+		auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+			reinterpret_cast<uint8_t*>(dosHeader) + importDesc->FirstThunk);
+
+		for (; thunk->u1.Function; thunk++) {
+			auto funcAddr = static_cast<uintptr_t>(thunk->u1.Function);
+			if (funcAddr == reinterpret_cast<uintptr_t>(OriginalSetCursorPos)) {
+				DWORD oldProtect;
+				VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProtect);
+				thunk->u1.Function = reinterpret_cast<uintptr_t>(&HookedSetCursorPos);
+				VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+				hooked = true;
+				logger::info("[OAR] SetCursorPos IAT hook installed");
+				break;
+			}
+		}
+		if (hooked) break;
+	}
+
+	if (!hooked) {
+		logger::warn("[OAR] SetCursorPos IAT entry not found in game exe, skipping hook");
+		OriginalSetCursorPos = nullptr;
+	}
+}
+
+BOOL WINAPI UIManager::HookedSetCursorPos(int a_x, int a_y)
+{
+	auto* ui = UIManager::GetSingleton();
+
+	// Suppress the game's cursor centering when our menu is open
 	if (ui->menuOpen.load()) {
 		return TRUE;
 	}
-	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
-		return TRUE;
-	}
 
-	if (OriginalClipCursor) {
-		return OriginalClipCursor(a_rect);
-	}
-	return TRUE;
+	return OriginalSetCursorPos(a_x, a_y);
 }
 
 void UIManager::ToggleMenu()
@@ -389,32 +433,64 @@ void UIManager::SetMenuOpen(bool a_open)
 {
 	menuOpen.store(a_open);
 
-	auto* controlMap = RE::ControlMap::GetSingleton();
-	if (controlMap) {
-		controlMap->ignoreKeyboardMouse = a_open;
-	}
-
 	if (a_open) {
-		// Always release cursor constraint using the raw Win32 API.
-		// The IAT hook may or may not be installed; this guarantees release.
-		::ClipCursor(nullptr);
-
-		// Move OS cursor to screen center so it's immediately visible and usable.
-		// Without this, the cursor can be stuck at the last game-warped position.
-		if (gameWindow) {
-			RECT rc;
-			if (GetClientRect(gameWindow, &rc)) {
-				POINT center = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
-				ClientToScreen(gameWindow, &center);
-				::SetCursorPos(center.x, center.y);
+		currentLockState = LockState::Locked;
+		if (Settings::GetSingleton()->bPauseOnMenuOpen) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				ui->menuMode += 1;
 			}
 		}
-
-		auto& io = ImGui::GetIO();
-		io.MouseDrawCursor = true;
 		UIMain::GetSingleton()->SetOpen(true);
 	} else {
-		auto& io = ImGui::GetIO();
-		io.MouseDrawCursor = false;
+		currentLockState = LockState::Unlocked;
+		if (Settings::GetSingleton()->bPauseOnMenuOpen) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				if (ui->menuMode > 0) {
+					ui->menuMode -= 1;
+				}
+			}
+		}
 	}
+}
+
+void UIManager::UpdateLockState()
+{
+	if (currentLockState == previousLockState)
+		return;
+
+	auto& io = ImGui::GetIO();
+
+	if (currentLockState == LockState::Locked) {
+		auto* controlMap = RE::ControlMap::GetSingleton();
+		if (controlMap) {
+			controlMap->ignoreKeyboardMouse = true;
+		}
+
+		if (previousLockState == LockState::Unlocked || previousLockState == LockState::None) {
+			::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
+			::ShowCursor(TRUE);
+		}
+
+		io.MouseDrawCursor = true;
+		io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+		io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+	} else if (currentLockState == LockState::Unlocked) {
+		auto* controlMap = RE::ControlMap::GetSingleton();
+		if (controlMap) {
+			controlMap->ignoreKeyboardMouse = false;
+		}
+
+		if (previousLockState == LockState::Locked) {
+			::ShowCursor(FALSE);
+		}
+
+		io.MouseDrawCursor = false;
+		io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+		io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+		io.ClearInputKeys();
+	}
+
+	previousLockState = currentLockState;
 }

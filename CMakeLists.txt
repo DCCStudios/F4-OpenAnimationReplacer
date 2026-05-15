@@ -65,6 +65,7 @@ set(SOURCES
 	src/Conditions.cpp
 	src/Parsing.cpp
 	src/Variants.cpp
+	src/Functions.cpp
 	src/Jobs.cpp
 	src/Utils.cpp
 	src/AnimationLog.cpp
@@ -77,6 +78,8 @@ set(SOURCES
 	src/UI/UIWelcomeBanner.cpp
 	src/UI/UIAnimationQueue.cpp
 	src/UI/UIDebugOverlay.cpp
+	src/UI/UIFormPicker.cpp
+	src/FormRegistry.cpp
 	src/API/OpenAnimationReplacerAPI.cpp
 )
 
@@ -110,6 +113,8 @@ set(HEADERS
 	src/UI/UIWelcomeBanner.h
 	src/UI/UIAnimationQueue.h
 	src/UI/UIDebugOverlay.h
+	src/UI/UIFormPicker.h
+	src/FormRegistry.h
 	src/ActiveReplacementTracker.h
 	src/API/OpenAnimationReplacerAPI.h
 )

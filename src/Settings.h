@@ -10,6 +10,7 @@ public:
 	}
 
 	void Load();
+	void Save();
 
 	bool  bEnabled{ true };
 	bool  bEnableUI{ true };
@@ -20,6 +21,7 @@ public:
 
 	std::uint32_t iToggleKey{ 0x18 };
 	bool  bRequireShift{ true };
+	bool  bPauseOnMenuOpen{ true };
 
 	bool  bLogActivate{ true };
 	bool  bLogReplace{ true };

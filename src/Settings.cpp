@@ -26,6 +26,7 @@ void Settings::Load()
 
 	iToggleKey   = static_cast<std::uint32_t>(ini.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
+	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 
 	bLogActivate   = getB("AnimationLog", "bLogActivate", bLogActivate);
 	bLogReplace    = getB("AnimationLog", "bLogReplace", bLogReplace);
@@ -52,4 +53,49 @@ void Settings::Load()
 
 	logger::info("[OAR] Settings loaded: enabled={}, UI={}, async={}, animLimit={}, verbose={}, loadClipsRVA=0x{:X}",
 		bEnabled, bEnableUI, bAsyncParsing, iAnimationLimit, bVerboseLogging, iLoadClipsAddressRVA);
+}
+
+void Settings::Save()
+{
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	ini.LoadFile(kSettingsPath);
+
+	auto setB = [&](const char* sec, const char* key, bool val) {
+		ini.SetBoolValue(sec, key, val);
+	};
+	auto setI = [&](const char* sec, const char* key, int val) {
+		ini.SetLongValue(sec, key, static_cast<long>(val));
+	};
+
+	setB("General", "bEnabled", bEnabled);
+	setB("General", "bEnableUI", bEnableUI);
+	setB("General", "bAsyncParsing", bAsyncParsing);
+	setB("General", "bDisablePreloading", bDisablePreloading);
+	setB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
+	setB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
+
+	setI("UI", "iToggleKey", static_cast<int>(iToggleKey));
+	setB("UI", "bRequireShift", bRequireShift);
+	setB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
+	setB("UI", "bEnableAnimationQueueProgressBar", bEnableAnimationQueueProgressBar);
+	ini.SetDoubleValue("UI", "fAnimationQueueLingerTime", static_cast<double>(fAnimationQueueLingerTime));
+
+	setB("AnimationLog", "bLogActivate", bLogActivate);
+	setB("AnimationLog", "bLogReplace", bLogReplace);
+	setB("AnimationLog", "bLogLoop", bLogLoop);
+	setB("AnimationLog", "bLogEcho", bLogEcho);
+	setB("AnimationLog", "bLogToFile", bLogToFile);
+	setI("AnimationLog", "iMaxLogEntries", iMaxLogEntries);
+
+	setI("Limits", "iAnimationLimit", iAnimationLimit);
+	setI("Limits", "iHavokHeapMultiplier", iHavokHeapMultiplier);
+
+	setB("Debug", "bVerboseLogging", bVerboseLogging);
+
+	if (ini.SaveFile(kSettingsPath) >= 0) {
+		logger::info("[OAR] Settings saved to '{}'", kSettingsPath);
+	} else {
+		logger::error("[OAR] Failed to save settings to '{}'", kSettingsPath);
+	}
 }

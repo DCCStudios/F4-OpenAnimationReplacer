@@ -59,11 +59,21 @@ void ActiveClip::OnActivate()
 
 void ActiveClip::OnUpdate()
 {
-	if (!isActive || !currentReplacement) return;
+	if (!isActive) return;
+	if (!currentReplacement) return;
 
 	auto* subMod = currentReplacement->GetParentSubMod();
-	if (subMod && subMod->IsInterruptible()) {
+	if (!subMod) return;
+
+	if (subMod->IsInterruptible()) {
 		EvaluateAndApplyReplacement();
+	} else {
+		// Even if not interruptible, check if the current replacement's own conditions
+		// have become false - if so, restore original
+		if (subMod->IsDisabled() || !subMod->EvaluateConditions(refr, clipGenerator)) {
+			RestoreOriginalIndex();
+			currentReplacement = nullptr;
+		}
 	}
 }
 
@@ -137,6 +147,12 @@ void ActiveClip::ReplaceActiveAnimation(ReplacementAnimation* a_newRepl)
 	if (!clipGenerator || !refr) return;
 
 	float blendTime = 0.2f;
+	if (a_newRepl) {
+		auto* subMod = a_newRepl->GetParentSubMod();
+		if (subMod && subMod->GetCustomBlendTimeOnInterrupt() >= 0.f) {
+			blendTime = subMod->GetCustomBlendTimeOnInterrupt();
+		}
+	}
 	StartBlend(blendTime);
 
 	RestoreOriginalIndex();
@@ -146,7 +162,10 @@ void ActiveClip::ReplaceActiveAnimation(ReplacementAnimation* a_newRepl)
 		int16_t newIndex = currentReplacement->GetBindingIndex();
 
 		if (currentReplacement->HasVariants()) {
-			newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID());
+			auto* subMod = currentReplacement->GetParentSubMod();
+			bool keepOnLoop = subMod ? subMod->GetKeepRandomResultsOnLoop() : false;
+			bool shareResults = subMod ? subMod->GetShareRandomResults() : false;
+			newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID(), keepOnLoop, shareResults);
 		}
 
 		if (newIndex >= 0) {
@@ -221,7 +240,12 @@ void ActiveClip::EvaluateAndApplyReplacement()
 
 	if (replacement != currentReplacement) {
 		if (currentReplacement && isActive) {
-			StartBlend(0.2f);
+			float blendOut = 0.2f;
+			auto* curSubMod = currentReplacement->GetParentSubMod();
+			if (curSubMod && curSubMod->GetCustomBlendTimeOnInterrupt() >= 0.f) {
+				blendOut = curSubMod->GetCustomBlendTimeOnInterrupt();
+			}
+			StartBlend(blendOut);
 		}
 
 		if (currentReplacement) {
@@ -234,7 +258,10 @@ void ActiveClip::EvaluateAndApplyReplacement()
 			int16_t newIndex = currentReplacement->GetBindingIndex();
 
 			if (currentReplacement->HasVariants()) {
-				newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID());
+				auto* subMod = currentReplacement->GetParentSubMod();
+				bool keepOnLoop = subMod ? subMod->GetKeepRandomResultsOnLoop() : false;
+				bool shareResults = subMod ? subMod->GetShareRandomResults() : false;
+				newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID(), keepOnLoop, shareResults);
 			}
 
 			if (newIndex >= 0) {

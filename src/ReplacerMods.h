@@ -3,6 +3,7 @@
 #include "Utils.h"
 #include "HavokTypes.h"
 #include "BaseConditions.h"
+#include "Functions.h"
 
 class ReplacementAnimation;
 
@@ -28,6 +29,7 @@ public:
 	bool GetReplaceOnEcho() const { return replaceOnEcho; }
 	bool GetKeepRandomResultsOnLoop() const { return keepRandomResultsOnLoop; }
 	bool GetShareRandomResults() const { return shareRandomResults; }
+	bool GetReplaceAnnotations() const { return replaceAnnotations; }
 	float GetCustomBlendTimeOnInterrupt() const { return customBlendTimeOnInterrupt; }
 	float GetCustomBlendTimeOnLoop() const { return customBlendTimeOnLoop; }
 	float GetCustomBlendTimeOnEcho() const { return customBlendTimeOnEcho; }
@@ -47,6 +49,7 @@ public:
 	void SetReplaceOnEcho(bool a_val) { replaceOnEcho = a_val; }
 	void SetKeepRandomResultsOnLoop(bool a_val) { keepRandomResultsOnLoop = a_val; }
 	void SetShareRandomResults(bool a_val) { shareRandomResults = a_val; }
+	void SetReplaceAnnotations(bool a_val) { replaceAnnotations = a_val; }
 	void SetDirty(bool a_dirty) { dirty = a_dirty; }
 	void SetConditionSet(std::unique_ptr<ConditionSet> a_set) { conditionSet = std::move(a_set); }
 	void AddReplacementAnimation(ReplacementAnimation* a_anim) { replacementAnimations.push_back(a_anim); }
@@ -62,6 +65,7 @@ public:
 	bool replaceOnEcho{ true };
 	bool keepRandomResultsOnLoop{ false };
 	bool shareRandomResults{ false };
+	bool replaceAnnotations{ true };
 	float customBlendTimeOnInterrupt{ -1.0f };
 	float customBlendTimeOnLoop{ -1.0f };
 	float customBlendTimeOnEcho{ -1.0f };
@@ -73,6 +77,10 @@ public:
 
 	std::unique_ptr<ConditionSet> conditionSet;
 	std::vector<ReplacementAnimation*> replacementAnimations;
+
+	std::vector<std::unique_ptr<IFunction>> functionsOnActivate;
+	std::vector<std::unique_ptr<IFunction>> functionsOnDeactivate;
+	std::vector<std::unique_ptr<IFunction>> functionsOnTrigger;
 };
 
 class ReplacerMod

@@ -3,9 +3,12 @@
 #include "OpenAnimationReplacer.h"
 #include "ActiveClip.h"
 #include "AnimationCache.h"
+#include "AnimationLog.h"
+#include "Functions.h"
 #include "Parsing.h"
 #include "UI/UIManager.h"
 #include "Offsets.h"
+#include "FormRegistry.h"
 
 namespace Plugin
 {
@@ -325,6 +328,8 @@ namespace
 		{
 			logger::info("[OAR] kGameDataReady - initializing");
 			Settings::GetSingleton()->Load();
+			AnimationLog::GetSingleton()->SetMaxEntries(Settings::GetSingleton()->iMaxLogEntries);
+			RegisterAllFunctions();
 			Hooks::Install();
 			Parsing::ParseAllMods();
 
@@ -335,6 +340,7 @@ namespace
 				StructProbe::ScanForLoadClipsCallSite();
 			}
 
+			UIManager::GetSingleton()->ShowWelcomeBanner();
 			logger::info("[OAR] Initialization complete");
 			break;
 		}
@@ -351,10 +357,14 @@ namespace
 		case F4SE::MessagingInterface::kPostLoadGame:
 			logger::info("[OAR] kPostLoadGame");
 			Settings::GetSingleton()->Load();
+			AnimationLog::GetSingleton()->SetMaxEntries(Settings::GetSingleton()->iMaxLogEntries);
 			ClearCharacterCache();
+			FormRegistry::GetSingleton()->InvalidateCache();
 			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
 				RegisterActorCharacter(player);
 			}
+			PopulateKnownStringData();
+			RefreshWeaponAnimFolder();
 			if (!HasActiveReplacements()) {
 				Hooks::LoadClipsHooks::TryDeferredInjection();
 			}
@@ -368,9 +378,12 @@ namespace
 			Settings::GetSingleton()->Load();
 			ClearCharacterCache();
 			ClearClipRuntimeState();
+			FormRegistry::GetSingleton()->InvalidateCache();
 			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
 				RegisterActorCharacter(player);
 			}
+			PopulateKnownStringData();
+			RefreshWeaponAnimFolder();
 			SetGameFullyLoaded(true);
 			logger::info("[OAR] New game started, clip hooks active");
 			break;
@@ -410,6 +423,9 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 	F4SE::Init(F4SE);
 
 	F4SE::AllocTrampoline(1024);
+
+	// Load settings early so the toggle hotkey is correct from the start
+	Settings::GetSingleton()->Load();
 
 	// D3D11 hooks MUST be installed here in F4SEPlugin_Load — before the game
 	// creates its D3D11 device. Installing them in kGameDataReady is too late

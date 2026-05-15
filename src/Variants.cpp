@@ -6,13 +6,27 @@ void Variants::AddVariant(VariantEntry a_entry)
 	entries.push_back(std::move(a_entry));
 }
 
-int16_t Variants::SelectVariant(uint32_t a_refrFormID)
+int16_t Variants::SelectVariant(uint32_t a_refrFormID, bool a_keepOnLoop, bool a_shareResults)
 {
 	if (entries.empty()) return -1;
 
 	switch (mode) {
 	case VariantMode::kRandom:
-		return SelectRandom();
+	{
+		if (a_shareResults && sharedResult >= 0) {
+			return sharedResult;
+		}
+		if (a_keepOnLoop) {
+			ReadLocker rlock(stateMutex);
+			auto it = lastRandomResult.find(a_refrFormID);
+			if (it != lastRandomResult.end()) return it->second;
+		}
+		int16_t result = SelectRandom();
+		WriteLocker wlock(stateMutex);
+		lastRandomResult[a_refrFormID] = result;
+		if (a_shareResults) sharedResult = result;
+		return result;
+	}
 	case VariantMode::kSequential:
 		return SelectSequential(a_refrFormID);
 	default:

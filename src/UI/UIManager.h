@@ -32,10 +32,12 @@ private:
 	void InitWindows();
 
 	static void HookClipCursor();
+	static void HookSetCursorPos();
 
 	static HRESULT WINAPI HookedPresent(IDXGISwapChain* a_swapChain, UINT a_syncInterval, UINT a_flags);
 	static LRESULT CALLBACK HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wParam, LPARAM a_lParam);
 	static BOOL WINAPI HookedClipCursor(const RECT* a_rect);
+	static BOOL WINAPI HookedSetCursorPos(int a_x, int a_y);
 
 	static HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 		IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
@@ -64,6 +66,16 @@ private:
 
 	using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
 	static inline ClipCursorFn OriginalClipCursor{ nullptr };
+
+	using SetCursorPosFn = BOOL(WINAPI*)(int, int);
+	static inline SetCursorPosFn OriginalSetCursorPos{ nullptr };
+
+	static inline RECT savedWindowRect{};
+
+	enum class LockState { None, Locked, Unlocked };
+	LockState previousLockState{ LockState::None };
+	LockState currentLockState{ LockState::None };
+	void UpdateLockState();
 
 	static inline bool s_consumeNextChar{ false };
 	static inline uint32_t s_consumeKeyUpScanCode{ 0 };

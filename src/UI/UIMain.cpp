@@ -256,6 +256,9 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 	bool editable = currentMode != UICommon::EditorMode::kInspect;
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "%s", a_subMod->GetName().c_str());
+	if (!a_subMod->GetDescription().empty()) {
+		ImGui::TextWrapped("%s", a_subMod->GetDescription().c_str());
+	}
 	ImGui::Separator();
 
 	if (editable) {
@@ -266,18 +269,45 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			logger::info("[OAR-UI] SubMod '{}' Disabled toggled -> {}", a_subMod->GetName(), isDisabled);
 		}
 
+		ImGui::SameLine(200);
 		int priority = a_subMod->GetPriority();
-		ImGui::SetNextItemWidth(120);
+		ImGui::SetNextItemWidth(100);
 		if (ImGui::InputInt("Priority", &priority)) {
 			a_subMod->SetPriority(priority);
 			a_subMod->SetDirty(true);
 		}
 
 		bool interruptible = a_subMod->IsInterruptible();
-		if (ImGui::Checkbox("Interruptible", &interruptible)) {
+		if (ImGui::Checkbox("Interruptible (?)", &interruptible)) {
 			a_subMod->SetInterruptible(interruptible);
 			a_subMod->SetDirty(true);
 		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Re-evaluate conditions every frame while animation is playing");
+
+		bool keepRandom = a_subMod->GetKeepRandomResultsOnLoop();
+		if (ImGui::Checkbox("Keep random results on loop (?)", &keepRandom)) {
+			a_subMod->SetKeepRandomResultsOnLoop(keepRandom);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Don't re-roll random variant when animation loops");
+
+		bool shareRandom = a_subMod->GetShareRandomResults();
+		if (ImGui::Checkbox("Share random results", &shareRandom)) {
+			a_subMod->SetShareRandomResults(shareRandom);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("All actors share the same random variant selection");
+
+		bool replAnnot = a_subMod->GetReplaceAnnotations();
+		if (ImGui::Checkbox("Replace Annotations (?)", &replAnnot)) {
+			a_subMod->SetReplaceAnnotations(replAnnot);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"When ON: fires sounds/events from the replacement animation.\n"
+			"When OFF: only replaces visuals — original animation's sounds and\n"
+			"events (weaponFire, etc.) still fire at their native timings.\n"
+			"Turn OFF for fire animations to prevent double-shots.");
 
 		bool replOnLoop = a_subMod->GetReplaceOnLoop();
 		if (ImGui::Checkbox("Replace on Loop", &replOnLoop)) {
@@ -290,6 +320,15 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->SetReplaceOnEcho(replOnEcho);
 			a_subMod->SetDirty(true);
 		}
+
+		// Custom blend times
+		float blendInterrupt = a_subMod->GetCustomBlendTimeOnInterrupt();
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputFloat("Blend time (interrupt) (?)", &blendInterrupt, 0, 0, "%.2f")) {
+			a_subMod->customBlendTimeOnInterrupt = blendInterrupt;
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Custom blend duration in seconds when interrupting. Default: 0.20s. Set negative to use default.");
 	} else {
 		ImGui::Text("Priority: %d", a_subMod->GetPriority());
 		ImGui::SameLine(200);
@@ -298,35 +337,39 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->IsInterruptible() ? "Yes" : "No",
 			a_subMod->GetReplaceOnLoop() ? "Yes" : "No",
 			a_subMod->GetReplaceOnEcho() ? "Yes" : "No");
+		ImGui::Text("Keep random on loop: %s  |  Share random: %s",
+			a_subMod->GetKeepRandomResultsOnLoop() ? "Yes" : "No",
+			a_subMod->GetShareRandomResults() ? "Yes" : "No");
 	}
 
-	if (!a_subMod->GetDescription().empty()) {
+	// --- Replacement Animations (collapsed by default, under submod like original) ---
+	ImGui::Spacing();
+	if (ImGui::CollapsingHeader("Replacement Animations")) {
+		DrawReplacementAnimList(a_subMod);
+	}
+
+	// --- Conditions ---
+	ImGui::Spacing();
+	if (ImGui::CollapsingHeader("Conditions", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Spacing();
-		ImGui::TextWrapped("%s", a_subMod->GetDescription().c_str());
-	}
 
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::TextColored(UICommon::Colors::AccentBlue, "Conditions");
-	ImGui::Spacing();
-
-	if (auto* condSet = a_subMod->GetConditionSet()) {
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		if (player) {
-			for (const auto& cond : condSet->GetConditions()) {
-				if (cond) cond->Evaluate(player, nullptr, a_subMod);
+		if (auto* condSet = a_subMod->GetConditionSet()) {
+			RE::TESObjectREFR* evalTarget = nullptr;
+			if (evalTargetFormID != 0) {
+				evalTarget = RE::TESForm::GetFormByID<RE::TESObjectREFR>(evalTargetFormID);
+			}
+			if (!evalTarget) {
+				evalTarget = RE::PlayerCharacter::GetSingleton();
+			}
+			if (evalTarget) {
+				for (const auto& cond : condSet->GetConditions()) {
+					if (cond) cond->Evaluate(evalTarget, nullptr, a_subMod);
+				}
 			}
 		}
+
+		DrawConditionSet(a_subMod->GetConditionSet(), a_subMod, 0);
 	}
-
-	DrawConditionSet(a_subMod->GetConditionSet(), a_subMod, 0);
-
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::TextColored(UICommon::Colors::AccentBlue, "Replacement Animations");
-	ImGui::Spacing();
-
-	DrawReplacementAnimList(a_subMod);
 
 	if (editable) {
 		ImGui::Spacing();
@@ -334,7 +377,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		ImGui::Spacing();
 
 		if (a_subMod->IsDirty()) {
-			if (ImGui::Button("Save")) {
+			if (ImGui::Button("Save user config")) {
 				nlohmann::json json;
 				json["name"] = a_subMod->GetName();
 				json["description"] = a_subMod->GetDescription();
@@ -343,6 +386,11 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["interruptible"] = a_subMod->IsInterruptible();
 				json["replaceOnLoop"] = a_subMod->GetReplaceOnLoop();
 				json["replaceOnEcho"] = a_subMod->GetReplaceOnEcho();
+				json["keepRandomResultsOnLoop"] = a_subMod->GetKeepRandomResultsOnLoop();
+				json["shareRandomResults"] = a_subMod->GetShareRandomResults();
+				json["replaceAnnotations"] = a_subMod->GetReplaceAnnotations();
+				if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
+					json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
 
 				if (auto* condSet = a_subMod->GetConditionSet()) {
 					auto& arr = json["conditions"];
@@ -364,14 +412,15 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			ImGui::SameLine();
 		}
 
-		if (ImGui::Button("Reload")) {
+		ImGui::SameLine();
+		if (ImGui::Button("Reload config")) {
 			JobQueue::GetSingleton()->Enqueue(std::make_unique<ReloadConfigJob>());
 		}
 
 		if (a_subMod->hasUserConfig) {
 			ImGui::SameLine();
 			if (UICommon::ButtonWithConfirmationModal(
-				"Delete User Config", "Confirm Delete",
+				"Delete user config", "Confirm Delete",
 				"Are you sure you want to delete the user config?"))
 			{
 				auto userPath = a_subMod->GetPath() / "user.json";
@@ -420,8 +469,44 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 
 	if (editable) {
 		ImGui::Spacing();
-		if (ImGui::SmallButton("+ Add Condition")) {
+		if (ImGui::SmallButton("Add new condition")) {
 			ImGui::OpenPopup("AddCondition");
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Condition set...")) {
+			ImGui::OpenPopup("CondSetMenu");
+		}
+		if (ImGui::BeginPopup("CondSetMenu")) {
+			if (ImGui::MenuItem("Copy all conditions")) {
+				nlohmann::json arr = nlohmann::json::array();
+				for (const auto& cond : a_condSet->GetConditions()) {
+					nlohmann::json j;
+					cond->Serialize(j);
+					arr.push_back(j);
+				}
+				copiedConditionJson = arr.dump();
+			}
+			if (ImGui::MenuItem("Paste conditions", nullptr, false, !copiedConditionJson.empty())) {
+				try {
+					auto parsed = nlohmann::json::parse(copiedConditionJson);
+					if (parsed.is_array()) {
+						for (auto& elem : parsed) {
+							auto newCond = CreateConditionFromJson(elem);
+							if (newCond) a_condSet->AddCondition(std::move(newCond));
+						}
+					} else {
+						auto newCond = CreateConditionFromJson(parsed);
+						if (newCond) a_condSet->AddCondition(std::move(newCond));
+					}
+					a_subMod->SetDirty(true);
+				} catch (...) {}
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Clear all")) {
+				a_condSet->ClearConditions();
+				a_subMod->SetDirty(true);
+			}
+			ImGui::EndPopup();
 		}
 
 		if (ImGui::BeginPopup("AddCondition")) {
@@ -503,6 +588,9 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 			}
 		}
 
+		// Right-click on the tree node row (must check before drawing the checkbox)
+		bool wantsContextMenu = editable && ImGui::IsItemClicked(ImGuiMouseButton_Right);
+
 		if (editable) {
 			ImGui::SameLine();
 			bool bEnabled = !isDisabled;
@@ -512,6 +600,46 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 				logger::info("[OAR-UI] Condition '{}' on SubMod '{}' enabled toggled -> {}",
 					a_condition->GetName(), a_subMod->GetName(), bEnabled);
 			}
+		}
+
+		if (wantsContextMenu) {
+			ImGui::OpenPopup("ConditionContextMenu");
+		}
+		if (ImGui::BeginPopup("ConditionContextMenu")) {
+			if (ImGui::MenuItem("Copy condition")) {
+				nlohmann::json condJson;
+				a_condition->Serialize(condJson);
+				copiedConditionJson = condJson.dump();
+			}
+			if (ImGui::MenuItem("Paste condition", nullptr, false, !copiedConditionJson.empty())) {
+				try {
+					auto parsed = nlohmann::json::parse(copiedConditionJson);
+					auto newCond = CreateConditionFromJson(parsed);
+					if (newCond) {
+						a_parentSet->AddCondition(std::move(newCond));
+						a_subMod->SetDirty(true);
+					}
+				} catch (...) {}
+			}
+			if (ImGui::MenuItem("Duplicate")) {
+				nlohmann::json condJson;
+				a_condition->Serialize(condJson);
+				auto newCond = CreateConditionFromJson(condJson);
+				if (newCond) {
+					a_parentSet->AddCondition(std::move(newCond));
+					a_subMod->SetDirty(true);
+				}
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Negate")) {
+				a_condition->SetNegated(!a_condition->IsNegated());
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::MenuItem("Delete")) {
+				a_parentSet->RemoveCondition(a_index);
+				a_subMod->SetDirty(true);
+			}
+			ImGui::EndPopup();
 		}
 
 		ImGui::SameLine();
@@ -658,30 +786,27 @@ void UIMain::DrawBottomBar()
 
 void UIMain::DrawSettingsPanel()
 {
-	ImGui::SetNextWindowSize(ImVec2(300, 400), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(350, 500), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("OAR Settings", &showSettings)) {
 		ImGui::End();
 		return;
 	}
 
 	auto* settings = Settings::GetSingleton();
+	bool dirty = false;
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "General");
-	ImGui::Checkbox("Enabled", &settings->bEnabled);
-	ImGui::Checkbox("Verbose Logging", &settings->bVerboseLogging);
-
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::TextColored(UICommon::Colors::AccentBlue, "Animation Log");
-	ImGui::Checkbox("Log Activate", &settings->bLogActivate);
-	ImGui::Checkbox("Log Replace", &settings->bLogReplace);
-	ImGui::Checkbox("Log Loop", &settings->bLogLoop);
-	ImGui::Checkbox("Log Echo", &settings->bLogEcho);
-	ImGui::SliderInt("Max Entries", &settings->iMaxLogEntries, 10, 1000);
+	dirty |= ImGui::Checkbox("Enabled", &settings->bEnabled);
+	dirty |= ImGui::Checkbox("Verbose Logging", &settings->bVerboseLogging);
 
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "UI");
+
+	dirty |= ImGui::Checkbox("Pause Game When UI Open", &settings->bPauseOnMenuOpen);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Pauses the game world while the OAR editor window is open.");
+	}
 
 	float scale = ImGui::GetIO().FontGlobalScale;
 	if (ImGui::SliderFloat("UI Scale", &scale, 0.8f, 2.0f, "%.1f")) {
@@ -692,9 +817,22 @@ void UIMain::DrawSettingsPanel()
 
 	ImGui::Spacing();
 	ImGui::Separator();
+	ImGui::TextColored(UICommon::Colors::AccentBlue, "Animation Log");
+	dirty |= ImGui::Checkbox("Log Activate", &settings->bLogActivate);
+	dirty |= ImGui::Checkbox("Log Replace", &settings->bLogReplace);
+	dirty |= ImGui::Checkbox("Log Loop", &settings->bLogLoop);
+	dirty |= ImGui::Checkbox("Log Echo", &settings->bLogEcho);
+	dirty |= ImGui::SliderInt("Max Entries", &settings->iMaxLogEntries, 10, 1000);
+
+	ImGui::Spacing();
+	ImGui::Separator();
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "Loading");
-	ImGui::Checkbox("Show Loading Progress Bar", &settings->bEnableAnimationQueueProgressBar);
-	ImGui::SliderFloat("Linger Time (s)", &settings->fAnimationQueueLingerTime, 1.0f, 15.0f, "%.1f");
+	dirty |= ImGui::Checkbox("Show Loading Progress Bar", &settings->bEnableAnimationQueueProgressBar);
+	dirty |= ImGui::SliderFloat("Linger Time (s)", &settings->fAnimationQueueLingerTime, 1.0f, 15.0f, "%.1f");
+
+	if (dirty) {
+		settings->Save();
+	}
 
 	ImGui::End();
 }
