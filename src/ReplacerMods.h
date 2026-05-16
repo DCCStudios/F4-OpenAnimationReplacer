@@ -89,13 +89,13 @@ public:
 		bool enabled = false;
 		enum class Mode { Override, Additive } mode = Mode::Additive;
 		float weight = 1.0f;
-		float blendInTime = 0.0f;   // seconds to ramp from 0→weight on activation (0 = instant)
-		float blendOutTime = 0.0f;  // seconds to ramp from weight→0 on deactivation (0 = instant)
+		float blendInTime = 0.0f;
+		float blendOutTime = 0.0f;
 		bool includeChildren = true;
 		std::vector<std::string> boneNames;
-		// Bumped whenever boneNames or includeChildren changes. Each character's
-		// resolved bone-index map (in Hooks.cpp) tracks the version it was built at
-		// and re-resolves when this version changes.
+		// Exclude list: bones matching here are removed from the final resolved set
+		bool excludeChildren = true;
+		std::vector<std::string> excludeBoneNames;
 		std::atomic<uint64_t> version{ 1 };
 		std::mutex boneMutex;
 	};

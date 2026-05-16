@@ -379,15 +379,20 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 	auto* parents = reinterpret_cast<int16_t*>(parentArr->data);
 
 	std::vector<std::string> wantedNames;
+	std::vector<std::string> excludeNames;
 	bool includeChildren;
+	bool excludeChildren;
 	{
 		std::lock_guard lock(a_filter->boneMutex);
 		wantedNames = a_filter->boneNames;
 		includeChildren = a_filter->includeChildren;
+		excludeNames = a_filter->excludeBoneNames;
+		excludeChildren = a_filter->excludeChildren;
 	}
 
 	if (wantedNames.empty()) return;
 
+	// Step 1: build the include set
 	std::unordered_set<int16_t> matched;
 	for (int16_t i = 0; i < numBones; ++i) {
 		auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
@@ -415,6 +420,43 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 					changed = true;
 				}
 			}
+		}
+	}
+
+	// Step 2: build the exclude set and subtract from matched
+	if (!excludeNames.empty() && !matched.empty()) {
+		std::unordered_set<int16_t> excluded;
+		for (int16_t i = 0; i < numBones; ++i) {
+			auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
+			namePtr &= ~uintptr_t(1);
+			const char* boneName = reinterpret_cast<const char*>(namePtr);
+			if (!boneName) continue;
+
+			for (const auto& excl : excludeNames) {
+				if (_stricmp(boneName, excl.c_str()) == 0) {
+					excluded.insert(i);
+					break;
+				}
+			}
+		}
+
+		if (excludeChildren && !excluded.empty()) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (int16_t i = 0; i < numBones; ++i) {
+					if (excluded.count(i)) continue;
+					int16_t parentIdx = parents[i];
+					if (parentIdx >= 0 && excluded.count(parentIdx)) {
+						excluded.insert(i);
+						changed = true;
+					}
+				}
+			}
+		}
+
+		for (int16_t idx : excluded) {
+			matched.erase(idx);
 		}
 	}
 

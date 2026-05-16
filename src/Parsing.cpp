@@ -310,12 +310,19 @@ namespace Parsing
 					a_subMod->trackFilter.boneNames.push_back(b.get<std::string>());
 				}
 			}
+			a_subMod->trackFilter.excludeChildren = tf.value("excludeChildren", true);
+			if (tf.contains("excludeBones") && tf["excludeBones"].is_array()) {
+				for (const auto& b : tf["excludeBones"]) {
+					a_subMod->trackFilter.excludeBoneNames.push_back(b.get<std::string>());
+				}
+			}
 			if (a_subMod->trackFilter.enabled) {
-				logger::info("[OAR] SubMod '{}' has trackFilter: mode={} weight={:.2f} bones={}",
+				logger::info("[OAR] SubMod '{}' has trackFilter: mode={} weight={:.2f} bones={} exclude={}",
 					a_subMod->GetName(),
 					a_subMod->trackFilter.mode == SubMod::TrackFilter::Mode::Override ? "override" : "additive",
 					a_subMod->trackFilter.weight,
-					a_subMod->trackFilter.boneNames.size());
+					a_subMod->trackFilter.boneNames.size(),
+					a_subMod->trackFilter.excludeBoneNames.size());
 			}
 		}
 	}

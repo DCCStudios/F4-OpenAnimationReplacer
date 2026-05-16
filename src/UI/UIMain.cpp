@@ -419,6 +419,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["blendOutTime"] = tf.blendOutTime;
 				tfJson["includeChildren"] = tf.includeChildren;
 				tfJson["bones"] = tf.boneNames;
+				tfJson["excludeChildren"] = tf.excludeChildren;
+				tfJson["excludeBones"] = tf.excludeBoneNames;
 				json["trackFilter"] = tfJson;
 			}
 
@@ -956,6 +958,106 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.1f, 1.0f),
 					"No bones selected — track filter will have no effect.");
 			}
+
+			// ---- Exclude Bones ----
+			ImGui::Spacing();
+			ImGui::Separator();
+
+			std::vector<std::string> excludeSnapshot;
+			{
+				std::lock_guard lock(tf.boneMutex);
+				excludeSnapshot = tf.excludeBoneNames;
+			}
+
+			ImGui::TextColored(UICommon::Colors::AccentBlue, "Excluded Bones (%zu)", excludeSnapshot.size());
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Bones listed here are REMOVED from the filtered set above.\n"
+					"Use this to include a parent + children but exclude specific\n"
+					"sub-branches (e.g. include RArm_UpperArm with children,\n"
+					"exclude RArm_Hand to skip the hand).");
+			}
+			ImGui::Spacing();
+
+			if (ImGui::Checkbox("Exclude Children##trackFilterExcl", &tf.excludeChildren)) {
+				tf.version.fetch_add(1, std::memory_order_relaxed);
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("When enabled, all child bones below each excluded bone are also excluded.");
+			}
+
+			int exclRemoveIdx = -1;
+			for (int i = 0; i < static_cast<int>(excludeSnapshot.size()); ++i) {
+				ImGui::PushID(1000 + i);
+				ImGui::BulletText("%s", excludeSnapshot[i].c_str());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("X##removeExclBone")) {
+					exclRemoveIdx = i;
+				}
+				ImGui::PopID();
+			}
+			if (exclRemoveIdx >= 0) {
+				std::lock_guard lock(tf.boneMutex);
+				if (exclRemoveIdx < static_cast<int>(tf.excludeBoneNames.size())) {
+					tf.excludeBoneNames.erase(tf.excludeBoneNames.begin() + exclRemoveIdx);
+				}
+				tf.version.fetch_add(1, std::memory_order_relaxed);
+				a_subMod->SetDirty(true);
+			}
+
+			ImGui::Spacing();
+
+			if (ImGui::Button("Add Exclude...")) {
+				ImGui::OpenPopup("AddExclBonePopup");
+			}
+			ImGui::SameLine();
+
+			static char customExclBoneName[128]{};
+			ImGui::SetNextItemWidth(160);
+			ImGui::InputTextWithHint("##customExclBone", "Custom bone name", customExclBoneName, sizeof(customExclBoneName));
+			ImGui::SameLine();
+			bool canAddExclCustom = customExclBoneName[0] != '\0';
+			if (!canAddExclCustom) ImGui::BeginDisabled();
+			if (ImGui::Button("Add Custom##excl")) {
+				std::lock_guard lock(tf.boneMutex);
+				bool alreadyExists = false;
+				for (auto& name : tf.excludeBoneNames) {
+					if (name == customExclBoneName) { alreadyExists = true; break; }
+				}
+				if (!alreadyExists) {
+					tf.excludeBoneNames.emplace_back(customExclBoneName);
+					tf.version.fetch_add(1, std::memory_order_relaxed);
+					a_subMod->SetDirty(true);
+				}
+				customExclBoneName[0] = '\0';
+			}
+			if (!canAddExclCustom) ImGui::EndDisabled();
+
+			if (ImGui::BeginPopup("AddExclBonePopup")) {
+				static char exclBoneFilter[64]{};
+				ImGui::InputTextWithHint("##exclBoneSearch", "Search bones...", exclBoneFilter, sizeof(exclBoneFilter));
+				ImGui::Separator();
+
+				for (const char* bone : kKnownBones) {
+					if (exclBoneFilter[0] != '\0' && !UICommon::FuzzyMatch(exclBoneFilter, bone)) continue;
+
+					bool alreadyAdded = false;
+					for (const auto& name : excludeSnapshot) {
+						if (name == bone) { alreadyAdded = true; break; }
+					}
+
+					if (alreadyAdded) {
+						ImGui::TextDisabled("  %s (already added)", bone);
+					} else if (ImGui::MenuItem(bone)) {
+						std::lock_guard lock(tf.boneMutex);
+						tf.excludeBoneNames.emplace_back(bone);
+						tf.version.fetch_add(1, std::memory_order_relaxed);
+						a_subMod->SetDirty(true);
+					}
+				}
+				ImGui::EndPopup();
+			}
 		}
 	} else {
 		ImGui::Text("Enabled: %s", tf.enabled ? "Yes" : "No");
@@ -965,17 +1067,25 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				tf.weight,
 				tf.includeChildren ? "Yes" : "No");
 			std::vector<std::string> displayBones;
+			std::vector<std::string> displayExclude;
 			{
 				std::lock_guard lock(tf.boneMutex);
 				displayBones = tf.boneNames;
+				displayExclude = tf.excludeBoneNames;
 			}
 			if (!displayBones.empty()) {
-				ImGui::Text("Bones:");
+				ImGui::Text("Include Bones:");
 				for (const auto& name : displayBones) {
 					ImGui::BulletText("%s", name.c_str());
 				}
 			} else {
 				UICommon::TextUnformattedDisabled("No bones configured");
+			}
+			if (!displayExclude.empty()) {
+				ImGui::Text("Exclude Bones (children: %s):", tf.excludeChildren ? "Yes" : "No");
+				for (const auto& name : displayExclude) {
+					ImGui::BulletText("%s", name.c_str());
+				}
 			}
 		}
 	}
@@ -1067,9 +1177,21 @@ void UIMain::DrawSettingsPanel()
 	ImGui::Separator();
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "UI");
 
-	dirty |= ImGui::Checkbox("Pause Game When UI Open", &settings->bPauseOnMenuOpen);
-	if (ImGui::IsItemHovered()) {
-		ImGui::SetTooltip("Pauses the game world while the OAR editor window is open.");
+	{
+		bool wasPausing = settings->bPauseOnMenuOpen;
+		dirty |= ImGui::Checkbox("Pause Game When UI Open", &settings->bPauseOnMenuOpen);
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("Pauses the game world while the OAR editor window is open.");
+		}
+		if (wasPausing != settings->bPauseOnMenuOpen) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				if (settings->bPauseOnMenuOpen) {
+					ui->menuMode += 1;
+				} else if (ui->menuMode > 0) {
+					ui->menuMode -= 1;
+				}
+			}
+		}
 	}
 
 	float scale = ImGui::GetIO().FontGlobalScale;
