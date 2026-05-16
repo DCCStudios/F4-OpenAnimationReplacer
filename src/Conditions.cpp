@@ -2212,6 +2212,128 @@ void IsQuestStageDoneCondition::SerializeImpl(nlohmann::json& a_json) const
 	a_json["stage"] = stage;
 }
 
+// ===== Animation Time Conditions =====
+
+static float GetAnimDuration(RE::hkbClipGenerator* a_clipGen)
+{
+	if (!a_clipGen) return 0.0f;
+	auto* anim = a_clipGen->GetAnimation();
+	return anim ? anim->duration : 0.0f;
+}
+
+bool AnimTimeRemainingCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const
+{
+	if (!a_clipGen) return false;
+	float duration = GetAnimDuration(a_clipGen);
+	if (duration <= 0.0f) return false;
+	float localTime = a_clipGen->GetLocalTime();
+	float remaining = duration - localTime;
+	float compareVal = numericValue.GetValue(nullptr);
+	return CompareValues(remaining, comparison, compareVal);
+}
+
+std::string AnimTimeRemainingCondition::GetParameterString() const
+{
+	return std::format("{} {:.2f}s", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void AnimTimeRemainingCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##atrOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(120);
+	if (ImGui::InputFloat("Seconds##atr", &numericValue.staticValue, 0.05f, 0.1f, "%.2f")) { a_dirty = true; }
+}
+
+void AnimTimeRemainingCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void AnimTimeRemainingCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	nlohmann::json nv; numericValue.Serialize(nv); a_json["numericValue"] = nv;
+}
+
+bool AnimTimeElapsedCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const
+{
+	if (!a_clipGen) return false;
+	float localTime = a_clipGen->GetLocalTime();
+	float compareVal = numericValue.GetValue(nullptr);
+	return CompareValues(localTime, comparison, compareVal);
+}
+
+std::string AnimTimeElapsedCondition::GetParameterString() const
+{
+	return std::format("{} {:.2f}s", ComparisonOpToString(comparison), numericValue.staticValue);
+}
+
+void AnimTimeElapsedCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##ateOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(120);
+	if (ImGui::InputFloat("Seconds##ate", &numericValue.staticValue, 0.05f, 0.1f, "%.2f")) { a_dirty = true; }
+}
+
+void AnimTimeElapsedCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void AnimTimeElapsedCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	nlohmann::json nv; numericValue.Serialize(nv); a_json["numericValue"] = nv;
+}
+
+bool AnimProgressCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const
+{
+	if (!a_clipGen) return false;
+	float duration = GetAnimDuration(a_clipGen);
+	if (duration <= 0.0f) return false;
+	float progress = a_clipGen->GetLocalTime() / duration;
+	float compareVal = numericValue.GetValue(nullptr);
+	return CompareValues(progress, comparison, compareVal);
+}
+
+std::string AnimProgressCondition::GetParameterString() const
+{
+	return std::format("{} {:.0f}%", ComparisonOpToString(comparison), numericValue.staticValue * 100.f);
+}
+
+void AnimProgressCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int compIdx = static_cast<int>(comparison);
+	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##apOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(120);
+	if (ImGui::SliderFloat("Progress##ap", &numericValue.staticValue, 0.0f, 1.0f, "%.2f")) { a_dirty = true; }
+}
+
+void AnimProgressCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void AnimProgressCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	nlohmann::json nv; numericValue.Serialize(nv); a_json["numericValue"] = nv;
+}
+
 // ===== Factory Registration =====
 
 void RegisterAllConditions()
@@ -2303,6 +2425,9 @@ void RegisterAllConditions()
 	factory->Register("CurrentTargetAngle", [] { return std::make_unique<CurrentTargetAngleCondition>(); });
 	factory->Register("FallDistance", [] { return std::make_unique<FallDistanceCondition>(); });
 	factory->Register("IsQuestStageDone", [] { return std::make_unique<IsQuestStageDoneCondition>(); });
+	factory->Register("AnimTimeRemaining", [] { return std::make_unique<AnimTimeRemainingCondition>(); });
+	factory->Register("AnimTimeElapsed", [] { return std::make_unique<AnimTimeElapsedCondition>(); });
+	factory->Register("AnimProgress", [] { return std::make_unique<AnimProgressCondition>(); });
 
 	logger::info("[OAR] Registered {} condition types", factory->GetAllFactories().size());
 }

@@ -1242,5 +1242,55 @@ private:
 	int32_t stage{ 0 };
 };
 
+// ===== Animation Time Conditions =====
+
+class AnimTimeRemainingCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "AnimTimeRemaining"; }
+	std::string GetDescription() const override { return "Compares the time remaining (seconds) in the current clip's animation. True while remaining time passes the comparison. When it fails, the replacement's conditions become false and blend-out begins."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kGreaterEqual };
+	NumericComponent numericValue;
+};
+
+class AnimTimeElapsedCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "AnimTimeElapsed"; }
+	std::string GetDescription() const override { return "Compares the elapsed time (seconds) since the current clip's animation started playing. Reads localTime from the hkbClipGenerator."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kGreaterEqual };
+	NumericComponent numericValue;
+};
+
+class AnimProgressCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "AnimProgress"; }
+	std::string GetDescription() const override { return "Compares the animation progress as a ratio (0.0 = start, 1.0 = end). Useful for triggering at a percentage of the animation rather than absolute seconds."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kLess };
+	NumericComponent numericValue;
+};
+
 void RegisterAllConditions();
 std::unique_ptr<ICondition> CreateConditionFromJson(const nlohmann::json& a_json);
