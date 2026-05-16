@@ -90,6 +90,7 @@ struct CharResolved {
 struct CharTrackFilterState {
 	RE::hkaAnimation* replacement = nullptr;
 	SubMod::TrackFilter* filter = nullptr;
+	SubMod* parentSubMod = nullptr;
 	RE::hkbClipGenerator* sourceClip = nullptr;
 	std::unordered_set<RE::hkbClipGenerator*> sourceClips;
 	std::string suffix;
@@ -114,7 +115,7 @@ static std::atomic<int> s_trackFilterActiveCount{ 0 };
 static std::atomic<uint64_t> s_currentFrame{ 0 };
 // Threshold: if no source clip has fired Generate for this many frames, the entry
 // is considered stale and erased (so non-source clips stop applying old cached pose).
-static constexpr uint64_t kTrackFilterStaleFrames = 2;
+static constexpr uint64_t kTrackFilterStaleFrames = 300;
 
 static RE::TESObjectREFR* GetRefrFromCharacter(RE::hkbCharacter* a_char) {
 	if (!a_char) return nullptr;
@@ -2491,6 +2492,7 @@ namespace
 					}
 					state.replacement = replacement;
 					state.filter = &winningInfo->parentSubMod->trackFilter;
+					state.parentSubMod = winningInfo->parentSubMod;
 					state.sourceClip = a_this;
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
@@ -2504,7 +2506,7 @@ namespace
 				*animSlot = originalAnim;
 			}
 			static int s_tfLog = 0;
-			if (s_tfLog < 20) {
+			if (s_tfLog < 3) {
 				logger::info("[OAR-TrackFilter] Registered filtered replacement for '{}' on actor {:X} (submod '{}')",
 					resolvedSuffix, reinterpret_cast<uintptr_t>(refr),
 					winningInfo->parentSubMod->GetName());
@@ -2675,19 +2677,27 @@ namespace
 		}
 
 	} else {
-		// Conditions failed — remove this clip from the source set
+		// Conditions failed — if this clip's suffix matches the active track
+		// filter's suffix, erase the ENTIRE entry. We can't rely on matching
+		// a_this against sourceClips because the behavior graph frequently
+		// creates new clip generator instances at different addresses for the
+		// same animation (state transitions), leaving stale entries in the set.
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
 			std::unique_lock tfLock(s_trackFilterMutex);
 			RE::TESObjectREFR* tfActor = refr;
 			if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
 			if (tfActor) {
 				auto it = s_charTrackFilterMap.find(tfActor);
-				if (it != s_charTrackFilterMap.end()) {
-					it->second.sourceClips.erase(a_this);
-					if (it->second.sourceClips.empty()) {
-						s_charTrackFilterMap.erase(it);
-						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+				if (it != s_charTrackFilterMap.end() &&
+					it->second.suffix == resolvedSuffix) {
+					static int s_cleanupLog = 0;
+					if (s_cleanupLog < 10) {
+						logger::info("[OAR-TrackFilter] Conditions false for '{}' — erasing track filter entry for actor {:X}",
+							resolvedSuffix, reinterpret_cast<uintptr_t>(tfActor));
+						s_cleanupLog++;
 					}
+					s_charTrackFilterMap.erase(it);
+					s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
 				}
 			}
 		}
@@ -2861,6 +2871,8 @@ namespace
 
 			// Non-source clips with valid cache and already-resolved bones:
 			// handle entirely under shared_lock (no writes to shared state).
+			// Condition re-evaluation in HookedActorUpdate handles cleanup when
+			// conditions become false, so no staleness check is needed here.
 			auto charIt = state.resolvedByChar.find(character);
 			bool alreadyResolved = (charIt != state.resolvedByChar.end() &&
 				charIt->second.version == filterPtr->version.load(std::memory_order_relaxed) &&
@@ -2930,20 +2942,6 @@ namespace
 		auto* replacement = state.replacement;
 		if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
-		// --- Staleness check (Issue #2 fix) ---
-		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
-		if (state.cacheValid && state.lastSourceFrame > 0 &&
-			curFrame > state.lastSourceFrame + kTrackFilterStaleFrames) {
-			static int s_staleLog = 0;
-			if (s_staleLog < 5) {
-				logger::info("[OAR-TrackFilter] Cache stale (last src frame={}, cur={}). Erasing entry for actor {:X}",
-					state.lastSourceFrame, curFrame, reinterpret_cast<uintptr_t>(actor));
-				s_staleLog++;
-			}
-			s_charTrackFilterMap.erase(it);
-			s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
-			return;
-		}
 
 		// --- Per-character resolution (Issue #1 fix) ---
 		auto& cr = state.resolvedByChar[character];
@@ -2952,6 +2950,7 @@ namespace
 
 		float weight = filterPtr->weight;
 		auto mode = filterPtr->mode;
+		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
 		auto** animSlot = a_this->GetAnimationSlot();
 		bool inRecursion = (animSlot && *animSlot == replacement);
@@ -3226,10 +3225,51 @@ namespace
 
 	void HookedActorUpdate()
 	{
-		// Per-frame tick: increment the global frame counter used by the partial-body
-		// track-filter staleness check (see hkbClipGenerator_Generate).
 		s_currentFrame.fetch_add(1, std::memory_order_relaxed);
+
+		// Process the original actor updates FIRST so game state is current.
 		Hooks::UpdateHooks::RunActorUpdatesOrig();
+
+		// Re-evaluate conditions for active track filters every frame.
+		// Done AFTER RunActorUpdatesOrig so weapon/ammo state is up to date.
+		// We copy entries under the lock, then evaluate WITHOUT the lock held
+		// (condition eval may trigger game code that must not be blocked).
+		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
+			struct PendingEval { RE::TESObjectREFR* actor; SubMod* subMod; std::string suffix; };
+			std::vector<PendingEval> toEval;
+			{
+				std::shared_lock tfShared(s_trackFilterMutex);
+				toEval.reserve(s_charTrackFilterMap.size());
+				for (auto& [actor, state] : s_charTrackFilterMap) {
+					if (state.parentSubMod && actor)
+						toEval.push_back({ actor, state.parentSubMod, state.suffix });
+				}
+			}
+
+			std::vector<RE::TESObjectREFR*> toErase;
+			for (auto& pe : toEval) {
+				if (!pe.subMod->EvaluateConditions(pe.actor, nullptr)) {
+					toErase.push_back(pe.actor);
+					static int s_condCleanLog = 0;
+					if (s_condCleanLog < 10) {
+						logger::info("[OAR-TrackFilter] Conditions now false for '{}' (re-eval) — erasing entry for actor {:X}",
+							pe.suffix, reinterpret_cast<uintptr_t>(pe.actor));
+						s_condCleanLog++;
+					}
+				}
+			}
+
+			if (!toErase.empty()) {
+				std::unique_lock tfLock(s_trackFilterMutex);
+				for (auto* actor : toErase) {
+					auto it = s_charTrackFilterMap.find(actor);
+					if (it != s_charTrackFilterMap.end()) {
+						s_charTrackFilterMap.erase(it);
+						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+					}
+				}
+			}
+		}
 	}
 
 	RE::hkbCharacterStringData* ExtractStringDataFromGraph(void* a_firstArg)
