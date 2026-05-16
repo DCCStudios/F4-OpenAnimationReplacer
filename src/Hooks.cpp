@@ -227,6 +227,37 @@ static void LerpTransform(RE::hkQsTransformRaw& base, const RE::hkQsTransformRaw
 		base.scale[i] = base.scale[i] * iw + rep.scale[i] * w;
 }
 
+// Set the "modified bones" bitmask bit for a bone in the pose track's output.
+//
+// The pose track in hkbGeneratorOutput stores pose data followed by a bitmask
+// indicating which bones have valid (modified) data. The engine uses this mask
+// during pose composition: bones whose bit is 0 are treated as "no data" and
+// their values are ignored / replaced by the next layer's contribution.
+//
+// When we override outputPose[idx] for a bone whose original animation does NOT
+// have a track for that bone (e.g., player idle has no WeaponBolt track), the
+// engine's Generate leaves the mask bit 0. Our pose data write is then ignored
+// at downstream processing. Setting the mask bit explicitly tells the engine
+// "this bone is modified, please honor it".
+//
+// Layout (per OAR Skyrim's ActiveAnimationPreview / Havok 2014):
+//   [tracksPtr + poseHeader.dataOffset]                              ← pose data start
+//   ...                                                              hkQsTransform[capacity]
+//   [tracksPtr + poseHeader.dataOffset + elementSizeBytes*capacity]  ← bone mask start
+//   uint32_t mask[(capacity + 32) >> 5]
+static void SetPoseBoneMaskBit(uint8_t* a_tracksPtr,
+	const RE::TrackHeaderRaw& a_poseHeader, int16_t a_boneIdx)
+{
+	if (!a_tracksPtr || a_boneIdx < 0) return;
+	if (a_poseHeader.elementSizeBytes <= 0 || a_poseHeader.capacity <= 0) return;
+	if (a_boneIdx >= a_poseHeader.capacity) return;
+
+	auto* maskBytes = a_tracksPtr + a_poseHeader.dataOffset
+		+ static_cast<uintptr_t>(a_poseHeader.elementSizeBytes) * a_poseHeader.capacity;
+	auto* mask = reinterpret_cast<uint32_t*>(maskBytes);
+	mask[a_boneIdx >> 5] |= (1u << (a_boneIdx & 0x1F));
+}
+
 // Additive: given the base pose from the original animation (origBase) and the
 // replacement pose (rep), compute delta = rep - origBase, then apply delta*weight
 // on top of whatever current output is. This lets additive work with full-pose
@@ -2797,9 +2828,98 @@ namespace
 		auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
 		int16_t numOutputBones = poseHeader.numData;
 
-		// Acquire UNIQUE lock for the whole track-filter operation. We may need to
-		// resolve bones for a new character (write), update cache (write), or invalidate
-		// stale entries (write). The lock is released before any recursive _Generate.
+		// One-shot diagnostic: log the pose track header so we can verify layout
+		// (size of element, capacity, onFraction, flags). The flags byte tells us
+		// if the pose is sparse/palette, and onFraction must be > 0 for the engine
+		// to consider this track valid downstream.
+		static int s_poseHdrLog = 0;
+		if (s_poseHdrLog < 3) {
+			logger::info("[OAR-TrackFilter] poseHeader: numData={} capacity={} elemSize={} dataOff={} onFrac={:.3f} flags=0x{:02X} type={}",
+				poseHeader.numData, poseHeader.capacity, poseHeader.elementSizeBytes,
+				poseHeader.dataOffset, poseHeader.onFraction,
+				static_cast<uint8_t>(poseHeader.flags), poseHeader.type);
+			s_poseHdrLog++;
+		}
+
+		// --- Try shared_lock first for the fast non-source path ---
+		// Non-source clips only READ cached data. We avoid unique_lock contention
+		// that causes freezes when many clips fire during weapon events.
+		{
+			std::shared_lock tfShared(s_trackFilterMutex);
+			auto it = s_charTrackFilterMap.find(actor);
+			if (it == s_charTrackFilterMap.end()) return;
+
+			auto& state = it->second;
+			auto* filterPtr = state.filter;
+			auto* replacement = state.replacement;
+			if (!filterPtr || !filterPtr->enabled || !replacement) return;
+
+			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+			auto** animSlot = a_this->GetAnimationSlot();
+			bool inRecursion = (animSlot && *animSlot == replacement);
+			if (inRecursion) return;
+
+			// Non-source clips with valid cache and already-resolved bones:
+			// handle entirely under shared_lock (no writes to shared state).
+			auto charIt = state.resolvedByChar.find(character);
+			bool alreadyResolved = (charIt != state.resolvedByChar.end() &&
+				charIt->second.version == filterPtr->version.load(std::memory_order_relaxed) &&
+				!charIt->second.nameAndIndex.empty());
+
+			if (!isSourceClip && state.cacheValid && alreadyResolved) {
+				auto& cr = charIt->second;
+				float weight = filterPtr->weight;
+				auto mode = filterPtr->mode;
+				const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
+
+				for (auto& [name, idx] : cr.nameAndIndex) {
+					if (idx < 0 || idx >= numOutputBones) continue;
+
+					if (isAdditiveClip) {
+						RE::hkQsTransformRaw identity{};
+						identity.translation[0] = 0.f; identity.translation[1] = 0.f;
+						identity.translation[2] = 0.f; identity.translation[3] = 0.f;
+						identity.rotation[0] = 0.f; identity.rotation[1] = 0.f;
+						identity.rotation[2] = 0.f; identity.rotation[3] = 1.f;
+						identity.scale[0] = 1.f; identity.scale[1] = 1.f;
+						identity.scale[2] = 1.f; identity.scale[3] = 0.f;
+						outputPose[idx] = identity;
+					} else {
+						auto rIt = state.cachedRepByName.find(name);
+						if (rIt == state.cachedRepByName.end()) continue;
+
+						if (mode == SubMod::TrackFilter::Mode::Override) {
+							LerpTransform(outputPose[idx], rIt->second, weight);
+						} else {
+							auto bIt = state.cachedBaseByName.find(name);
+							if (bIt != state.cachedBaseByName.end()) {
+								BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
+							} else {
+								LerpTransform(outputPose[idx], rIt->second, weight);
+							}
+						}
+					}
+					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+				}
+				if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
+
+				static int s_nonSrcFastLog = 0;
+				if (s_nonSrcFastLog < 5) {
+					int dumped = 0;
+					for (auto& [name, idx] : cr.nameAndIndex) {
+						if (dumped++ >= 2) break;
+						if (idx < 0 || idx >= numOutputBones) continue;
+						auto& f = outputPose[idx];
+						logger::info("[OAR-TrackFilter] FINAL nonsrc(fast) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
+							name, idx, f.translation[0], f.translation[1], f.translation[2], isAdditiveClip);
+					}
+					s_nonSrcFastLog++;
+				}
+				return;
+			}
+		} // shared_lock released
+
+		// Acquire UNIQUE lock for source clips, first-time resolution, or stale checks.
 		std::unique_lock tfLock(s_trackFilterMutex);
 
 		auto it = s_charTrackFilterMap.find(actor);
@@ -2811,10 +2931,6 @@ namespace
 		if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
 		// --- Staleness check (Issue #2 fix) ---
-		// If no source clip has fired Generate for kTrackFilterStaleFrames frames,
-		// the override is "leaking" past its conditions — erase the entry. This catches
-		// the case where Update never fires the conditions=false branch because the
-		// source clip was deactivated mid-state-transition.
 		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
 		if (state.cacheValid && state.lastSourceFrame > 0 &&
 			curFrame > state.lastSourceFrame + kTrackFilterStaleFrames) {
@@ -2830,9 +2946,6 @@ namespace
 		}
 
 		// --- Per-character resolution (Issue #1 fix) ---
-		// Each hkbCharacter (1p body, 3p body, weapon graph) resolves filter bone
-		// names against its own skeleton, so the same filter applies correctly to
-		// whichever character is being rendered.
 		auto& cr = state.resolvedByChar[character];
 		ResolveForChar(filterPtr, cr, character);
 		if (cr.nameAndIndex.empty()) return;
@@ -2938,8 +3051,16 @@ namespace
 					} else {
 						BlendAdditiveTransform(outputPose[idx], baseVal, repVal, weight);
 					}
+					// Mark this bone as MODIFIED in the pose's bone mask, so the
+					// engine's downstream pose composition honors our write.
+					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
 				if (wantBindingDiag) s_bindingDiagLog++;
+
+				// Force the pose track to "valid" — onFraction > 0 means the engine
+				// will read this track. Without this, if the original animation had
+				// the track inactive (onFraction=0), our writes are discarded.
+				if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
 
 				state.cacheValid = true;
 				state.lastSourceFrame = curFrame;
@@ -2968,11 +3089,10 @@ namespace
 				return;
 			}
 
-			// ============== Fallback: swap-and-recursive-Generate ==============
-			// Use this only when no binding is reachable. This is the previous
-			// behavior — it produces SOME override (better than none). Note: it
-			// implicitly assumes binding[track]==bone (identity); if that's not
-			// true on this skeleton, the override may land on a sibling bone.
+			// ============== Swap-and-Generate fallback ==============
+			// Swap the binding's animation pointer to our replacement, call
+			// _Generate to let the engine sample it through its normal code path
+			// (which handles null offsets in the clone), then read the result.
 			if (!animSlot || !*animSlot) return;
 
 			RE::hkaAnimation* originalInSlot = *animSlot;
@@ -3016,18 +3136,26 @@ namespace
 					if (bIt != state2.cachedBaseByName.end())
 						BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
 				}
+				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 			}
+			if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
 
 			static int s_fbFinalLog = 0;
-			if (s_fbFinalLog < 5) {
+			if (s_fbFinalLog < 10) {
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
 					auto& f = outputPose[idx];
-					logger::info("[OAR-TrackFilter] FINAL(fallback) src char={:X} '{}'[{}]: out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
-						reinterpret_cast<uintptr_t>(character), name, idx,
-						f.translation[0], f.translation[1], f.translation[2],
-						mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
-						weight);
+					auto bIt = state2.cachedBaseByName.find(name);
+					auto rIt = state2.cachedRepByName.find(name);
+					if (bIt != state2.cachedBaseByName.end() && rIt != state2.cachedRepByName.end()) {
+						logger::info("[OAR-TrackFilter] FINAL(fallback) '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
+							name, idx,
+							bIt->second.translation[0], bIt->second.translation[1], bIt->second.translation[2],
+							rIt->second.translation[0], rIt->second.translation[1], rIt->second.translation[2],
+							f.translation[0], f.translation[1], f.translation[2],
+							mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
+							weight);
+					}
 					break;
 				}
 				s_fbFinalLog++;
@@ -3041,22 +3169,41 @@ namespace
 		// =====================================================================
 		if (!state.cacheValid) return;
 
+		const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
+
 		for (auto& [name, idx] : cr.nameAndIndex) {
 			if (idx < 0 || idx >= numOutputBones) continue;
-			auto rIt = state.cachedRepByName.find(name);
-			if (rIt == state.cachedRepByName.end()) continue;
 
-			if (mode == SubMod::TrackFilter::Mode::Override) {
-				LerpTransform(outputPose[idx], rIt->second, weight);
+			if (isAdditiveClip) {
+				// Additive clips contribute DELTAS. Writing zero/identity means
+				// "this clip adds nothing for this bone", letting the source
+				// clip's absolute override stand without being pushed further.
+				RE::hkQsTransformRaw identity{};
+				identity.translation[0] = 0.f; identity.translation[1] = 0.f;
+				identity.translation[2] = 0.f; identity.translation[3] = 0.f;
+				identity.rotation[0] = 0.f; identity.rotation[1] = 0.f;
+				identity.rotation[2] = 0.f; identity.rotation[3] = 1.f;
+				identity.scale[0] = 1.f; identity.scale[1] = 1.f;
+				identity.scale[2] = 1.f; identity.scale[3] = 0.f;
+				outputPose[idx] = identity;
 			} else {
-				auto bIt = state.cachedBaseByName.find(name);
-				if (bIt != state.cachedBaseByName.end()) {
-					BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
-				} else {
+				auto rIt = state.cachedRepByName.find(name);
+				if (rIt == state.cachedRepByName.end()) continue;
+
+				if (mode == SubMod::TrackFilter::Mode::Override) {
 					LerpTransform(outputPose[idx], rIt->second, weight);
+				} else {
+					auto bIt = state.cachedBaseByName.find(name);
+					if (bIt != state.cachedBaseByName.end()) {
+						BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
+					} else {
+						LerpTransform(outputPose[idx], rIt->second, weight);
+					}
 				}
 			}
+			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}
+		if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
 
 		static int s_nonSrcFinalLog = 0;
 		if (s_nonSrcFinalLog < 5) {
@@ -3065,9 +3212,8 @@ namespace
 				if (dumped++ >= 2) break;
 				if (idx < 0 || idx >= numOutputBones) continue;
 				auto& f = outputPose[idx];
-				logger::info("[OAR-TrackFilter] FINAL nonsrc char={:X} '{}'[{}]: trans=({:.3f},{:.3f},{:.3f})",
-					reinterpret_cast<uintptr_t>(character), name, idx,
-					f.translation[0], f.translation[1], f.translation[2]);
+				logger::info("[OAR-TrackFilter] FINAL nonsrc(slow) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
+					name, idx, f.translation[0], f.translation[1], f.translation[2], isAdditiveClip);
 			}
 			s_nonSrcFinalLog++;
 		}
