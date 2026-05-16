@@ -783,13 +783,35 @@ bool IsTalkingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGene
 	return a_refr && a_refr->IsTalking();
 }
 
-// IsAttacking
+// IsAttacking — melee OR gun firing (any combat action)
 bool IsAttackingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr) return false;
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return false;
-	return actor->meleeAttackState != 0;
+	if (actor->meleeAttackState != 0) return true;
+	auto gs = static_cast<std::uint32_t>(actor->gunState);
+	return gs == 7 || gs == 8; // kFire, kFireSighted
+}
+
+// IsReloading — gunState == 4 (kReloading)
+bool IsReloadingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto gs = static_cast<std::uint32_t>(actor->gunState);
+	return gs == 4;
+}
+
+// IsFiring — gunState 7 (kFire) or 8 (kFireSighted)
+bool IsFiringCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+	auto gs = static_cast<std::uint32_t>(actor->gunState);
+	return gs == 7 || gs == 8;
 }
 
 // IsBlocking
@@ -2223,6 +2245,8 @@ void RegisterAllConditions()
 	factory->Register("IsPlayerTeammate", [] { return std::make_unique<IsPlayerTeammateCondition>(); });
 	factory->Register("IsTalking", [] { return std::make_unique<IsTalkingCondition>(); });
 	factory->Register("IsAttacking", [] { return std::make_unique<IsAttackingCondition>(); });
+	factory->Register("IsReloading", [] { return std::make_unique<IsReloadingCondition>(); });
+	factory->Register("IsFiring", [] { return std::make_unique<IsFiringCondition>(); });
 	factory->Register("IsBlocking", [] { return std::make_unique<IsBlockingCondition>(); });
 	factory->Register("IsRunning", [] { return std::make_unique<IsRunningCondition>(); });
 	factory->Register("IsInInterior", [] { return std::make_unique<IsInInteriorCondition>(); });

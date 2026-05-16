@@ -125,16 +125,19 @@ static std::atomic<uint64_t> s_currentFrame{ 0 };
 static constexpr uint64_t kTrackFilterStaleFrames = 300;
 
 // --- Full-body replacement blend state ---
-// Keyed by (actor, clip suffix) so multiple clips on same actor can blend independently.
+// Uses a cached pose snapshot so we NEVER call _Generate twice per frame.
+// Keyed by (actor, clip suffix).
 struct FullBodyBlendState {
 	RE::hkaAnimation* replacement = nullptr;
 	RE::hkaAnimation* original = nullptr;
-	float blendAlpha = 1.0f;       // 0 = fully original, 1 = fully replacement
+	RE::hkbClipGenerator* ownerClip = nullptr; // only this clip applies blending
+	float blendAlpha = 0.0f;       // 0 = fully original, 1 = fully replacement
 	float blendElapsed = 0.0f;
 	float blendDuration = 0.0f;
 	bool blendingIn = false;       // ramping 0→1
 	bool blendingOut = false;      // ramping 1→0
-	std::string suffix;
+	bool poseSnapshotValid = false;
+	std::vector<RE::hkQsTransformRaw> poseSnapshot; // frozen pose from the "other" side
 };
 struct ActorClipKey {
 	RE::TESObjectREFR* actor = nullptr;
@@ -180,6 +183,7 @@ static void SlerpQuat(const float* a, const float* b, float t, float* out)
 	float dot = QuatDot(a, b);
 	float sign = 1.0f;
 	if (dot < 0.0f) { dot = -dot; sign = -1.0f; }
+	if (dot > 1.0f) dot = 1.0f;
 
 	float s0, s1;
 	if (dot > 0.9995f) {
@@ -188,8 +192,8 @@ static void SlerpQuat(const float* a, const float* b, float t, float* out)
 	} else {
 		float theta = acosf(dot);
 		float sinTheta = sinf(theta);
-		s0 = sinf((1.0f - t) * theta) / sinTheta;
-		s1 = sinf(t * theta) / sinTheta * sign;
+		if (sinTheta < 1e-6f) { s0 = 1.0f - t; s1 = t * sign; }
+		else { s0 = sinf((1.0f - t) * theta) / sinTheta; s1 = sinf(t * theta) / sinTheta * sign; }
 	}
 	for (int i = 0; i < 4; ++i)
 		out[i] = a[i] * s0 + b[i] * s1;
@@ -297,8 +301,19 @@ static void SetPoseBoneMaskBit(uint8_t* a_tracksPtr,
 	if (a_poseHeader.elementSizeBytes <= 0 || a_poseHeader.capacity <= 0) return;
 	if (a_boneIdx >= a_poseHeader.capacity) return;
 
-	auto* maskBytes = a_tracksPtr + a_poseHeader.dataOffset
+	// The bone mask only exists for sparse tracks (flags & 0x02).
+	// Dense tracks have all bones "active" — no mask to write.
+	if ((a_poseHeader.flags & 0x02) == 0) return;
+
+	auto maskOffset = static_cast<uintptr_t>(a_poseHeader.dataOffset)
 		+ static_cast<uintptr_t>(a_poseHeader.elementSizeBytes) * a_poseHeader.capacity;
+	auto maskWordOffset = maskOffset + static_cast<uintptr_t>(a_boneIdx >> 5) * 4;
+
+	// Bounds check against total buffer size (TrackMasterHeaderRaw::numBytes)
+	auto* master = reinterpret_cast<RE::TrackMasterHeaderRaw*>(a_tracksPtr);
+	if (static_cast<int32_t>(maskWordOffset + 4) > master->numBytes) return;
+
+	auto* maskBytes = a_tracksPtr + maskOffset;
 	auto* mask = reinterpret_cast<uint32_t*>(maskBytes);
 	mask[a_boneIdx >> 5] |= (1u << (a_boneIdx & 0x1F));
 }
@@ -2596,34 +2611,41 @@ namespace
 					// Start full-body blend-in if SubMod has a blend time configured
 					float blendTime = (winningInfo && winningInfo->parentSubMod)
 						? winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt() : -1.0f;
-					if (blendTime < 0.0f) blendTime = 0.0f;  // negative means "use default" → instant
+					if (blendTime < 0.0f) blendTime = 0.0f;
 					if (blendTime > 0.0f && originalAnim) {
-						ActorClipKey key{ refr ? refr : RE::PlayerCharacter::GetSingleton(), suffix };
-						std::unique_lock fbLock(s_fullBodyBlendMutex);
-						auto& bs = s_fullBodyBlendMap[key];
-						if (!bs.blendingIn && bs.blendAlpha >= 1.0f) {
-							// Fresh blend-in
-						} else if (bs.blendingOut) {
-							// Cancel blend-out, resume from current alpha
-						}
-						bool isNew = (bs.replacement != replacement);
-						bs.replacement = replacement;
-						bs.original = originalAnim;
-						bs.suffix = suffix;
-						bs.blendingOut = false;
-						bs.blendingIn = true;
-						if (isNew) {
-							bs.blendElapsed = 0.0f;
-							bs.blendAlpha = 0.0f;
-							static int s_fbRegLog = 0;
-							if (s_fbRegLog < 10) {
-								logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' blendTime={:.2f}s actor={:X}",
-									suffix, blendTime, reinterpret_cast<uintptr_t>(refr));
-								s_fbRegLog++;
+						RE::TESObjectREFR* blendActor = refr ? refr : RE::PlayerCharacter::GetSingleton();
+						if (blendActor) {
+							ActorClipKey key{ blendActor, suffix };
+							std::unique_lock fbLock(s_fullBodyBlendMutex);
+							bool isNew = (s_fullBodyBlendMap.find(key) == s_fullBodyBlendMap.end());
+							auto& bs = s_fullBodyBlendMap[key];
+							if (isNew || bs.replacement != replacement) {
+								bs.replacement = replacement;
+								bs.original = originalAnim;
+								bs.ownerClip = a_this;
+								bs.blendElapsed = 0.0f;
+								bs.blendAlpha = 0.0f;
+								bs.blendingIn = true;
+								bs.blendingOut = false;
+								bs.blendDuration = blendTime;
+								bs.poseSnapshotValid = false;
+								bs.poseSnapshot.clear();
+								if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
+								static int s_fbRegLog = 0;
+								if (s_fbRegLog < 10) {
+									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s",
+										suffix, blendTime);
+									s_fbRegLog++;
+								}
+							} else if (bs.blendingOut) {
+								// Re-activation during blend-out: cancel, resume blend-in
+								bs.blendingOut = false;
+								bs.blendingIn = true;
+								bs.blendElapsed = 0.0f;
+								bs.poseSnapshotValid = false;
+								bs.ownerClip = a_this;
 							}
 						}
-						bs.blendDuration = blendTime;
-						if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
 					}
 				if (bReplaceAnnot) {
 					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
@@ -2801,16 +2823,18 @@ namespace
 				std::unique_lock fbLock(s_fullBodyBlendMutex);
 				auto it = s_fullBodyBlendMap.find(key);
 				if (it != s_fullBodyBlendMap.end()) {
-					if (it->second.blendingOut) {
-						// Already blending out — don't touch it, just let it finish
+					if (it->second.blendingIn) {
+						// Another clip with this suffix has conditions=true and is
+						// blending in. Don't interfere — skip this clip's deactivation.
+						startedBlendOut = true;
+					} else if (it->second.blendingOut) {
 						startedBlendOut = true;
 					} else {
-						// Start new blend-out
+						// Steady state — start blend-out.
+						// Swap slot to original NOW so Generate outputs original.
+						// The snapshot (captured on first Generate frame) will be replacement.
 						float blendOutTime = 0.0f;
-						if (winningInfo && winningInfo->parentSubMod) {
-							float v = winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt();
-							if (v > 0.0f) blendOutTime = v;
-						} else if (it->second.blendDuration > 0.0f) {
+						if (it->second.blendDuration > 0.0f) {
 							blendOutTime = it->second.blendDuration;
 						}
 						if (blendOutTime > 0.0f) {
@@ -2819,11 +2843,15 @@ namespace
 							it->second.blendElapsed = 0.0f;
 							it->second.blendDuration = blendOutTime;
 							it->second.original = originalAnim;
+							it->second.poseSnapshotValid = false;
+							it->second.ownerClip = a_this;
 							startedBlendOut = true;
+							// Restore slot to original so Generate samples original pose
+							*animSlot = originalAnim;
 							static int s_fbBoLog = 0;
 							if (s_fbBoLog < 10) {
 								logger::info("[OAR] Full-body blend-out started for '{}' (duration={:.2f}s)",
-									resolvedSuffix, blendOutTime);
+									suffix, blendOutTime);
 								s_fbBoLog++;
 							}
 						}
@@ -2858,12 +2886,12 @@ namespace
 						s_ibrRestoreLog++;
 					}
 				}
-				// Remove blend entry if present (instant removal)
+				// Remove blend entry if present (instant removal) — skip if blending in
 				if (blendActor) {
 					ActorClipKey key{ blendActor, suffix };
 					std::unique_lock fbLock(s_fullBodyBlendMutex);
 					auto it = s_fullBodyBlendMap.find(key);
-					if (it != s_fullBodyBlendMap.end()) {
+					if (it != s_fullBodyBlendMap.end() && !it->second.blendingIn) {
 						s_fullBodyBlendMap.erase(it);
 						s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
 					}
@@ -2952,74 +2980,115 @@ namespace
 		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
 
 		// --- Full-body replacement blending ---
+		// One-shot _Generate captures the "other" pose on the first blend frame only.
+		// All subsequent frames use the frozen snapshot. Only ownerClip applies.
+		// All data is copied out under lock before use — no dangling pointers.
 		if (s_fullBodyBlendActiveCount.load(std::memory_order_relaxed) > 0) {
-			auto* actor = GetRefrFromContext(a_context);
-			if (!actor) actor = RE::PlayerCharacter::GetSingleton();
-			if (actor) {
+			auto* fbActor = GetRefrFromContext(a_context);
+			if (!fbActor) fbActor = RE::PlayerCharacter::GetSingleton();
+			if (fbActor) {
 				std::string clipSuffix;
 				{
 					std::shared_lock lock(s_clipSuffixMutex);
-					auto it = s_clipSuffixCache.find(a_this);
-					if (it != s_clipSuffixCache.end())
-						clipSuffix = it->second;
+					auto cit = s_clipSuffixCache.find(a_this);
+					if (cit != s_clipSuffixCache.end()) clipSuffix = cit->second;
 				}
 				if (!clipSuffix.empty()) {
-					ActorClipKey key{ actor, clipSuffix };
-					std::shared_lock fbLock(s_fullBodyBlendMutex);
-					auto it = s_fullBodyBlendMap.find(key);
-					if (it != s_fullBodyBlendMap.end()) {
-						float alpha = it->second.blendAlpha;
-						RE::hkaAnimation* origAnim = it->second.original;
-						fbLock.unlock();
+					ActorClipKey fbKey{ fbActor, clipSuffix };
 
-						static int s_fbGenLog = 0;
-						if (s_fbGenLog < 20) {
-							logger::info("[OAR-FullBodyBlend] Generate: clip='{}' alpha={:.3f}", clipSuffix, alpha);
-							s_fbGenLog++;
+					float fbAlpha = 0.0f;
+					bool fbBlendingIn = false, fbBlendingOut = false;
+					bool fbNeedSnapshot = false;
+					RE::hkaAnimation* fbOrigAnim = nullptr;
+					RE::hkaAnimation* fbRepAnim = nullptr;
+					thread_local std::vector<RE::hkQsTransformRaw> tl_snapshot;
+
+					{
+						std::shared_lock fbLock(s_fullBodyBlendMutex);
+						auto fbIt = s_fullBodyBlendMap.find(fbKey);
+						if (fbIt != s_fullBodyBlendMap.end() && fbIt->second.ownerClip == a_this) {
+							auto& bs = fbIt->second;
+							fbAlpha = bs.blendAlpha;
+							fbBlendingIn = bs.blendingIn;
+							fbBlendingOut = bs.blendingOut;
+							fbNeedSnapshot = !bs.poseSnapshotValid;
+							fbOrigAnim = bs.original;
+							fbRepAnim = bs.replacement;
+							if (bs.poseSnapshotValid && !bs.poseSnapshot.empty())
+								tl_snapshot = bs.poseSnapshot;
 						}
+					}
 
-						if (alpha < 0.999f && origAnim) {
-							auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
-							if (tracksPtr) {
-								auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
-								auto& poseHeader = headers[RE::kTrackIndex_Pose];
-								if (poseHeader.numData > 0 && poseHeader.dataOffset > 0) {
-									auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
-									int16_t numBones = poseHeader.numData;
+					if ((fbBlendingIn || fbBlendingOut) && fbAlpha > 0.001f && fbAlpha < 0.999f && fbOrigAnim && fbRepAnim) {
+						auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
+						if (tracksPtr) {
+							auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
+							auto& poseHeader = headers[RE::kTrackIndex_Pose];
+							if (poseHeader.numData > 0 && poseHeader.dataOffset > 0) {
+								auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
+								int16_t numBones = poseHeader.numData;
 
-									thread_local std::vector<RE::hkQsTransformRaw> tl_repPose;
-									tl_repPose.assign(outputPose, outputPose + numBones);
+								if (fbNeedSnapshot) {
+									// One-shot: save live output, swap to "other" anim, re-generate, swap back.
+									thread_local std::vector<RE::hkQsTransformRaw> tl_livePose;
+									tl_livePose.assign(outputPose, outputPose + numBones);
 
 									auto** animSlot = a_this->GetAnimationSlot();
-									if (animSlot && *animSlot != origAnim) {
-										RE::hkaAnimation* savedAnim = *animSlot;
-										*animSlot = origAnim;
-										Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
-										*animSlot = savedAnim;
+									if (animSlot) {
+										RE::hkaAnimation* saved = *animSlot;
+										RE::hkaAnimation* other = fbBlendingIn ? fbOrigAnim : fbRepAnim;
+										if (saved != other) {
+											*animSlot = other;
+											Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+											*animSlot = saved;
 
-										for (int16_t i = 0; i < numBones; ++i) {
-											LerpTransform(outputPose[i], tl_repPose[i], alpha);
-										}
+											// outputPose now has the "other" pose — store as snapshot
+											tl_snapshot.assign(outputPose, outputPose + numBones);
+											{
+												std::unique_lock fbLock2(s_fullBodyBlendMutex);
+												auto fbIt2 = s_fullBodyBlendMap.find(fbKey);
+												if (fbIt2 != s_fullBodyBlendMap.end() && fbIt2->second.ownerClip == a_this) {
+													fbIt2->second.poseSnapshot = tl_snapshot;
+													fbIt2->second.poseSnapshotValid = true;
+												}
+											}
 
-										static int s_fbApplyLog = 0;
-										if (s_fbApplyLog < 15) {
-											logger::info("[OAR-FullBodyBlend] Applied blend: alpha={:.3f} bones={}", alpha, numBones);
-											s_fbApplyLog++;
+											// Restore the live pose back to output
+											std::memcpy(outputPose, tl_livePose.data(), numBones * sizeof(RE::hkQsTransformRaw));
+
+											static int s_snapLog = 0;
+											if (s_snapLog < 10) {
+												logger::info("[OAR-FullBodyBlend] Snapshot captured: {} bones, in={}", numBones, fbBlendingIn);
+												s_snapLog++;
+											}
 										}
+									}
+								}
+
+								// Apply blend: lerp live output against frozen snapshot (local copy, safe)
+								if (!tl_snapshot.empty() && static_cast<int16_t>(tl_snapshot.size()) == numBones) {
+									if (fbBlendingIn) {
+										// snapshot = original (frozen), output = replacement (live)
+										// alpha 0→1: mix from original toward replacement
+										for (int16_t i = 0; i < numBones; ++i)
+											LerpTransform(outputPose[i], tl_snapshot[i], 1.0f - fbAlpha);
 									} else {
-										static int s_fbSkipLog = 0;
-										if (s_fbSkipLog < 5) {
-											logger::warn("[OAR-FullBodyBlend] SKIPPED: animSlot={:X} origAnim={:X} (same={})",
-												animSlot ? reinterpret_cast<uintptr_t>(*animSlot) : 0,
-												reinterpret_cast<uintptr_t>(origAnim),
-												animSlot ? (*animSlot == origAnim) : false);
-											s_fbSkipLog++;
-										}
+										// snapshot = replacement (frozen), output = original (live)
+										// alpha 1→0: mix from replacement toward original
+										for (int16_t i = 0; i < numBones; ++i)
+											LerpTransform(outputPose[i], tl_snapshot[i], fbAlpha);
+									}
+
+									static int s_fbApplyLog = 0;
+									if (s_fbApplyLog < 15) {
+										logger::info("[OAR-FullBodyBlend] Applied: a={:.3f} in={} out={}", fbAlpha, fbBlendingIn, fbBlendingOut);
+										s_fbApplyLog++;
 									}
 								}
 							}
 						}
 					}
+					tl_snapshot.clear();
 				}
 			}
 		}

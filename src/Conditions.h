@@ -411,7 +411,29 @@ class IsAttackingCondition : public ConditionBase
 {
 public:
 	std::string GetName() const override { return "IsAttacking"; }
-	std::string GetDescription() const override { return "True during attack animations. Reads the 'IsAttacking' graph variable."; }
+	std::string GetDescription() const override { return "True during any attack: melee (meleeAttackState != 0) OR gun firing (gunState 7/8). Covers all combat actions."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
+class IsReloadingCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsReloading"; }
+	std::string GetDescription() const override { return "True when the actor is reloading their weapon. Checks gunState == 4 (kReloading)."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
+class IsFiringCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsFiring"; }
+	std::string GetDescription() const override { return "True when the actor is firing a ranged weapon. Checks gunState 7 (kFire) or 8 (kFireSighted)."; }
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
 	void InitializeImpl(const nlohmann::json&) override {}
