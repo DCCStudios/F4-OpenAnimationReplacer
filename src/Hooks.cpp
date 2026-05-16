@@ -10,6 +10,9 @@
 #include "ActiveReplacementTracker.h"
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
+#include <cmath>
+#include <algorithm>
 
 static std::atomic<bool> s_gameFullyLoaded{ false };
 static std::atomic<bool> s_hasActiveReplacements{ false };
@@ -69,6 +72,301 @@ static std::unordered_map<uint64_t, std::string> s_subGraphIDToFolder;  // subgr
 static std::shared_mutex s_idleAnimReverseMutex;
 static std::unordered_map<RE::hkbClipGenerator*, std::string> s_idleAnimReverseMap;
 static std::atomic<bool> s_idleAnimReverseBuilt{ false };
+
+// ============ Partial Body Animation Layering ============
+// Per-actor state for filtered (partial body) replacements. Keyed by TESObjectREFR*
+// so the filter persists across ALL hkbCharacters that belong to the same actor
+// (e.g. 1stperson body, 3rdperson body, weapon graph). Each character resolves bone
+// indices against ITS OWN skeleton and the cached replacement pose is keyed by bone
+// NAME so it's portable across different skeletons.
+
+// Per-character bone resolution: ordered list of (bone-name, bone-index) pairs for
+// this character's skeleton, expanded by includeChildren if requested.
+struct CharResolved {
+	std::vector<std::pair<std::string, int16_t>> nameAndIndex;
+	uint64_t version = 0; // matches TrackFilter::version when this was resolved
+};
+
+struct CharTrackFilterState {
+	RE::hkaAnimation* replacement = nullptr;
+	SubMod::TrackFilter* filter = nullptr;
+	RE::hkbClipGenerator* sourceClip = nullptr;
+	std::unordered_set<RE::hkbClipGenerator*> sourceClips;
+	std::string suffix;
+
+	// Cache rep/base pose by bone NAME so it's portable across 1p/3p skeletons.
+	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedRepByName;
+	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedBaseByName;
+	bool cacheValid = false;
+
+	// Per-character bone-name → index resolution (rebuilt when filter version changes).
+	std::unordered_map<RE::hkbCharacter*, CharResolved> resolvedByChar;
+
+	// Frame counter at the last source-clip Generate. Used to invalidate the cache
+	// when source clips stop generating (without firing a Deactivate hook).
+	uint64_t lastSourceFrame = 0;
+};
+static std::shared_mutex s_trackFilterMutex;
+static std::unordered_map<RE::TESObjectREFR*, CharTrackFilterState> s_charTrackFilterMap;
+static std::atomic<int> s_trackFilterActiveCount{ 0 };
+
+// Per-frame counter, incremented in HookedActorUpdate. Used for staleness detection.
+static std::atomic<uint64_t> s_currentFrame{ 0 };
+// Threshold: if no source clip has fired Generate for this many frames, the entry
+// is considered stale and erased (so non-source clips stop applying old cached pose).
+static constexpr uint64_t kTrackFilterStaleFrames = 2;
+
+static RE::TESObjectREFR* GetRefrFromCharacter(RE::hkbCharacter* a_char) {
+	if (!a_char) return nullptr;
+	std::shared_lock lock(s_characterCacheMutex);
+	auto it = s_characterCache.find(a_char);
+	return (it != s_characterCache.end()) ? it->second : nullptr;
+}
+
+// ---- Quaternion math helpers for bone blending ----
+
+static float QuatDot(const float* a, const float* b)
+{
+	return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+}
+
+static void SlerpQuat(const float* a, const float* b, float t, float* out)
+{
+	float dot = QuatDot(a, b);
+	float sign = 1.0f;
+	if (dot < 0.0f) { dot = -dot; sign = -1.0f; }
+
+	float s0, s1;
+	if (dot > 0.9995f) {
+		s0 = 1.0f - t;
+		s1 = t * sign;
+	} else {
+		float theta = acosf(dot);
+		float sinTheta = sinf(theta);
+		s0 = sinf((1.0f - t) * theta) / sinTheta;
+		s1 = sinf(t * theta) / sinTheta * sign;
+	}
+	for (int i = 0; i < 4; ++i)
+		out[i] = a[i] * s0 + b[i] * s1;
+}
+
+static void MultiplyQuat(const float* p, const float* q, float* out)
+{
+	float r[4];
+	r[0] = p[3]*q[0] + p[0]*q[3] + p[1]*q[2] - p[2]*q[1];
+	r[1] = p[3]*q[1] - p[0]*q[2] + p[1]*q[3] + p[2]*q[0];
+	r[2] = p[3]*q[2] + p[0]*q[1] - p[1]*q[0] + p[2]*q[3];
+	r[3] = p[3]*q[3] - p[0]*q[0] - p[1]*q[1] - p[2]*q[2];
+	for (int i = 0; i < 4; ++i) out[i] = r[i];
+}
+
+static void InverseQuat(const float* q, float* out)
+{
+	out[0] = -q[0]; out[1] = -q[1]; out[2] = -q[2]; out[3] = q[3];
+}
+
+// ---- Binding helpers ----
+
+// Read the clip's "active" hkaAnimationBinding (the one used by Generate when
+// it samples). Two locations may hold a binding pointer at runtime:
+//   1. hkbClipGenerator + 0xE8  ("file/structural" binding; can be null after
+//                               post-activation cleanup)
+//   2. animationControl + 0x38 ("live" binding used by SamplePartialTracks;
+//                               this is what GetAnimationSlot follows)
+// We prefer (2) because that's the binding the engine actually consults when
+// sampling. Fall back to (1) only if (2) is missing.
+static uint8_t* GetActiveBindingBytes(const RE::hkbClipGenerator* a_clip)
+{
+	if (!a_clip) return nullptr;
+
+	// Try animationControl path first (matches GetAnimationSlot() in HavokTypes.h)
+	auto* ctrl = reinterpret_cast<uint8_t*>(a_clip->GetAnimationControlRaw());
+	if (ctrl) {
+		auto* bindFromCtrl = *reinterpret_cast<uint8_t**>(ctrl + 0x38);
+		if (bindFromCtrl) return bindFromCtrl;
+	}
+
+	// Fallback: clip's own binding slot
+	return reinterpret_cast<uint8_t*>(a_clip->GetBindingRaw());
+}
+
+// Read the binding's transformTrackToBoneIndices array. Returns nullptr if no
+// binding is currently associated with the clip.
+//   binding+0x18: hkRefPtr<hkaAnimation> animation
+//   binding+0x20: hkArray<int16_t>       transformTrackToBoneIndices
+static const RE::hkArrayRawLayout* GetTrackToBoneIndices(const RE::hkbClipGenerator* a_clip)
+{
+	auto* bindingBytes = GetActiveBindingBytes(a_clip);
+	if (!bindingBytes) return nullptr;
+	return reinterpret_cast<const RE::hkArrayRawLayout*>(
+		bindingBytes + RE::kBindingOffset_transformTrackToBoneIndices);
+}
+
+// Find the TRACK index in `a_clip`'s binding that maps to the given skeleton
+// bone index. Returns -1 if no track in the binding maps to that bone (e.g.,
+// the bone has no animation track on this clip).
+static int32_t FindTrackIndexForBone(const RE::hkbClipGenerator* a_clip, int16_t a_boneIdx)
+{
+	const auto* arr = GetTrackToBoneIndices(a_clip);
+	if (!arr || !arr->data || arr->size <= 0) return -1;
+	const auto* indices = reinterpret_cast<const int16_t*>(arr->data);
+	for (int32_t t = 0; t < arr->size; ++t) {
+		if (indices[t] == a_boneIdx) return t;
+	}
+	return -1;
+}
+
+// Override: lerp base toward replacement absolute pose
+static void LerpTransform(RE::hkQsTransformRaw& base, const RE::hkQsTransformRaw& rep, float w)
+{
+	float iw = 1.0f - w;
+	for (int i = 0; i < 4; ++i)
+		base.translation[i] = base.translation[i] * iw + rep.translation[i] * w;
+	SlerpQuat(base.rotation, rep.rotation, w, base.rotation);
+	for (int i = 0; i < 4; ++i)
+		base.scale[i] = base.scale[i] * iw + rep.scale[i] * w;
+}
+
+// Additive: given the base pose from the original animation (origBase) and the
+// replacement pose (rep), compute delta = rep - origBase, then apply delta*weight
+// on top of whatever current output is. This lets additive work with full-pose
+// replacement animations, computing a proper offset.
+static void BlendAdditiveTransform(RE::hkQsTransformRaw& output,
+	const RE::hkQsTransformRaw& origBase, const RE::hkQsTransformRaw& rep, float w)
+{
+	for (int i = 0; i < 3; ++i)
+		output.translation[i] += (rep.translation[i] - origBase.translation[i]) * w;
+
+	float invBase[4];
+	InverseQuat(origBase.rotation, invBase);
+	float deltaRot[4];
+	MultiplyQuat(invBase, rep.rotation, deltaRot);
+	static constexpr float kIdentityQuat[4] = { 0.f, 0.f, 0.f, 1.f };
+	float weightedDelta[4];
+	SlerpQuat(kIdentityQuat, deltaRot, w, weightedDelta);
+	MultiplyQuat(output.rotation, weightedDelta, output.rotation);
+
+	for (int i = 0; i < 3; ++i) {
+		float deltaScale = (origBase.scale[i] > 0.0001f) ? (rep.scale[i] / origBase.scale[i]) : 1.0f;
+		output.scale[i] *= (1.0f + (deltaScale - 1.0f) * w);
+	}
+}
+
+// Resolve bone names in a TrackFilter to skeleton bone indices, against THIS character's
+// skeleton (which may differ between 1p/3p bodies). Each character gets its own
+// resolution so the same filter can apply correctly across all of an actor's bodies.
+//
+// Caller MUST hold s_trackFilterMutex (unique). The result is stored in a_resolved.
+static void ResolveForChar(SubMod::TrackFilter* a_filter,
+	CharResolved& a_resolved,
+	RE::hkbCharacter* a_character)
+{
+	if (!a_filter || !a_character) return;
+
+	uint64_t curVersion = a_filter->version.load(std::memory_order_relaxed);
+	// version > 0 means we've resolved at least once at this version. Treat "no
+	// matches" as a sticky cached negative result so we don't redo the search every
+	// Generate call for skeletons that don't contain the wanted bones.
+	if (a_resolved.version == curVersion) return;
+
+	a_resolved.nameAndIndex.clear();
+	a_resolved.version = curVersion;
+
+	auto* setup = a_character->setup._ptr;
+	if (!setup) return;
+
+	auto* skeleton = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr);
+	if (!skeleton) return;
+
+	auto* bonesArr = reinterpret_cast<RE::hkArrayRawLayout*>(skeleton + RE::kSkeletonOffset_bones);
+	auto* parentArr = reinterpret_cast<RE::hkArrayRawLayout*>(skeleton + RE::kSkeletonOffset_parentIndices);
+	if (!bonesArr->data || bonesArr->size <= 0) return;
+	if (!parentArr->data || parentArr->size <= 0) return;
+
+	int16_t numBones = static_cast<int16_t>(bonesArr->size);
+	auto* boneData = reinterpret_cast<uint8_t*>(bonesArr->data);
+	auto* parents = reinterpret_cast<int16_t*>(parentArr->data);
+
+	std::vector<std::string> wantedNames;
+	bool includeChildren;
+	{
+		std::lock_guard lock(a_filter->boneMutex);
+		wantedNames = a_filter->boneNames;
+		includeChildren = a_filter->includeChildren;
+	}
+
+	if (wantedNames.empty()) return;
+
+	std::unordered_set<int16_t> matched;
+	for (int16_t i = 0; i < numBones; ++i) {
+		auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
+		namePtr &= ~uintptr_t(1);
+		const char* boneName = reinterpret_cast<const char*>(namePtr);
+		if (!boneName) continue;
+
+		for (const auto& wanted : wantedNames) {
+			if (_stricmp(boneName, wanted.c_str()) == 0) {
+				matched.insert(i);
+				break;
+			}
+		}
+	}
+
+	if (includeChildren && !matched.empty()) {
+		bool changed = true;
+		while (changed) {
+			changed = false;
+			for (int16_t i = 0; i < numBones; ++i) {
+				if (matched.count(i)) continue;
+				int16_t parentIdx = parents[i];
+				if (parentIdx >= 0 && matched.count(parentIdx)) {
+					matched.insert(i);
+					changed = true;
+				}
+			}
+		}
+	}
+
+	std::vector<int16_t> sortedIndices(matched.begin(), matched.end());
+	std::sort(sortedIndices.begin(), sortedIndices.end());
+
+	a_resolved.nameAndIndex.reserve(sortedIndices.size());
+	for (int16_t idx : sortedIndices) {
+		auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + idx * RE::kHkaBoneStride);
+		namePtr &= ~uintptr_t(1);
+		const char* name = reinterpret_cast<const char*>(namePtr);
+		if (name) {
+			a_resolved.nameAndIndex.emplace_back(std::string(name), idx);
+		}
+	}
+
+	logger::info("[OAR-TrackFilter] Resolved {} bones on character {:X} (skel size={}, wanted={}, version={})",
+		a_resolved.nameAndIndex.size(), reinterpret_cast<uintptr_t>(a_character),
+		numBones, wantedNames.size(), curVersion);
+	for (auto& [name, idx] : a_resolved.nameAndIndex) {
+		logger::info("[OAR-TrackFilter]   bone[{}] = '{}' (char {:X})",
+			idx, name, reinterpret_cast<uintptr_t>(a_character));
+	}
+
+	// Diagnostic: dump bone names for every distinct character (one-shot per
+	// character) so we can see exactly what skeletons exist for THIS actor.
+	// Capped at 80 names to keep logs readable. Helps identify whether the
+	// 1stperson body, a weapon sub-graph, etc. has a differently-named bone.
+	{
+		static std::unordered_set<RE::hkbCharacter*> s_dumped;
+		if (s_dumped.insert(a_character).second) {
+			logger::info("[OAR-TrackFilter-Dump] Char {:X} ({} bones) full skeleton dump:",
+				reinterpret_cast<uintptr_t>(a_character), numBones);
+			int dumpMax = std::min<int>(numBones, 80);
+			for (int16_t i = 0; i < dumpMax; ++i) {
+				auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
+				namePtr &= ~uintptr_t(1);
+				const char* name = reinterpret_cast<const char*>(namePtr);
+				logger::info("[OAR-TrackFilter-Dump]   bone[{}] = '{}'", i, name ? name : "(null)");
+			}
+		}
+	}
+}
 
 void RegisterActorCharacter(RE::TESObjectREFR* a_refr)
 {
@@ -2101,75 +2399,21 @@ namespace
 				auto it = s_lastShouldReplace.find(a_this);
 				if (it != s_lastShouldReplace.end()) { prevKnown = true; prev = it->second; }
 			}
-			if (!prevKnown || prev != shouldReplace) {
-				std::unique_lock ulock(s_lastShouldReplaceMutex);
-				s_lastShouldReplace[a_this] = shouldReplace;
-				ulock.unlock();
+		if (!prevKnown || prev != shouldReplace) {
+			std::unique_lock ulock(s_lastShouldReplaceMutex);
+			s_lastShouldReplace[a_this] = shouldReplace;
+			ulock.unlock();
+
+			static std::atomic<int> s_transitionLogCount{ 0 };
+			int transCount = s_transitionLogCount.fetch_add(1, std::memory_order_relaxed);
+			if (transCount < 30) {
 				std::string winnerName = (winningInfo && winningInfo->parentSubMod)
 					? winningInfo->parentSubMod->GetName() : "(none)";
 				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={})",
 					resolvedSuffix, prevKnown ? (prev ? "true" : "false") : "?",
 					shouldReplace ? "true" : "false", winnerName,
 					totalCands, disabledCands, evalFalseCands, noCondCands);
-
-				// Detailed per-condition diagnostic on ANY transition
-				if (winningInfo && winningInfo->parentSubMod) {
-					auto* diagCS = winningInfo->parentSubMod->GetConditionSet();
-					if (diagCS && !diagCS->IsEmpty()) {
-						logger::info("[OAR-CondDiag] '{}' refr={:X} condCount={}",
-							resolvedSuffix, refr ? refr->GetFormID() : 0,
-							diagCS->GetConditions().size());
-						int idx = 0;
-						for (const auto& cond : diagCS->GetConditions()) {
-							bool condDisabled = cond->IsDisabled();
-							bool condNegated = cond->IsNegated();
-							bool evalResult = false;
-							if (!condDisabled && refr) {
-								try {
-									evalResult = cond->Evaluate(refr, a_this, winningInfo->parentSubMod);
-								} catch (...) { evalResult = false; }
-							} else {
-								evalResult = true;
-							}
-							logger::info("[OAR-CondDiag] '{}' cond[{}] '{}' disabled={} negated={} eval={} param='{}'",
-								resolvedSuffix, idx, cond->GetName(),
-								condDisabled, condNegated, evalResult,
-								cond->GetParameterString());
-							++idx;
-						}
-					}
-				} else if (!shouldReplace) {
-					// Also log when conditions FAIL so we can confirm correct behavior
-					for (auto* info : candidates) {
-						if (!info || !info->parentSubMod) continue;
-						if (info->parentSubMod->IsDisabled()) continue;
-						auto* diagCS = info->parentSubMod->GetConditionSet();
-						if (diagCS && !diagCS->IsEmpty()) {
-							logger::info("[OAR-CondDiag] '{}' FAILED refr={:X} condCount={}",
-								resolvedSuffix, refr ? refr->GetFormID() : 0,
-								diagCS->GetConditions().size());
-							int idx = 0;
-							for (const auto& cond : diagCS->GetConditions()) {
-								bool condDisabled = cond->IsDisabled();
-								bool condNegated = cond->IsNegated();
-								bool evalResult = false;
-								if (!condDisabled && refr) {
-									try {
-										evalResult = cond->Evaluate(refr, a_this, info->parentSubMod);
-									} catch (...) { evalResult = false; }
-								} else {
-									evalResult = true;
-								}
-								logger::info("[OAR-CondDiag] '{}' cond[{}] '{}' disabled={} negated={} eval={} param='{}'",
-									resolvedSuffix, idx, cond->GetName(),
-									condDisabled, condNegated, evalResult,
-									cond->GetParameterString());
-								++idx;
-							}
-						}
-						break;
-					}
-				}
+			}
 			}
 		}
 
@@ -2191,7 +2435,52 @@ namespace
 			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim);
 			bool bReplaceAnnot = winningInfo && winningInfo->parentSubMod ?
 				winningInfo->parentSubMod->GetReplaceAnnotations() : true;
-			if (replacement) {
+
+			// ---- Partial body (trackFilter) path ----
+			// When the winning submod has trackFilter.enabled, do NOT swap the animation
+			// slot. Instead register the replacement so Generate can sample it per-bone.
+		bool useTrackFilter = winningInfo && winningInfo->parentSubMod &&
+			winningInfo->parentSubMod->trackFilter.enabled && replacement;
+		if (useTrackFilter) {
+			{
+				std::unique_lock tfLock(s_trackFilterMutex);
+				RE::TESObjectREFR* tfActor = refr;
+				if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
+				if (tfActor) {
+					bool isNew = (s_charTrackFilterMap.find(tfActor) == s_charTrackFilterMap.end());
+					auto& state = s_charTrackFilterMap[tfActor];
+					// If the filter or replacement target changed, drop stale per-character
+					// resolution so it gets rebuilt against the current filter version.
+					if (state.filter != &winningInfo->parentSubMod->trackFilter ||
+						state.replacement != replacement) {
+						state.resolvedByChar.clear();
+						state.cachedRepByName.clear();
+						state.cachedBaseByName.clear();
+						state.cacheValid = false;
+					}
+					state.replacement = replacement;
+					state.filter = &winningInfo->parentSubMod->trackFilter;
+					state.sourceClip = a_this;
+					state.sourceClips.insert(a_this);
+					state.suffix = cacheSuffix;
+					// Seed lastSourceFrame so the staleness check doesn't immediately
+					// erase the entry before Generate has a chance to fire.
+					state.lastSourceFrame = s_currentFrame.load(std::memory_order_relaxed);
+					if (isNew) s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			if (*animSlot != originalAnim && originalAnim) {
+				*animSlot = originalAnim;
+			}
+			static int s_tfLog = 0;
+			if (s_tfLog < 20) {
+				logger::info("[OAR-TrackFilter] Registered filtered replacement for '{}' on actor {:X} (submod '{}')",
+					resolvedSuffix, reinterpret_cast<uintptr_t>(refr),
+					winningInfo->parentSubMod->GetName());
+				s_tfLog++;
+			}
+		} else if (replacement) {
+				// ---- Standard full-body replacement path ----
 				auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
 				if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
 					if (*animSlot != replacement) {
@@ -2202,9 +2491,6 @@ namespace
 						}
 						*animSlot = replacement;
 
-						// Only NULL triggers if we're replacing annotations.
-						// When replaceAnnotations is OFF, keep original triggers so the
-						// game's native sounds/events fire at their original timings.
 						if (bReplaceAnnot) {
 							InstallReplacementTriggers(a_this, cacheSuffix);
 						}
@@ -2220,7 +2506,6 @@ namespace
 				if (bReplaceAnnot) {
 					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
 				} else {
-					// replaceAnnotations OFF: ensure triggers are restored so native events fire
 					RestoreClipTriggers(a_this);
 				}
 				}
@@ -2359,6 +2644,23 @@ namespace
 		}
 
 	} else {
+		// Conditions failed — remove this clip from the source set
+		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
+			std::unique_lock tfLock(s_trackFilterMutex);
+			RE::TESObjectREFR* tfActor = refr;
+			if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
+			if (tfActor) {
+				auto it = s_charTrackFilterMap.find(tfActor);
+				if (it != s_charTrackFilterMap.end()) {
+					it->second.sourceClips.erase(a_this);
+					if (it->second.sourceClips.empty()) {
+						s_charTrackFilterMap.erase(it);
+						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+					}
+				}
+			}
+		}
+
 		// Conditions failed — restore original. Since originalAnim was validated via
 		// GetValidOriginal, it should be safe. But add a final defensive check in case
 		// the pointer was freed between validation and this point (race condition).
@@ -2447,15 +2749,328 @@ namespace
 				std::unique_lock lock(s_bypassMutex);
 				s_bypassSet.erase(a_this);
 			}
-		}
+			// Remove this clip from any track filter source sets to prevent stale
+			// pointers from being used if a new clip is allocated at the same address.
+			if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
+				std::unique_lock tfLock(s_trackFilterMutex);
+				for (auto it = s_charTrackFilterMap.begin(); it != s_charTrackFilterMap.end(); ) {
+					it->second.sourceClips.erase(a_this);
+					if (it->second.sourceClip == a_this) it->second.sourceClip = nullptr;
+					if (it->second.sourceClips.empty()) {
+						it = s_charTrackFilterMap.erase(it);
+						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+					} else {
+						++it;
+					}
+				}
+			}
+	}
 
-		Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
+	Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
 	}
 
 	void hkbClipGenerator_Generate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context,
 		const RE::hkbGeneratorOutput** a_activeChildrenOutput, RE::hkbGeneratorOutput& a_output, float a_timeOffset)
 	{
 		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+
+		// Fast path: skip all locking if no track filter is active anywhere
+		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) <= 0) return;
+
+		auto* character = a_context ? a_context->character : nullptr;
+		if (!character) return;
+
+		// Use the cache-aware resolver. On miss it re-registers the player's
+		// graphs (so newly-spawned graphs become tracked). Returns nullptr for
+		// NPCs whose characters aren't in our cache — for those we MUST NOT
+		// fall back to "assume player", or we'd apply the player's filter to
+		// nearby NPCs' skeletons.
+		auto* actor = GetRefrFromContext(a_context);
+		if (!actor) return;
+
+		// Get output pose pointers up-front (no lock needed).
+		auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
+		if (!tracksPtr) return;
+		auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
+		auto& poseHeader = headers[RE::kTrackIndex_Pose];
+		if (poseHeader.numData <= 0 || poseHeader.dataOffset <= 0) return;
+		auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
+		int16_t numOutputBones = poseHeader.numData;
+
+		// Acquire UNIQUE lock for the whole track-filter operation. We may need to
+		// resolve bones for a new character (write), update cache (write), or invalidate
+		// stale entries (write). The lock is released before any recursive _Generate.
+		std::unique_lock tfLock(s_trackFilterMutex);
+
+		auto it = s_charTrackFilterMap.find(actor);
+		if (it == s_charTrackFilterMap.end()) return;
+
+		auto& state = it->second;
+		auto* filterPtr = state.filter;
+		auto* replacement = state.replacement;
+		if (!filterPtr || !filterPtr->enabled || !replacement) return;
+
+		// --- Staleness check (Issue #2 fix) ---
+		// If no source clip has fired Generate for kTrackFilterStaleFrames frames,
+		// the override is "leaking" past its conditions — erase the entry. This catches
+		// the case where Update never fires the conditions=false branch because the
+		// source clip was deactivated mid-state-transition.
+		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
+		if (state.cacheValid && state.lastSourceFrame > 0 &&
+			curFrame > state.lastSourceFrame + kTrackFilterStaleFrames) {
+			static int s_staleLog = 0;
+			if (s_staleLog < 5) {
+				logger::info("[OAR-TrackFilter] Cache stale (last src frame={}, cur={}). Erasing entry for actor {:X}",
+					state.lastSourceFrame, curFrame, reinterpret_cast<uintptr_t>(actor));
+				s_staleLog++;
+			}
+			s_charTrackFilterMap.erase(it);
+			s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+			return;
+		}
+
+		// --- Per-character resolution (Issue #1 fix) ---
+		// Each hkbCharacter (1p body, 3p body, weapon graph) resolves filter bone
+		// names against its own skeleton, so the same filter applies correctly to
+		// whichever character is being rendered.
+		auto& cr = state.resolvedByChar[character];
+		ResolveForChar(filterPtr, cr, character);
+		if (cr.nameAndIndex.empty()) return;
+
+		float weight = filterPtr->weight;
+		auto mode = filterPtr->mode;
+		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+		auto** animSlot = a_this->GetAnimationSlot();
+		bool inRecursion = (animSlot && *animSlot == replacement);
+
+		static int s_genEntryLog = 0;
+		if (s_genEntryLog < 6) {
+			logger::info("[OAR-TrackFilter] Generate: char={:X} a_this={:X} isSource={} inRec={} bones={}",
+				reinterpret_cast<uintptr_t>(character),
+				reinterpret_cast<uintptr_t>(a_this),
+				isSourceClip, inRecursion, cr.nameAndIndex.size());
+			s_genEntryLog++;
+		}
+
+		// Don't re-enter our logic during the swap-fallback's recursive _Generate.
+		if (inRecursion) return;
+
+		// =====================================================================
+		// SOURCE CLIP PATH
+		//
+		// Preferred path: read the binding's transformTrackToBoneIndices, sample
+		// the replacement directly via SamplePartialTracks, look up the right
+		// track per filtered bone, and apply. This is the "correct track / right
+		// joint" path.
+		//
+		// Fallback path: if no binding can be read for this clip, fall back to
+		// the swap-and-recursive-Generate approach so we don't regress to "no
+		// override at all". This matches the previous behavior.
+		// =====================================================================
+		if (isSourceClip) {
+			RE::hkaAnimation* repAnim = replacement;
+			if (!repAnim) return;
+
+			const auto* trackToBoneArr = GetTrackToBoneIndices(a_this);
+			const bool haveBinding =
+				trackToBoneArr && trackToBoneArr->data && trackToBoneArr->size > 0;
+
+			static int s_pathLog = 0;
+			if (s_pathLog < 3) {
+				logger::info("[OAR-TrackFilter] Source path: clip={:X} haveBinding={} bindingTracks={}",
+					reinterpret_cast<uintptr_t>(a_this), haveBinding,
+					haveBinding ? trackToBoneArr->size : 0);
+				s_pathLog++;
+			}
+
+			if (haveBinding) {
+				// ============== Direct sampling path ==============
+				const auto* trackToBoneData = reinterpret_cast<const int16_t*>(trackToBoneArr->data);
+				const int32_t bindingNumTracks = trackToBoneArr->size;
+				const int32_t animNumTracks = repAnim->numberOfTransformTracks;
+				const int32_t numTracksToSample = std::min(animNumTracks, bindingNumTracks);
+				if (numTracksToSample <= 0) return;
+
+				float localTime = a_this->GetLocalTime();
+				thread_local std::vector<RE::hkQsTransformRaw> tl_sampledTracks;
+				thread_local std::vector<float> tl_sampledFloats;
+				tl_sampledTracks.assign(numTracksToSample, RE::hkQsTransformRaw{});
+				tl_sampledFloats.assign(std::max(1, repAnim->numberOfFloatTracks), 0.0f);
+
+				repAnim->SamplePartialTracks(localTime,
+					static_cast<uint32_t>(numTracksToSample),
+					tl_sampledTracks.data(),
+					static_cast<uint32_t>(repAnim->numberOfFloatTracks),
+					tl_sampledFloats.data(),
+					nullptr);
+
+				static int s_bindingDiagLog = 0;
+				bool wantBindingDiag = (s_bindingDiagLog < 3);
+				if (wantBindingDiag) {
+					logger::info("[OAR-TrackFilter-Binding] char={:X} bindingTracks={} animTracks={} localTime={:.3f}",
+						reinterpret_cast<uintptr_t>(character),
+						bindingNumTracks, animNumTracks, localTime);
+				}
+
+				for (auto& [name, idx] : cr.nameAndIndex) {
+					if (idx < 0 || idx >= numOutputBones) continue;
+
+					int32_t trackIdx = -1;
+					for (int32_t t = 0; t < numTracksToSample; ++t) {
+						if (trackToBoneData[t] == idx) { trackIdx = t; break; }
+					}
+
+					if (wantBindingDiag) {
+						logger::info("[OAR-TrackFilter-Binding]   '{}': boneIdx={} trackIdx={} (identity={})",
+							name, idx, trackIdx, (trackIdx == idx ? "yes" : "no"));
+					}
+
+					if (trackIdx < 0) continue;
+
+					const RE::hkQsTransformRaw& repVal = tl_sampledTracks[trackIdx];
+					RE::hkQsTransformRaw baseVal = outputPose[idx];
+
+					state.cachedRepByName[name] = repVal;
+					state.cachedBaseByName[name] = baseVal;
+
+					if (mode == SubMod::TrackFilter::Mode::Override) {
+						LerpTransform(outputPose[idx], repVal, weight);
+					} else {
+						BlendAdditiveTransform(outputPose[idx], baseVal, repVal, weight);
+					}
+				}
+				if (wantBindingDiag) s_bindingDiagLog++;
+
+				state.cacheValid = true;
+				state.lastSourceFrame = curFrame;
+
+				static int s_finalLog = 0;
+				if (s_finalLog < 5) {
+					int dumped = 0;
+					for (auto& [name, idx] : cr.nameAndIndex) {
+						if (dumped++ >= 2) break;
+						if (idx < 0 || idx >= numOutputBones) continue;
+						auto& f = outputPose[idx];
+						auto baseIt = state.cachedBaseByName.find(name);
+						auto repIt = state.cachedRepByName.find(name);
+						if (baseIt == state.cachedBaseByName.end() || repIt == state.cachedRepByName.end())
+							continue;
+						logger::info("[OAR-TrackFilter] FINAL(direct) src char={:X} '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
+							reinterpret_cast<uintptr_t>(character), name, idx,
+							baseIt->second.translation[0], baseIt->second.translation[1], baseIt->second.translation[2],
+							repIt->second.translation[0], repIt->second.translation[1], repIt->second.translation[2],
+							f.translation[0], f.translation[1], f.translation[2],
+							mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
+							weight);
+					}
+					s_finalLog++;
+				}
+				return;
+			}
+
+			// ============== Fallback: swap-and-recursive-Generate ==============
+			// Use this only when no binding is reachable. This is the previous
+			// behavior — it produces SOME override (better than none). Note: it
+			// implicitly assumes binding[track]==bone (identity); if that's not
+			// true on this skeleton, the override may land on a sibling bone.
+			if (!animSlot || !*animSlot) return;
+
+			RE::hkaAnimation* originalInSlot = *animSlot;
+
+			thread_local std::vector<RE::hkQsTransformRaw> tl_fullBasePose;
+			tl_fullBasePose.resize(numOutputBones);
+			memcpy(tl_fullBasePose.data(), outputPose, numOutputBones * sizeof(RE::hkQsTransformRaw));
+
+			*animSlot = replacement;
+			tfLock.unlock();
+			Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+			tfLock.lock();
+
+			*animSlot = originalInSlot;
+
+			it = s_charTrackFilterMap.find(actor);
+			if (it == s_charTrackFilterMap.end()) {
+				memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
+				return;
+			}
+			auto& state2 = it->second;
+
+			for (auto& [name, idx] : cr.nameAndIndex) {
+				if (idx < 0 || idx >= numOutputBones) continue;
+				state2.cachedRepByName[name] = outputPose[idx];
+				state2.cachedBaseByName[name] = tl_fullBasePose[idx];
+			}
+			state2.cacheValid = true;
+			state2.lastSourceFrame = curFrame;
+
+			memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
+
+			for (auto& [name, idx] : cr.nameAndIndex) {
+				if (idx < 0 || idx >= numOutputBones) continue;
+				auto rIt = state2.cachedRepByName.find(name);
+				if (rIt == state2.cachedRepByName.end()) continue;
+				if (mode == SubMod::TrackFilter::Mode::Override) {
+					LerpTransform(outputPose[idx], rIt->second, weight);
+				} else {
+					auto bIt = state2.cachedBaseByName.find(name);
+					if (bIt != state2.cachedBaseByName.end())
+						BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
+				}
+			}
+
+			static int s_fbFinalLog = 0;
+			if (s_fbFinalLog < 5) {
+				for (auto& [name, idx] : cr.nameAndIndex) {
+					if (idx < 0 || idx >= numOutputBones) continue;
+					auto& f = outputPose[idx];
+					logger::info("[OAR-TrackFilter] FINAL(fallback) src char={:X} '{}'[{}]: out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
+						reinterpret_cast<uintptr_t>(character), name, idx,
+						f.translation[0], f.translation[1], f.translation[2],
+						mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
+						weight);
+					break;
+				}
+				s_fbFinalLog++;
+			}
+			return;
+		}
+
+		// =====================================================================
+		// NON-SOURCE CLIP PATH: apply the cached rep value (sampled by the
+		// source clip earlier this frame) so the filter "sticks" across blends.
+		// =====================================================================
+		if (!state.cacheValid) return;
+
+		for (auto& [name, idx] : cr.nameAndIndex) {
+			if (idx < 0 || idx >= numOutputBones) continue;
+			auto rIt = state.cachedRepByName.find(name);
+			if (rIt == state.cachedRepByName.end()) continue;
+
+			if (mode == SubMod::TrackFilter::Mode::Override) {
+				LerpTransform(outputPose[idx], rIt->second, weight);
+			} else {
+				auto bIt = state.cachedBaseByName.find(name);
+				if (bIt != state.cachedBaseByName.end()) {
+					BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
+				} else {
+					LerpTransform(outputPose[idx], rIt->second, weight);
+				}
+			}
+		}
+
+		static int s_nonSrcFinalLog = 0;
+		if (s_nonSrcFinalLog < 5) {
+			int dumped = 0;
+			for (auto& [name, idx] : cr.nameAndIndex) {
+				if (dumped++ >= 2) break;
+				if (idx < 0 || idx >= numOutputBones) continue;
+				auto& f = outputPose[idx];
+				logger::info("[OAR-TrackFilter] FINAL nonsrc char={:X} '{}'[{}]: trans=({:.3f},{:.3f},{:.3f})",
+					reinterpret_cast<uintptr_t>(character), name, idx,
+					f.translation[0], f.translation[1], f.translation[2]);
+			}
+			s_nonSrcFinalLog++;
+		}
 	}
 
 	void hkbClipGenerator_StartEcho(RE::hkbClipGenerator* a_this, float a_duration)
@@ -2465,6 +3080,9 @@ namespace
 
 	void HookedActorUpdate()
 	{
+		// Per-frame tick: increment the global frame counter used by the partial-body
+		// track-filter staleness check (see hkbClipGenerator_Generate).
+		s_currentFrame.fetch_add(1, std::memory_order_relaxed);
 		Hooks::UpdateHooks::RunActorUpdatesOrig();
 	}
 

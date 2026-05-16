@@ -12,6 +12,7 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <mutex>
 
 ImGuiWindowFlags UIMain::GetWindowFlags() const
 {
@@ -56,12 +57,22 @@ void UIMain::DrawFilterBar()
 
 	ImGui::SameLine(availWidth * 0.5f);
 
+	if (!modeInitialized) {
+		currentMode = static_cast<UICommon::EditorMode>(
+			std::clamp(Settings::GetSingleton()->iEditorMode, 0, 2));
+		modeInitialized = true;
+	}
 	int modeInt = static_cast<int>(currentMode);
+	UICommon::EditorMode prevMode = currentMode;
 	if (ImGui::RadioButton("Inspect", modeInt == 0)) currentMode = UICommon::EditorMode::kInspect;
 	ImGui::SameLine();
 	if (ImGui::RadioButton("User", modeInt == 1)) currentMode = UICommon::EditorMode::kUser;
 	ImGui::SameLine();
 	if (ImGui::RadioButton("Author", modeInt == 2)) currentMode = UICommon::EditorMode::kAuthor;
+	if (currentMode != prevMode) {
+		Settings::GetSingleton()->iEditorMode = static_cast<int>(currentMode);
+		Settings::GetSingleton()->Save();
+	}
 
 	ImGui::SameLine(availWidth - 140);
 	ImGui::Text("Target:");
@@ -342,6 +353,12 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->GetShareRandomResults() ? "Yes" : "No");
 	}
 
+	// --- Track Filter (partial body animation layering) ---
+	ImGui::Spacing();
+	if (ImGui::CollapsingHeader("Track Filter (Partial Body Layering)")) {
+		DrawTrackFilterSection(a_subMod, editable);
+	}
+
 	// --- Replacement Animations (collapsed by default, under submod like original) ---
 	ImGui::Spacing();
 	if (ImGui::CollapsingHeader("Replacement Animations")) {
@@ -389,10 +406,21 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["keepRandomResultsOnLoop"] = a_subMod->GetKeepRandomResultsOnLoop();
 				json["shareRandomResults"] = a_subMod->GetShareRandomResults();
 				json["replaceAnnotations"] = a_subMod->GetReplaceAnnotations();
-				if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
-					json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
+			if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
+				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
 
-				if (auto* condSet = a_subMod->GetConditionSet()) {
+			{
+				auto& tf = a_subMod->trackFilter;
+				nlohmann::json tfJson;
+				tfJson["enabled"] = tf.enabled;
+				tfJson["mode"] = (tf.mode == SubMod::TrackFilter::Mode::Override) ? "override" : "additive";
+				tfJson["weight"] = tf.weight;
+				tfJson["includeChildren"] = tf.includeChildren;
+				tfJson["bones"] = tf.boneNames;
+				json["trackFilter"] = tfJson;
+			}
+
+			if (auto* condSet = a_subMod->GetConditionSet()) {
 					auto& arr = json["conditions"];
 					arr = nlohmann::json::array();
 					for (const auto& cond : condSet->GetConditions()) {
@@ -717,6 +745,226 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 	}
 
 	ImGui::PopID();
+}
+
+void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
+{
+	if (!a_subMod) return;
+
+	auto& tf = a_subMod->trackFilter;
+
+	// Havok skeleton bones — matches the actual animation skeleton definition
+	static const char* kKnownBones[] = {
+		// Core body
+		"Root", "COM", "Pelvis", "Spine1", "Spine2", "Chest", "Neck", "Head",
+		// Left arm
+		"LArm_Collarbone", "LArm_UpperArm", "LArm_UpperTwist1", "LArm_UpperTwist2",
+		"LArm_ForeArm1", "LArm_ForeArm2", "LArm_ForeArm3", "LArm_Hand",
+		"LArm_Finger11", "LArm_Finger12", "LArm_Finger13",
+		"LArm_Finger21", "LArm_Finger22", "LArm_Finger23",
+		"LArm_Finger31", "LArm_Finger32", "LArm_Finger33",
+		"LArm_Finger41", "LArm_Finger42", "LArm_Finger43",
+		"LArm_Finger51", "LArm_Finger52", "LArm_Finger53",
+		// Right arm
+		"RArm_Collarbone", "RArm_UpperArm", "RArm_UpperTwist1", "RArm_UpperTwist2",
+		"RArm_ForeArm1", "RArm_ForeArm2", "RArm_ForeArm3", "PipboyBone", "RArm_Hand",
+		"RArm_Finger11", "RArm_Finger12", "RArm_Finger13",
+		"RArm_Finger21", "RArm_Finger22", "RArm_Finger23",
+		"RArm_Finger31", "RArm_Finger32", "RArm_Finger33",
+		"RArm_Finger41", "RArm_Finger42", "RArm_Finger43",
+		"RArm_Finger51", "RArm_Finger52", "RArm_Finger53",
+		// Legs
+		"LLeg_Thigh", "LLeg_Calf", "LLeg_Foot", "LLeg_Toe1",
+		"RLeg_Thigh", "RLeg_Calf", "RLeg_Foot", "RLeg_Toe1",
+		// Weapon (right hand)
+		"Weapon", "WeaponBolt", "WeaponTrigger", "WeaponMagazine",
+		"WeaponMagazineChild1", "WeaponMagazineChild2", "WeaponMagazineChild3",
+		"WeaponMagazineChild4", "WeaponMagazineChild5",
+		"WeaponMagazineChild6", "WeaponMagazineChild7", "WeaponMagazineChild8",
+		"WeaponMagazineChild9", "WeaponMagazineChild10", "WeaponMagazineChild11",
+		"WeaponMagazineChild12", "WeaponMagazineChild13", "WeaponMagazineChild14",
+		"WeaponMagazineChild15",
+		"WeaponOptics1", "WeaponOptics2",
+		"WeaponExtra1", "WeaponExtra2", "WeaponExtra3",
+		"WeaponExtra4", "WeaponExtra5", "WeaponExtra6", "WeaponExtra7",
+		"WeaponExtra8", "WeaponExtra9", "WeaponExtra10", "WeaponExtra11",
+		"WeaponExtra12", "WeaponExtra13", "WeaponExtra14", "WeaponExtra15",
+		"WeaponExtra16", "WeaponExtra17", "WeaponExtra18", "WeaponExtra19", "WeaponExtra20",
+		"WeaponBipod", "WeaponBipodL", "WeaponBipodR",
+		// Weapon (left hand)
+		"WeaponLeft",
+		// IK / Camera / Anim objects
+		"WeaponIKTargetL", "WeaponIKTargetR",
+		"WeaponIKTargetLMirror", "WeaponIKTargetRMirror",
+		"Camera", "Camera Control", "CamTarget",
+		"AnimObjectA", "AnimObjectB",
+		"AnimObjectL1", "AnimObjectL2", "AnimObjectL3",
+		"AnimObjectR1", "AnimObjectR2", "AnimObjectR3",
+		// Helpers
+		"L_RibHelper", "R_RibHelper",
+	};
+
+	ImGui::Indent(8.f);
+
+	if (a_editable) {
+		if (ImGui::Checkbox("Enabled##trackFilter", &tf.enabled)) {
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(
+				"When enabled, this submod's replacement animations are applied\n"
+				"only to the specified bones instead of replacing the full animation.\n"
+				"The filtered bones are blended on top of whatever base animation\n"
+				"is currently playing.");
+		}
+
+		if (tf.enabled) {
+			ImGui::Spacing();
+
+			int modeInt = (tf.mode == SubMod::TrackFilter::Mode::Override) ? 0 : 1;
+			ImGui::SetNextItemWidth(140);
+			if (ImGui::Combo("Blend Mode##trackFilter", &modeInt, "Override\0Additive\0")) {
+				tf.mode = (modeInt == 0) ? SubMod::TrackFilter::Mode::Override : SubMod::TrackFilter::Mode::Additive;
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Override: replacement bone transforms directly replace the base pose (lerped by weight).\n"
+					"Additive: replacement transforms are added on top of the base pose.");
+			}
+
+			ImGui::SetNextItemWidth(200);
+			if (ImGui::SliderFloat("Weight##trackFilter", &tf.weight, 0.0f, 1.0f, "%.2f")) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("Blend strength. 0 = no effect, 1 = full replacement/additive strength.");
+			}
+
+			if (ImGui::Checkbox("Include Children##trackFilter", &tf.includeChildren)) {
+				tf.version.fetch_add(1, std::memory_order_relaxed);
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"When enabled, all child bones in the hierarchy below the specified\n"
+					"bones are also included. e.g. 'LArm_UpperArm' will include the\n"
+					"entire left arm chain down to the hand.");
+			}
+
+			ImGui::Spacing();
+			ImGui::Separator();
+
+			// Take a snapshot for display to avoid holding lock during ImGui rendering
+			std::vector<std::string> boneSnapshot;
+			{
+				std::lock_guard lock(tf.boneMutex);
+				boneSnapshot = tf.boneNames;
+			}
+			ImGui::TextColored(UICommon::Colors::AccentBlue, "Filtered Bones (%zu)", boneSnapshot.size());
+			ImGui::Spacing();
+			int removeIdx = -1;
+			for (int i = 0; i < static_cast<int>(boneSnapshot.size()); ++i) {
+				ImGui::PushID(i);
+				ImGui::BulletText("%s", boneSnapshot[i].c_str());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("X##removeBone")) {
+					removeIdx = i;
+				}
+				ImGui::PopID();
+			}
+			if (removeIdx >= 0) {
+				std::lock_guard lock(tf.boneMutex);
+				if (removeIdx < static_cast<int>(tf.boneNames.size())) {
+					tf.boneNames.erase(tf.boneNames.begin() + removeIdx);
+				}
+				tf.version.fetch_add(1, std::memory_order_relaxed);
+				a_subMod->SetDirty(true);
+			}
+
+			ImGui::Spacing();
+
+			if (ImGui::Button("Add Bone...")) {
+				ImGui::OpenPopup("AddBonePopup");
+			}
+			ImGui::SameLine();
+
+			static char customBoneName[128]{};
+			ImGui::SetNextItemWidth(160);
+			ImGui::InputTextWithHint("##customBone", "Custom bone name", customBoneName, sizeof(customBoneName));
+			ImGui::SameLine();
+			bool canAddCustom = customBoneName[0] != '\0';
+			if (!canAddCustom) ImGui::BeginDisabled();
+			if (ImGui::Button("Add Custom")) {
+				std::lock_guard lock(tf.boneMutex);
+				bool alreadyExists = false;
+				for (auto& name : tf.boneNames) {
+					if (name == customBoneName) { alreadyExists = true; break; }
+				}
+				if (!alreadyExists) {
+					tf.boneNames.emplace_back(customBoneName);
+					tf.version.fetch_add(1, std::memory_order_relaxed);
+					a_subMod->SetDirty(true);
+				}
+				customBoneName[0] = '\0';
+			}
+			if (!canAddCustom) ImGui::EndDisabled();
+
+			if (ImGui::BeginPopup("AddBonePopup")) {
+				static char boneFilter[64]{};
+				ImGui::InputTextWithHint("##boneSearch", "Search bones...", boneFilter, sizeof(boneFilter));
+				ImGui::Separator();
+
+				for (const char* bone : kKnownBones) {
+					if (boneFilter[0] != '\0' && !UICommon::FuzzyMatch(boneFilter, bone)) continue;
+
+					bool alreadyAdded = false;
+					for (const auto& name : boneSnapshot) {
+						if (name == bone) { alreadyAdded = true; break; }
+					}
+
+					if (alreadyAdded) {
+						ImGui::TextDisabled("  %s (already added)", bone);
+					} else if (ImGui::MenuItem(bone)) {
+						std::lock_guard lock(tf.boneMutex);
+						tf.boneNames.emplace_back(bone);
+						tf.version.fetch_add(1, std::memory_order_relaxed);
+						a_subMod->SetDirty(true);
+					}
+				}
+				ImGui::EndPopup();
+			}
+
+			if (boneSnapshot.empty()) {
+				ImGui::Spacing();
+				ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.1f, 1.0f),
+					"No bones selected — track filter will have no effect.");
+			}
+		}
+	} else {
+		ImGui::Text("Enabled: %s", tf.enabled ? "Yes" : "No");
+		if (tf.enabled) {
+			ImGui::Text("Mode: %s  |  Weight: %.2f  |  Children: %s",
+				tf.mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
+				tf.weight,
+				tf.includeChildren ? "Yes" : "No");
+			std::vector<std::string> displayBones;
+			{
+				std::lock_guard lock(tf.boneMutex);
+				displayBones = tf.boneNames;
+			}
+			if (!displayBones.empty()) {
+				ImGui::Text("Bones:");
+				for (const auto& name : displayBones) {
+					ImGui::BulletText("%s", name.c_str());
+				}
+			} else {
+				UICommon::TextUnformattedDisabled("No bones configured");
+			}
+		}
+	}
+
+	ImGui::Unindent(8.f);
 }
 
 void UIMain::DrawReplacementAnimList(SubMod* a_subMod)

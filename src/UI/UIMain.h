@@ -35,11 +35,13 @@ private:
 	void DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod);
 	void DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_depth = 0);
 	void DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, int a_index, SubMod* a_subMod, int a_depth);
+	void DrawTrackFilterSection(SubMod* a_subMod, bool a_editable);
 	void DrawReplacementAnimList(SubMod* a_subMod);
 	void DrawBottomBar();
 	void DrawSettingsPanel();
 
 	UICommon::EditorMode currentMode{ UICommon::EditorMode::kInspect };
+	bool modeInitialized{ false };
 	char filterText[256]{};
 	uint32_t evalTargetFormID{ 0x14 };
 	SubMod* selectedSubMod{ nullptr };

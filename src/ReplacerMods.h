@@ -4,6 +4,8 @@
 #include "HavokTypes.h"
 #include "BaseConditions.h"
 #include "Functions.h"
+#include <atomic>
+#include <mutex>
 
 class ReplacementAnimation;
 
@@ -81,6 +83,21 @@ public:
 	std::vector<std::unique_ptr<IFunction>> functionsOnActivate;
 	std::vector<std::unique_ptr<IFunction>> functionsOnDeactivate;
 	std::vector<std::unique_ptr<IFunction>> functionsOnTrigger;
+
+	// Partial body animation layering: only apply replacement to specific bones
+	struct TrackFilter {
+		bool enabled = false;
+		enum class Mode { Override, Additive } mode = Mode::Additive;
+		float weight = 1.0f;
+		bool includeChildren = true;
+		std::vector<std::string> boneNames;
+		// Bumped whenever boneNames or includeChildren changes. Each character's
+		// resolved bone-index map (in Hooks.cpp) tracks the version it was built at
+		// and re-resolves when this version changes.
+		std::atomic<uint64_t> version{ 1 };
+		std::mutex boneMutex;
+	};
+	TrackFilter trackFilter;
 };
 
 class ReplacerMod

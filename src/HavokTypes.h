@@ -286,6 +286,9 @@ namespace RE
 		hkArray<Annotation, hkContainerHeapAllocator> annotations;
 	};
 
+	// Forward decl for SamplePartialTracks parameter (hkQsTransform layout = hkQsTransformRaw)
+	struct hkQsTransformRaw;
+
 	struct hkaAnimation : public hkReferencedObject
 	{
 		int32_t type;                    // +0x10 AnimationType (1..5)
@@ -294,6 +297,24 @@ namespace RE
 		int32_t numberOfFloatTracks;     // +0x1C
 		// +0x20: extractedMotion (hkRefPtr)
 		// +0x28: annotationTracks (hkArray<hkaAnnotationTrack>)
+
+		// Vtable [4] in F4 (Havok 2014, confirmed via SKSE/CommonLibSSE NG): SamplePartialTracks
+		// Samples this animation at a_time and fills a_outTracks (track-indexed) with the
+		// per-track hkQsTransform. a_outFloats is filled with float track values.
+		void SamplePartialTracks(float a_time,
+			uint32_t a_maxNumTransformTracks,
+			hkQsTransformRaw* a_outTracks,
+			uint32_t a_maxNumFloatTracks,
+			float* a_outFloats,
+			void* a_chunkCache /* hkaChunkCache* */) const
+		{
+			using SampleFn = void(*)(const hkaAnimation*, float, uint32_t,
+				hkQsTransformRaw*, uint32_t, float*, void*);
+			auto* vtbl = *reinterpret_cast<void* const* const*>(this);
+			auto fn = reinterpret_cast<SampleFn>(vtbl[4]);
+			fn(this, a_time, a_maxNumTransformTracks, a_outTracks,
+				a_maxNumFloatTracks, a_outFloats, a_chunkCache);
+		}
 	};
 	static_assert(offsetof(hkaAnimation, type) == 0x10);
 	static_assert(offsetof(hkaAnimation, duration) == 0x14);
@@ -628,6 +649,67 @@ namespace RE
 			return func(this);
 		}
 	};
+
+	// ========================================================================
+	// hkbGeneratorOutput layout (confirmed from Full Body Awareness F4SE RE_Shims.h)
+	// Used by partial body animation layering to read/write per-bone transforms.
+	// ========================================================================
+
+	struct TrackMasterHeaderRaw {
+		int32_t numBytes;
+		int32_t numTracks;
+		uint8_t unused[8];
+	};
+	static_assert(sizeof(TrackMasterHeaderRaw) == 16);
+
+	struct TrackHeaderRaw {
+		int16_t capacity;
+		int16_t numData;           // number of bones (for pose track)
+		int16_t dataOffset;        // byte offset from Tracks* start to data
+		int16_t elementSizeBytes;
+		float   onFraction;
+		int8_t  flags;
+		int8_t  type;
+		int8_t  pad[2];
+	};
+	static_assert(sizeof(TrackHeaderRaw) == 16);
+
+	// Track indices within hkbGeneratorOutput::Tracks
+	static constexpr int kTrackIndex_Pose = 2;
+
+	struct hkQsTransformRaw {
+		float translation[4];  // xyz + w(usually 0)
+		float rotation[4];     // quaternion xyzw
+		float scale[4];        // xyz + w(usually 0)
+	};
+	static_assert(sizeof(hkQsTransformRaw) == 48);
+
+	// hkaSkeleton layout (for bone resolution in partial body layering)
+	// Access path: hkbCharacter.setup -> hkbCharacterSetup.animationSkeleton (offset +0x20)
+	// hkaSkeleton:
+	//   +0x18  hkArray<int16_t> parentIndices
+	//   +0x28  hkArray<hkaBone>  bones  (each hkaBone: hkStringPtr name(8) + lockTranslation(1) + pad(7) = 16 bytes)
+	struct hkArrayRawLayout {
+		void* data;
+		int32_t size;
+		int32_t capacityAndFlags;
+	};
+	static_assert(sizeof(hkArrayRawLayout) == 16);
+
+	static constexpr uintptr_t kSkeletonOffset_parentIndices = 0x18;
+	static constexpr uintptr_t kSkeletonOffset_bones = 0x28;
+	static constexpr size_t kHkaBoneStride = 16;  // hkStringPtr(8) + lockTranslation(1) + pad(7)
+
+	// hkaAnimationBinding layout (verified from CommonLibSSE NG / Havok 2014):
+	//   +0x00 vtable, +0x08 refCount/memSize
+	//   +0x10 hkRefPtr<hkaSkeletonInfo> originalSkeletonName (deprecated, sometimes absent)
+	//   +0x18 hkRefPtr<hkaAnimation> animation
+	//   +0x20 hkArray<int16_t>     transformTrackToBoneIndices  ← what we need
+	//   +0x30 hkArray<int16_t>     floatTrackToFloatSlotIndices
+	//   +0x40 hkArray<int16_t>     partitionIndices
+	//   +0x?? blendHint (BlendHint enum, byte)
+	//   total size 0x48
+	static constexpr uintptr_t kBindingOffset_transformTrackToBoneIndices = 0x20;
 
 	namespace GraphUtils
 	{

@@ -22,6 +22,7 @@ public:
 	std::uint32_t iToggleKey{ 0x18 };
 	bool  bRequireShift{ true };
 	bool  bPauseOnMenuOpen{ true };
+	int   iEditorMode{ 0 };
 
 	bool  bLogActivate{ true };
 	bool  bLogReplace{ true };

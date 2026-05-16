@@ -289,6 +289,33 @@ namespace Parsing
 			}
 			a_subMod->SetConditionSet(std::move(condSet));
 		}
+
+		// Partial body animation layering configuration
+		if (json.contains("trackFilter") && json["trackFilter"].is_object()) {
+			auto& tf = json["trackFilter"];
+			a_subMod->trackFilter.enabled = tf.value("enabled", false);
+			if (tf.contains("mode")) {
+				std::string mode = tf["mode"].get<std::string>();
+				if (mode == "override")
+					a_subMod->trackFilter.mode = SubMod::TrackFilter::Mode::Override;
+				else
+					a_subMod->trackFilter.mode = SubMod::TrackFilter::Mode::Additive;
+			}
+			a_subMod->trackFilter.weight = tf.value("weight", 1.0f);
+			a_subMod->trackFilter.includeChildren = tf.value("includeChildren", true);
+			if (tf.contains("bones") && tf["bones"].is_array()) {
+				for (const auto& b : tf["bones"]) {
+					a_subMod->trackFilter.boneNames.push_back(b.get<std::string>());
+				}
+			}
+			if (a_subMod->trackFilter.enabled) {
+				logger::info("[OAR] SubMod '{}' has trackFilter: mode={} weight={:.2f} bones={}",
+					a_subMod->GetName(),
+					a_subMod->trackFilter.mode == SubMod::TrackFilter::Mode::Override ? "override" : "additive",
+					a_subMod->trackFilter.weight,
+					a_subMod->trackFilter.boneNames.size());
+			}
+		}
 	}
 
 	void ParseUserConfig(SubMod* a_subMod, const std::filesystem::path& a_userConfigPath)

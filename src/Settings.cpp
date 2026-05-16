@@ -27,6 +27,7 @@ void Settings::Load()
 	iToggleKey   = static_cast<std::uint32_t>(ini.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
+	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
 
 	bLogActivate   = getB("AnimationLog", "bLogActivate", bLogActivate);
 	bLogReplace    = getB("AnimationLog", "bLogReplace", bLogReplace);
@@ -78,6 +79,7 @@ void Settings::Save()
 	setI("UI", "iToggleKey", static_cast<int>(iToggleKey));
 	setB("UI", "bRequireShift", bRequireShift);
 	setB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
+	setI("UI", "iEditorMode", iEditorMode);
 	setB("UI", "bEnableAnimationQueueProgressBar", bEnableAnimationQueueProgressBar);
 	ini.SetDoubleValue("UI", "fAnimationQueueLingerTime", static_cast<double>(fAnimationQueueLingerTime));
 
