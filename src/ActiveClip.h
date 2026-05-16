@@ -91,6 +91,9 @@ private:
 
 	RE::hkRefPtr<RE::hkbClipTriggerArray> triggersBackup;
 	bool triggersBackedUp{ false };
+
+	float deactivationDelayRemaining{ 0.0f };
+	bool deactivationDelayActive{ false };
 };
 
 class ActiveClipManager

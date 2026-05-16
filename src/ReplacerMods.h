@@ -35,6 +35,10 @@ public:
 	float GetCustomBlendTimeOnInterrupt() const { return customBlendTimeOnInterrupt; }
 	float GetCustomBlendTimeOnLoop() const { return customBlendTimeOnLoop; }
 	float GetCustomBlendTimeOnEcho() const { return customBlendTimeOnEcho; }
+	float GetDeactivationDelay() const { return deactivationDelay; }
+	void SetDeactivationDelay(float a_val) { deactivationDelay = a_val; }
+	bool GetPlayOnceFullBody() const { return playOnceFullBody; }
+	void SetPlayOnceFullBody(bool a_val) { playOnceFullBody = a_val; }
 	const std::string& GetRequiredProjectName() const { return requiredProjectName; }
 	const std::string& GetOverrideAnimFolder() const { return overrideAnimationsFolder; }
 	const std::filesystem::path& GetPath() const { return path; }
@@ -71,6 +75,8 @@ public:
 	float customBlendTimeOnInterrupt{ -1.0f };
 	float customBlendTimeOnLoop{ -1.0f };
 	float customBlendTimeOnEcho{ -1.0f };
+	float deactivationDelay{ 0.0f };
+	bool playOnceFullBody{ false };
 	std::string requiredProjectName;
 	std::string overrideAnimationsFolder;
 	std::filesystem::path path;
@@ -83,6 +89,13 @@ public:
 	std::vector<std::unique_ptr<IFunction>> functionsOnActivate;
 	std::vector<std::unique_ptr<IFunction>> functionsOnDeactivate;
 	std::vector<std::unique_ptr<IFunction>> functionsOnTrigger;
+
+	// Custom behavior events fired at replacement start/end.
+	// These allow users to force-fire events the behavior graph needs
+	// (e.g. ReloadEnd, SprintStop) that would otherwise be suppressed
+	// when triggers are NULLed during annotation replacement.
+	std::vector<std::string> eventsOnStart;
+	std::vector<std::string> eventsOnEnd;
 
 	// Partial body animation layering: only apply replacement to specific bones
 	struct TrackFilter {

@@ -275,6 +275,14 @@ namespace Parsing
 			a_subMod->customBlendTimeOnLoop = json["customBlendTimeOnLoop"].get<float>();
 		if (json.contains("customBlendTimeOnEcho"))
 			a_subMod->customBlendTimeOnEcho = json["customBlendTimeOnEcho"].get<float>();
+		if (json.contains("deactivationDelay"))
+			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
+		if (json.contains("playOnceFullBody"))
+			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
+		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
+			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
+		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
+			a_subMod->eventsOnEnd = json["eventsOnEnd"].get<std::vector<std::string>>();
 
 		if (json.contains("requiredProjectName"))
 			a_subMod->requiredProjectName = json["requiredProjectName"].get<std::string>();
@@ -338,6 +346,14 @@ namespace Parsing
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
+		if (json.contains("deactivationDelay"))
+			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
+		if (json.contains("playOnceFullBody"))
+			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
+		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
+			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
+		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
+			a_subMod->eventsOnEnd = json["eventsOnEnd"].get<std::vector<std::string>>();
 
 		if (json.contains("conditions") && json["conditions"].is_array()) {
 			auto condSet = std::make_unique<ConditionSet>();

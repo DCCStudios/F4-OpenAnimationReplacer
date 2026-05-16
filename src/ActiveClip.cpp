@@ -65,14 +65,32 @@ void ActiveClip::OnUpdate()
 	auto* subMod = currentReplacement->GetParentSubMod();
 	if (!subMod) return;
 
+	// "Play Once (Full Body)" — skip ALL condition re-evaluation while the clip is active.
+	// The replacement stays until the clip generator is deactivated by the game (e.g. state
+	// transition, reload finishes). This prevents mid-animation condition flips from yanking
+	// the replacement out (e.g. ammo count changing during a reload animation).
+	if (subMod->GetPlayOnceFullBody()) return;
+
 	if (subMod->IsInterruptible()) {
 		EvaluateAndApplyReplacement();
 	} else {
-		// Even if not interruptible, check if the current replacement's own conditions
-		// have become false - if so, restore original
-		if (subMod->IsDisabled() || !subMod->EvaluateConditions(refr, clipGenerator)) {
-			RestoreOriginalIndex();
-			currentReplacement = nullptr;
+		bool condsFalse = subMod->IsDisabled() || !subMod->EvaluateConditions(refr, clipGenerator);
+		float delay = subMod->GetDeactivationDelay();
+
+		if (condsFalse) {
+			if (delay > 0.0f) {
+				if (!deactivationDelayActive) {
+					deactivationDelayActive = true;
+					deactivationDelayRemaining = delay;
+				}
+			} else {
+				RestoreOriginalIndex();
+				currentReplacement = nullptr;
+				deactivationDelayActive = false;
+			}
+		} else {
+			deactivationDelayActive = false;
+			deactivationDelayRemaining = 0.0f;
 		}
 	}
 }
@@ -85,6 +103,16 @@ void ActiveClip::PreUpdate(float a_timestep)
 			it = blendingClips.erase(it);
 		} else {
 			++it;
+		}
+	}
+
+	if (deactivationDelayActive && currentReplacement) {
+		deactivationDelayRemaining -= a_timestep;
+		if (deactivationDelayRemaining <= 0.0f) {
+			deactivationDelayActive = false;
+			deactivationDelayRemaining = 0.0f;
+			RestoreOriginalIndex();
+			currentReplacement = nullptr;
 		}
 	}
 
@@ -239,6 +267,22 @@ void ActiveClip::EvaluateAndApplyReplacement()
 	auto* replacement = oar->GetReplacementAnimation(clipGenerator, originalBindingIndex, refr);
 
 	if (replacement != currentReplacement) {
+		// Transitioning away from a replacement to nothing — apply deactivation delay
+		if (currentReplacement && !replacement) {
+			auto* curSubMod = currentReplacement->GetParentSubMod();
+			float delay = curSubMod ? curSubMod->GetDeactivationDelay() : 0.0f;
+			if (delay > 0.0f) {
+				if (!deactivationDelayActive) {
+					deactivationDelayActive = true;
+					deactivationDelayRemaining = delay;
+				}
+				return;
+			}
+		}
+
+		deactivationDelayActive = false;
+		deactivationDelayRemaining = 0.0f;
+
 		if (currentReplacement && isActive) {
 			float blendOut = 0.2f;
 			auto* curSubMod = currentReplacement->GetParentSubMod();
@@ -267,6 +311,12 @@ void ActiveClip::EvaluateAndApplyReplacement()
 			if (newIndex >= 0) {
 				clipGenerator->animationBindingIndex = newIndex;
 			}
+		}
+	} else {
+		// Conditions are still matching — cancel any pending deactivation delay
+		if (replacement) {
+			deactivationDelayActive = false;
+			deactivationDelayRemaining = 0.0f;
 		}
 	}
 }

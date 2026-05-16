@@ -113,10 +113,20 @@ struct CharTrackFilterState {
 	bool blendingOut = false;        // true = ramping down, erase when alpha reaches 0
 	float blendElapsed = 0.0f;       // seconds elapsed since blend started
 	float blendDuration = 0.0f;      // target duration for current blend direction
+
+	// Deactivation delay: holds the filter active for N seconds after conditions become false
+	bool deactivationDelayActive = false;
+	float deactivationDelayRemaining = 0.0f;
 };
 static std::shared_mutex s_trackFilterMutex;
 static std::unordered_map<RE::TESObjectREFR*, CharTrackFilterState> s_charTrackFilterMap;
 static std::atomic<int> s_trackFilterActiveCount{ 0 };
+
+// Play Once (Full Body): tracks the initial replacement decision per clip generator.
+// When a clip has a playOnceFullBody candidate, the first evaluation result is locked
+// so that mid-animation condition flips in either direction are ignored.
+static std::shared_mutex s_playOnceDecisionMutex;
+static std::unordered_map<RE::hkbClipGenerator*, bool> s_playOnceDecision;
 
 // Per-frame counter, incremented in HookedActorUpdate. Used for staleness detection.
 static std::atomic<uint64_t> s_currentFrame{ 0 };
@@ -390,34 +400,39 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		excludeChildren = a_filter->excludeChildren;
 	}
 
-	if (wantedNames.empty()) return;
-
 	// Step 1: build the include set
 	std::unordered_set<int16_t> matched;
-	for (int16_t i = 0; i < numBones; ++i) {
-		auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
-		namePtr &= ~uintptr_t(1);
-		const char* boneName = reinterpret_cast<const char*>(namePtr);
-		if (!boneName) continue;
 
-		for (const auto& wanted : wantedNames) {
-			if (_stricmp(boneName, wanted.c_str()) == 0) {
-				matched.insert(i);
-				break;
+	if (wantedNames.empty()) {
+		// No explicit inclusion list — include every bone, then let exclusion subtract
+		for (int16_t i = 0; i < numBones; ++i)
+			matched.insert(i);
+	} else {
+		for (int16_t i = 0; i < numBones; ++i) {
+			auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
+			namePtr &= ~uintptr_t(1);
+			const char* boneName = reinterpret_cast<const char*>(namePtr);
+			if (!boneName) continue;
+
+			for (const auto& wanted : wantedNames) {
+				if (_stricmp(boneName, wanted.c_str()) == 0) {
+					matched.insert(i);
+					break;
+				}
 			}
 		}
-	}
 
-	if (includeChildren && !matched.empty()) {
-		bool changed = true;
-		while (changed) {
-			changed = false;
-			for (int16_t i = 0; i < numBones; ++i) {
-				if (matched.count(i)) continue;
-				int16_t parentIdx = parents[i];
-				if (parentIdx >= 0 && matched.count(parentIdx)) {
-					matched.insert(i);
-					changed = true;
+		if (includeChildren && !matched.empty()) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (int16_t i = 0; i < numBones; ++i) {
+					if (matched.count(i)) continue;
+					int16_t parentIdx = parents[i];
+					if (parentIdx >= 0 && matched.count(parentIdx)) {
+						matched.insert(i);
+						changed = true;
+					}
 				}
 			}
 		}
@@ -706,6 +721,48 @@ namespace
 	static std::shared_mutex s_originalAnimMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, RE::hkaAnimation*> s_originalAnimMap;
 
+	// Track the active SubMod per clip for firing custom "on end" events at deactivation.
+	static std::shared_mutex s_activeSubModMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, SubMod*> s_activeSubModMap;
+
+	// Clips whose triggers have been restored after the animation completed.
+	// Prevents EnsureReplacementTriggersInstalled from re-NULLing them.
+	static std::mutex s_triggersRestoredMutex;
+	static std::unordered_set<RE::hkbClipGenerator*> s_triggersRestoredSet;
+
+	// Direct Havok variable access (mirrors FPInertia approach).
+	// Path: BSAnimationGraphManager → BShkbAnimationGraph (0xC0)
+	//       → hkbCharacter (0x1C8) → hkbBehaviorGraph (0x80)
+	//       → hkbVariableValueSet (0x110) → hkArray<hkbVariableValue>.m_data (0x10)
+	static constexpr int kHavokVar_IsReloading = 31;
+
+	static bool SetHavokBool(RE::Actor* a_actor, int a_index, bool a_val)
+	{
+		if (!a_actor) return false;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
+		if (!a_actor->GetAnimationGraphManagerImpl(mgr) || !mgr) return false;
+		auto mgrAddr = reinterpret_cast<std::uintptr_t>(mgr.get());
+
+		auto* graphPtr = *reinterpret_cast<void**>(mgrAddr + 0xC0);
+		if (!graphPtr) return false;
+		auto graphAddr = reinterpret_cast<std::uintptr_t>(graphPtr);
+
+		auto* behaviorGraph = *reinterpret_cast<void**>(graphAddr + 0x1C8 + 0x80);
+		if (!behaviorGraph) return false;
+		auto bgAddr = reinterpret_cast<std::uintptr_t>(behaviorGraph);
+
+		auto* varSet = *reinterpret_cast<void**>(bgAddr + 0x110);
+		if (!varSet) return false;
+		auto vsAddr = reinterpret_cast<std::uintptr_t>(varSet);
+
+		struct VarArray { int32_t* data; int32_t size; int32_t capacityAndFlags; };
+		auto* arr = reinterpret_cast<VarArray*>(vsAddr + 0x10);
+		if (!arr->data || a_index < 0 || a_index >= arr->size) return false;
+
+		arr->data[a_index] = a_val ? 1 : 0;
+		return true;
+	}
+
 	// Validated access to s_originalAnimMap — returns nullptr and erases entry if the
 	// stored pointer is freed/stale (IsBadReadPtr or vtable mismatch). This prevents
 	// the crash scenario where weapon switch frees old animations but the map still
@@ -962,9 +1019,7 @@ namespace
 		*origTriggersPtr = nullptr;
 	}
 
-	// Every frame: ensure triggers stay NULL'd (engine may restore originals between frames,
-	// The engine may rebuild triggers from the clone's annotationTracks on reactivation.
-	// This function re-NULLs them every frame to keep original events suppressed.
+	// Every frame: ensure triggers stay NULL'd (engine may restore originals between frames).
 	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
 	{
 		if (!a_clipGen) return;
@@ -983,12 +1038,6 @@ namespace
 		}
 		*triggersPtr = nullptr;
 		*origTriggersPtr = nullptr;
-		static int s_reNullLog = 0;
-		if (s_reNullLog < 10) {
-			logger::info("[OAR-Triggers] Re-NULL'd clipGen={:X} (engine restored between frames)",
-				reinterpret_cast<uintptr_t>(a_clipGen));
-			s_reNullLog++;
-		}
 	}
 
 	static void RestoreClipTriggers(RE::hkbClipGenerator* a_clipGen)
@@ -2219,6 +2268,60 @@ namespace
 		}
 	}
 
+	// Deferred custom event queue — events are queued during hkbClipGenerator hooks
+	// and fired AFTER RunActorUpdatesOrig() completes to avoid re-entrant graph traversal.
+	struct DeferredEvent {
+		RE::TESObjectREFR* refr;
+		std::string eventName;
+		std::string label;
+	};
+	static std::mutex s_deferredEventMutex;
+	static std::vector<DeferredEvent> s_deferredEvents;
+
+	// Queue events for deferred firing (safe to call from within Havok update hooks).
+	static void QueueCustomEvents(RE::TESObjectREFR* a_refr, const std::vector<std::string>& a_events, const char* a_label)
+	{
+		if (!a_refr || a_events.empty()) return;
+		std::lock_guard lock(s_deferredEventMutex);
+		for (const auto& evt : a_events) {
+			if (evt.empty()) continue;
+			s_deferredEvents.push_back({ a_refr, evt, a_label });
+		}
+	}
+
+	// Process all queued events (call from outside Havok update, e.g. HookedActorUpdate).
+	static void FlushDeferredEvents()
+	{
+		std::vector<DeferredEvent> batch;
+		{
+			std::lock_guard lock(s_deferredEventMutex);
+			if (s_deferredEvents.empty()) return;
+			batch.swap(s_deferredEvents);
+		}
+		for (auto& de : batch) {
+			if (!de.refr) continue;
+			RE::BSFixedString evtName(de.eventName.c_str());
+			SafeNotifyAnimGraph(de.refr, evtName);
+			SafeNotifyEventSinks(de.refr, evtName);
+
+			// When ReloadEnd fires as a custom event, also force isReloading=false
+			// so the state machine can transition (mirrors FPInertia Early ADS).
+			if (de.eventName == "ReloadEnd" || de.eventName == "reloadEnd") {
+				auto* actor = de.refr->As<RE::Actor>();
+				if (actor) {
+					SetHavokBool(actor, kHavokVar_IsReloading, false);
+				}
+			}
+
+			static int s_ceLog = 0;
+			if (s_ceLog < 50) {
+				logger::info("[OAR-CustomEvent] Fired '{}' ({}) on {:X}", de.eventName, de.label,
+					de.refr->GetFormID());
+				s_ceLog++;
+			}
+		}
+	}
+
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
 	{
 		// Call original Update first — variable bindings must process before any animation swap.
@@ -2415,8 +2518,8 @@ namespace
 		} else {
 			auto infoIt = s_suffixToInfos.find(suffix);
 			if (infoIt == s_suffixToInfos.end()) {
-				static std::unordered_set<std::string> s_noMatchLoggedOnce;
-				if (s_noMatchLoggedOnce.insert(suffix).second) {
+				static std::atomic<int> s_noMatchLogCount{ 0 };
+				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
 					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
 				return;
@@ -2504,21 +2607,68 @@ namespace
 			}
 		}
 
+		// "Play Once (Full Body)": once a clip has been initially evaluated and a
+		// candidate SubMod has playOnceFullBody, the initial decision (replace or not)
+		// is locked for the clip's entire lifetime. This prevents mid-animation
+		// condition flips in BOTH directions:
+		//   - replacement active  → conditions flip false → replacement stays
+		//   - no replacement      → conditions flip true  → stays un-replaced
+		// The set is cleaned in hkbClipGenerator_Deactivate.
+		bool hasPlayOnceCandidate = false;
+		for (auto* info : candidates) {
+			if (info && info->parentSubMod && info->parentSubMod->GetPlayOnceFullBody() &&
+				!info->parentSubMod->IsDisabled()) {
+				hasPlayOnceCandidate = true;
+				break;
+			}
+		}
+
+		bool playOnceLocked = false;
+		bool playOnceLockedResult = false;
+		if (hasPlayOnceCandidate) {
+			std::shared_lock poLock(s_playOnceDecisionMutex);
+			auto it = s_playOnceDecision.find(a_this);
+			if (it != s_playOnceDecision.end()) {
+				playOnceLocked = true;
+				playOnceLockedResult = it->second;
+			}
+		}
+
 		bool shouldReplace = false;
 		ReplacementAnimFileInfo* winningInfo = nullptr;
 		int totalCands = 0, disabledCands = 0, evalFalseCands = 0;
 		int noCondCands = 0;
-		for (auto* info : candidates) {
-			if (!info || !info->parentSubMod) continue;
-			++totalCands;
-			if (info->parentSubMod->IsDisabled()) { ++disabledCands; continue; }
-			auto* cs = info->parentSubMod->GetConditionSet();
-			if (!cs || cs->IsEmpty()) { shouldReplace = true; winningInfo = info; ++noCondCands; break; }
-			if (!refr) continue;
-			try {
-				if (info->parentSubMod->EvaluateConditions(refr, a_this)) { shouldReplace = true; winningInfo = info; break; }
-				++evalFalseCands;
-			} catch (...) { continue; }
+
+		if (playOnceLocked) {
+			shouldReplace = playOnceLockedResult;
+			if (shouldReplace) {
+				for (auto* info : candidates) {
+					if (info && info->parentSubMod && info->parentSubMod->GetPlayOnceFullBody() &&
+						!info->parentSubMod->IsDisabled()) {
+						winningInfo = info;
+						break;
+					}
+				}
+			}
+		} else {
+			for (auto* info : candidates) {
+				if (!info || !info->parentSubMod) continue;
+				++totalCands;
+				if (info->parentSubMod->IsDisabled()) { ++disabledCands; continue; }
+				auto* cs = info->parentSubMod->GetConditionSet();
+				if (!cs || cs->IsEmpty()) { shouldReplace = true; winningInfo = info; ++noCondCands; break; }
+				if (!refr) continue;
+				try {
+					if (info->parentSubMod->EvaluateConditions(refr, a_this)) { shouldReplace = true; winningInfo = info; break; }
+					++evalFalseCands;
+				} catch (...) { continue; }
+			}
+
+			// Record the initial decision for playOnceFullBody candidates
+			if (hasPlayOnceCandidate) {
+				std::unique_lock poLock(s_playOnceDecisionMutex);
+				s_playOnceDecision[a_this] = shouldReplace;
+			}
 		}
 
 		// Per-clip transition logging: log whenever shouldReplace flips for this clip
@@ -2637,8 +2787,21 @@ namespace
 						}
 						*animSlot = replacement;
 
-						if (bReplaceAnnot) {
+						// When playOnceFullBody is active, keep original triggers intact so the
+						// Havok state machine can still transition out of the current state
+						// (e.g. reloadComplete → exit reload). Trigger NULLing blocks internal
+						// hkbStateMachine transitions because it only reads from the trigger array.
+						bool skipTriggerNull = (winningInfo && winningInfo->parentSubMod &&
+							winningInfo->parentSubMod->GetPlayOnceFullBody());
+						if (bReplaceAnnot && !skipTriggerNull) {
 							InstallReplacementTriggers(a_this, cacheSuffix);
+						}
+
+						// Fire custom "on start" events and track active SubMod
+						if (winningInfo && winningInfo->parentSubMod && refr) {
+							QueueCustomEvents(refr, winningInfo->parentSubMod->eventsOnStart, "onStart");
+							std::unique_lock smLock(s_activeSubModMutex);
+							s_activeSubModMap[a_this] = winningInfo->parentSubMod;
 						}
 
 						if (AnimationLog::GetSingleton()->IsEnabled() && winningInfo) {
@@ -2690,7 +2853,14 @@ namespace
 						}
 					}
 				if (bReplaceAnnot) {
-					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
+					bool alreadyRestored = false;
+					{
+						std::lock_guard rg(s_triggersRestoredMutex);
+						alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+					}
+					if (!alreadyRestored) {
+						EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
+					}
 				} else {
 					RestoreClipTriggers(a_this);
 				}
@@ -2798,24 +2968,39 @@ namespace
 							// SoundPlay annotations: play directly through BSAudioManager
 							const char* soundName = text.c_str() + kSoundPlayLen;
 							PlaySoundDirect(soundName, refr);
-						} else {
-							// Behavior events (weaponFire, reloadComplete, etc.):
-							// fire via both behavior graph AND event sinks.
-							// Wrapped in SEH because NotifyAnimationGraphImpl triggers
-							// event broadcast which can traverse stale animation data
-							// in other plugins (HaBCR, etc.) if a weapon switch freed
-							// the old animations between frames.
-							RE::BSFixedString evtName(text.c_str());
-							if (!SafeNotifyAnimGraph(refr, evtName)) {
-								static int s_notifyFailLog = 0;
-								if (s_notifyFailLog < 10) {
-									logger::error("[OAR-SEH] NotifyAnimationGraphImpl crash caught for event '{}' — stale graph data",
-										text);
-									s_notifyFailLog++;
-								}
+					} else {
+						// Behavior events (weaponFire, reloadComplete, etc.):
+						// fire via both behavior graph AND event sinks.
+						RE::BSFixedString evtName(text.c_str());
+						if (!SafeNotifyAnimGraph(refr, evtName)) {
+							static int s_notifyFailLog = 0;
+							if (s_notifyFailLog < 10) {
+								logger::error("[OAR-SEH] NotifyAnimationGraphImpl crash caught for event '{}' — stale graph data",
+									text);
+								s_notifyFailLog++;
 							}
-							SafeNotifyEventSinks(refr, evtName);
 						}
+						SafeNotifyEventSinks(refr, evtName);
+
+						// When the replacement annotation fires "ReloadEnd", also
+						// force isReloading=false and restore triggers so the state
+						// machine can transition (mirrors FPInertia Early ADS).
+						if (text == "ReloadEnd" || text == "reloadEnd") {
+							auto* actor = refr->As<RE::Actor>();
+							if (actor) {
+								SetHavokBool(actor, kHavokVar_IsReloading, false);
+							}
+							RestoreClipTriggers(a_this);
+							{
+								std::lock_guard rg(s_triggersRestoredMutex);
+								s_triggersRestoredSet.insert(a_this);
+							}
+							{
+								std::unique_lock poLock(s_playOnceDecisionMutex);
+								s_playOnceDecision.erase(a_this);
+							}
+						}
+					}
 
 						static int s_annotFireLog = 0;
 						if (s_annotFireLog < 50) {
@@ -2825,6 +3010,44 @@ namespace
 						}
 					}
 					s_oarFiringAnnotations = false;
+				}
+			}
+		}
+
+		// When triggers are NULLed, the behavior graph state machine loses its
+		// transition signal (e.g. reloadComplete). Once the replacement animation
+		// has completed at least one full playthrough, restore the original triggers
+		// so the state machine can transition out of the current state.
+		{
+			std::shared_lock tLock(s_triggersBackupMutex);
+			auto tIt = s_triggersBackup.find(a_this);
+			if (tIt != s_triggersBackup.end() && tIt->second.nulled) {
+				float localTime = a_this->GetLocalTime();
+				auto* curAnim = *animSlot;
+				float duration = 0.0f;
+				if (curAnim && !IsBadReadPtr(curAnim, sizeof(uintptr_t))) {
+					duration = *reinterpret_cast<float*>(
+						reinterpret_cast<uint8_t*>(curAnim) + 0x14);
+				}
+				if (duration > 0.01f && localTime >= duration - 0.01f) {
+					tLock.unlock();
+					RestoreClipTriggers(a_this);
+					{
+						std::lock_guard rg(s_triggersRestoredMutex);
+						s_triggersRestoredSet.insert(a_this);
+					}
+					// Clear the playOnceFullBody decision lock so condition
+					// re-evaluation resumes and can detect conditions are now false.
+					{
+						std::unique_lock poLock(s_playOnceDecisionMutex);
+						s_playOnceDecision.erase(a_this);
+					}
+					static int s_trigRestoreLog = 0;
+					if (s_trigRestoreLog < 20) {
+						logger::info("[OAR-Triggers] Restored triggers for '{}' (anim completed, localTime={:.3f} duration={:.3f}) [playOnce unlocked]",
+							resolvedSuffix, localTime, duration);
+						s_trigRestoreLog++;
+					}
 				}
 			}
 		}
@@ -2908,6 +3131,23 @@ namespace
 					bool ok = (expected != 0) ? (vtbl == expected)
 						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
 					if (ok) {
+						// Fire custom "on end" events before restoring
+						{
+							std::shared_lock smLock(s_activeSubModMutex);
+							auto smIt = s_activeSubModMap.find(a_this);
+							if (smIt != s_activeSubModMap.end() && smIt->second && refr) {
+								QueueCustomEvents(refr, smIt->second->eventsOnEnd, "onEnd");
+							}
+						}
+						{
+							std::unique_lock smLock(s_activeSubModMutex);
+							s_activeSubModMap.erase(a_this);
+						}
+						{
+							std::lock_guard rg(s_triggersRestoredMutex);
+							s_triggersRestoredSet.erase(a_this);
+						}
+
 						static int s_restoreLog = 0;
 						if (s_restoreLog < 50) {
 							logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
@@ -2995,6 +3235,30 @@ namespace
 			{
 				std::unique_lock lock(s_bypassMutex);
 				s_bypassSet.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_playOnceDecisionMutex);
+				s_playOnceDecision.erase(a_this);
+			}
+			// Fire custom "on end" events at deactivation
+			{
+				std::shared_lock smLock(s_activeSubModMutex);
+				auto smIt = s_activeSubModMap.find(a_this);
+				if (smIt != s_activeSubModMap.end() && smIt->second) {
+					auto* deactRefr = GetRefrFromContext(a_context);
+					if (!deactRefr) deactRefr = RE::PlayerCharacter::GetSingleton();
+					if (deactRefr) {
+						QueueCustomEvents(deactRefr, smIt->second->eventsOnEnd, "onEnd/deactivate");
+					}
+				}
+			}
+			{
+				std::unique_lock smLock(s_activeSubModMutex);
+				s_activeSubModMap.erase(a_this);
+			}
+			{
+				std::lock_guard rg(s_triggersRestoredMutex);
+				s_triggersRestoredSet.erase(a_this);
 			}
 			// Remove this clip from any track filter source sets to prevent stale
 			// pointers from being used if a new clip is allocated at the same address.
@@ -3266,7 +3530,10 @@ namespace
 
 		// --- Per-character resolution (Issue #1 fix) ---
 		auto& cr = state.resolvedByChar[character];
-		ResolveForChar(filterPtr, cr, character);
+		uint64_t filterVersion = filterPtr->version.load(std::memory_order_relaxed);
+		if (cr.version != filterVersion) {
+			ResolveForChar(filterPtr, cr, character);
+		}
 		if (cr.nameAndIndex.empty()) return;
 
 		float weight = filterPtr->weight * state.blendAlpha;
@@ -3552,6 +3819,9 @@ namespace
 		// Process the original actor updates FIRST so game state is current.
 		Hooks::UpdateHooks::RunActorUpdatesOrig();
 
+		// Fire deferred custom events now that the Havok update cycle is complete.
+		FlushDeferredEvents();
+
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
 		static auto s_lastTick = std::chrono::high_resolution_clock::now();
 		auto now = std::chrono::high_resolution_clock::now();
@@ -3574,6 +3844,7 @@ namespace
 
 			std::unordered_set<RE::TESObjectREFR*> conditionsFalse;
 			for (auto& pe : toEval) {
+				if (pe.subMod->GetPlayOnceFullBody()) continue;
 				if (!pe.subMod->EvaluateConditions(pe.actor, nullptr))
 					conditionsFalse.insert(pe.actor);
 			}
@@ -3585,7 +3856,15 @@ namespace
 					auto* filterPtr = state.filter;
 					bool condFalse = conditionsFalse.count(it->first) > 0;
 
-					if (condFalse && !state.blendingOut) {
+				if (condFalse && !state.blendingOut) {
+					float deactivDelay = state.parentSubMod ? state.parentSubMod->GetDeactivationDelay() : 0.0f;
+					if (deactivDelay > 0.0f && !state.deactivationDelayActive) {
+						state.deactivationDelayActive = true;
+						state.deactivationDelayRemaining = deactivDelay;
+					}
+
+					if (!state.deactivationDelayActive || state.deactivationDelayRemaining <= 0.0f) {
+						state.deactivationDelayActive = false;
 						state.blendingOut = true;
 						state.blendElapsed = 0.0f;
 						state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
@@ -3596,6 +3875,14 @@ namespace
 							s_boLog++;
 						}
 					}
+				} else if (!condFalse) {
+					state.deactivationDelayActive = false;
+					state.deactivationDelayRemaining = 0.0f;
+				}
+
+				if (state.deactivationDelayActive) {
+					state.deactivationDelayRemaining -= dt;
+				}
 
 					if (state.blendingOut) {
 						if (state.blendDuration <= 0.0f) {

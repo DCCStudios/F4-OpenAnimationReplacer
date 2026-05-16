@@ -300,14 +300,23 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->SetKeepRandomResultsOnLoop(keepRandom);
 			a_subMod->SetDirty(true);
 		}
-		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Don't re-roll random variant when animation loops");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"When a random variant is selected, keep playing the same one when\n"
+			"the animation loops instead of re-rolling. Each actor remembers\n"
+			"their own selected variant independently.\n\n"
+			"Requires multiple animation files registered as variants under\n"
+			"this SubMod (NOT YET IMPLEMENTED — variant loading is pending).");
 
 		bool shareRandom = a_subMod->GetShareRandomResults();
-		if (ImGui::Checkbox("Share random results", &shareRandom)) {
+		if (ImGui::Checkbox("Share random results (?)", &shareRandom)) {
 			a_subMod->SetShareRandomResults(shareRandom);
 			a_subMod->SetDirty(true);
 		}
-		if (ImGui::IsItemHovered()) ImGui::SetTooltip("All actors share the same random variant selection");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"All actors use the same randomly-selected variant instead of each\n"
+			"actor rolling independently. Useful for synchronized group animations.\n\n"
+			"Requires multiple animation files registered as variants under\n"
+			"this SubMod (NOT YET IMPLEMENTED — variant loading is pending).");
 
 		bool replAnnot = a_subMod->GetReplaceAnnotations();
 		if (ImGui::Checkbox("Replace Annotations (?)", &replAnnot)) {
@@ -321,16 +330,37 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"Turn OFF for fire animations to prevent double-shots.");
 
 		bool replOnLoop = a_subMod->GetReplaceOnLoop();
-		if (ImGui::Checkbox("Replace on Loop", &replOnLoop)) {
+		if (ImGui::Checkbox("Replace on Loop (?)", &replOnLoop)) {
 			a_subMod->SetReplaceOnLoop(replOnLoop);
 			a_subMod->SetDirty(true);
 		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"When the animation loops, re-evaluate conditions and apply a\n"
+			"new replacement if one matches. If OFF, the original (non-replaced)\n"
+			"animation plays on subsequent loops.");
 		ImGui::SameLine();
 		bool replOnEcho = a_subMod->GetReplaceOnEcho();
-		if (ImGui::Checkbox("Replace on Echo", &replOnEcho)) {
+		if (ImGui::Checkbox("Replace on Echo (?)", &replOnEcho)) {
 			a_subMod->SetReplaceOnEcho(replOnEcho);
 			a_subMod->SetDirty(true);
 		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"When the animation receives an 'echo' (game re-triggers the same clip\n"
+			"without deactivating it first), re-evaluate conditions and apply a\n"
+			"replacement. Common with idle animations.");
+
+		bool playOnce = a_subMod->GetPlayOnceFullBody();
+		if (ImGui::Checkbox("Lock Replacement Until Clip Ends (?)", &playOnce)) {
+			a_subMod->SetPlayOnceFullBody(playOnce);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Once this replacement starts playing, lock it in place — conditions\n"
+			"are NOT re-evaluated until the clip naturally finishes or deactivates.\n"
+			"Prevents mid-animation interruptions from game state changes.\n\n"
+			"Use for reloads, one-shot animations, or any case where game state\n"
+			"changes mid-animation (e.g. ammo count refilling during reload)\n"
+			"would incorrectly interrupt the replacement.");
 
 		// Custom blend times
 		float blendInterrupt = a_subMod->GetCustomBlendTimeOnInterrupt();
@@ -340,6 +370,110 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->SetDirty(true);
 		}
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Custom blend duration in seconds when interrupting. Default: 0.20s. Set negative to use default.");
+
+		float deactivDelay = a_subMod->GetDeactivationDelay();
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputFloat("Deactivation Delay (?)", &deactivDelay, 0, 0, "%.2f")) {
+			if (deactivDelay < 0.0f) deactivDelay = 0.0f;
+			a_subMod->SetDeactivationDelay(deactivDelay);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Seconds to keep the replacement active after conditions become false, before blend-out begins. 0 = disabled (immediate).");
+
+		// --- Custom Animation Events ---
+		ImGui::Spacing();
+		ImGui::Separator();
+		ImGui::Text("Custom Animation Events");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Behavior events to force-fire at the start or end of this replacement.\n"
+			"Useful for ensuring state machine transitions (e.g. ReloadEnd, SprintStop)\n"
+			"fire correctly even when original triggers are suppressed.");
+
+		static const char* s_commonEvents[] = {
+			"ReloadComplete", "ReloadEnd", "reloadStart", "reloadState",
+			"reloadStateEnter", "reloadStateExit",
+			"AttackEnd", "attackStart", "attackStop", "attackRelease",
+			"meleeEnd", "meleeStart", "EndMeleeAttack",
+			"SprintStart", "SprintStop", "MoveStart", "MoveStop",
+			"jumpStart", "jumpEnd", "jumpLand",
+			"WeaponFire", "FireSingle", "weaponDraw", "weaponSheath",
+			"WeapEquip", "weapUnequip",
+			"sneakStart", "sneakStop",
+			"GunDown", "GunUp",
+			"EjectShellCasing", "Recoil",
+			"idleLoopingStart", "idleLoopingExit", "IdleStop",
+			"blockStart", "blockStop", "blockEnd",
+			"staggerExit", "staggerStop",
+			"DoNotInterrupt", "EarlyExit", "InstantExitClip",
+			"FootLeft", "FootRight", "FootDown",
+			"sightedStateEnter", "sightedStateExit",
+			"initiateBoltStart", "initiateEnd", "initiateStart",
+			"grenadeThrowStart", "throwEnd",
+		};
+		static const int s_numCommonEvents = sizeof(s_commonEvents) / sizeof(s_commonEvents[0]);
+
+		auto DrawEventList = [&](const char* label, std::vector<std::string>& events, const char* id) {
+			ImGui::PushID(id);
+			ImGui::Text("%s:", label);
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip("Events fire in order from top to bottom.");
+
+			for (int i = 0; i < (int)events.size(); ++i) {
+				ImGui::PushID(i);
+				ImGui::Text("  %d. %s", i + 1, events[i].c_str());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("X")) {
+					events.erase(events.begin() + i);
+					a_subMod->SetDirty(true);
+					ImGui::PopID();
+					break;
+				}
+				if (i > 0) {
+					ImGui::SameLine();
+					if (ImGui::SmallButton("^")) {
+						std::swap(events[i], events[i - 1]);
+						a_subMod->SetDirty(true);
+					}
+				}
+				if (i < (int)events.size() - 1) {
+					ImGui::SameLine();
+					if (ImGui::SmallButton("v")) {
+						std::swap(events[i], events[i + 1]);
+						a_subMod->SetDirty(true);
+					}
+				}
+				ImGui::PopID();
+			}
+
+			// Dropdown for common events
+			static int selectedCommon = 0;
+			ImGui::SetNextItemWidth(200);
+			ImGui::Combo("##common", &selectedCommon, s_commonEvents, s_numCommonEvents);
+			ImGui::SameLine();
+			if (ImGui::Button("Add from List")) {
+				events.push_back(s_commonEvents[selectedCommon]);
+				a_subMod->SetDirty(true);
+			}
+
+			// Manual text entry
+			static char customBuf[128] = "";
+			ImGui::SetNextItemWidth(200);
+			ImGui::InputText("##custom", customBuf, sizeof(customBuf));
+			ImGui::SameLine();
+			if (ImGui::Button("Add Custom")) {
+				std::string s(customBuf);
+				if (!s.empty()) {
+					events.push_back(s);
+					a_subMod->SetDirty(true);
+					customBuf[0] = '\0';
+				}
+			}
+			ImGui::PopID();
+		};
+
+		DrawEventList("Events on Start", a_subMod->eventsOnStart, "evtStart");
+		ImGui::Spacing();
+		DrawEventList("Events on End", a_subMod->eventsOnEnd, "evtEnd");
+
 	} else {
 		ImGui::Text("Priority: %d", a_subMod->GetPriority());
 		ImGui::SameLine(200);
@@ -351,6 +485,20 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		ImGui::Text("Keep random on loop: %s  |  Share random: %s",
 			a_subMod->GetKeepRandomResultsOnLoop() ? "Yes" : "No",
 			a_subMod->GetShareRandomResults() ? "Yes" : "No");
+		if (a_subMod->GetPlayOnceFullBody())
+			ImGui::Text("Lock Replacement Until Clip Ends: Yes");
+		if (a_subMod->GetDeactivationDelay() > 0.0f)
+			ImGui::Text("Deactivation delay: %.2fs", a_subMod->GetDeactivationDelay());
+		if (!a_subMod->eventsOnStart.empty()) {
+			std::string startStr = "Events on Start:";
+			for (auto& e : a_subMod->eventsOnStart) startStr += " " + e;
+			ImGui::Text("%s", startStr.c_str());
+		}
+		if (!a_subMod->eventsOnEnd.empty()) {
+			std::string endStr = "Events on End:";
+			for (auto& e : a_subMod->eventsOnEnd) endStr += " " + e;
+			ImGui::Text("%s", endStr.c_str());
+		}
 	}
 
 	// --- Track Filter (partial body animation layering) ---
@@ -408,6 +556,14 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["replaceAnnotations"] = a_subMod->GetReplaceAnnotations();
 			if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
 				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
+			if (a_subMod->GetDeactivationDelay() > 0.0f)
+				json["deactivationDelay"] = a_subMod->GetDeactivationDelay();
+			if (a_subMod->GetPlayOnceFullBody())
+				json["playOnceFullBody"] = true;
+			if (!a_subMod->eventsOnStart.empty())
+				json["eventsOnStart"] = a_subMod->eventsOnStart;
+			if (!a_subMod->eventsOnEnd.empty())
+				json["eventsOnEnd"] = a_subMod->eventsOnEnd;
 
 			{
 				auto& tf = a_subMod->trackFilter;
