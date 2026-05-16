@@ -89,6 +89,8 @@ public:
 		bool enabled = false;
 		enum class Mode { Override, Additive } mode = Mode::Additive;
 		float weight = 1.0f;
+		float blendInTime = 0.0f;   // seconds to ramp from 0→weight on activation (0 = instant)
+		float blendOutTime = 0.0f;  // seconds to ramp from weight→0 on deactivation (0 = instant)
 		bool includeChildren = true;
 		std::vector<std::string> boneNames;
 		// Bumped whenever boneNames or includeChildren changes. Each character's

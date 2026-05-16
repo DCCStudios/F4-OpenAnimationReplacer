@@ -415,6 +415,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["enabled"] = tf.enabled;
 				tfJson["mode"] = (tf.mode == SubMod::TrackFilter::Mode::Override) ? "override" : "additive";
 				tfJson["weight"] = tf.weight;
+				tfJson["blendInTime"] = tf.blendInTime;
+				tfJson["blendOutTime"] = tf.blendOutTime;
 				tfJson["includeChildren"] = tf.includeChildren;
 				tfJson["bones"] = tf.boneNames;
 				json["trackFilter"] = tfJson;
@@ -839,6 +841,20 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			}
 			if (ImGui::IsItemHovered()) {
 				ImGui::SetTooltip("Blend strength. 0 = no effect, 1 = full replacement/additive strength.");
+			}
+
+			if (ImGui::SliderFloat("Blend In##trackFilter", &tf.blendInTime, 0.0f, 2.0f, "%.2f s")) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("Time in seconds to ramp from 0 to full weight when conditions become true.\n0 = instant snap.");
+			}
+
+			if (ImGui::SliderFloat("Blend Out##trackFilter", &tf.blendOutTime, 0.0f, 2.0f, "%.2f s")) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("Time in seconds to ramp from full weight to 0 when conditions become false.\n0 = instant snap.");
 			}
 
 			if (ImGui::Checkbox("Include Children##trackFilter", &tf.includeChildren)) {

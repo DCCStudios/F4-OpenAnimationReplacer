@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 
 static std::atomic<bool> s_gameFullyLoaded{ false };
 static std::atomic<bool> s_hasActiveReplacements{ false };
@@ -106,6 +107,12 @@ struct CharTrackFilterState {
 	// Frame counter at the last source-clip Generate. Used to invalidate the cache
 	// when source clips stop generating (without firing a Deactivate hook).
 	uint64_t lastSourceFrame = 0;
+
+	// Temporal blend state: ramps effectiveAlpha toward 1.0 (active) or 0.0 (deactivating)
+	float blendAlpha = 0.0f;        // current interpolated alpha [0, 1]
+	bool blendingOut = false;        // true = ramping down, erase when alpha reaches 0
+	float blendElapsed = 0.0f;       // seconds elapsed since blend started
+	float blendDuration = 0.0f;      // target duration for current blend direction
 };
 static std::shared_mutex s_trackFilterMutex;
 static std::unordered_map<RE::TESObjectREFR*, CharTrackFilterState> s_charTrackFilterMap;
@@ -117,11 +124,48 @@ static std::atomic<uint64_t> s_currentFrame{ 0 };
 // is considered stale and erased (so non-source clips stop applying old cached pose).
 static constexpr uint64_t kTrackFilterStaleFrames = 300;
 
+// --- Full-body replacement blend state ---
+// Keyed by (actor, clip suffix) so multiple clips on same actor can blend independently.
+struct FullBodyBlendState {
+	RE::hkaAnimation* replacement = nullptr;
+	RE::hkaAnimation* original = nullptr;
+	float blendAlpha = 1.0f;       // 0 = fully original, 1 = fully replacement
+	float blendElapsed = 0.0f;
+	float blendDuration = 0.0f;
+	bool blendingIn = false;       // ramping 0→1
+	bool blendingOut = false;      // ramping 1→0
+	std::string suffix;
+};
+struct ActorClipKey {
+	RE::TESObjectREFR* actor = nullptr;
+	std::string suffix;
+	bool operator==(const ActorClipKey& o) const { return actor == o.actor && suffix == o.suffix; }
+};
+struct ActorClipKeyHash {
+	size_t operator()(const ActorClipKey& k) const {
+		size_t h1 = std::hash<void*>{}(k.actor);
+		size_t h2 = std::hash<std::string>{}(k.suffix);
+		return h1 ^ (h2 << 1);
+	}
+};
+static std::shared_mutex s_fullBodyBlendMutex;
+static std::unordered_map<ActorClipKey, FullBodyBlendState, ActorClipKeyHash> s_fullBodyBlendMap;
+static std::atomic<int> s_fullBodyBlendActiveCount{ 0 };
+
 static RE::TESObjectREFR* GetRefrFromCharacter(RE::hkbCharacter* a_char) {
 	if (!a_char) return nullptr;
 	std::shared_lock lock(s_characterCacheMutex);
 	auto it = s_characterCache.find(a_char);
 	return (it != s_characterCache.end()) ? it->second : nullptr;
+}
+
+// ---- Easing for temporal blend ----
+
+static float EaseInOutQuad(float t)
+{
+	if (t <= 0.0f) return 0.0f;
+	if (t >= 1.0f) return 1.0f;
+	return t < 0.5f ? 2.0f * t * t : t * (4.0f - 2.0f * t) - 1.0f;
 }
 
 // ---- Quaternion math helpers for bone blending ----
@@ -2496,10 +2540,22 @@ namespace
 					state.sourceClip = a_this;
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
-					// Seed lastSourceFrame so the staleness check doesn't immediately
-					// erase the entry before Generate has a chance to fire.
 					state.lastSourceFrame = s_currentFrame.load(std::memory_order_relaxed);
-					if (isNew) s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
+					if (isNew) {
+						s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
+						// Initialize blend-in state
+						float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
+						state.blendAlpha = (blendIn <= 0.0f) ? 1.0f : 0.0f;
+						state.blendElapsed = 0.0f;
+						state.blendDuration = blendIn;
+						state.blendingOut = false;
+					}
+					// If re-registered while blending out, cancel blend-out
+					if (state.blendingOut) {
+						state.blendingOut = false;
+						state.blendElapsed = 0.0f;
+						state.blendDuration = winningInfo->parentSubMod->trackFilter.blendInTime;
+					}
 				}
 			}
 			if (*animSlot != originalAnim && originalAnim) {
@@ -2535,6 +2591,39 @@ namespace
 								AnimationLog::EventType::kReplace,
 								refr, resolvedSuffix, winningInfo->replacementPath, subModName);
 						}
+					}
+
+					// Start full-body blend-in if SubMod has a blend time configured
+					float blendTime = (winningInfo && winningInfo->parentSubMod)
+						? winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt() : -1.0f;
+					if (blendTime < 0.0f) blendTime = 0.0f;  // negative means "use default" → instant
+					if (blendTime > 0.0f && originalAnim) {
+						ActorClipKey key{ refr ? refr : RE::PlayerCharacter::GetSingleton(), suffix };
+						std::unique_lock fbLock(s_fullBodyBlendMutex);
+						auto& bs = s_fullBodyBlendMap[key];
+						if (!bs.blendingIn && bs.blendAlpha >= 1.0f) {
+							// Fresh blend-in
+						} else if (bs.blendingOut) {
+							// Cancel blend-out, resume from current alpha
+						}
+						bool isNew = (bs.replacement != replacement);
+						bs.replacement = replacement;
+						bs.original = originalAnim;
+						bs.suffix = suffix;
+						bs.blendingOut = false;
+						bs.blendingIn = true;
+						if (isNew) {
+							bs.blendElapsed = 0.0f;
+							bs.blendAlpha = 0.0f;
+							static int s_fbRegLog = 0;
+							if (s_fbRegLog < 10) {
+								logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' blendTime={:.2f}s actor={:X}",
+									suffix, blendTime, reinterpret_cast<uintptr_t>(refr));
+								s_fbRegLog++;
+							}
+						}
+						bs.blendDuration = blendTime;
+						if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
 					}
 				if (bReplaceAnnot) {
 					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
@@ -2702,35 +2791,82 @@ namespace
 			}
 		}
 
-		// Conditions failed — restore original. Since originalAnim was validated via
-		// GetValidOriginal, it should be safe. But add a final defensive check in case
-		// the pointer was freed between validation and this point (race condition).
+		// Conditions failed — check if we should blend out or instant-restore.
 		if (originalAnim && *animSlot != originalAnim) {
-			if (!IsBadReadPtr(originalAnim, sizeof(uintptr_t))) {
-				auto vtbl = *reinterpret_cast<uintptr_t*>(originalAnim);
-				auto expected = cache->GetGameAnimVtable();
-				bool ok = (expected != 0) ? (vtbl == expected)
-					: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
-				if (ok) {
-					static int s_restoreLog = 0;
-					if (s_restoreLog < 50) {
-						logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
-						s_restoreLog++;
-					}
-					*animSlot = originalAnim;
-				} else {
-					// Original became stale between validation and now — leave clone in slot
-					static int s_staleRestoreLog = 0;
-					if (s_staleRestoreLog < 20) {
-						logger::warn("[OAR] Original stale at restore for '{}' — leaving clone in slot (safe)", suffix);
-						s_staleRestoreLog++;
+			// Check if there's a full-body blend entry that needs blend-out
+			RE::TESObjectREFR* blendActor = refr ? refr : RE::PlayerCharacter::GetSingleton();
+			bool startedBlendOut = false;
+			if (blendActor) {
+				ActorClipKey key{ blendActor, suffix };
+				std::unique_lock fbLock(s_fullBodyBlendMutex);
+				auto it = s_fullBodyBlendMap.find(key);
+				if (it != s_fullBodyBlendMap.end()) {
+					if (it->second.blendingOut) {
+						// Already blending out — don't touch it, just let it finish
+						startedBlendOut = true;
+					} else {
+						// Start new blend-out
+						float blendOutTime = 0.0f;
+						if (winningInfo && winningInfo->parentSubMod) {
+							float v = winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt();
+							if (v > 0.0f) blendOutTime = v;
+						} else if (it->second.blendDuration > 0.0f) {
+							blendOutTime = it->second.blendDuration;
+						}
+						if (blendOutTime > 0.0f) {
+							it->second.blendingOut = true;
+							it->second.blendingIn = false;
+							it->second.blendElapsed = 0.0f;
+							it->second.blendDuration = blendOutTime;
+							it->second.original = originalAnim;
+							startedBlendOut = true;
+							static int s_fbBoLog = 0;
+							if (s_fbBoLog < 10) {
+								logger::info("[OAR] Full-body blend-out started for '{}' (duration={:.2f}s)",
+									resolvedSuffix, blendOutTime);
+								s_fbBoLog++;
+							}
+						}
 					}
 				}
-			} else {
-				static int s_ibrRestoreLog = 0;
-				if (s_ibrRestoreLog < 20) {
-					logger::warn("[OAR] Original unreadable at restore for '{}' — leaving clone in slot", suffix);
-					s_ibrRestoreLog++;
+			}
+
+			if (!startedBlendOut) {
+				if (!IsBadReadPtr(originalAnim, sizeof(uintptr_t))) {
+					auto vtbl = *reinterpret_cast<uintptr_t*>(originalAnim);
+					auto expected = cache->GetGameAnimVtable();
+					bool ok = (expected != 0) ? (vtbl == expected)
+						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
+					if (ok) {
+						static int s_restoreLog = 0;
+						if (s_restoreLog < 50) {
+							logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
+							s_restoreLog++;
+						}
+						*animSlot = originalAnim;
+					} else {
+						static int s_staleRestoreLog = 0;
+						if (s_staleRestoreLog < 20) {
+							logger::warn("[OAR] Original stale at restore for '{}' — leaving clone in slot (safe)", suffix);
+							s_staleRestoreLog++;
+						}
+					}
+				} else {
+					static int s_ibrRestoreLog = 0;
+					if (s_ibrRestoreLog < 20) {
+						logger::warn("[OAR] Original unreadable at restore for '{}' — leaving clone in slot", suffix);
+						s_ibrRestoreLog++;
+					}
+				}
+				// Remove blend entry if present (instant removal)
+				if (blendActor) {
+					ActorClipKey key{ blendActor, suffix };
+					std::unique_lock fbLock(s_fullBodyBlendMutex);
+					auto it = s_fullBodyBlendMap.find(key);
+					if (it != s_fullBodyBlendMap.end()) {
+						s_fullBodyBlendMap.erase(it);
+						s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
+					}
 				}
 			}
 		}
@@ -2815,6 +2951,79 @@ namespace
 	{
 		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
 
+		// --- Full-body replacement blending ---
+		if (s_fullBodyBlendActiveCount.load(std::memory_order_relaxed) > 0) {
+			auto* actor = GetRefrFromContext(a_context);
+			if (!actor) actor = RE::PlayerCharacter::GetSingleton();
+			if (actor) {
+				std::string clipSuffix;
+				{
+					std::shared_lock lock(s_clipSuffixMutex);
+					auto it = s_clipSuffixCache.find(a_this);
+					if (it != s_clipSuffixCache.end())
+						clipSuffix = it->second;
+				}
+				if (!clipSuffix.empty()) {
+					ActorClipKey key{ actor, clipSuffix };
+					std::shared_lock fbLock(s_fullBodyBlendMutex);
+					auto it = s_fullBodyBlendMap.find(key);
+					if (it != s_fullBodyBlendMap.end()) {
+						float alpha = it->second.blendAlpha;
+						RE::hkaAnimation* origAnim = it->second.original;
+						fbLock.unlock();
+
+						static int s_fbGenLog = 0;
+						if (s_fbGenLog < 20) {
+							logger::info("[OAR-FullBodyBlend] Generate: clip='{}' alpha={:.3f}", clipSuffix, alpha);
+							s_fbGenLog++;
+						}
+
+						if (alpha < 0.999f && origAnim) {
+							auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
+							if (tracksPtr) {
+								auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
+								auto& poseHeader = headers[RE::kTrackIndex_Pose];
+								if (poseHeader.numData > 0 && poseHeader.dataOffset > 0) {
+									auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
+									int16_t numBones = poseHeader.numData;
+
+									thread_local std::vector<RE::hkQsTransformRaw> tl_repPose;
+									tl_repPose.assign(outputPose, outputPose + numBones);
+
+									auto** animSlot = a_this->GetAnimationSlot();
+									if (animSlot && *animSlot != origAnim) {
+										RE::hkaAnimation* savedAnim = *animSlot;
+										*animSlot = origAnim;
+										Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+										*animSlot = savedAnim;
+
+										for (int16_t i = 0; i < numBones; ++i) {
+											LerpTransform(outputPose[i], tl_repPose[i], alpha);
+										}
+
+										static int s_fbApplyLog = 0;
+										if (s_fbApplyLog < 15) {
+											logger::info("[OAR-FullBodyBlend] Applied blend: alpha={:.3f} bones={}", alpha, numBones);
+											s_fbApplyLog++;
+										}
+									} else {
+										static int s_fbSkipLog = 0;
+										if (s_fbSkipLog < 5) {
+											logger::warn("[OAR-FullBodyBlend] SKIPPED: animSlot={:X} origAnim={:X} (same={})",
+												animSlot ? reinterpret_cast<uintptr_t>(*animSlot) : 0,
+												reinterpret_cast<uintptr_t>(origAnim),
+												animSlot ? (*animSlot == origAnim) : false);
+											s_fbSkipLog++;
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Fast path: skip all locking if no track filter is active anywhere
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) <= 0) return;
 
@@ -2880,7 +3089,8 @@ namespace
 
 			if (!isSourceClip && state.cacheValid && alreadyResolved) {
 				auto& cr = charIt->second;
-				float weight = filterPtr->weight;
+				float weight = filterPtr->weight * state.blendAlpha;
+				if (weight <= 0.001f) return;
 				auto mode = filterPtr->mode;
 				const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 
@@ -2948,7 +3158,8 @@ namespace
 		ResolveForChar(filterPtr, cr, character);
 		if (cr.nameAndIndex.empty()) return;
 
-		float weight = filterPtr->weight;
+		float weight = filterPtr->weight * state.blendAlpha;
+		if (weight <= 0.001f) return;
 		auto mode = filterPtr->mode;
 		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
@@ -3230,10 +3441,14 @@ namespace
 		// Process the original actor updates FIRST so game state is current.
 		Hooks::UpdateHooks::RunActorUpdatesOrig();
 
-		// Re-evaluate conditions for active track filters every frame.
-		// Done AFTER RunActorUpdatesOrig so weapon/ammo state is up to date.
-		// We copy entries under the lock, then evaluate WITHOUT the lock held
-		// (condition eval may trigger game code that must not be blocked).
+		// Compute frame delta time for blend ramping (shared by track filter + full-body)
+		static auto s_lastTick = std::chrono::high_resolution_clock::now();
+		auto now = std::chrono::high_resolution_clock::now();
+		float dt = std::chrono::duration<float>(now - s_lastTick).count();
+		dt = std::clamp(dt, 0.0001f, 0.1f);
+		s_lastTick = now;
+
+		// --- Track filter blend update ---
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
 			struct PendingEval { RE::TESObjectREFR* actor; SubMod* subMod; std::string suffix; };
 			std::vector<PendingEval> toEval;
@@ -3246,27 +3461,95 @@ namespace
 				}
 			}
 
-			std::vector<RE::TESObjectREFR*> toErase;
+			std::unordered_set<RE::TESObjectREFR*> conditionsFalse;
 			for (auto& pe : toEval) {
-				if (!pe.subMod->EvaluateConditions(pe.actor, nullptr)) {
-					toErase.push_back(pe.actor);
-					static int s_condCleanLog = 0;
-					if (s_condCleanLog < 10) {
-						logger::info("[OAR-TrackFilter] Conditions now false for '{}' (re-eval) — erasing entry for actor {:X}",
-							pe.suffix, reinterpret_cast<uintptr_t>(pe.actor));
-						s_condCleanLog++;
-					}
-				}
+				if (!pe.subMod->EvaluateConditions(pe.actor, nullptr))
+					conditionsFalse.insert(pe.actor);
 			}
 
-			if (!toErase.empty()) {
+			{
 				std::unique_lock tfLock(s_trackFilterMutex);
-				for (auto* actor : toErase) {
-					auto it = s_charTrackFilterMap.find(actor);
-					if (it != s_charTrackFilterMap.end()) {
-						s_charTrackFilterMap.erase(it);
-						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+				for (auto it = s_charTrackFilterMap.begin(); it != s_charTrackFilterMap.end(); ) {
+					auto& state = it->second;
+					auto* filterPtr = state.filter;
+					bool condFalse = conditionsFalse.count(it->first) > 0;
+
+					if (condFalse && !state.blendingOut) {
+						state.blendingOut = true;
+						state.blendElapsed = 0.0f;
+						state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
+						static int s_boLog = 0;
+						if (s_boLog < 10) {
+							logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
+								state.suffix, state.blendDuration);
+							s_boLog++;
+						}
 					}
+
+					if (state.blendingOut) {
+						if (state.blendDuration <= 0.0f) {
+							it = s_charTrackFilterMap.erase(it);
+							s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+							continue;
+						}
+						state.blendElapsed += dt;
+						float t = std::clamp(state.blendElapsed / state.blendDuration, 0.0f, 1.0f);
+						state.blendAlpha = 1.0f - EaseInOutQuad(t);
+						if (state.blendAlpha <= 0.001f) {
+							it = s_charTrackFilterMap.erase(it);
+							s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+							continue;
+						}
+					} else {
+						float blendInTime = filterPtr ? filterPtr->blendInTime : 0.0f;
+						if (blendInTime <= 0.0f || state.blendAlpha >= 1.0f) {
+							state.blendAlpha = 1.0f;
+						} else {
+							state.blendElapsed += dt;
+							float t = std::clamp(state.blendElapsed / blendInTime, 0.0f, 1.0f);
+							state.blendAlpha = EaseInOutQuad(t);
+						}
+					}
+					++it;
+				}
+			}
+		}
+
+		// --- Full-body replacement blend update ---
+		if (s_fullBodyBlendActiveCount.load(std::memory_order_relaxed) > 0) {
+			std::unique_lock fbLock(s_fullBodyBlendMutex);
+			for (auto it = s_fullBodyBlendMap.begin(); it != s_fullBodyBlendMap.end(); ) {
+				auto& bs = it->second;
+				if (bs.blendingIn) {
+					if (bs.blendDuration <= 0.0f) {
+						bs.blendAlpha = 1.0f;
+						bs.blendingIn = false;
+					} else {
+						bs.blendElapsed += dt;
+						float t = std::clamp(bs.blendElapsed / bs.blendDuration, 0.0f, 1.0f);
+						bs.blendAlpha = EaseInOutQuad(t);
+						if (bs.blendAlpha >= 0.999f) {
+							bs.blendAlpha = 1.0f;
+							bs.blendingIn = false;
+						}
+					}
+					++it;
+				} else if (bs.blendingOut) {
+					if (bs.blendDuration <= 0.0f) {
+						bs.blendAlpha = 0.0f;
+					} else {
+						bs.blendElapsed += dt;
+						float t = std::clamp(bs.blendElapsed / bs.blendDuration, 0.0f, 1.0f);
+						bs.blendAlpha = 1.0f - EaseInOutQuad(t);
+					}
+					if (bs.blendAlpha <= 0.001f) {
+						it = s_fullBodyBlendMap.erase(it);
+						s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
+						continue;
+					}
+					++it;
+				} else {
+					++it;
 				}
 			}
 		}
