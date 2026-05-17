@@ -615,12 +615,6 @@ bool CurrentMagazineAmmoCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::h
 		float ammoCount = static_cast<float>(wd->ammoCount);
 		float compareVal = numericValue.GetValue(a_refr);
 		bool result = CompareValues(ammoCount, comparison, compareVal);
-		static int s_ammoLogCount = 0;
-		if (s_ammoLogCount < 20 || (s_ammoLogCount % 500 == 0)) {
-			logger::info("[OAR-Cond] CurrentMagazineAmmo: count={} {} {} -> {}",
-				ammoCount, ComparisonOpToString(comparison), compareVal, result);
-		}
-		s_ammoLogCount++;
 		return result;
 	}
 	return false;
@@ -2334,6 +2328,35 @@ void AnimProgressCondition::SerializeImpl(nlohmann::json& a_json) const
 	nlohmann::json nv; numericValue.Serialize(nv); a_json["numericValue"] = nv;
 }
 
+// ===== IsPlayingIdleAnimation =====
+
+bool IsPlayingIdleAnimationCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !form.cachedForm) return false;
+
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+
+	auto* process = actor->currentProcess;
+	if (!process || !process->middleHigh) return false;
+
+	auto* currentIdle = process->middleHigh->currentIdle;
+	if (!currentIdle) return false;
+
+	return currentIdle->GetFormID() == form.cachedForm->GetFormID();
+}
+
+void IsPlayingIdleAnimationCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	form.Initialize(a_json);
+	form.ResolveForm();
+}
+
+void IsPlayingIdleAnimationCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	form.Serialize(a_json);
+}
+
 // ===== Factory Registration =====
 
 void RegisterAllConditions()
@@ -2428,6 +2451,7 @@ void RegisterAllConditions()
 	factory->Register("AnimTimeRemaining", [] { return std::make_unique<AnimTimeRemainingCondition>(); });
 	factory->Register("AnimTimeElapsed", [] { return std::make_unique<AnimTimeElapsedCondition>(); });
 	factory->Register("AnimProgress", [] { return std::make_unique<AnimProgressCondition>(); });
+	factory->Register("IsPlayingIdleAnimation", [] { return std::make_unique<IsPlayingIdleAnimationCondition>(); });
 
 	logger::info("[OAR] Registered {} condition types", factory->GetAllFactories().size());
 }

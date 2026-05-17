@@ -13,6 +13,7 @@ struct ReplacementAnimFileInfo
 	std::string replacementPath;
 	std::string absoluteDiskPath;
 	SubMod* parentSubMod{ nullptr };
+	ReplacementAnimation* replacementAnim{ nullptr };
 };
 
 class OpenAnimationReplacer

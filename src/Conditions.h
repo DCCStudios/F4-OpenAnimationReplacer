@@ -1292,5 +1292,20 @@ private:
 	NumericComponent numericValue;
 };
 
+class IsPlayingIdleAnimationCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsPlayingIdleAnimation"; }
+	std::string GetDescription() const override { return "Checks if the actor is currently playing a specific idle animation (TESIdleForm). Uses currentIdle from the AI process."; }
+	std::string GetParameterString() const override { return form.GetDisplayString(); }
+	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Idle Animation", a_dirty, RE::ENUM_FORM_ID::kIDLE); }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	FormComponent form;
+};
+
 void RegisterAllConditions();
 std::unique_ptr<ICondition> CreateConditionFromJson(const nlohmann::json& a_json);

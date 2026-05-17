@@ -185,22 +185,6 @@ void ActiveClip::ReplaceActiveAnimation(ReplacementAnimation* a_newRepl)
 
 	RestoreOriginalIndex();
 	currentReplacement = a_newRepl;
-
-	if (currentReplacement) {
-		int16_t newIndex = currentReplacement->GetBindingIndex();
-
-		if (currentReplacement->HasVariants()) {
-			auto* subMod = currentReplacement->GetParentSubMod();
-			bool keepOnLoop = subMod ? subMod->GetKeepRandomResultsOnLoop() : false;
-			bool shareResults = subMod ? subMod->GetShareRandomResults() : false;
-			newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID(), keepOnLoop, shareResults);
-		}
-
-		if (newIndex >= 0) {
-			clipGenerator->animationBindingIndex = newIndex;
-		}
-	}
-
 	transitioning = true;
 }
 
@@ -297,21 +281,6 @@ void ActiveClip::EvaluateAndApplyReplacement()
 		}
 
 		currentReplacement = replacement;
-
-		if (currentReplacement) {
-			int16_t newIndex = currentReplacement->GetBindingIndex();
-
-			if (currentReplacement->HasVariants()) {
-				auto* subMod = currentReplacement->GetParentSubMod();
-				bool keepOnLoop = subMod ? subMod->GetKeepRandomResultsOnLoop() : false;
-				bool shareResults = subMod ? subMod->GetShareRandomResults() : false;
-				newIndex = currentReplacement->GetVariants()->SelectVariant(refr->GetFormID(), keepOnLoop, shareResults);
-			}
-
-			if (newIndex >= 0) {
-				clipGenerator->animationBindingIndex = newIndex;
-			}
-		}
 	} else {
 		// Conditions are still matching — cancel any pending deactivation delay
 		if (replacement) {

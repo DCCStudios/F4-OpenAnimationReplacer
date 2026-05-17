@@ -4,6 +4,7 @@
 #include "HavokTypes.h"
 #include "BaseConditions.h"
 #include "Functions.h"
+#include "Variants.h"
 #include <atomic>
 #include <mutex>
 
@@ -113,6 +114,12 @@ public:
 		std::mutex boneMutex;
 	};
 	TrackFilter trackFilter;
+
+	// Variant animation configuration (loaded from JSON, applied to Variants objects)
+	bool variantsEnabled{ true };
+	VariantMode variantMode{ VariantMode::kRandom };
+	VariantRerollPolicy variantRerollPolicy{ VariantRerollPolicy::kOnEachPlay };
+	std::unordered_map<std::string, float> variantWeights;  // filename -> weight
 };
 
 class ReplacerMod

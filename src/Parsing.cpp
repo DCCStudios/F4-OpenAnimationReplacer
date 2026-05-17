@@ -12,6 +12,32 @@ namespace Parsing
 {
 	static constexpr std::string_view kOarFolderName = "OpenAnimationReplacer";
 
+	// Mirrors ExtractAnimSuffix in Hooks.cpp: extracts the cache key from a full normalized path
+	static std::string PathToAnimSuffix(const std::string& a_normalizedPath)
+	{
+		auto lower = a_normalizedPath;
+		std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		std::ranges::replace(lower, '/', '\\');
+
+		auto pos = lower.find("animations\\");
+		if (pos != std::string::npos) {
+			auto suffix = lower.substr(pos + 11);
+			auto dot = suffix.rfind('.');
+			if (dot != std::string::npos) suffix = suffix.substr(0, dot);
+			return suffix;
+		}
+
+		auto dot = lower.rfind('.');
+		if (dot != std::string::npos) lower = lower.substr(0, dot);
+		auto lastSep = lower.rfind('\\');
+		if (lastSep != std::string::npos && lastSep > 0) {
+			auto prevSep = lower.rfind('\\', lastSep - 1);
+			if (prevSep != std::string::npos)
+				return lower.substr(prevSep + 1);
+		}
+		return lower;
+	}
+
 	static std::filesystem::path ExtractPathAfterMeshes(const std::filesystem::path& a_fullPath)
 	{
 		auto pathStr = a_fullPath.string();
@@ -194,6 +220,20 @@ namespace Parsing
 			subMod->hasUserConfig = true;
 		}
 
+		struct HkxFileEntry {
+			std::filesystem::path diskPath;
+			std::filesystem::path relativePath;  // relative to submod
+			std::string filename;
+			std::string stem;
+			std::string baseKey;  // lowercase dir\baseStem (variant suffix stripped)
+			int variantIndex;     // -1 = not a variant candidate, 0+ = variant N
+			bool isBase;          // true if no _N suffix detected
+		};
+
+		// First pass: collect all .hkx files
+		std::vector<HkxFileEntry> allFiles;
+		std::unordered_set<std::string> baseKeys;  // keys that have a base file (no _N suffix)
+
 		for (auto& fileEntry : std::filesystem::recursive_directory_iterator(a_subModPath,
 			std::filesystem::directory_options::skip_permission_denied))
 		{
@@ -204,40 +244,204 @@ namespace Parsing
 			if (ext != ".hkx") continue;
 
 			auto relativePath = std::filesystem::relative(fileEntry.path(), a_subModPath);
-			auto originalPath = a_meshesPrefix / relativePath;
+			std::string stem = relativePath.stem().string();
+			std::string relDir = relativePath.parent_path().string();
 
-		auto normalizedOriginal = Utils::NormalizePath(originalPath);
-
-		auto afterMeshes = ExtractPathAfterMeshes(fileEntry.path());
-		auto afterMeshesStr = afterMeshes.string();
-		std::string normalizedReplacement;
-		{
-			auto lowerAfter = afterMeshesStr;
-			std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			auto animPos = lowerAfter.find("animations\\");
-			if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
-			if (animPos != std::string::npos) {
-				normalizedReplacement = afterMeshesStr.substr(animPos);
-			} else {
-				normalizedReplacement = afterMeshesStr;
+			// Try to detect _N variant suffix
+			int variantIdx = -1;
+			std::string baseStem = stem;
+			bool isBase = true;
+			{
+				auto underscorePos = stem.rfind('_');
+				if (underscorePos != std::string::npos && underscorePos + 1 < stem.size()) {
+					auto numPart = stem.substr(underscorePos + 1);
+					bool allDigits = !numPart.empty() && std::all_of(numPart.begin(), numPart.end(), ::isdigit);
+					if (allDigits) {
+						variantIdx = std::stoi(numPart);
+						baseStem = stem.substr(0, underscorePos);
+						isBase = false;
+					}
+				}
 			}
-			std::ranges::replace(normalizedReplacement, '/', '\\');
+
+			// Construct base key: relDir\baseStem (normalized, lowercase)
+			std::string baseKey;
+			if (!relDir.empty() && relDir != ".") {
+				baseKey = relDir + "\\" + baseStem;
+			} else {
+				baseKey = baseStem;
+			}
+			std::ranges::transform(baseKey, baseKey.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			std::ranges::replace(baseKey, '/', '\\');
+
+			if (isBase) baseKeys.insert(baseKey);
+
+			HkxFileEntry hfe;
+			hfe.diskPath = fileEntry.path();
+			hfe.relativePath = relativePath;
+			hfe.filename = relativePath.filename().string();
+			hfe.stem = stem;
+			hfe.baseKey = baseKey;
+			hfe.variantIndex = variantIdx;
+			hfe.isBase = isBase;
+			allFiles.push_back(std::move(hfe));
 		}
 
-		auto replacement = std::make_unique<ReplacementAnimation>(
-			normalizedOriginal, normalizedReplacement, -1, subMod.get());
+		// Second pass: group files — only treat _N files as variants if a base exists
+		std::map<std::string, std::vector<HkxFileEntry*>> variantGroups;
+		std::vector<HkxFileEntry*> standaloneFiles;
 
-		subMod->AddReplacementAnimation(replacement.get());
+		for (auto& f : allFiles) {
+			if (f.isBase) {
+				// This is a base file, always part of its own group
+				variantGroups[f.baseKey].push_back(&f);
+			} else {
+				// This has _N suffix — only group it if a matching base exists
+				if (baseKeys.count(f.baseKey)) {
+					variantGroups[f.baseKey].push_back(&f);
+				} else {
+					// No matching base → treat as standalone
+					standaloneFiles.push_back(&f);
+				}
+			}
+		}
 
-		ReplacementAnimFileInfo fileInfo;
-		fileInfo.originalPath = normalizedOriginal;
-		fileInfo.replacementPath = normalizedReplacement;
-		fileInfo.absoluteDiskPath = fileEntry.path().string();
-		fileInfo.parentSubMod = subMod.get();
-		OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(normalizedOriginal, fileInfo);
+		// Helper lambda to register a single file as a ReplacementAnimation
+		auto registerSingleFile = [&](HkxFileEntry* f) {
+			auto originalPath = a_meshesPrefix / f->relativePath;
+			auto normalizedOriginal = Utils::NormalizePath(originalPath);
 
-		OpenAnimationReplacer::GetSingleton()->AddOwnedAnimation(std::move(replacement));
-		OpenAnimationReplacer::GetSingleton()->loadingParsedAnims.fetch_add(1);
+			auto afterMeshes = ExtractPathAfterMeshes(f->diskPath);
+			auto afterMeshesStr = afterMeshes.string();
+			std::string normalizedReplacement;
+			{
+				auto lowerAfter = afterMeshesStr;
+				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				auto animPos = lowerAfter.find("animations\\");
+				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
+				if (animPos != std::string::npos) {
+					normalizedReplacement = afterMeshesStr.substr(animPos);
+				} else {
+					normalizedReplacement = afterMeshesStr;
+				}
+				std::ranges::replace(normalizedReplacement, '/', '\\');
+			}
+
+			auto replacement = std::make_unique<ReplacementAnimation>(
+				normalizedOriginal, normalizedReplacement, -1, subMod.get());
+
+			ReplacementAnimFileInfo fileInfo;
+			fileInfo.originalPath = normalizedOriginal;
+			fileInfo.replacementPath = normalizedReplacement;
+			fileInfo.absoluteDiskPath = f->diskPath.string();
+			fileInfo.parentSubMod = subMod.get();
+			fileInfo.replacementAnim = replacement.get();
+			OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(normalizedOriginal, fileInfo);
+
+			subMod->AddReplacementAnimation(replacement.get());
+			OpenAnimationReplacer::GetSingleton()->AddOwnedAnimation(std::move(replacement));
+			OpenAnimationReplacer::GetSingleton()->loadingParsedAnims.fetch_add(1);
+		};
+
+		// Register standalone files (no variant grouping)
+		for (auto* f : standaloneFiles) {
+			registerSingleFile(f);
+		}
+
+		// Third pass: register each variant group
+		for (auto& [baseKey, files] : variantGroups) {
+			if (files.size() == 1) {
+				// Single file in group (just the base, no variants found)
+				registerSingleFile(files[0]);
+				continue;
+			}
+
+			// Sort: base (isBase=true or variantIndex=-1 meaning no suffix) first, then by variant index
+			std::ranges::sort(files, [](const HkxFileEntry* a, const HkxFileEntry* b) {
+				if (a->isBase != b->isBase) return a->isBase;  // base first
+				return a->variantIndex < b->variantIndex;
+			});
+
+			auto* baseFile = files[0];
+
+			// Compute normalizedOriginal from the base file's actual path
+			auto originalPath = a_meshesPrefix / baseFile->relativePath;
+			auto normalizedOriginal = Utils::NormalizePath(originalPath);
+
+			// Compute normalizedReplacement for the base file
+			auto afterMeshes = ExtractPathAfterMeshes(baseFile->diskPath);
+			auto afterMeshesStr = afterMeshes.string();
+			std::string normalizedReplacement;
+			{
+				auto lowerAfter = afterMeshesStr;
+				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				auto animPos = lowerAfter.find("animations\\");
+				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
+				if (animPos != std::string::npos) {
+					normalizedReplacement = afterMeshesStr.substr(animPos);
+				} else {
+					normalizedReplacement = afterMeshesStr;
+				}
+				std::ranges::replace(normalizedReplacement, '/', '\\');
+			}
+
+			auto replacement = std::make_unique<ReplacementAnimation>(
+				normalizedOriginal, normalizedReplacement, -1, subMod.get());
+
+			// Create variants for all files in the group
+			auto variants = std::make_unique<Variants>();
+
+			for (size_t i = 0; i < files.size(); ++i) {
+				auto* f = files[i];
+
+				// Compute a unique cache path for this variant
+				// Base (index 0) uses normalizedOriginal, variants get "__v{N}" appended
+				std::string variantCachePath;
+				if (i == 0) {
+					variantCachePath = normalizedOriginal;
+				} else {
+					auto dotPos = normalizedOriginal.rfind('.');
+					std::string noExt = (dotPos != std::string::npos) ? normalizedOriginal.substr(0, dotPos) : normalizedOriginal;
+					variantCachePath = noExt + "__v" + std::to_string(f->variantIndex) + ".hkx";
+				}
+
+				VariantEntry entry;
+				entry.filename = f->filename;
+				entry.cacheSuffix = PathToAnimSuffix(variantCachePath);
+				entry.weight = 1.0f;
+				entry.bindingIndex = static_cast<int16_t>(i);
+				variants->AddVariant(std::move(entry));
+
+				// Register each variant file with the cache system
+				ReplacementAnimFileInfo fileInfo;
+				fileInfo.originalPath = variantCachePath;
+				fileInfo.replacementPath = normalizedReplacement;
+				fileInfo.absoluteDiskPath = f->diskPath.string();
+				fileInfo.parentSubMod = subMod.get();
+				fileInfo.replacementAnim = replacement.get();
+				OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(variantCachePath, fileInfo);
+			}
+
+			// Apply variant config from SubMod (parsed from JSON)
+			variants->SetMode(subMod->variantMode);
+			if (!subMod->variantWeights.empty()) {
+				for (auto& ve : variants->GetEntriesMutable()) {
+					auto it = subMod->variantWeights.find(ve.filename);
+					if (it != subMod->variantWeights.end()) {
+						ve.weight = it->second;
+					}
+				}
+			}
+
+			replacement->SetVariants(std::move(variants));
+
+			logger::info("[OAR-Variants] Grouped {} variants for '{}' in submod '{}' (mode={})",
+				files.size(), normalizedOriginal, subMod->GetName(),
+				subMod->variantMode == VariantMode::kSequential ? "sequential" : "random");
+
+			subMod->AddReplacementAnimation(replacement.get());
+			OpenAnimationReplacer::GetSingleton()->AddOwnedAnimation(std::move(replacement));
+			OpenAnimationReplacer::GetSingleton()->loadingParsedAnims.fetch_add(1);
 		}
 
 		return subMod;
@@ -289,16 +493,43 @@ namespace Parsing
 		if (json.contains("overrideAnimationsFolder"))
 			a_subMod->overrideAnimationsFolder = json["overrideAnimationsFolder"].get<std::string>();
 
-		if (json.contains("conditions") && json["conditions"].is_array()) {
-			auto condSet = std::make_unique<ConditionSet>();
-			for (const auto& condJson : json["conditions"]) {
-				auto cond = CreateConditionFromJson(condJson);
-				if (cond) condSet->AddCondition(std::move(cond));
-			}
-			a_subMod->SetConditionSet(std::move(condSet));
+	// Variant animation configuration
+	if (json.contains("variants") && json["variants"].is_object()) {
+		auto& vj = json["variants"];
+		if (vj.contains("enabled"))
+			a_subMod->variantsEnabled = vj["enabled"].get<bool>();
+		if (vj.contains("mode")) {
+			std::string modeStr = vj["mode"].get<std::string>();
+			if (modeStr == "sequential")
+				a_subMod->variantMode = VariantMode::kSequential;
+			else
+				a_subMod->variantMode = VariantMode::kRandom;
 		}
+		if (vj.contains("rerollPolicy")) {
+			std::string policyStr = vj["rerollPolicy"].get<std::string>();
+			if (policyStr == "whileActive")
+				a_subMod->variantRerollPolicy = VariantRerollPolicy::kWhileActive;
+			else
+				a_subMod->variantRerollPolicy = VariantRerollPolicy::kOnEachPlay;
+		}
+		if (vj.contains("weights") && vj["weights"].is_object()) {
+			for (auto& [filename, weight] : vj["weights"].items()) {
+				if (weight.is_number())
+					a_subMod->variantWeights[filename] = weight.get<float>();
+			}
+		}
+	}
 
-		// Partial body animation layering configuration
+	if (json.contains("conditions") && json["conditions"].is_array()) {
+		auto condSet = std::make_unique<ConditionSet>();
+		for (const auto& condJson : json["conditions"]) {
+			auto cond = CreateConditionFromJson(condJson);
+			if (cond) condSet->AddCondition(std::move(cond));
+		}
+		a_subMod->SetConditionSet(std::move(condSet));
+	}
+
+	// Partial body animation layering configuration
 		if (json.contains("trackFilter") && json["trackFilter"].is_object()) {
 			auto& tf = json["trackFilter"];
 			a_subMod->trackFilter.enabled = tf.value("enabled", false);
@@ -354,6 +585,33 @@ namespace Parsing
 			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
 		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
 			a_subMod->eventsOnEnd = json["eventsOnEnd"].get<std::vector<std::string>>();
+
+	// Variant animation configuration (user override)
+	if (json.contains("variants") && json["variants"].is_object()) {
+		auto& vj = json["variants"];
+		if (vj.contains("enabled"))
+			a_subMod->variantsEnabled = vj["enabled"].get<bool>();
+		if (vj.contains("mode")) {
+			std::string modeStr = vj["mode"].get<std::string>();
+			if (modeStr == "sequential")
+				a_subMod->variantMode = VariantMode::kSequential;
+			else
+				a_subMod->variantMode = VariantMode::kRandom;
+		}
+		if (vj.contains("rerollPolicy")) {
+			std::string policyStr = vj["rerollPolicy"].get<std::string>();
+			if (policyStr == "whileActive")
+				a_subMod->variantRerollPolicy = VariantRerollPolicy::kWhileActive;
+			else
+				a_subMod->variantRerollPolicy = VariantRerollPolicy::kOnEachPlay;
+		}
+		if (vj.contains("weights") && vj["weights"].is_object()) {
+			for (auto& [filename, weight] : vj["weights"].items()) {
+				if (weight.is_number())
+					a_subMod->variantWeights[filename] = weight.get<float>();
+			}
+		}
+	}
 
 		if (json.contains("conditions") && json["conditions"].is_array()) {
 			auto condSet = std::make_unique<ConditionSet>();

@@ -833,6 +833,10 @@ namespace
 	static std::shared_mutex s_clipSuffixMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipSuffixCache;
 
+	// Per-clip variant suffix cache (for kOnEachPlay: each clip gets its own roll)
+	static std::shared_mutex s_clipVariantMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipVariantCache;
+
 	// Manual annotation firing state — tracks localTime progression per clip
 	struct ClipAnnotationState
 	{
@@ -1226,6 +1230,10 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_clipSuffixMutex);
 		s_clipSuffixCache.clear();
+	}
+	{
+		std::unique_lock lock(s_clipVariantMutex);
+		s_clipVariantCache.clear();
 	}
 	{
 		std::unique_lock lock(s_annotStateMutex);
@@ -2689,13 +2697,48 @@ namespace
 
 			static std::atomic<int> s_transitionLogCount{ 0 };
 			int transCount = s_transitionLogCount.fetch_add(1, std::memory_order_relaxed);
-			if (transCount < 30) {
+			if (transCount < 50) {
 				std::string winnerName = (winningInfo && winningInfo->parentSubMod)
 					? winningInfo->parentSubMod->GetName() : "(none)";
 				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={})",
 					resolvedSuffix, prevKnown ? (prev ? "true" : "false") : "?",
 					shouldReplace ? "true" : "false", winnerName,
 					totalCands, disabledCands, evalFalseCands, noCondCands);
+
+				if (!shouldReplace && evalFalseCands > 0) {
+					for (auto* info : candidates) {
+						if (!info || !info->parentSubMod || info->parentSubMod->IsDisabled()) continue;
+						auto* cs = info->parentSubMod->GetConditionSet();
+						if (!cs || cs->IsEmpty()) continue;
+						logger::info("[OAR-CondDetail]   SubMod='{}' conditions:", info->parentSubMod->GetName());
+						for (const auto& cond : cs->GetConditions()) {
+							if (!cond) continue;
+							std::string prefix = cond->IsNegated() ? "NOT " : "";
+							std::string evalStr = cond->lastEvalResult.has_value()
+								? (cond->lastEvalResult.value() ? "PASS" : "FAIL") : "?";
+							logger::info("[OAR-CondDetail]     {}{} [{}] -> {}",
+								prefix, cond->GetName(), cond->GetParameterString(), evalStr);
+						}
+					}
+				}
+			}
+
+			// Reset variant state when conditions transition true→false for kWhileActive policy
+			if (prevKnown && prev && !shouldReplace) {
+				auto* transRefr = GetRefrFromContext(a_context);
+				if (!transRefr) transRefr = RE::PlayerCharacter::GetSingleton();
+				if (transRefr) {
+					for (auto* info : candidates) {
+						if (!info || !info->parentSubMod) continue;
+						if (info->parentSubMod->variantRerollPolicy == VariantRerollPolicy::kWhileActive) {
+							for (auto* ra : info->parentSubMod->GetReplacementAnimations()) {
+								if (ra && ra->HasVariants()) {
+									ra->GetVariants()->ResetState(transRefr->GetFormID());
+								}
+							}
+						}
+					}
+				}
 			}
 			}
 		}
@@ -2714,7 +2757,51 @@ namespace
 
 		if (shouldReplace) {
 			auto* cache = AnimationCache::GetSingleton();
-			const auto& cacheSuffix = resolvedSuffix;
+			std::string variantSuffix;
+
+			// Variant selection: if the winning replacement has variants and they're enabled, pick one
+			if (winningInfo && winningInfo->replacementAnim &&
+				winningInfo->replacementAnim->HasVariants() && refr) {
+				auto* subMod = winningInfo->parentSubMod;
+				if (subMod && subMod->variantsEnabled) {
+					if (subMod->variantRerollPolicy == VariantRerollPolicy::kOnEachPlay) {
+						// Per-clip caching: each clip generator gets its own fresh roll
+						// that is stable for the clip's entire lifetime (no mid-play re-rolls)
+						{
+							std::shared_lock cvLock(s_clipVariantMutex);
+							auto cvIt = s_clipVariantCache.find(a_this);
+							if (cvIt != s_clipVariantCache.end()) {
+								variantSuffix = cvIt->second;
+							}
+						}
+						if (variantSuffix.empty()) {
+							auto* variants = winningInfo->replacementAnim->GetVariants();
+							int32_t idx = variants->SelectRandomIndex_Fresh();
+							if (idx >= 0 && idx < static_cast<int32_t>(variants->GetCount())) {
+								variantSuffix = variants->GetEntries()[idx].cacheSuffix;
+							}
+							{
+								std::unique_lock cvLock(s_clipVariantMutex);
+								s_clipVariantCache[a_this] = variantSuffix;
+							}
+							static std::atomic<int> s_variantSelectLog{ 0 };
+							int vCount = s_variantSelectLog.fetch_add(1);
+							if (vCount < 30 || vCount % 500 == 0) {
+								logger::info("[OAR-Variant] Fresh roll (OnEachPlay) clip={:X} refr={:X}: suffix='{}' (count={})",
+									reinterpret_cast<uintptr_t>(a_this), refr->GetFormID(), variantSuffix,
+									variants->GetCount());
+							}
+						}
+					} else {
+						// kWhileActive: use actor-keyed caching (persists across clips while conditions hold)
+						bool shareResults = subMod->GetShareRandomResults();
+						variantSuffix = winningInfo->replacementAnim->GetVariants()->SelectVariantSuffix(
+							refr->GetFormID(), false, shareResults);
+					}
+				}
+			}
+
+			const std::string& cacheSuffix = variantSuffix.empty() ? resolvedSuffix : variantSuffix;
 			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim);
 			bool bReplaceAnnot = winningInfo && winningInfo->parentSubMod ?
 				winningInfo->parentSubMod->GetReplaceAnnotations() : true;
@@ -2871,7 +2958,11 @@ namespace
 		entry.clipSuffix = resolvedSuffix;
 		entry.conditionsPassed = true;
 		if (winningInfo) {
-			entry.replacementPath = winningInfo->replacementPath;
+			if (!variantSuffix.empty()) {
+				entry.replacementPath = variantSuffix + " (variant)";
+			} else {
+				entry.replacementPath = winningInfo->replacementPath;
+			}
 			if (winningInfo->parentSubMod)
 				entry.subModName = winningInfo->parentSubMod->GetName();
 		}
@@ -2901,7 +2992,7 @@ namespace
 		// Fire replacement annotations manually (only if replaceAnnotations is enabled).
 		// When disabled, original triggers are kept so the game handles sounds/events natively.
 		if (bReplaceAnnot) {
-			const auto& annotSuffix = resolvedSuffix;
+			const auto& annotSuffix = cacheSuffix;
 			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix);
 			if (annotations && !annotations->empty() && refr) {
 				float localTime = a_this->GetLocalTime();
@@ -2942,6 +3033,10 @@ namespace
 							}
 							astate.lastFiredIndex = -1;
 							prevT = 0.f;
+
+							// Note: per-clip variant cache is NOT cleared on loop.
+							// For kOnEachPlay, the variant is stable for the clip's entire lifetime.
+							// A new variant is selected only when a new clip generator is created.
 						}
 
 						for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
@@ -3229,6 +3324,10 @@ namespace
 				s_clipSuffixCache.erase(a_this);
 			}
 			{
+				std::unique_lock lock(s_clipVariantMutex);
+				s_clipVariantCache.erase(a_this);
+			}
+			{
 				std::unique_lock lock(s_annotStateMutex);
 				s_annotStateMap.erase(a_this);
 			}
@@ -3240,7 +3339,7 @@ namespace
 				std::unique_lock lock(s_playOnceDecisionMutex);
 				s_playOnceDecision.erase(a_this);
 			}
-			// Fire custom "on end" events at deactivation
+			// Fire custom "on end" events at deactivation + reset variant state if kOnEachPlay
 			{
 				std::shared_lock smLock(s_activeSubModMutex);
 				auto smIt = s_activeSubModMap.find(a_this);
@@ -3249,6 +3348,9 @@ namespace
 					if (!deactRefr) deactRefr = RE::PlayerCharacter::GetSingleton();
 					if (deactRefr) {
 						QueueCustomEvents(deactRefr, smIt->second->eventsOnEnd, "onEnd/deactivate");
+
+						// kOnEachPlay uses per-clip cache (s_clipVariantCache) which is
+						// erased above — no actor-keyed reset needed.
 					}
 				}
 			}

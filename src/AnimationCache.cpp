@@ -109,8 +109,8 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		return false;
 	}
 
-	logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}", 
-		a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks);
+	logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={} path='{}'", 
+		a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_absolutePath.string());
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
 

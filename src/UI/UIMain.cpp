@@ -304,8 +304,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"When a random variant is selected, keep playing the same one when\n"
 			"the animation loops instead of re-rolling. Each actor remembers\n"
 			"their own selected variant independently.\n\n"
-			"Requires multiple animation files registered as variants under\n"
-			"this SubMod (NOT YET IMPLEMENTED — variant loading is pending).");
+			"Requires variant animation files (e.g. anim_1.hkx, anim_2.hkx)\n"
+			"in the SubMod folder alongside the base animation.");
 
 		bool shareRandom = a_subMod->GetShareRandomResults();
 		if (ImGui::Checkbox("Share random results (?)", &shareRandom)) {
@@ -315,8 +315,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
 			"All actors use the same randomly-selected variant instead of each\n"
 			"actor rolling independently. Useful for synchronized group animations.\n\n"
-			"Requires multiple animation files registered as variants under\n"
-			"this SubMod (NOT YET IMPLEMENTED — variant loading is pending).");
+			"Requires variant animation files (e.g. anim_1.hkx, anim_2.hkx)\n"
+			"in the SubMod folder alongside the base animation.");
 
 		bool replAnnot = a_subMod->GetReplaceAnnotations();
 		if (ImGui::Checkbox("Replace Annotations (?)", &replAnnot)) {
@@ -580,6 +580,30 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["trackFilter"] = tfJson;
 			}
 
+			// Serialize variant configuration
+			{
+				bool hasVariants = false;
+				for (auto* ra : a_subMod->GetReplacementAnimations()) {
+					if (ra && ra->HasVariants()) { hasVariants = true; break; }
+				}
+				if (hasVariants) {
+					nlohmann::json varJson;
+					varJson["enabled"] = a_subMod->variantsEnabled;
+					varJson["mode"] = (a_subMod->variantMode == VariantMode::kSequential) ? "sequential" : "random";
+					varJson["rerollPolicy"] = (a_subMod->variantRerollPolicy == VariantRerollPolicy::kWhileActive) ? "whileActive" : "onEachPlay";
+					nlohmann::json weightsJson = nlohmann::json::object();
+					for (auto* ra : a_subMod->GetReplacementAnimations()) {
+						if (!ra || !ra->HasVariants()) continue;
+						for (auto& ve : ra->GetVariants()->GetEntries()) {
+							weightsJson[ve.filename] = ve.weight;
+						}
+					}
+					if (!weightsJson.empty())
+						varJson["weights"] = weightsJson;
+					json["variants"] = varJson;
+				}
+			}
+
 			if (auto* condSet = a_subMod->GetConditionSet()) {
 					auto& arr = json["conditions"];
 					arr = nlohmann::json::array();
@@ -636,9 +660,17 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 	ImVec2 lineEnd = lineStart;
 
 	int index = 0;
-	for (const auto& cond : a_condSet->GetConditions()) {
+	bool conditionDeleted = false;
+	auto& condVec = a_condSet->GetConditions();
+	for (size_t i = 0; i < condVec.size(); ++i) {
 		ImVec2 beforePos = ImGui::GetCursorScreenPos();
-		DrawCondition(cond.get(), a_condSet, index, a_subMod, a_depth);
+		DrawCondition(condVec[i].get(), a_condSet, static_cast<int>(i), a_subMod, a_depth);
+
+		if (condVec.size() <= i || !condVec[i]) {
+			conditionDeleted = true;
+			break;
+		}
+
 		ImVec2 afterPos = ImGui::GetCursorScreenPos();
 
 		if (a_depth > 0) {
@@ -793,6 +825,7 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 		if (wantsContextMenu) {
 			ImGui::OpenPopup("ConditionContextMenu");
 		}
+		bool deletedViaContextMenu = false;
 		if (ImGui::BeginPopup("ConditionContextMenu")) {
 			if (ImGui::MenuItem("Copy condition")) {
 				nlohmann::json condJson;
@@ -826,8 +859,16 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 			if (ImGui::MenuItem("Delete")) {
 				a_parentSet->RemoveCondition(a_index);
 				a_subMod->SetDirty(true);
+				deletedViaContextMenu = true;
 			}
 			ImGui::EndPopup();
+		}
+		if (deletedViaContextMenu) {
+			ImGui::EndTable();
+			ImGui::PopStyleVar();
+			if (bStyleVarPushed) ImGui::PopStyleVar();
+			ImGui::PopID();
+			return;
 		}
 
 		ImGui::SameLine();
@@ -859,6 +900,7 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 		if (nodeOpen) {
 			ImGui::Spacing();
 
+			bool deletedViaButton = false;
 			if (editable) {
 				bool bNOT = a_condition->IsNegated();
 				if (ImGui::Checkbox("Negate", &bNOT)) {
@@ -870,25 +912,28 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 				if (ImGui::Button("Delete condition")) {
 					a_parentSet->RemoveCondition(a_index);
 					a_subMod->SetDirty(true);
+					deletedViaButton = true;
 				}
 			}
 
-			if (hasChildren) {
-				if (orCond) {
-					ImGui::Indent();
-					DrawConditionSet(&orCond->GetConditionSet(), a_subMod, a_depth + 1);
-					ImGui::Unindent();
-				} else if (andCond) {
-					ImGui::Indent();
-					DrawConditionSet(&andCond->GetConditionSet(), a_subMod, a_depth + 1);
-					ImGui::Unindent();
+			if (!deletedViaButton) {
+				if (hasChildren) {
+					if (orCond) {
+						ImGui::Indent();
+						DrawConditionSet(&orCond->GetConditionSet(), a_subMod, a_depth + 1);
+						ImGui::Unindent();
+					} else if (andCond) {
+						ImGui::Indent();
+						DrawConditionSet(&andCond->GetConditionSet(), a_subMod, a_depth + 1);
+						ImGui::Unindent();
+					}
 				}
-			}
 
-			if (editable) {
-				bool dirty = false;
-				a_condition->DrawEditWidgets(dirty);
-				if (dirty) a_subMod->SetDirty(true);
+				if (editable) {
+					bool dirty = false;
+					a_condition->DrawEditWidgets(dirty);
+					if (dirty) a_subMod->SetDirty(true);
+				}
 			}
 
 			if (canExpand) {
@@ -1259,11 +1304,13 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 		return;
 	}
 
+	bool editable = (currentMode != UICommon::EditorMode::kInspect);
+
 	if (ImGui::BeginTable("AnimTable", 3,
 		ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable)) {
 		ImGui::TableSetupColumn("Original", ImGuiTableColumnFlags_None, 0.4f);
 		ImGui::TableSetupColumn("Replacement", ImGuiTableColumnFlags_None, 0.5f);
-		ImGui::TableSetupColumn("Idx", ImGuiTableColumnFlags_WidthFixed, 40.f);
+		ImGui::TableSetupColumn("Variants", ImGuiTableColumnFlags_WidthFixed, 60.f);
 		ImGui::TableHeadersRow();
 
 		for (auto* anim : anims) {
@@ -1286,10 +1333,132 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 			}
 
 			ImGui::TableNextColumn();
-			ImGui::Text("%d", anim->GetBindingIndex());
+			if (anim->HasVariants()) {
+				ImGui::Text("%zu", anim->GetVariants()->GetCount());
+			} else {
+				UICommon::TextUnformattedDisabled("-");
+			}
 		}
 
 		ImGui::EndTable();
+	}
+
+	// Variant controls for animations that have variants
+	bool hasAnyVariants = false;
+	for (auto* anim : anims) {
+		if (anim && anim->HasVariants()) { hasAnyVariants = true; break; }
+	}
+
+	if (hasAnyVariants) {
+		ImGui::Spacing();
+		ImGui::Separator();
+		ImGui::Spacing();
+		ImGui::TextUnformatted("Variant Animation Settings");
+		ImGui::Spacing();
+
+		// Enable/disable toggle
+		if (editable) {
+			if (ImGui::Checkbox("Enable Variant Selection", &a_subMod->variantsEnabled)) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("When enabled, a variant is randomly or sequentially selected from the group.\nWhen disabled, only the base animation plays.");
+			}
+		} else {
+			ImGui::Text("Variant Selection: %s", a_subMod->variantsEnabled ? "Enabled" : "Disabled");
+		}
+
+		if (!a_subMod->variantsEnabled) {
+			ImGui::Spacing();
+			ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Variant selection is disabled. Only the base animation will play.");
+			ImGui::Spacing();
+		}
+
+		if (a_subMod->variantsEnabled) {
+		// Mode toggle
+		int modeInt = static_cast<int>(a_subMod->variantMode);
+		if (editable) {
+			if (ImGui::RadioButton("Random", &modeInt, 0)) {
+				a_subMod->variantMode = VariantMode::kRandom;
+				for (auto* anim : anims) {
+					if (anim && anim->HasVariants())
+						anim->GetVariants()->SetMode(VariantMode::kRandom);
+				}
+				a_subMod->SetDirty(true);
+			}
+			ImGui::SameLine();
+			if (ImGui::RadioButton("Sequential", &modeInt, 1)) {
+				a_subMod->variantMode = VariantMode::kSequential;
+				for (auto* anim : anims) {
+					if (anim && anim->HasVariants())
+						anim->GetVariants()->SetMode(VariantMode::kSequential);
+				}
+				a_subMod->SetDirty(true);
+			}
+		} else {
+			ImGui::Text("Mode: %s", modeInt == 0 ? "Random" : "Sequential");
+		}
+
+		// Reroll policy dropdown
+		ImGui::Spacing();
+		if (editable) {
+			static const char* rerollLabels[] = { "On Each Play", "While Conditions Active" };
+			int rerollInt = static_cast<int>(a_subMod->variantRerollPolicy);
+			ImGui::TextUnformatted("Variant Selection Timing:");
+			if (ImGui::Combo("##reroll_policy", &rerollInt, rerollLabels, IM_ARRAYSIZE(rerollLabels))) {
+				a_subMod->variantRerollPolicy = static_cast<VariantRerollPolicy>(rerollInt);
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"On Each Play: A new random variant is selected every time the animation plays.\n"
+					"While Conditions Active: A variant is selected once and kept until the conditions become false.");
+			}
+
+			bool shareResults = a_subMod->GetShareRandomResults();
+			if (ImGui::Checkbox("Share results across actors (?)", &shareResults)) {
+				a_subMod->SetShareRandomResults(shareResults);
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("When checked, all actors play the same randomly-selected\n"
+					"variant instead of rolling independently.");
+			}
+		} else {
+			static const char* rerollLabels[] = { "On Each Play", "While Conditions Active" };
+			int rerollInt = static_cast<int>(a_subMod->variantRerollPolicy);
+			ImGui::Text("Variant Selection Timing: %s", rerollLabels[rerollInt]);
+		}
+
+		// Per-variant weight sliders (only in random mode)
+		if (a_subMod->variantMode == VariantMode::kRandom) {
+			ImGui::Spacing();
+			ImGui::TextUnformatted("Variant Weights:");
+
+			for (auto* anim : anims) {
+				if (!anim || !anim->HasVariants()) continue;
+
+				auto* variants = anim->GetVariants();
+				auto& entries = variants->GetEntriesMutable();
+
+				for (size_t i = 0; i < entries.size(); ++i) {
+					auto& ve = entries[i];
+					std::string label = ve.filename + "##weight_" + std::to_string(i);
+
+					if (editable) {
+						ImGui::PushItemWidth(120.f);
+						if (ImGui::SliderFloat(label.c_str(), &ve.weight, 0.01f, 10.0f, "%.2f")) {
+							a_subMod->variantWeights[ve.filename] = ve.weight;
+							a_subMod->SetDirty(true);
+						}
+						ImGui::PopItemWidth();
+					} else {
+						ImGui::Text("%s: %.2f", ve.filename.c_str(), ve.weight);
+					}
+				}
+			}
+		}
+		} // end variantsEnabled
 	}
 }
 
