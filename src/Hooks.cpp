@@ -3695,6 +3695,19 @@ namespace
 				if (numTracksToSample <= 0) return;
 
 				float localTime = a_this->GetLocalTime();
+
+				// The clip generator's localTime is driven by the ORIGINAL animation's
+				// duration (since *animSlot isn't swapped for track filtering). Wrap it
+				// to the replacement's duration so different-length replacements sample
+				// correctly — preventing both out-of-bounds reads (replacement shorter)
+				// and ensuring the full replacement plays through (replacement longer,
+				// cycling independently of the base animation's loop).
+				float repDuration = repAnim->duration;
+				if (repDuration > 0.001f) {
+					localTime = std::fmod(localTime, repDuration);
+					if (localTime < 0.f) localTime += repDuration;
+				}
+
 				thread_local std::vector<RE::hkQsTransformRaw> tl_sampledTracks;
 				thread_local std::vector<float> tl_sampledFloats;
 				tl_sampledTracks.assign(numTracksToSample, RE::hkQsTransformRaw{});
