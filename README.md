@@ -33,11 +33,14 @@ Use it to replace weapon reloads, idles, sprints, and other gameplay animations 
 |---------|-------------|
 | **Replacer Mod** | Top-level pack folder under `OpenAnimationReplacer/` |
 | **SubMod** | One logical replacement rule set (conditions + settings + `.hkx` files) |
-| **Replacement animation** | A single target clip (e.g. `scar\wpnreload`) and its replacement file(s) |
-| **Variant** | Multiple `.hkx` files grouped as `base`, `base_1`, `base_2`, … with random/sequential selection |
-| **Cache suffix** | Internal key used to load and clone the correct `.hkx` (base or `__vN` synthetic suffix) |
+| **Replacement animation** | A `.hkx` file that replaces a vanilla animation when conditions pass |
+| **Suffix** | Internal matching key -- the part of an animation path after `Animations\` minus the extension (e.g. `scar\wpnreload`). OAR matches replacements to playing clips by suffix. |
+| **Leaf fallback** | When no exact suffix match exists, OAR matches on filename alone (e.g. `wpnreload`). Conditions disambiguate if multiple replacements share a leaf. |
+| **Variant** | Multiple `.hkx` files grouped as `base`, `base_1`, `base_2`, ... with random/sequential selection |
+| **Conditions** | AND-logic rules that determine WHEN a SubMod's replacement should activate (e.g. specific weapon equipped, specific actor, in combat) |
+| **Priority** | Integer value -- when multiple SubMods match the same animation, highest priority wins |
 
-OAR hooks `hkbClipGenerator` (Activate, Update, Deactivate, Generate) and optionally redirects file loads so the game’s animation database can resolve replacement paths.
+OAR hooks `hkbClipGenerator` (Activate, Update, Deactivate, Generate) and optionally redirects file loads so the game's animation database can resolve replacement paths.
 
 ---
 
@@ -51,12 +54,14 @@ flowchart TB
         A[Scan OpenAnimationReplacer folders] --> B[Parse config and user JSON]
         B --> C[Group variant N files]
         C --> D[Preload hkx into AnimationCache]
-        D --> E[Inject paths into animation DB]
+        D --> E[Build suffix lookup table and leaf index]
     end
 
     subgraph runtime ["Per-frame Update hook"]
-        F[Resolve clip suffix] --> G{Candidates for suffix}
-        G -->|No| H[Play vanilla]
+        F[Extract clip suffix from active animation] --> G{Registered replacements exist for suffix}
+        G -->|No| G2{Leaf fallback: single match on filename}
+        G2 -->|No| H[Play vanilla]
+        G2 -->|Yes| I
         G -->|Yes| I[Evaluate SubMod conditions by priority]
         I --> J{Winner found}
         J -->|No| H
@@ -69,6 +74,18 @@ flowchart TB
 
     load --> runtime
 ```
+
+### Matching mechanism
+
+OAR uses a **suffix-based matching** system with a **leaf fallback**:
+
+1. **Suffix extraction:** From each registered `.hkx`, OAR computes a suffix by taking the path after `Animations\` and stripping the extension. Example: `scar\wpnreload`.
+
+2. **Runtime resolution:** When a clip plays, OAR extracts the same kind of suffix from the active animation using multiple sources (weapon graph path, behavior string data, idle anim data, animationName field).
+
+3. **Leaf fallback:** If the full suffix (e.g. `44pistol\wpnreload`) has no registered replacement, OAR falls back to just the filename/leaf (e.g. `wpnreload`). If exactly one replacement is registered for that leaf, it matches. If multiple share it, all are evaluated via conditions.
+
+4. **Condition evaluation:** Among candidates, SubMods are tried in priority order (highest first). The first whose conditions all pass wins.
 
 ### Data hierarchy
 
@@ -102,8 +119,9 @@ sequenceDiagram
 
     Game->>Clip: Activate vanilla hkx
     Clip->>OAR: Update each frame
-    OAR->>OAR: Match suffix and candidates
-    OAR->>OAR: Pick winning SubMod by priority
+    OAR->>OAR: Extract suffix from clip context
+    OAR->>OAR: Leaf fallback if no direct match
+    OAR->>OAR: Pick winning SubMod by priority + conditions
     alt Full-body replacement
         OAR->>Cache: GetOrBuildRuntimeAnim
         Cache-->>OAR: Return runtime clone
@@ -141,32 +159,96 @@ sequenceDiagram
 
 ## Content authoring
 
+### How animation matching works
+
+OAR does **not** require you to replicate the full vanilla folder structure. Matching is based on the **animation filename** (the "leaf name") combined with **conditions** -- not on mirroring exact directory paths.
+
+At startup, OAR extracts a **suffix** from each `.hkx` file you provide. At runtime, it extracts the same kind of suffix from the animation the game is currently playing and looks for a match. The matching uses a **leaf fallback**: if multiple replacements share the same filename, conditions and priority determine which one wins.
+
+**In practice this means:**
+
+1. Your `.hkx` filename must match the animation filename the game uses (e.g. `WPNReload.hkx` to replace a reload animation named `WPNReload.hkx`).
+2. **Conditions** are the primary mechanism for targeting -- use them to specify which weapon, actor, or game state triggers your replacement.
+3. Folder structure within your SubMod is optional and only provides disambiguation when multiple mods target the same filename. If your filename is unique across all installed OAR mods, folders don't matter.
+4. **Priority** (integer in `config.json`) resolves conflicts when multiple SubMods match the same clip -- highest value wins.
+
 ### Folder structure
 
-OAR scans recursively for directories named **`OpenAnimationReplacer`**. Each **Replacer Mod** contains one or more **SubMods** (subfolders with `config.json` and `.hkx` files).
+OAR scans recursively under `Data/Meshes/` for directories named **`OpenAnimationReplacer`**. Each immediate subfolder is a **Replacer Mod**, and each subfolder within that is a **SubMod**.
 
 ```
 Data/Meshes/
-└── Actors/
-    └── Character/
-        └── _1stPerson/                    ← note: _1stPerson not 1stPerson
-            └── Animations/
-                └── OpenAnimationReplacer/
-                    └── SCAR OAR Test/              ← Replacer Mod
-                        ├── config.json             ← optional mod metadata
-                        └── SCAR Reload Test/       ← SubMod
-                            ├── config.json         ← conditions, priority, variants, trackFilter
-                            ├── user.json           ← optional user overrides (GUI-written)
-                            └── SCAR/
-                                ├── WPNReload.hkx
-                                ├── WPNReload_1.hkx
-                                ├── WPNReload_2.hkx
-                                └── WPNReload_3.hkx
++-- Actors/
+    +-- Character/
+        +-- _1stPerson/                    <-- note: _1stPerson not 1stPerson
+            +-- Animations/
+                +-- OpenAnimationReplacer/
+                    +-- SCAR OAR Test/              <-- Replacer Mod
+                        |-- config.json             <-- optional mod metadata
+                        +-- SCAR Reload Test/       <-- SubMod
+                            |-- config.json         <-- conditions, priority, variants, trackFilter
+                            |-- user.json           <-- optional user overrides (GUI-written)
+                            |-- WPNReload.hkx       <-- flat layout works fine
+                            |-- WPNReload_1.hkx
+                            |-- WPNReload_2.hkx
+                            +-- WPNReload_3.hkx
 ```
 
-**Path rule:** A file in the SubMod must mirror the **relative animation path** it replaces.  
-Example: `SCAR/WPNReload.hkx` in the SubMod replaces  
-`Meshes/Actors/Character/_1stPerson/Animations/SCAR/WPNReload.hkx`.
+You can also organize files into subfolders within the SubMod for clarity or disambiguation:
+
+```
++-- SCAR Reload Test/
+    |-- config.json
+    +-- SCAR/                <-- optional subfolder for disambiguation
+        |-- WPNReload.hkx
+        +-- WPNReload_1.hkx
+```
+
+When a subfolder is used, the matching suffix becomes `scar\wpnreload` instead of just `wpnreload`. This is useful when multiple weapons share the same animation filename and you need OAR to distinguish them.
+
+### Matching rules summary
+
+| Scenario | What happens |
+|----------|-------------|
+| Your file is `WPNReload.hkx` and only one SubMod targets that name | Matches via leaf fallback -- no subfolder needed |
+| Multiple SubMods all have `WPNReload.hkx` | All are evaluated; **conditions + priority** determine the winner |
+| You put your file under `SCAR/WPNReload.hkx` | Suffix becomes `scar\wpnreload` -- only matches clips whose full path contains that |
+| Conditions are empty (`"conditions": []`) | SubMod always matches (acts as a universal default for that animation) |
+
+### Step-by-step setup guide
+
+1. **Identify the animation to replace.** Enable `bVerboseLogging=1` in `OpenAnimationReplacer.ini`, then perform the action in-game. Check the log for `[OAR-Suffix]` lines -- the suffix shown is what OAR will try to match against.
+
+2. **Name your `.hkx` file to match.** The filename must correspond to the leaf part of the suffix from step 1. For example, if the log shows suffix `scar\wpnreload`, your file should be named `WPNReload.hkx` (case-insensitive).
+
+3. **Create the folder structure:**
+   ```
+   Data/Meshes/Actors/Character/_1stPerson/Animations/OpenAnimationReplacer/
+   +-- Your Mod Name/           <-- Replacer Mod (any name)
+       +-- Your SubMod Name/    <-- SubMod (any name, or a number for default priority)
+           |-- config.json      <-- conditions + settings
+           +-- WPNReload.hkx    <-- your replacement animation
+   ```
+
+4. **Write conditions in `config.json`** to target the specific situation (weapon, actor state, etc.). Without conditions, the SubMod will replace that animation for everyone always.
+
+5. **(Optional) Add variants** by placing additional files with `_N` suffixes: `WPNReload_1.hkx`, `WPNReload_2.hkx`, etc. A base file without a suffix must also exist for variants to be grouped.
+
+6. **Set priority** if other OAR mods might also target the same animation. Higher priority wins.
+
+### Path placement (where under Meshes)
+
+The `OpenAnimationReplacer/` folder must be placed somewhere within the scan paths. OAR scans:
+
+- `Data/Meshes/Actors/<race>/Animations/` (3rd-person animations)
+- `Data/Meshes/Actors/<race>/_1stPerson/` (1st-person animations)
+- `Data/Meshes/Actors/<race>/Character/Animations/` (fallback path)
+- Full `Data/Meshes/` recursive scan as a last resort (if nothing found in targeted paths)
+
+For first-person weapon animations, the standard placement is:
+```
+Data/Meshes/Actors/Character/_1stPerson/Animations/OpenAnimationReplacer/
+```
 
 ### Mod-level `config.json` (optional)
 
@@ -240,7 +322,7 @@ Example: `SCAR/WPNReload.hkx` in the SubMod replaces
 | `playOnceFullBody` | bool | false | Keep vanilla triggers until anim completes (state machine exit) |
 | `deactivationDelay` | float | 0 | Seconds to hold replacement after conditions fail |
 | `conditions` | array | `[]` | AND list; empty = always match |
-| `variants` | object | — | Variant selection settings (see below) |
+| `variants` | object | -- | Variant selection settings (see below) |
 | `trackFilter` | object | disabled | Partial-body bone override |
 | `eventsOnStart` / `eventsOnEnd` | string[] | `[]` | Custom behavior graph events |
 
@@ -260,7 +342,7 @@ Players can override author settings without editing `config.json`. The in-game 
 
 ## Configuration reference
 
-### Plugin INI — `Data/F4SE/Plugins/OpenAnimationReplacer.ini`
+### Plugin INI -- `Data/F4SE/Plugins/OpenAnimationReplacer.ini`
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
@@ -325,7 +407,7 @@ flowchart TD
 | `variants.mode` | Behavior |
 |-----------------|----------|
 | `random` | Weighted roll; optional `weights` per filename |
-| `sequential` | Cycles 0 → 1 → 2 → … per actor |
+| `sequential` | Cycles 0, 1, 2, ... per actor |
 
 | `variants.rerollPolicy` | Behavior |
 |-------------------------|----------|
@@ -350,7 +432,7 @@ flowchart TD
 
 ### Duration and annotations
 
-Each variant loads its own `.hkx` into `AnimationCache` with its own **duration**, **tracks**, and **annotations**. Full-body replacement patches the cloned `hkaAnimation` duration so the engine loops at the replacement length. Annotation events (reload stages, sounds) are fired manually from the replacement clip’s annotation list.
+Each variant loads its own `.hkx` into `AnimationCache` with its own **duration**, **tracks**, and **annotations**. Full-body replacement patches the cloned `hkaAnimation` duration so the engine loops at the replacement length. Annotation events (reload stages, sounds) are fired manually from the replacement clip's annotation list.
 
 ---
 
@@ -369,11 +451,11 @@ flowchart LR
     end
 ```
 
-- Swaps the pointer at `animationControl → binding → animation`.
+- Swaps the pointer at `animationControl -> binding -> animation`.
 - Replacement **duration** and spline metadata are patched on the clone.
 - Best for complete reload / idle / locomotion overrides.
 
-**Caveat:** Hardcoded behavior graph **transitions** (e.g. “exit reload at 2.5s”) still follow the `.hkb` graph, not your clip length. Use `playOnceFullBody` or `eventsOnEnd` where needed.
+**Caveat:** Hardcoded behavior graph **transitions** (e.g. "exit reload at 2.5s") still follow the `.hkb` graph, not your clip length. Use `playOnceFullBody` or `eventsOnEnd` where needed.
 
 ### Partial-body (track filter)
 
@@ -391,8 +473,8 @@ flowchart TB
 ```
 
 - Does **not** swap `animSlot`; samples the replacement per filtered bone.
-- `trackFilter.boneNames` — bones to override or additively blend.
-- `blendInTime` / `blendOutTime` — alpha ramp when conditions toggle.
+- `trackFilter.boneNames` -- bones to override or additively blend.
+- `blendInTime` / `blendOutTime` -- alpha ramp when conditions toggle.
 - `localTime` is wrapped to the replacement duration when sampling (different-length clips).
 
 | `trackFilter.mode` | Effect |
@@ -419,7 +501,7 @@ SubMod conditions use **AND** logic at the root. Use `OR` / `AND` / `XOR` nodes 
 | **World** | `IsWorldSpace`, `IsParentCell`, `IsInLocation`, `IsInInterior`, `CurrentWeather`, `LightLevel` |
 | **Animation** | `IsPlayingIdleAnimation`, `AnimProgress`, `AnimTimeElapsed`, `AnimTimeRemaining` |
 | **Logic** | `OR`, `AND`, `XOR`, `Random`, `TARGET`, `PLAYER` |
-| **Comparison** | `Level`, `CompareActorValue`, `Scale`, `FactionRank`, … |
+| **Comparison** | `Level`, `CompareActorValue`, `Scale`, `FactionRank`, etc. |
 
 Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 
@@ -433,7 +515,7 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 }
 ```
 
-`comparison: 1` = Not Equal → passes when ammo **≠** 0.
+`comparison: 1` = Not Equal -- passes when ammo is not 0.
 
 ### Example: only while a specific idle plays
 
@@ -457,16 +539,16 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 | Mode | Capabilities |
 |------|----------------|
 | **Inspect** | View mods, conditions, live pass/fail |
-| **User** | Enable/disable SubMods, priorities → saves `user.json` |
-| **Author** | Edit conditions, variants, track filter → saves `config.json` |
+| **User** | Enable/disable SubMods, priorities -- saves `user.json` |
+| **Author** | Edit conditions, variants, track filter -- saves `config.json` |
 
 ### Windows
 
-- **Replacer tree** — mods → submods → replacement list (variant count shown).
-- **Condition editor** — add/remove/negate; form pickers for idle/weapon records.
-- **Variant settings** — enable, random/sequential, reroll policy, weight sliders.
-- **Active Replacements** — debug view of current swaps (includes variant suffix).
-- **Animation Log** — real-time activate/replace/loop events.
+- **Replacer tree** -- mods, submods, replacement list (variant count shown).
+- **Condition editor** -- add/remove/negate; form pickers for idle/weapon records.
+- **Variant settings** -- enable, random/sequential, reroll policy, weight sliders.
+- **Active Replacements** -- debug view of current swaps (includes variant suffix).
+- **Animation Log** -- real-time activate/replace/loop events.
 
 ---
 
@@ -474,25 +556,25 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 
 ```
 OpenAnimationReplacer/
-├── CMakeLists.txt          # Build + CommonLibF4 link
-├── CMakePresets.json       # msvc-release / msvc-debug
-├── OpenAnimationReplacer.ini
-├── README.md
-├── docs/
-│   ├── QuickStart.md       # Authoring + conditions (detailed)
-│   ├── HavokReference.md
-│   └── HavokReference2.md
-├── src/
-│   ├── main.cpp            # F4SE entry, messaging
-│   ├── Hooks.cpp           # hkbClipGenerator hooks, track filter, variants
-│   ├── Parsing.cpp         # Disk scan, variant grouping, JSON
-│   ├── AnimationCache.cpp  # .hkx load, runtime clone, annotations
-│   ├── Variants.cpp        # Random/sequential selection
-│   ├── Conditions.cpp      # Condition implementations
-│   ├── ReplacerMods.h      # SubMod, TrackFilter, variant settings
-│   ├── OpenAnimationReplacer.cpp  # Path map, DB injection
-│   └── UI/                 # ImGui (UIManager, UIMain, debug overlay)
-└── Compile/F4SE/Plugins/   # Build output (OpenAnimationReplacer.dll)
+|-- CMakeLists.txt          # Build + CommonLibF4 link
+|-- CMakePresets.json       # msvc-release / msvc-debug
+|-- OpenAnimationReplacer.ini
+|-- README.md
+|-- docs/
+|   |-- QuickStart.md       # Authoring + conditions (detailed)
+|   |-- HavokReference.md
+|   +-- HavokReference2.md
+|-- src/
+|   |-- main.cpp            # F4SE entry, messaging
+|   |-- Hooks.cpp           # hkbClipGenerator hooks, track filter, variants
+|   |-- Parsing.cpp         # Disk scan, variant grouping, JSON
+|   |-- AnimationCache.cpp  # .hkx load, runtime clone, annotations
+|   |-- Variants.cpp        # Random/sequential selection
+|   |-- Conditions.cpp      # Condition implementations
+|   |-- ReplacerMods.h      # SubMod, TrackFilter, variant settings
+|   |-- OpenAnimationReplacer.cpp  # Path map, DB injection
+|   +-- UI/                 # ImGui (UIManager, UIMain, debug overlay)
++-- Compile/F4SE/Plugins/   # Build output (OpenAnimationReplacer.dll)
 ```
 
 ### Key runtime components
@@ -515,10 +597,10 @@ OpenAnimationReplacer/
 | Tool | Notes |
 |------|-------|
 | **Visual Studio 2022** | x64, Desktop development with C++ |
-| **CMake** | ≥ 3.21 |
+| **CMake** | >= 3.21 |
 | **vcpkg** | `VCPKG_ROOT` set; triplet `x64-windows-static-md` |
 | **CommonLibF4** | Expected at `../PluginTemplate/CommonLibF4` (adjust `CMakeLists.txt` if needed) |
-| **Fallout4Path** | Environment variable → game root |
+| **Fallout4Path** | Environment variable -- game root |
 
 ### Commands
 
@@ -545,9 +627,9 @@ Dependencies are declared in `vcpkg.json` (e.g. `spdlog`, `nlohmann-json`, `imgu
 | **No replacement in game** | `bEnabled=1`; conditions in log (`OpenAnimationReplacer.log`); priority vs other SubMods; correct `_1stPerson` path |
 | **Only one variant plays** | `variants.enabled`; `rerollPolicy`; ensure multiple `_N` files + base exist |
 | **Reload anim cancels mid-play** | Often interruptible SubMod or competing priority; check transition logs |
-| **Ammo updates but no visible anim** | Conditions pass but clip swap failed — check cache load errors in log |
+| **Ammo updates but no visible anim** | Conditions pass but clip swap failed -- check cache load errors in log |
 | **No sound / reload events** | `replaceAnnotations`; annotation times in replacement `.hkx`; `eventsOnEnd` |
-| **Crash at startup in ReadBoundAnimDataBinary** | Usually corrupt/unrelated `.hkx` in load order — not OAR hook code; test without animation packs |
+| **Crash at startup in ReadBoundAnimDataBinary** | Usually corrupt/unrelated `.hkx` in load order -- not OAR hook code; test without animation packs |
 | **Track filter looks wrong** | Bone names must match skeleton; try `override` vs `additive`; check blend times |
 
 Enable `bVerboseLogging=1` and inspect `[OAR-Transition]`, `[OAR-Variant]`, `[OAR-Cache]` lines.
@@ -568,7 +650,7 @@ Parent workspace (if present): `F4SE_Plugin_Development_Reference.md` for F4SE p
 
 ## Credits
 
-- **Original Skyrim mod:** [Open Animation Replacer](https://github.com/Andrealphus-Mods/OpenAnimationReplacer) — Andrealphus-Mods
+- **Original Skyrim mod:** [Open Animation Replacer](https://github.com/Andrealphus-Mods/OpenAnimationReplacer) -- Andrealphus-Mods
 - **Fallout 4 port:** [DCC Studios](https://github.com/DCCStudios/F4-OpenAnimationReplacer) / contributors
 - **CommonLibF4:** Ryan-rsm-McKenzie and contributors
 
