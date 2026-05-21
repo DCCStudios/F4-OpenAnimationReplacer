@@ -47,23 +47,23 @@ OAR hooks `hkbClipGenerator` (Activate, Update, Deactivate, Generate) and option
 
 ```mermaid
 flowchart TB
-    subgraph load ["Startup / kPostLoad"]
-        A[Scan Meshes/.../OpenAnimationReplacer] --> B[Parse config.json + user.json]
-        B --> C[Group variant _N files]
-        C --> D[Preload .hkx into AnimationCache]
+    subgraph load ["Startup kPostLoad"]
+        A[Scan OpenAnimationReplacer folders] --> B[Parse config and user JSON]
+        B --> C[Group variant N files]
+        C --> D[Preload hkx into AnimationCache]
         D --> E[Inject paths into animation DB]
     end
 
-    subgraph runtime ["Per-frame (hkbClipGenerator_Update)"]
-        F[Resolve clip suffix] --> G{Candidates for suffix?}
+    subgraph runtime ["Per-frame Update hook"]
+        F[Resolve clip suffix] --> G{Candidates for suffix}
         G -->|No| H[Play vanilla]
         G -->|Yes| I[Evaluate SubMod conditions by priority]
-        I --> J{Winner?}
+        I --> J{Winner found}
         J -->|No| H
-        J -->|Yes| K{Track filter enabled?}
-        K -->|No| L[Full-body: swap animation pointer]
-        K -->|Yes| M[Partial: sample replacement per bone in Generate]
-        L --> N[Fire annotations / custom events]
+        J -->|Yes| K{Track filter enabled}
+        K -->|No| L[Full-body swap animation pointer]
+        K -->|Yes| M[Partial sample per bone in Generate]
+        L --> N[Fire annotations and custom events]
         M --> N
     end
 
@@ -77,8 +77,8 @@ flowchart LR
     RM[Replacer Mod folder]
     SM1[SubMod A]
     SM2[SubMod B]
-    RA1[Replacement: wpnreload]
-    RA2[Replacement: wpnsprint]
+    RA1[Replacement wpnreload]
+    RA2[Replacement wpnsprint]
     V1[Variants v1 v2 v3]
     HKX[.hkx on disk]
 
@@ -95,26 +95,26 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant Game as Fallout 4 / Havok
+    participant Game as Fallout4_Havok
     participant Clip as hkbClipGenerator
-    participant OAR as OAR Update hook
+    participant OAR as OAR_Update_hook
     participant Cache as AnimationCache
 
-    Game->>Clip: Activate (vanilla .hkx)
+    Game->>Clip: Activate vanilla hkx
     Clip->>OAR: Update each frame
-    OAR->>OAR: Match suffix e.g. scar\wpnreload
-    OAR->>OAR: Pick highest-priority SubMod passing conditions
+    OAR->>OAR: Match suffix and candidates
+    OAR->>OAR: Pick winning SubMod by priority
     alt Full-body replacement
-        OAR->>Cache: GetOrBuildRuntimeAnim(suffix)
-        Cache-->>OAR: Cloned hkaAnimation (patched duration/tracks)
-        OAR->>Clip: *animSlot = replacement
-    else Track filter
+        OAR->>Cache: GetOrBuildRuntimeAnim
+        Cache-->>OAR: Return runtime clone
+        OAR->>Clip: Swap animSlot to replacement
+    else Track filter path
         OAR->>Cache: Register replacement for Generate
-        Note over Clip: Original slot unchanged; bones blended in Generate
+        OAR->>Clip: Keep vanilla slot blend bones in Generate
     end
-    OAR->>OAR: Manual annotation firing if needed
+    OAR->>OAR: Fire annotations if needed
     Game->>Clip: Deactivate
-    OAR->>OAR: Cleanup maps, optional variant reset
+    OAR->>OAR: Cleanup state and variant cache
 ```
 
 ---
@@ -311,8 +311,8 @@ At parse time, variants receive synthetic cache suffixes so each file loads inde
 
 ```mermaid
 flowchart TD
-    Start[Clip needs replacement] --> Enabled{variants.enabled?}
-    Enabled -->|No| Base[Always use base .hkx]
+    Start[Clip needs replacement] --> Enabled{variants enabled}
+    Enabled -->|No| Base[Always use base hkx]
     Enabled -->|Yes| Mode{mode}
     Mode -->|random| R[Weighted random index]
     Mode -->|sequential| S[Round-robin per actor]
@@ -380,7 +380,7 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph slot ["Animation slot"]
-        V[Vanilla hkaAnimation - unchanged]
+        V[Vanilla hkaAnimation unchanged]
     end
     subgraph generate ["hkbClipGenerator_Generate"]
         V --> P[Vanilla pose]
