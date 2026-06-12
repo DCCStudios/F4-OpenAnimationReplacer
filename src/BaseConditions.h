@@ -27,6 +27,19 @@ inline bool CompareValues(float a_lhs, ComparisonOperator a_op, float a_rhs)
 	}
 }
 
+inline const char* ComparisonOperatorToString(ComparisonOperator a_op)
+{
+	switch (a_op) {
+	case ComparisonOperator::kEqual:        return "==";
+	case ComparisonOperator::kNotEqual:     return "!=";
+	case ComparisonOperator::kGreater:      return ">";
+	case ComparisonOperator::kGreaterEqual: return ">=";
+	case ComparisonOperator::kLess:         return "<";
+	case ComparisonOperator::kLessEqual:    return "<=";
+	default: return "?";
+	}
+}
+
 class ICondition
 {
 public:

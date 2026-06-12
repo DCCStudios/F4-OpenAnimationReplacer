@@ -19,11 +19,12 @@ Use it to replace weapon reloads, idles, sprints, and other gameplay animations 
 7. [Replacement modes](#replacement-modes)
 8. [Conditions](#conditions)
 9. [In-game UI](#in-game-ui)
-10. [Project layout (developers)](#project-layout-developers)
-11. [Building from source](#building-from-source)
-12. [Troubleshooting](#troubleshooting)
-13. [Documentation](#documentation)
-14. [Credits](#credits)
+10. [Plugin API (for developers)](#plugin-api-for-developers)
+11. [Project layout (developers)](#project-layout-developers)
+12. [Building from source](#building-from-source)
+13. [Troubleshooting](#troubleshooting)
+14. [Documentation](#documentation)
+15. [Credits](#credits)
 
 ---
 
@@ -552,6 +553,226 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 
 ---
 
+## Plugin API (for developers)
+
+OAR exposes a C++ API that allows other F4SE plugins to register custom condition types at runtime. This means you can add entirely new conditions without modifying OAR's source code.
+
+### Architecture
+
+```mermaid
+sequenceDiagram
+    participant YourPlugin as Your F4SE Plugin
+    participant OAR as OpenAnimationReplacer.dll
+    participant Factory as ConditionFactory
+    participant Runtime as Animation Runtime
+
+    YourPlugin->>OAR: GetModuleHandle + GetProcAddress
+    OAR-->>YourPlugin: IConditionsAPI pointer
+    YourPlugin->>OAR: RegisterCondition name and factory
+    OAR->>Factory: Register factory function
+    Note over Runtime: Game loads SubMod JSON with your condition name
+    Runtime->>Factory: Create condition by name
+    Factory-->>Runtime: Your condition instance
+    Runtime->>Runtime: Calls EvaluateImpl on your condition
+```
+
+### Quick Start
+
+1. **Copy two SDK headers** into your project (from OAR's `src/API/` folder):
+   - `OpenAnimationReplacerAPI-Conditions.h` — API interface + `GetAPI()` helper
+   - `OpenAnimationReplacer-ConditionTypes.h` — `ConditionBase`, components, utilities
+
+2. **Create your condition class** (inherit `OAR::ConditionBase`):
+
+```cpp
+#include "OAR/OpenAnimationReplacerAPI-Conditions.h"
+
+class IsNearWaterCondition : public OAR::ConditionBase
+{
+public:
+    std::string GetName() const override { return "IsNearWater"; }
+    std::string GetDescription() const override {
+        return "True when actor is within range of a water surface.";
+    }
+
+protected:
+    bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*,
+                      const OAR::SubMod*) const override
+    {
+        if (!a_refr) return false;
+        // Your custom logic here
+        float waterLevel = /* ... */;
+        float actorZ = a_refr->data.location.z;
+        float diff = actorZ - waterLevel;
+        return OAR::CompareValues(diff, comparison, numericValue.GetValue(a_refr));
+    }
+
+    void InitializeImpl(const nlohmann::json& j) override {
+        if (j.contains("comparison"))
+            comparison = static_cast<OAR::ComparisonOperator>(j["comparison"].get<int>());
+        if (j.contains("numericValue"))
+            numericValue.Initialize(j["numericValue"]);
+    }
+
+    void SerializeImpl(nlohmann::json& j) const override {
+        j["comparison"] = static_cast<int>(comparison);
+        nlohmann::json nv;
+        numericValue.Serialize(nv);
+        j["numericValue"] = nv;
+    }
+
+private:
+    OAR::ComparisonOperator comparison{ OAR::ComparisonOperator::kLess };
+    OAR::NumericComponent numericValue;
+};
+```
+
+3. **Register during `kPostLoad`**:
+
+```cpp
+#include "OAR/OpenAnimationReplacerAPI-Conditions.h"
+
+void OnMessage(F4SE::MessagingInterface::Message* msg)
+{
+    if (msg->type == F4SE::MessagingInterface::kPostLoad) {
+        auto* api = OAR::Conditions::GetAPI();
+        if (!api) {
+            logger::error("OAR not found!");
+            return;
+        }
+
+        auto result = api->RegisterCondition("IsNearWater",
+            [] { return std::make_unique<IsNearWaterCondition>(); });
+
+        if (result == OAR::Conditions::APIResult::OK)
+            logger::info("IsNearWater condition registered!");
+    }
+}
+```
+
+4. **Use in JSON configs** — content authors can now reference your condition:
+
+```json
+{
+  "condition": "IsNearWater",
+  "comparison": 4,
+  "numericValue": { "type": "Static", "value": 200.0 }
+}
+```
+
+### What You Get For Free
+
+By inheriting `OAR::ConditionBase`, your condition automatically has:
+
+- **Negation** — users can set `"negated": true` in JSON to invert your result
+- **Disable** — `"disabled": true` makes the condition always pass
+- **JSON envelope** — OAR handles the `"condition"` key, `"negated"`, `"disabled"` fields
+- **UI integration** — your condition appears in OAR's in-game ImGui editor
+- **Evaluation caching** — `lastEvalResult` is tracked for debug overlay display
+- **Error handling** — exceptions during Initialize are caught and logged
+
+### Available Components
+
+The SDK headers provide these reusable building blocks:
+
+| Component | Purpose | Example |
+|-----------|---------|---------|
+| `OAR::ComparisonOperator` | Enum for ==, !=, >, >=, <, <= | `CompareValues(a, op, b)` |
+| `OAR::NumericComponent` | Value from static/global/actor-value | `numericValue.GetValue(refr)` |
+| `OAR::FormComponent` | Resolve a form by plugin+localID | `form.ResolveForm(); form.cachedForm` |
+| `OAR::ConditionSet` | Embed child conditions (composite) | `childConditions.EvaluateAll(...)` |
+
+### API Reference
+
+```cpp
+namespace OAR::Conditions {
+    // Get the API (returns nullptr if OAR not loaded)
+    IConditionsAPI* GetAPI();
+
+    class IConditionsAPI {
+        // API version (currently 2)
+        uint32_t GetAPIVersion() const;
+
+        // Register a new condition type
+        // Returns: OK, AlreadyRegistered, Invalid, or Failed
+        APIResult RegisterCondition(const char* name, ConditionFactoryFn factory);
+
+        // Remove a previously registered condition
+        bool UnregisterCondition(const char* name);
+
+        // Total registered condition count (built-in + custom)
+        uint32_t GetRegisteredConditionCount() const;
+    };
+
+    // Factory function signature
+    using ConditionFactoryFn = std::unique_ptr<OAR::ICondition>(*)();
+}
+```
+
+### Timing
+
+- Call `GetAPI()` during `kPostLoad` or `kPostPostLoad` messaging
+- OAR loads SubMod configs after all plugins have loaded, so your conditions will be available
+- Do NOT call `GetAPI()` during `F4SEPlugin_Load` (OAR may not be loaded yet)
+
+### Advanced: Composite Conditions
+
+For conditions that contain child conditions (like `DetectedBy` / `Detects`):
+
+```cpp
+class MyCompositeCondition : public OAR::ConditionBase
+{
+protected:
+    bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clip,
+                      const OAR::SubMod* a_sub) const override
+    {
+        // Evaluate children against a different target
+        RE::TESObjectREFR* otherRefr = /* get alternate target */;
+        return childConditions.EvaluateAll(otherRefr, a_clip, a_sub);
+    }
+
+    void InitializeImpl(const nlohmann::json& j) override {
+        if (j.contains("conditions") && j["conditions"].is_array()) {
+            for (const auto& cj : j["conditions"]) {
+                // Use OAR's factory to create child conditions
+                // (requires forward-declaring CreateConditionFromJson)
+            }
+        }
+    }
+
+private:
+    OAR::ConditionSet childConditions;
+};
+```
+
+### Custom UI (Optional)
+
+Override `DrawEditWidgets` for custom ImGui controls in the OAR editor:
+
+```cpp
+void DrawEditWidgets(bool& a_dirty) override {
+    static const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+    int idx = static_cast<int>(comparison);
+    if (ImGui::Combo("Operator", &idx, ops, 6)) {
+        comparison = static_cast<OAR::ComparisonOperator>(idx);
+        a_dirty = true;
+    }
+    if (ImGui::InputFloat("Threshold", &numericValue.staticValue)) {
+        a_dirty = true;
+    }
+}
+```
+
+### Build Requirements for API Plugins
+
+- Visual Studio 2022 (MSVC, x64)
+- CommonLibF4 (same version OAR links against)
+- nlohmann-json (header-only, same version)
+- C++23 standard
+- `x64-windows-static-md` vcpkg triplet (matching OAR)
+
+---
+
 ## Project layout (developers)
 
 ```
@@ -640,6 +861,7 @@ Enable `bVerboseLogging=1` and inspect `[OAR-Transition]`, `[OAR-Variant]`, `[OA
 
 | Document | Contents |
 |----------|----------|
+| [docs/ConditionReference.md](docs/ConditionReference.md) | Complete list of all 97 conditions with parameters and examples |
 | [docs/QuickStart.md](docs/QuickStart.md) | Step-by-step authoring, full condition list, examples |
 | [docs/HavokReference.md](docs/HavokReference.md) | Struct offsets and Havok notes |
 | [docs/HavokReference2.md](docs/HavokReference2.md) | Additional Havok / clip generator notes |

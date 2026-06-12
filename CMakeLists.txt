@@ -116,6 +116,7 @@ set(HEADERS
 	src/UI/UIFormPicker.h
 	src/FormRegistry.h
 	src/ActiveReplacementTracker.h
+	src/RE_Additions.h
 	src/API/OpenAnimationReplacerAPI.h
 )
 

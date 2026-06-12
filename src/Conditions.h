@@ -1307,5 +1307,155 @@ private:
 	FormComponent form;
 };
 
+// =============================================================================
+// Detection Conditions — ported from Skyrim OAR Detection Conditions plugin
+// =============================================================================
+
+// Thread-local context: set by DetectedBy/Detects during iteration, read by
+// child-only conditions (DetectionDistance, DetectionRelationship, DetectionAngle)
+inline thread_local RE::Actor* g_detectionTarget = nullptr;
+inline thread_local RE::Actor* g_detectionSource = nullptr;
+
+class DetectedByCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "DetectedBy"; }
+	std::string GetDescription() const override { return "True if an actor that passes all child conditions detects the evaluated actor (stealth detection)."; }
+	ConditionSet& GetConditionSet() { return childConditions; }
+	const ConditionSet& GetConditionSet() const { return childConditions; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ConditionSet childConditions;
+};
+
+class DetectsCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "Detects"; }
+	std::string GetDescription() const override { return "True if the evaluated actor detects an actor that passes all child conditions (stealth detection)."; }
+	ConditionSet& GetConditionSet() { return childConditions; }
+	const ConditionSet& GetConditionSet() const { return childConditions; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ConditionSet childConditions;
+};
+
+class DetectionDistanceCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "DetectionDistance"; }
+	std::string GetDescription() const override { return "Compares distance between detector and target. Only meaningful inside DetectedBy/Detects conditions."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kLess };
+	NumericComponent numericValue;
+};
+
+class DetectionRelationshipCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "DetectionRelationship"; }
+	std::string GetDescription() const override { return "Compares relationship rank between detector and target (-4 Archnemesis to +4 Lover). Only meaningful inside DetectedBy/Detects conditions."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	ComparisonOperator comparison{ ComparisonOperator::kEqual };
+	NumericComponent numericValue;
+};
+
+class DetectionAngleCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "DetectionAngle"; }
+	std::string GetDescription() const override { return "Compares angle from one actor to another (degrees). Options to swap perspective and limit to left/right side. Only meaningful inside DetectedBy/Detects conditions."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	bool swapActors{ false };
+	ComparisonOperator comparison{ ComparisonOperator::kLess };
+	NumericComponent numericValue;
+	bool limitRight{ false };
+	bool limitLeft{ false };
+};
+
+// =============================================================================
+// Dialogue Condition — ported from Skyrim OAR Dialogue Conditions plugin
+// =============================================================================
+
+class DialogueCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "Dialogue"; }
+	std::string GetDescription() const override { return "Detects dialogue state phases. Enable sub-checks for the phases you want to match. Uses edge detection for transient states (started, chose, ended)."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	// Which sub-checks are enabled (true = require this state to match)
+	bool checkDialogueActive{ false };
+	bool checkDialogueStarted{ false };
+	bool checkPlayerChoosing{ false };
+	bool checkPlayerChose{ false };
+	bool checkDialogueEnded{ false };
+
+	// Mutable state tracking for edge detection
+	mutable bool prevMenuOpen{ false };
+	mutable bool dialogueStartedFlag{ false };
+	mutable bool playerChoseFlag{ false };
+	mutable bool dialogueEndedFlag{ false };
+};
+
+// =============================================================================
+// Math Condition — ported from Skyrim OAR Math plugin
+// =============================================================================
+
+struct MathVariable
+{
+	std::string name;
+	NumericComponent numericValue;
+};
+
+class MathStatementCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "MathStatement"; }
+	std::string GetDescription() const override { return "Evaluates a mathematical expression. Variables are bound to numeric values (static, global, actor value). Expression is true when result != 0."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	std::string expression;
+	std::vector<MathVariable> variables;
+
+	// Cached compiled expression state (mutable for const evaluate)
+	mutable bool needsRecompile{ true };
+	mutable std::string lastExpression;
+};
+
 void RegisterAllConditions();
 std::unique_ptr<ICondition> CreateConditionFromJson(const nlohmann::json& a_json);

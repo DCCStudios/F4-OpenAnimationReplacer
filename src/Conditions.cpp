@@ -2,11 +2,14 @@
 #include "Utils.h"
 #include "OpenAnimationReplacer.h"
 #include <imgui.h>
+#include <numbers>
 #include "RE/Bethesda/ActorValueInfo.h"
 #include "RE/Bethesda/Calendar.h"
 #include "RE/Bethesda/PlayerCharacter.h"
 #include "RE/Bethesda/TESBoundObjects.h"
+#include "RE/Bethesda/UI.h"
 #include "UI/UIFormPicker.h"
+#include "RE_Additions.h"
 
 // ===== FormComponent =====
 
@@ -2357,6 +2360,722 @@ void IsPlayingIdleAnimationCondition::SerializeImpl(nlohmann::json& a_json) cons
 	form.Serialize(a_json);
 }
 
+// =============================================================================
+// Detection Conditions
+// =============================================================================
+
+namespace
+{
+	// Validates that a target actor is suitable for detection iteration
+	bool ValidateDetectionTarget(RE::Actor* a_actor, RE::Actor* a_target)
+	{
+		if (!a_target || !a_actor) return false;
+		if (a_target == a_actor) return false;
+		// Check deleted flag (bit 5) and initially-disabled flag (bit 11)
+		uint32_t flags = a_target->GetFormFlags();
+		if (flags & ((1u << 5) | (1u << 11))) return false;
+		if (a_target->IsDead(false)) return false;
+		return true;
+	}
+
+	// Core detection loop shared by DetectedBy and Detects
+	bool EvaluateDetection(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen,
+		const SubMod* a_sub, const ConditionSet& a_childConditions, bool a_isDetectedBy)
+	{
+		if (!a_refr) return false;
+		auto* actor = a_refr->As<RE::Actor>();
+		if (!actor) return false;
+
+		auto* processLists = OAR_RE::ProcessLists::GetSingleton();
+		if (!processLists) return false;
+
+		// Collect actors that pass detection check
+		auto checkActor = [&](RE::Actor* candidate) -> bool {
+			if (!ValidateDetectionTarget(actor, candidate)) return false;
+
+			RE::Actor* detector = a_isDetectedBy ? candidate : actor;
+			RE::Actor* detectee = a_isDetectedBy ? actor : candidate;
+
+			if (OAR_RE::RequestDetectionLevel(detector, detectee) <= 0)
+				return false;
+
+			// Set thread-local context for child-only conditions
+			g_detectionTarget = candidate;
+			g_detectionSource = actor;
+
+			// Evaluate child conditions against the candidate
+			bool childrenPass = a_childConditions.IsEmpty() ||
+				a_childConditions.EvaluateAll(candidate->As<RE::TESObjectREFR>(), a_clipGen, a_sub);
+
+			if (childrenPass) return true;
+			return false;
+		};
+
+		// Iterate high-process actors
+		for (auto& actorHandle : processLists->highActorHandles) {
+			if (auto actorPtr = actorHandle.get()) {
+				if (auto* target = actorPtr.get()) {
+					if (checkActor(target)) {
+						g_detectionTarget = nullptr;
+						g_detectionSource = nullptr;
+						return true;
+					}
+				}
+			}
+		}
+
+		// Also check player (not always in high-process list)
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player && checkActor(player)) {
+			g_detectionTarget = nullptr;
+			g_detectionSource = nullptr;
+			return true;
+		}
+
+		g_detectionTarget = nullptr;
+		g_detectionSource = nullptr;
+		return false;
+	}
+}
+
+// --- DetectedBy ---
+
+bool DetectedByCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const
+{
+	return EvaluateDetection(a_refr, a_clipGen, a_sub, childConditions, true);
+}
+
+void DetectedByCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("conditions") && a_json["conditions"].is_array()) {
+		for (const auto& condJson : a_json["conditions"]) {
+			if (auto cond = CreateConditionFromJson(condJson)) {
+				childConditions.AddCondition(std::move(cond));
+			}
+		}
+	}
+}
+
+void DetectedByCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	auto& arr = a_json["conditions"];
+	arr = nlohmann::json::array();
+	for (const auto& cond : childConditions.GetConditions()) {
+		nlohmann::json condJson;
+		cond->Serialize(condJson);
+		arr.push_back(condJson);
+	}
+}
+
+// --- Detects ---
+
+bool DetectsCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_sub) const
+{
+	return EvaluateDetection(a_refr, a_clipGen, a_sub, childConditions, false);
+}
+
+void DetectsCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("conditions") && a_json["conditions"].is_array()) {
+		for (const auto& condJson : a_json["conditions"]) {
+			if (auto cond = CreateConditionFromJson(condJson)) {
+				childConditions.AddCondition(std::move(cond));
+			}
+		}
+	}
+}
+
+void DetectsCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	auto& arr = a_json["conditions"];
+	arr = nlohmann::json::array();
+	for (const auto& cond : childConditions.GetConditions()) {
+		nlohmann::json condJson;
+		cond->Serialize(condJson);
+		arr.push_back(condJson);
+	}
+}
+
+// --- DetectionDistance ---
+
+bool DetectionDistanceCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!g_detectionTarget || !g_detectionSource) return false;
+
+	float distSq = OAR_RE::GetSquaredDistance(
+		g_detectionSource->data.location,
+		g_detectionTarget->data.location);
+
+	float threshold = numericValue.GetValue(a_refr);
+	// Compare squared distance against squared threshold to avoid sqrt
+	return CompareValues(distSq, comparison, threshold * threshold);
+}
+
+void DetectionDistanceCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void DetectionDistanceCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+std::string DetectionDistanceCondition::GetParameterString() const
+{
+	return std::format("dist {} {}", ComparisonOperatorToString(comparison), numericValue.staticValue);
+}
+
+void DetectionDistanceCondition::DrawEditWidgets(bool& a_dirty)
+{
+	static const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	int compIdx = static_cast<int>(comparison);
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##ddOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##ddVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+}
+
+// --- DetectionRelationship ---
+
+bool DetectionRelationshipCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!g_detectionTarget || !g_detectionSource) return false;
+
+	auto* npc1 = g_detectionSource->GetNPC();
+	auto* npc2 = g_detectionTarget->GetNPC();
+	if (!npc1 || !npc2) return false;
+
+	int32_t rank = OAR_RE::GetRelationshipRank(npc1, npc2);
+	return CompareValues(static_cast<float>(rank), comparison, numericValue.GetValue(a_refr));
+}
+
+void DetectionRelationshipCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+}
+
+void DetectionRelationshipCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+}
+
+std::string DetectionRelationshipCondition::GetParameterString() const
+{
+	return std::format("rank {} {}", ComparisonOperatorToString(comparison), numericValue.staticValue);
+}
+
+void DetectionRelationshipCondition::DrawEditWidgets(bool& a_dirty)
+{
+	static const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	int compIdx = static_cast<int>(comparison);
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##drOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##drVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::TextDisabled("(-4=Archnemesis .. +4=Lover)");
+}
+
+// --- DetectionAngle ---
+
+bool DetectionAngleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!g_detectionTarget || !g_detectionSource) return false;
+
+	RE::Actor* angleActor = swapActors ? g_detectionTarget : g_detectionSource;
+	RE::Actor* targetActor = swapActors ? g_detectionSource : g_detectionTarget;
+
+	// Actor's heading in degrees (data.angle.z is in radians)
+	float actorAngle = angleActor->data.angle.z * (180.0f / static_cast<float>(std::numbers::pi));
+
+	// Compute bearing from angleActor to targetActor
+	float dx = targetActor->data.location.x - angleActor->data.location.x;
+	float dy = targetActor->data.location.y - angleActor->data.location.y;
+	float angleToTarget = std::atan2(dx, dy) * (180.0f / static_cast<float>(std::numbers::pi));
+	if (angleToTarget < 0) angleToTarget += 360.0f;
+
+	// Normalize actorAngle to 0-360
+	if (actorAngle < 0) actorAngle += 360.0f;
+
+	// Handle phase wrapping
+	if (std::fabs(actorAngle - angleToTarget) > 180.0f) {
+		if (actorAngle < angleToTarget)
+			actorAngle += 360.0f;
+		else
+			angleToTarget += 360.0f;
+	}
+
+	bool targetOnRight = (actorAngle - angleToTarget) < 0;
+
+	float relativeAngle = std::fabs(actorAngle - angleToTarget);
+	if (relativeAngle > 180.0f) relativeAngle = 360.0f - relativeAngle;
+
+	// Side filtering
+	if (limitRight && !targetOnRight) return false;
+	if (limitLeft && targetOnRight) return false;
+
+	return CompareValues(relativeAngle, comparison, numericValue.GetValue(a_refr));
+}
+
+void DetectionAngleCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("swapActors")) swapActors = a_json["swapActors"].get<bool>();
+	if (a_json.contains("comparison")) comparison = static_cast<ComparisonOperator>(a_json["comparison"].get<int32_t>());
+	if (a_json.contains("numericValue")) numericValue.Initialize(a_json["numericValue"]);
+	if (a_json.contains("limitRight")) limitRight = a_json["limitRight"].get<bool>();
+	if (a_json.contains("limitLeft")) limitLeft = a_json["limitLeft"].get<bool>();
+}
+
+void DetectionAngleCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["swapActors"] = swapActors;
+	a_json["comparison"] = static_cast<int32_t>(comparison);
+	numericValue.Serialize(a_json["numericValue"]);
+	a_json["limitRight"] = limitRight;
+	a_json["limitLeft"] = limitLeft;
+}
+
+std::string DetectionAngleCondition::GetParameterString() const
+{
+	std::string s = std::format("angle {} {}", ComparisonOperatorToString(comparison), numericValue.staticValue);
+	if (swapActors) s += " [swapped]";
+	if (limitRight) s += " [R]";
+	if (limitLeft) s += " [L]";
+	return s;
+}
+
+void DetectionAngleCondition::DrawEditWidgets(bool& a_dirty)
+{
+	if (ImGui::Checkbox("Swap perspective##da", &swapActors)) a_dirty = true;
+	ImGui::SameLine();
+	static const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
+	int compIdx = static_cast<int>(comparison);
+	ImGui::SetNextItemWidth(60);
+	if (ImGui::Combo("##daOp", &compIdx, ops, 6)) { comparison = static_cast<ComparisonOperator>(compIdx); a_dirty = true; }
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(80);
+	if (ImGui::InputFloat("##daVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
+	if (ImGui::Checkbox("Right only##da", &limitRight)) a_dirty = true;
+	ImGui::SameLine();
+	if (ImGui::Checkbox("Left only##da", &limitLeft)) a_dirty = true;
+}
+
+// =============================================================================
+// Dialogue Condition
+// =============================================================================
+
+bool DialogueCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	(void)a_refr;
+
+	// Query current dialogue menu state
+	auto* ui = RE::UI::GetSingleton();
+	bool menuCurrentlyOpen = ui ? ui->GetMenuOpen(RE::BSFixedString("DialogueMenu")) : false;
+
+	// Edge detection for transient states
+	if (menuCurrentlyOpen && !prevMenuOpen) {
+		dialogueStartedFlag = true;
+		dialogueEndedFlag = false;
+	}
+	if (!menuCurrentlyOpen && prevMenuOpen) {
+		dialogueEndedFlag = true;
+		dialogueStartedFlag = false;
+		playerChoseFlag = false;
+	}
+	prevMenuOpen = menuCurrentlyOpen;
+
+	// Check MenuTopicManager for player choosing state
+	bool playerCurrentlyChoosing = false;
+	if (auto* mtm = OAR_RE::MenuTopicManager::GetSingleton()) {
+		// When the menu is open and not shutting down, player is in dialogue.
+		// canSkip being false often indicates waiting for player choice.
+		playerCurrentlyChoosing = mtm->menuOpen && !mtm->canSkip && !mtm->shutMenu;
+	}
+
+	// Evaluate each enabled sub-check
+	if (checkDialogueActive && !menuCurrentlyOpen) return false;
+	if (checkDialogueStarted && !dialogueStartedFlag) return false;
+	if (checkPlayerChoosing && !playerCurrentlyChoosing) return false;
+	if (checkPlayerChose && !playerChoseFlag) return false;
+	if (checkDialogueEnded && !dialogueEndedFlag) return false;
+
+	// Clear one-shot flags after they've been consumed
+	if (checkDialogueStarted && dialogueStartedFlag) dialogueStartedFlag = false;
+	if (checkDialogueEnded && dialogueEndedFlag) dialogueEndedFlag = false;
+
+	// At least one sub-check must be enabled for the condition to be meaningful
+	return checkDialogueActive || checkDialogueStarted || checkPlayerChoosing ||
+		checkPlayerChose || checkDialogueEnded;
+}
+
+void DialogueCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("dialogueActive")) checkDialogueActive = a_json["dialogueActive"].get<bool>();
+	if (a_json.contains("dialogueStarted")) checkDialogueStarted = a_json["dialogueStarted"].get<bool>();
+	if (a_json.contains("playerChoosing")) checkPlayerChoosing = a_json["playerChoosing"].get<bool>();
+	if (a_json.contains("playerChose")) checkPlayerChose = a_json["playerChose"].get<bool>();
+	if (a_json.contains("dialogueEnded")) checkDialogueEnded = a_json["dialogueEnded"].get<bool>();
+}
+
+void DialogueCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["dialogueActive"] = checkDialogueActive;
+	a_json["dialogueStarted"] = checkDialogueStarted;
+	a_json["playerChoosing"] = checkPlayerChoosing;
+	a_json["playerChose"] = checkPlayerChose;
+	a_json["dialogueEnded"] = checkDialogueEnded;
+}
+
+std::string DialogueCondition::GetParameterString() const
+{
+	std::string s;
+	if (checkDialogueActive) s += "active ";
+	if (checkDialogueStarted) s += "started ";
+	if (checkPlayerChoosing) s += "choosing ";
+	if (checkPlayerChose) s += "chose ";
+	if (checkDialogueEnded) s += "ended ";
+	if (s.empty()) s = "(none)";
+	return s;
+}
+
+void DialogueCondition::DrawEditWidgets(bool& a_dirty)
+{
+	if (ImGui::Checkbox("Dialogue Active", &checkDialogueActive)) a_dirty = true;
+	if (ImGui::Checkbox("Dialogue Started (edge)", &checkDialogueStarted)) a_dirty = true;
+	if (ImGui::Checkbox("Player Choosing", &checkPlayerChoosing)) a_dirty = true;
+	if (ImGui::Checkbox("Player Chose (edge)", &checkPlayerChose)) a_dirty = true;
+	if (ImGui::Checkbox("Dialogue Ended (edge)", &checkDialogueEnded)) a_dirty = true;
+}
+
+// =============================================================================
+// Math Statement Condition
+// =============================================================================
+
+// Simple expression evaluator that handles basic math operators and comparisons.
+// Supports: +, -, *, /, >, <, >=, <=, ==, !=, and, or, not
+// Variables are resolved via the MathVariable vector.
+namespace MathEval
+{
+	struct Token
+	{
+		enum class Type { Number, Variable, Op, LParen, RParen, End };
+		Type type;
+		double value{ 0.0 };
+		std::string name;
+		char op{ 0 };
+	};
+
+	class Tokenizer
+	{
+	public:
+		Tokenizer(const std::string& expr) : src(expr), pos(0) {}
+
+		Token Next()
+		{
+			SkipWhitespace();
+			if (pos >= src.size()) return { Token::Type::End };
+
+			char c = src[pos];
+
+			// Numbers
+			if (std::isdigit(c) || (c == '.' && pos + 1 < src.size() && std::isdigit(src[pos + 1]))) {
+				return ReadNumber();
+			}
+
+			// Identifiers (variables and keywords)
+			if (std::isalpha(c) || c == '_') {
+				return ReadIdentifier();
+			}
+
+			// Two-character operators
+			if (pos + 1 < src.size()) {
+				std::string two = src.substr(pos, 2);
+				if (two == ">=" || two == "<=" || two == "==" || two == "!=") {
+					pos += 2;
+					return { Token::Type::Op, 0.0, "", two[0] == '>' ? 'G' : two[0] == '<' ? 'L' : two[0] == '=' ? 'E' : 'N' };
+				}
+			}
+
+			// Single-character operators
+			if (c == '+' || c == '-' || c == '*' || c == '/' || c == '>' || c == '<') {
+				pos++;
+				return { Token::Type::Op, 0.0, "", c };
+			}
+
+			if (c == '(') { pos++; return { Token::Type::LParen }; }
+			if (c == ')') { pos++; return { Token::Type::RParen }; }
+
+			// Unknown character — skip
+			pos++;
+			return Next();
+		}
+
+	private:
+		void SkipWhitespace() { while (pos < src.size() && std::isspace(src[pos])) pos++; }
+
+		Token ReadNumber()
+		{
+			size_t start = pos;
+			while (pos < src.size() && (std::isdigit(src[pos]) || src[pos] == '.')) pos++;
+			double val = std::stod(src.substr(start, pos - start));
+			return { Token::Type::Number, val };
+		}
+
+		Token ReadIdentifier()
+		{
+			size_t start = pos;
+			while (pos < src.size() && (std::isalnum(src[pos]) || src[pos] == '_')) pos++;
+			std::string id = src.substr(start, pos - start);
+
+			// Keywords
+			if (id == "and") return { Token::Type::Op, 0.0, "", '&' };
+			if (id == "or") return { Token::Type::Op, 0.0, "", '|' };
+			if (id == "not") return { Token::Type::Op, 0.0, "", '!' };
+
+			return { Token::Type::Variable, 0.0, id };
+		}
+
+		std::string src;
+		size_t pos;
+	};
+
+	// Recursive descent parser with operator precedence
+	class Parser
+	{
+	public:
+		Parser(const std::string& expr, const std::unordered_map<std::string, double>& vars)
+			: tokenizer(expr), variables(vars)
+		{
+			current = tokenizer.Next();
+		}
+
+		double Parse() { return ParseOr(); }
+
+	private:
+		double ParseOr()
+		{
+			double left = ParseAnd();
+			while (current.type == Token::Type::Op && current.op == '|') {
+				Advance();
+				double right = ParseAnd();
+				left = (left != 0.0 || right != 0.0) ? 1.0 : 0.0;
+			}
+			return left;
+		}
+
+		double ParseAnd()
+		{
+			double left = ParseComparison();
+			while (current.type == Token::Type::Op && current.op == '&') {
+				Advance();
+				double right = ParseComparison();
+				left = (left != 0.0 && right != 0.0) ? 1.0 : 0.0;
+			}
+			return left;
+		}
+
+		double ParseComparison()
+		{
+			double left = ParseAddSub();
+			while (current.type == Token::Type::Op &&
+				(current.op == '>' || current.op == '<' || current.op == 'G' ||
+					current.op == 'L' || current.op == 'E' || current.op == 'N')) {
+				char op = current.op;
+				Advance();
+				double right = ParseAddSub();
+				switch (op) {
+				case '>': left = left > right ? 1.0 : 0.0; break;
+				case '<': left = left < right ? 1.0 : 0.0; break;
+				case 'G': left = left >= right ? 1.0 : 0.0; break; // >=
+				case 'L': left = left <= right ? 1.0 : 0.0; break; // <=
+				case 'E': left = (std::abs(left - right) < 0.0001) ? 1.0 : 0.0; break; // ==
+				case 'N': left = (std::abs(left - right) >= 0.0001) ? 1.0 : 0.0; break; // !=
+				}
+			}
+			return left;
+		}
+
+		double ParseAddSub()
+		{
+			double left = ParseMulDiv();
+			while (current.type == Token::Type::Op && (current.op == '+' || current.op == '-')) {
+				char op = current.op;
+				Advance();
+				double right = ParseMulDiv();
+				left = (op == '+') ? left + right : left - right;
+			}
+			return left;
+		}
+
+		double ParseMulDiv()
+		{
+			double left = ParseUnary();
+			while (current.type == Token::Type::Op && (current.op == '*' || current.op == '/')) {
+				char op = current.op;
+				Advance();
+				double right = ParseUnary();
+				if (op == '*') left *= right;
+				else left = (right != 0.0) ? left / right : 0.0;
+			}
+			return left;
+		}
+
+		double ParseUnary()
+		{
+			if (current.type == Token::Type::Op && current.op == '-') {
+				Advance();
+				return -ParseUnary();
+			}
+			if (current.type == Token::Type::Op && current.op == '!') {
+				Advance();
+				return ParseUnary() == 0.0 ? 1.0 : 0.0;
+			}
+			return ParsePrimary();
+		}
+
+		double ParsePrimary()
+		{
+			if (current.type == Token::Type::Number) {
+				double val = current.value;
+				Advance();
+				return val;
+			}
+			if (current.type == Token::Type::Variable) {
+				std::string name = current.name;
+				Advance();
+				auto it = variables.find(name);
+				return it != variables.end() ? it->second : 0.0;
+			}
+			if (current.type == Token::Type::LParen) {
+				Advance();
+				double val = ParseOr();
+				if (current.type == Token::Type::RParen) Advance();
+				return val;
+			}
+			return 0.0;
+		}
+
+		void Advance() { current = tokenizer.Next(); }
+
+		Tokenizer tokenizer;
+		Token current;
+		const std::unordered_map<std::string, double>& variables;
+	};
+
+	inline double Evaluate(const std::string& expr, const std::unordered_map<std::string, double>& vars)
+	{
+		Parser parser(expr, vars);
+		return parser.Parse();
+	}
+}
+
+bool MathStatementCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (expression.empty()) return false;
+
+	// Build variable map from current values
+	std::unordered_map<std::string, double> varMap;
+	for (const auto& var : variables) {
+		varMap[var.name] = static_cast<double>(var.numericValue.GetValue(a_refr));
+	}
+
+	double result = MathEval::Evaluate(expression, varMap);
+	return result != 0.0;
+}
+
+void MathStatementCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("expression")) expression = a_json["expression"].get<std::string>();
+	if (a_json.contains("variables") && a_json["variables"].is_array()) {
+		for (const auto& varJson : a_json["variables"]) {
+			MathVariable mv;
+			if (varJson.contains("name")) mv.name = varJson["name"].get<std::string>();
+			if (varJson.contains("numericValue")) mv.numericValue.Initialize(varJson["numericValue"]);
+			variables.push_back(std::move(mv));
+		}
+	}
+}
+
+void MathStatementCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["expression"] = expression;
+	auto& arr = a_json["variables"];
+	arr = nlohmann::json::array();
+	for (const auto& var : variables) {
+		nlohmann::json varJson;
+		varJson["name"] = var.name;
+		var.numericValue.Serialize(varJson["numericValue"]);
+		arr.push_back(varJson);
+	}
+}
+
+std::string MathStatementCondition::GetParameterString() const
+{
+	if (expression.empty()) return "(empty expression)";
+	return expression;
+}
+
+void MathStatementCondition::DrawEditWidgets(bool& a_dirty)
+{
+	// Expression input
+	static char exprBuf[512];
+	strncpy_s(exprBuf, expression.c_str(), sizeof(exprBuf) - 1);
+	ImGui::Text("Expression:");
+	ImGui::SetNextItemWidth(-1);
+	if (ImGui::InputText("##mathExpr", exprBuf, sizeof(exprBuf))) {
+		expression = exprBuf;
+		a_dirty = true;
+	}
+
+	ImGui::Separator();
+	ImGui::Text("Variables:");
+
+	// Existing variables
+	int removeIdx = -1;
+	for (int i = 0; i < static_cast<int>(variables.size()); i++) {
+		ImGui::PushID(i);
+		auto& var = variables[i];
+
+		static char nameBuf[64];
+		strncpy_s(nameBuf, var.name.c_str(), sizeof(nameBuf) - 1);
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputText("##vname", nameBuf, sizeof(nameBuf))) {
+			var.name = nameBuf;
+			a_dirty = true;
+		}
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputFloat("##vval", &var.numericValue.staticValue, 0, 0, "%.2f")) {
+			a_dirty = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("X##vdel")) {
+			removeIdx = i;
+			a_dirty = true;
+		}
+		ImGui::PopID();
+	}
+
+	if (removeIdx >= 0) {
+		variables.erase(variables.begin() + removeIdx);
+	}
+
+	// Add variable button
+	if (ImGui::SmallButton("+ Add Variable")) {
+		MathVariable mv;
+		mv.name = std::format("v{}", variables.size());
+		variables.push_back(std::move(mv));
+		a_dirty = true;
+	}
+}
+
 // ===== Factory Registration =====
 
 void RegisterAllConditions()
@@ -2452,6 +3171,19 @@ void RegisterAllConditions()
 	factory->Register("AnimTimeElapsed", [] { return std::make_unique<AnimTimeElapsedCondition>(); });
 	factory->Register("AnimProgress", [] { return std::make_unique<AnimProgressCondition>(); });
 	factory->Register("IsPlayingIdleAnimation", [] { return std::make_unique<IsPlayingIdleAnimationCondition>(); });
+
+	// Detection conditions (ported from Skyrim OAR Detection Conditions plugin)
+	factory->Register("DetectedBy", [] { return std::make_unique<DetectedByCondition>(); });
+	factory->Register("Detects", [] { return std::make_unique<DetectsCondition>(); });
+	factory->Register("DetectionDistance", [] { return std::make_unique<DetectionDistanceCondition>(); });
+	factory->Register("DetectionRelationship", [] { return std::make_unique<DetectionRelationshipCondition>(); });
+	factory->Register("DetectionAngle", [] { return std::make_unique<DetectionAngleCondition>(); });
+
+	// Dialogue condition (ported from Skyrim OAR Dialogue Conditions plugin)
+	factory->Register("Dialogue", [] { return std::make_unique<DialogueCondition>(); });
+
+	// Math condition (ported from Skyrim OAR Math plugin)
+	factory->Register("MathStatement", [] { return std::make_unique<MathStatementCondition>(); });
 
 	logger::info("[OAR] Registered {} condition types", factory->GetAllFactories().size());
 }
