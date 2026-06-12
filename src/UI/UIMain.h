@@ -48,4 +48,8 @@ private:
 	bool showSettings{ false };
 	float firstColumnPercent{ 0.45f };
 	std::string copiedConditionJson;
+
+	// Rename popup state
+	SubMod* renamingSubMod{ nullptr };
+	char renameBuffer[256]{};
 };

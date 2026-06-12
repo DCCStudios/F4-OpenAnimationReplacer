@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+class SubMod;
+
 struct ActiveReplacementEntry
 {
 	std::string clipSuffix;
@@ -14,6 +16,7 @@ struct ActiveReplacementEntry
 	std::string actorName;
 	uint32_t actorFormID{ 0 };
 	bool conditionsPassed{ false };
+	const SubMod* subMod{ nullptr }; // For live re-evaluation of conditions in the UI
 };
 
 class ActiveReplacementTracker

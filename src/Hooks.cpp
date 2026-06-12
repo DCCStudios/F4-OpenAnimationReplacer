@@ -18,6 +18,27 @@
 static std::atomic<bool> s_gameFullyLoaded{ false };
 static std::atomic<bool> s_hasActiveReplacements{ false };
 
+// ActionFireEmpty detection — tracks when the engine dispatches the "fire empty" action
+// to an actor's animation graph. Used by IsDryFiringCondition for reliable detection.
+// Stores the tick (steady_clock) when ActionFireEmpty was last dispatched per actor formID.
+static std::shared_mutex s_fireEmptyMutex;
+static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_fireEmptyTimestamps;
+
+// Window in which IsDryFiring reports true after ActionFireEmpty dispatch (ms).
+// Kept short — just a brief pulse to trigger the submod. Users can pair with
+// AnimationTime conditions to hold the replacement for longer if needed.
+static constexpr int64_t kFireEmptyWindowMs = 150;
+
+bool WasFireEmptyRecent(uint32_t a_formID)
+{
+	std::shared_lock lock{ s_fireEmptyMutex };
+	auto it = s_fireEmptyTimestamps.find(a_formID);
+	if (it == s_fireEmptyTimestamps.end()) return false;
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - it->second).count();
+	return elapsed < kFireEmptyWindowMs;
+}
+
 // Per-clip bypass set: clips that failed pre-swap in Activate are skipped in Update
 // to prevent partial-state corruption when the animation control was built from a
 // different animation than what OAR would try to swap in.
@@ -90,6 +111,7 @@ struct CharResolved {
 
 struct CharTrackFilterState {
 	RE::hkaAnimation* replacement = nullptr;
+	RE::hkaAnimation* sourceAnimation = nullptr; // Original animation the source clip plays (for blend-sibling identification)
 	SubMod::TrackFilter* filter = nullptr;
 	SubMod* parentSubMod = nullptr;
 	RE::hkbClipGenerator* sourceClip = nullptr;
@@ -488,11 +510,11 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		}
 	}
 
-	logger::info("[OAR-TrackFilter] Resolved {} bones on character {:X} (skel size={}, wanted={}, version={})",
+	logger::trace("[OAR-TrackFilter] Resolved {} bones on character {:X} (skel size={}, wanted={}, version={})",
 		a_resolved.nameAndIndex.size(), reinterpret_cast<uintptr_t>(a_character),
 		numBones, wantedNames.size(), curVersion);
 	for (auto& [name, idx] : a_resolved.nameAndIndex) {
-		logger::info("[OAR-TrackFilter]   bone[{}] = '{}' (char {:X})",
+		logger::trace("[OAR-TrackFilter]   bone[{}] = '{}' (char {:X})",
 			idx, name, reinterpret_cast<uintptr_t>(a_character));
 	}
 
@@ -836,6 +858,21 @@ namespace
 	// Per-clip variant suffix cache (for kOnEachPlay: each clip gets its own roll)
 	static std::shared_mutex s_clipVariantMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipVariantCache;
+
+	// Per-clip flags for loop/echo events that allow non-interruptible submods to
+	// re-evaluate conditions at specific points (matching Skyrim OAR behavior).
+	static std::shared_mutex s_loopEchoFlagMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, bool> s_clipLoopPending;
+	static std::unordered_map<RE::hkbClipGenerator*, bool> s_clipEchoPending;
+
+	// Deactivation delay: per-clip timer that holds the replacement in place
+	// for a configurable duration after conditions become false.
+	struct DeactivationDelayState {
+		float remaining{ 0.f };
+		bool active{ false };
+	};
+	static std::shared_mutex s_deactDelayMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, DeactivationDelayState> s_deactivationDelay;
 
 	// Manual annotation firing state — tracks localTime progression per clip
 	struct ClipAnnotationState
@@ -1416,6 +1453,21 @@ namespace
 	static bool s_lookupBuilt = false;
 
 	// s_originalAnimMap declared above ClearClipRuntimeState()
+
+	// Extract the leaf name from a suffix for comparison purposes.
+	// "scar\wpnidleready" → "wpnidleready", "multi:wpnidleready" → "wpnidleready"
+	static std::string_view GetSuffixLeaf(const std::string& a_suffix)
+	{
+		std::string_view sv(a_suffix);
+		if (sv.size() > 6 && sv.substr(0, 6) == "multi:") {
+			sv = sv.substr(6);
+		}
+		auto lastSlash = sv.rfind('\\');
+		if (lastSlash != std::string_view::npos) {
+			sv = sv.substr(lastSlash + 1);
+		}
+		return sv;
+	}
 
 	static std::string ExtractAnimSuffix(const std::string& a_path)
 	{
@@ -2383,6 +2435,13 @@ namespace
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
 				suffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+				// Backfill the cache so Generate can find this clip's suffix later.
+				// Clips that missed Activate (already active at hook install time) are
+				// caught here.
+				if (!suffix.empty()) {
+					std::unique_lock lock(s_clipSuffixMutex);
+					s_clipSuffixCache[a_this] = suffix;
+				}
 			}
 		}
 
@@ -2642,6 +2701,41 @@ namespace
 			}
 		}
 
+		// "Interruptible" check: if the clip currently has an active replacement from
+		// a non-interruptible submod, skip condition re-evaluation UNLESS a loop or
+		// echo event occurred (matching Skyrim OAR behavior where non-interruptible
+		// clips still re-evaluate at loop/echo boundaries).
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto smIt = s_activeSubModMap.find(a_this);
+			if (smIt != s_activeSubModMap.end() && smIt->second) {
+				if (!smIt->second->IsInterruptible() && !smIt->second->IsDisabled()) {
+					bool allowReeval = false;
+
+					// Check if a loop/echo event allows re-evaluation
+					{
+						std::unique_lock leLock(s_loopEchoFlagMutex);
+						auto loopIt = s_clipLoopPending.find(a_this);
+						if (loopIt != s_clipLoopPending.end() && loopIt->second) {
+							if (smIt->second->GetReplaceOnLoop()) {
+								allowReeval = true;
+							}
+							loopIt->second = false;
+						}
+						auto echoIt = s_clipEchoPending.find(a_this);
+						if (echoIt != s_clipEchoPending.end() && echoIt->second) {
+							if (smIt->second->GetReplaceOnEcho()) {
+								allowReeval = true;
+							}
+							echoIt->second = false;
+						}
+					}
+
+					if (!allowReeval) return;
+				}
+			}
+		}
+
 		bool shouldReplace = false;
 		ReplacementAnimFileInfo* winningInfo = nullptr;
 		int totalCands = 0, disabledCands = 0, evalFalseCands = 0;
@@ -2756,6 +2850,16 @@ namespace
 		}
 
 		if (shouldReplace) {
+			// Conditions passed — cancel any pending deactivation delay
+			{
+				std::unique_lock ddLock(s_deactDelayMutex);
+				auto ddIt = s_deactivationDelay.find(a_this);
+				if (ddIt != s_deactivationDelay.end()) {
+					ddIt->second.active = false;
+					ddIt->second.remaining = 0.f;
+				}
+			}
+
 			auto* cache = AnimationCache::GetSingleton();
 			std::string variantSuffix;
 
@@ -2819,11 +2923,17 @@ namespace
 				if (tfActor) {
 					bool isNew = (s_charTrackFilterMap.find(tfActor) == s_charTrackFilterMap.end());
 					auto& state = s_charTrackFilterMap[tfActor];
-					// If the filter or replacement target changed, drop stale per-character
-					// resolution so it gets rebuilt against the current filter version.
-					if (state.filter != &winningInfo->parentSubMod->trackFilter ||
-						state.replacement != replacement) {
+					// If the FILTER itself changed (different bone set), drop bone resolution cache.
+					// Note: resolvedByChar only depends on skeleton + filter bone names, NOT on
+					// which replacement animation is active. Don't clear it on replacement change.
+					if (state.filter != &winningInfo->parentSubMod->trackFilter) {
 						state.resolvedByChar.clear();
+						state.cachedRepByName.clear();
+						state.cachedBaseByName.clear();
+						state.cacheValid = false;
+					} else if (state.replacement != replacement) {
+						// Replacement changed but filter is the same — only invalidate animation
+						// sample caches, not bone resolution
 						state.cachedRepByName.clear();
 						state.cachedBaseByName.clear();
 						state.cacheValid = false;
@@ -2835,6 +2945,12 @@ namespace
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
 					state.lastSourceFrame = s_currentFrame.load(std::memory_order_relaxed);
+					// Store the original animation pointer for blend-sibling identification.
+					// Track filter doesn't swap the animation slot, so the source clip's
+					// current animation IS the original.
+					if (animSlot && *animSlot) {
+						state.sourceAnimation = *animSlot;
+					}
 					if (isNew) {
 						s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
 						// Initialize blend-in state
@@ -2854,6 +2970,11 @@ namespace
 			}
 			if (*animSlot != originalAnim && originalAnim) {
 				*animSlot = originalAnim;
+			}
+			// Record in activeSubModMap so the interruptible check works for track-filtered submods too
+			if (winningInfo->parentSubMod) {
+				std::unique_lock smLock(s_activeSubModMutex);
+				s_activeSubModMap[a_this] = winningInfo->parentSubMod;
 			}
 			static int s_tfLog = 0;
 			if (s_tfLog < 3) {
@@ -2963,8 +3084,10 @@ namespace
 			} else {
 				entry.replacementPath = winningInfo->replacementPath;
 			}
-			if (winningInfo->parentSubMod)
+			if (winningInfo->parentSubMod) {
 				entry.subModName = winningInfo->parentSubMod->GetName();
+				entry.subMod = winningInfo->parentSubMod;
+			}
 		}
 		uint32_t actorID = 0;
 		if (refr) {
@@ -3034,9 +3157,24 @@ namespace
 							astate.lastFiredIndex = -1;
 							prevT = 0.f;
 
-							// Note: per-clip variant cache is NOT cleared on loop.
-							// For kOnEachPlay, the variant is stable for the clip's entire lifetime.
-							// A new variant is selected only when a new clip generator is created.
+							// Signal that a loop occurred — non-interruptible submods with
+							// replaceOnLoop=true will re-evaluate conditions once.
+							{
+								std::unique_lock leLock(s_loopEchoFlagMutex);
+								s_clipLoopPending[a_this] = true;
+							}
+
+							// If keepRandomResultsOnLoop is false, clear the per-clip
+							// variant cache so a new variant is selected on loop.
+							{
+								std::shared_lock smLock(s_activeSubModMutex);
+								auto smIt = s_activeSubModMap.find(a_this);
+								if (smIt != s_activeSubModMap.end() && smIt->second &&
+									!smIt->second->GetKeepRandomResultsOnLoop()) {
+									std::unique_lock cvLock(s_clipVariantMutex);
+									s_clipVariantCache.erase(a_this);
+								}
+							}
 						}
 
 						for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
@@ -3148,6 +3286,33 @@ namespace
 		}
 
 	} else {
+		// Deactivation delay: if the active submod has a delay configured,
+		// hold the replacement in place for that duration after conditions fail.
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto smIt = s_activeSubModMap.find(a_this);
+			if (smIt != s_activeSubModMap.end() && smIt->second) {
+				float delay = smIt->second->GetDeactivationDelay();
+				if (delay > 0.0f) {
+					std::unique_lock ddLock(s_deactDelayMutex);
+					auto& ds = s_deactivationDelay[a_this];
+					if (!ds.active) {
+						// Start the delay timer
+						ds.active = true;
+						ds.remaining = delay;
+						return;
+					}
+					// Timer is running — decrement and check
+					ds.remaining -= a_timestep;
+					if (ds.remaining > 0.0f) {
+						return;  // Still within delay, keep replacement
+					}
+					// Timer expired — fall through to normal restore logic
+					ds.active = false;
+				}
+			}
+		}
+
 		// Conditions failed — if this clip's suffix matches the active track
 		// filter's suffix, erase the ENTIRE entry. We can't rely on matching
 		// a_this against sourceClips because the behavior graph frequently
@@ -3339,6 +3504,15 @@ namespace
 				std::unique_lock lock(s_playOnceDecisionMutex);
 				s_playOnceDecision.erase(a_this);
 			}
+			{
+				std::unique_lock lock(s_loopEchoFlagMutex);
+				s_clipLoopPending.erase(a_this);
+				s_clipEchoPending.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_deactDelayMutex);
+				s_deactivationDelay.erase(a_this);
+			}
 			// Fire custom "on end" events at deactivation + reset variant state if kOnEachPlay
 			{
 				std::shared_lock smLock(s_activeSubModMutex);
@@ -3521,6 +3695,10 @@ namespace
 		auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
 		auto& poseHeader = headers[RE::kTrackIndex_Pose];
 		if (poseHeader.numData <= 0 || poseHeader.dataOffset <= 0) return;
+		// CRITICAL: Never force an inactive clip to become active. If onFraction is 0,
+		// Do NOT early-out on onFraction <= 0 here. The non-source paths handle
+		// this per-clip: if a clip is truly inactive the engine won't blend it in,
+		// but we still need to process source clips so their cache is populated.
 		auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
 		int16_t numOutputBones = poseHeader.numData;
 
@@ -3565,11 +3743,40 @@ namespace
 				!charIt->second.nameAndIndex.empty());
 
 			if (!isSourceClip && state.cacheValid && alreadyResolved) {
+				// Skip clips with onFraction=0 — their pose buffer is uninitialized.
+				if (poseHeader.onFraction <= 0.f) return;
+
+				// NON-SOURCE POLICY:
+				// The track filter's purpose is applying a partial-bone override
+				// (e.g., pistol slide locked back) across all normal animations
+				// (walk, fire, turn, idle) without needing separate assets for each.
+				//
+				// - Non-additive clips: override target bones with cached replacement.
+				// - Additive clips: zero target bones (suppress sway/jiggle deltas).
+				// - EXCEPTION — sneak-related clips: skip entirely. The sneak offset
+				//   additive provides the crouch positional delta; zeroing it prevents
+				//   the weapon from following the camera downward → white screen.
+				//   Sneak non-additive clips similarly shouldn't be overridden with
+				//   standing-pose values during crouch transitions.
+				std::string clipSuffix;
+				{
+					std::shared_lock csLock(s_clipSuffixMutex);
+					auto csIt = s_clipSuffixCache.find(a_this);
+					if (csIt != s_clipSuffixCache.end())
+						clipSuffix = csIt->second;
+				}
+
+				// Skip sneak-related clips — let them keep natural bone positions.
+				if (!clipSuffix.empty()) {
+					auto leafView = GetSuffixLeaf(clipSuffix);
+					if (leafView.find("sneak") != std::string_view::npos) return;
+				}
+
+				const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 				auto& cr = charIt->second;
 				float weight = filterPtr->weight * state.blendAlpha;
 				if (weight <= 0.001f) return;
 				auto mode = filterPtr->mode;
-				const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
@@ -3586,7 +3793,6 @@ namespace
 					} else {
 						auto rIt = state.cachedRepByName.find(name);
 						if (rIt == state.cachedRepByName.end()) continue;
-
 						if (mode == SubMod::TrackFilter::Mode::Override) {
 							LerpTransform(outputPose[idx], rIt->second, weight);
 						} else {
@@ -3600,7 +3806,6 @@ namespace
 					}
 					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
-				if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
 
 				static int s_nonSrcFastLog = 0;
 				if (s_nonSrcFastLog < 5) {
@@ -3671,6 +3876,11 @@ namespace
 		// override at all". This matches the previous behavior.
 		// =====================================================================
 		if (isSourceClip) {
+			// If the engine has set onFraction=0, this clip is being deactivated
+			// (state transition). Respect that — do NOT sample or force it active.
+			// Otherwise we keep a stale standing pose at full weight during transitions.
+			if (poseHeader.onFraction <= 0.f) return;
+
 			RE::hkaAnimation* repAnim = replacement;
 			if (!repAnim) return;
 
@@ -3760,10 +3970,7 @@ namespace
 				}
 				if (wantBindingDiag) s_bindingDiagLog++;
 
-				// Force the pose track to "valid" — onFraction > 0 means the engine
-				// will read this track. Without this, if the original animation had
-				// the track inactive (onFraction=0), our writes are discarded.
-				if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
+				// onFraction is > 0 here (source path has an early-out at the top).
 
 				state.cacheValid = true;
 				state.lastSourceFrame = curFrame;
@@ -3841,7 +4048,7 @@ namespace
 				}
 				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 			}
-			if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
+			// onFraction is > 0 here (source path has an early-out at the top).
 
 			static int s_fbFinalLog = 0;
 			if (s_fbFinalLog < 10) {
@@ -3867,10 +4074,27 @@ namespace
 		}
 
 		// =====================================================================
-		// NON-SOURCE CLIP PATH: apply the cached rep value (sampled by the
-		// source clip earlier this frame) so the filter "sticks" across blends.
+		// NON-SOURCE CLIP PATH (slow): same logic as the fast path but reached
+		// when bones weren't yet resolved or cache wasn't valid above.
 		// =====================================================================
 		if (!state.cacheValid) return;
+		// Skip inactive clips — their pose buffer is uninitialized
+		if (poseHeader.onFraction <= 0.f) return;
+
+		// Same policy as fast path: override everything except sneak-related clips.
+		{
+			std::string clipSuffix;
+			{
+				std::shared_lock csLock(s_clipSuffixMutex);
+				auto csIt = s_clipSuffixCache.find(a_this);
+				if (csIt != s_clipSuffixCache.end())
+					clipSuffix = csIt->second;
+			}
+			if (!clipSuffix.empty()) {
+				auto leafView = GetSuffixLeaf(clipSuffix);
+				if (leafView.find("sneak") != std::string_view::npos) return;
+			}
+		}
 
 		const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 
@@ -3878,9 +4102,6 @@ namespace
 			if (idx < 0 || idx >= numOutputBones) continue;
 
 			if (isAdditiveClip) {
-				// Additive clips contribute DELTAS. Writing zero/identity means
-				// "this clip adds nothing for this bone", letting the source
-				// clip's absolute override stand without being pushed further.
 				RE::hkQsTransformRaw identity{};
 				identity.translation[0] = 0.f; identity.translation[1] = 0.f;
 				identity.translation[2] = 0.f; identity.translation[3] = 0.f;
@@ -3892,7 +4113,6 @@ namespace
 			} else {
 				auto rIt = state.cachedRepByName.find(name);
 				if (rIt == state.cachedRepByName.end()) continue;
-
 				if (mode == SubMod::TrackFilter::Mode::Override) {
 					LerpTransform(outputPose[idx], rIt->second, weight);
 				} else {
@@ -3906,7 +4126,6 @@ namespace
 			}
 			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}
-		if (poseHeader.onFraction <= 0.f) poseHeader.onFraction = 1.0f;
 
 		static int s_nonSrcFinalLog = 0;
 		if (s_nonSrcFinalLog < 5) {
@@ -3925,6 +4144,13 @@ namespace
 	void hkbClipGenerator_StartEcho(RE::hkbClipGenerator* a_this, float a_duration)
 	{
 		Hooks::ClipGeneratorHooks::_StartEcho(a_this, a_duration);
+
+		// Signal that an echo event occurred — non-interruptible submods with
+		// replaceOnEcho=true will re-evaluate conditions once on the next Update.
+		if (a_this) {
+			std::unique_lock leLock(s_loopEchoFlagMutex);
+			s_clipEchoPending[a_this] = true;
+		}
 	}
 
 	void HookedActorUpdate()
@@ -3946,21 +4172,30 @@ namespace
 
 		// --- Track filter blend update ---
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
-			struct PendingEval { RE::TESObjectREFR* actor; SubMod* subMod; std::string suffix; };
+			struct PendingEval {
+				RE::TESObjectREFR* actor;
+				SubMod* subMod;
+				std::string suffix;
+				RE::hkbClipGenerator* sourceClip;
+			};
 			std::vector<PendingEval> toEval;
 			{
 				std::shared_lock tfShared(s_trackFilterMutex);
 				toEval.reserve(s_charTrackFilterMap.size());
 				for (auto& [actor, state] : s_charTrackFilterMap) {
 					if (state.parentSubMod && actor)
-						toEval.push_back({ actor, state.parentSubMod, state.suffix });
+						toEval.push_back({ actor, state.parentSubMod, state.suffix, state.sourceClip });
 				}
 			}
 
 			std::unordered_set<RE::TESObjectREFR*> conditionsFalse;
 			for (auto& pe : toEval) {
 				if (pe.subMod->GetPlayOnceFullBody()) continue;
-				if (!pe.subMod->EvaluateConditions(pe.actor, nullptr))
+				// Track-filtered submods always re-evaluate conditions regardless of
+				// the interruptible flag — they overlay bones and must deactivate
+				// immediately when conditions become false (e.g., player crouches).
+				// The interruptible flag is only meaningful for full-body replacements.
+				if (!pe.subMod->EvaluateConditions(pe.actor, pe.sourceClip))
 					conditionsFalse.insert(pe.actor);
 			}
 
@@ -4334,6 +4569,75 @@ namespace
 
 namespace Hooks
 {
+	// === ActionFireEmpty hook via Actor vtable ===
+	// IAnimationGraphManagerHolder::NotifyAnimationGraphImpl is vfunc index 1
+	// on the IAnimationGraphManagerHolder vtable (Actor vtable entry index 5).
+	namespace ActionFireEmptyHook
+	{
+		using NotifyFn = bool(*)(RE::IAnimationGraphManagerHolder*, const RE::BSFixedString&);
+		static NotifyFn _OriginalNotify = nullptr;
+
+		static bool HookedNotifyAnimGraph(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		{
+			// Check if this is ActionFireEmpty
+			const char* evtStr = a_eventName.c_str();
+			if (evtStr && _stricmp(evtStr, "ActionFireEmpty") == 0) {
+				// Resolve the actor from the IAnimationGraphManagerHolder pointer.
+				// IAnimationGraphManagerHolder is at offset 0x048 in TESObjectREFR,
+				// so subtract 0x048 to get back to the TESObjectREFR base.
+				auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
+					reinterpret_cast<uintptr_t>(a_this) - 0x48);
+				if (refr) {
+					uint32_t formID = refr->GetFormID();
+					std::unique_lock lock{ s_fireEmptyMutex };
+					s_fireEmptyTimestamps[formID] = std::chrono::steady_clock::now();
+				}
+			}
+			return _OriginalNotify(a_this, a_eventName);
+		}
+
+		void Install()
+		{
+			// Actor's IAnimationGraphManagerHolder vtable is at index 5 in the Actor vtable array
+			REL::Relocation<uintptr_t> actorAnimGraphVtbl{ REL::ID(453840) };
+			_OriginalNotify = reinterpret_cast<NotifyFn>(
+				actorAnimGraphVtbl.write_vfunc(1, &HookedNotifyAnimGraph));
+			logger::info("[OAR] ActionFireEmpty vtable hook installed (Actor::NotifyAnimationGraphImpl)");
+		}
+	}
+
+	// Secondary detection: hook the PlayerControls "fire empty" code path directly.
+	// REL::ID(818081) is the function called when the player presses fire with an empty
+	// magazine. At offset 0x40A there's a call to DoAction that triggers the auto-reload.
+	// By hooking this call site, we reliably detect fire-empty input at the PlayerControls
+	// level — upstream of the animation graph, so it fires even if the anim event is
+	// swallowed or doesn't reach NotifyAnimationGraphImpl.
+	namespace PlayerFireEmptyHook
+	{
+		using DoActionFn = int64_t(*)(int64_t, int, unsigned int);
+		static DoActionFn _OriginalDoAction = nullptr;
+
+		static int64_t HookedDoAction(int64_t a_arg1, int a_arg2, unsigned int a_arg3)
+		{
+			// The player just pressed fire with an empty weapon — record timestamp.
+			// We use formID 0x14 (player) since this only fires for the player character.
+			{
+				std::unique_lock lock{ s_fireEmptyMutex };
+				s_fireEmptyTimestamps[0x14] = std::chrono::steady_clock::now();
+			}
+			// Call through so the game's normal logic (or other mod hooks) still runs
+			return _OriginalDoAction(a_arg1, a_arg2, a_arg3);
+		}
+
+		void Install(F4SE::Trampoline& trampoline)
+		{
+			REL::Relocation<std::uintptr_t> callLocation{ REL::ID(818081), 0x40A };
+			_OriginalDoAction = reinterpret_cast<DoActionFn>(
+				trampoline.write_call<5>(callLocation.address(), &HookedDoAction));
+			logger::info("[OAR] PlayerFireEmpty hook installed (REL::ID 818081 + 0x40A)");
+		}
+	}
+
 	void Install()
 	{
 		ClipGeneratorHooks::Install();
@@ -4342,6 +4646,8 @@ namespace Hooks
 		PreloadHooks::Install();
 		UpdateHooks::Install();
 		FileRedirectHooks::Install();
+		ActionFireEmptyHook::Install();
+		PlayerFireEmptyHook::Install(F4SE::GetTrampoline());
 		logger::info("[OAR] All hooks installed");
 	}
 

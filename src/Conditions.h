@@ -440,6 +440,37 @@ protected:
 	void SerializeImpl(nlohmann::json&) const override {}
 };
 
+// IsDryFiring — true when the engine dispatches ActionFireEmpty to this actor
+// (i.e., the player pressed fire with no ammo). Pure input detection only.
+class IsDryFiringCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsDryFiring"; }
+	std::string GetDescription() const override { return "True when the engine fires the ActionFireEmpty event (player pressed fire with no ammo). Pure input detection — combine with CurrentMagazineAmmo, IsWeaponDrawn, etc. as needed."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
+// IsButtonHeld — true when a specific user event's mapped button is currently pressed.
+// User events: "Attack", "Activate", "Sprint", "Jump", "Sneak", "Block", "Ready",
+// "Reload", "Bash", "ADS", "Melee", "Grenade", "VATS", "Favorites", etc.
+class IsButtonHeldCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsButtonHeld"; }
+	std::string GetDescription() const override { return "True when the specified user event button is currently held. Enter the event name (e.g. 'Attack', 'Sprint', 'Activate', 'Jump', 'Reload')."; }
+	std::string GetParameterString() const override { return std::format("'{}'", userEvent); }
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	std::string userEvent;
+};
+
 class IsBlockingCondition : public ConditionBase
 {
 public:

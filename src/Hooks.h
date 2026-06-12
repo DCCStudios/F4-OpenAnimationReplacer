@@ -12,6 +12,10 @@ void PopulateKnownStringData();
 void RefreshWeaponAnimFolder();
 void RegisterWeaponEquipListener();
 
+// ActionFireEmpty detection — returns true if the engine dispatched ActionFireEmpty
+// to the given actor within the last ~1 second.
+bool WasFireEmptyRecent(uint32_t a_formID);
+
 namespace Hooks
 {
 	void Install();

@@ -1,6 +1,7 @@
 #include "UI/UIDebugOverlay.h"
 #include "UI/UICommon.h"
 #include "ActiveReplacementTracker.h"
+#include "ReplacerMods.h"
 
 #include <imgui.h>
 #include <algorithm>
@@ -55,7 +56,22 @@ void UIDebugOverlay::DrawContents()
 			ImGui::TextUnformatted(entry.subModName.c_str());
 
 			ImGui::TableNextColumn();
-			if (entry.conditionsPassed) {
+			// Re-evaluate conditions live against the current game state
+			bool currentlyPassing = false;
+			if (entry.subMod && entry.actorFormID != 0) {
+				auto* form = RE::TESForm::GetFormByID(entry.actorFormID);
+				auto* refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+				if (refr) {
+					// Pass nullptr for clipGen — timing conditions will return false,
+					// but all gameplay conditions evaluate correctly
+					currentlyPassing = entry.subMod->EvaluateConditions(refr, nullptr);
+				}
+			} else if (!entry.subMod) {
+				// No condition set (unconditional replacement) — always active
+				currentlyPassing = true;
+			}
+
+			if (currentlyPassing) {
 				ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "YES");
 			} else {
 				ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "NO");

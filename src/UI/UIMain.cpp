@@ -121,6 +121,39 @@ void UIMain::DrawReplacerModsTab()
 		ImGui::TextDisabled("Select a SubMod from the tree to view details");
 	}
 	ImGui::EndChild();
+
+	// Rename SubMod modal popup
+	if (renamingSubMod) {
+		ImGui::OpenPopup("Rename SubMod");
+	}
+	if (ImGui::BeginPopupModal("Rename SubMod", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::Text("Enter new name:");
+		ImGui::SetNextItemWidth(300);
+		bool submitted = ImGui::InputText("##RenameInput", renameBuffer, sizeof(renameBuffer),
+			ImGuiInputTextFlags_EnterReturnsTrue);
+
+		// Auto-focus the input on first frame
+		if (ImGui::IsWindowAppearing()) {
+			ImGui::SetKeyboardFocusHere(-1);
+		}
+
+		ImGui::Spacing();
+		if (submitted || ImGui::Button("OK", ImVec2(120, 0))) {
+			if (renamingSubMod && renameBuffer[0] != '\0') {
+				renamingSubMod->SetName(renameBuffer);
+				renamingSubMod->SetDirty(true);
+				logger::info("[OAR-UI] SubMod renamed to '{}'", renameBuffer);
+			}
+			renamingSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			renamingSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
 }
 
 void UIMain::DrawReplacementAnimsTab()
@@ -254,6 +287,22 @@ void UIMain::DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod)
 	ImGui::TreeNodeEx(label.c_str(), flags);
 	if (ImGui::IsItemClicked()) {
 		selectedSubMod = a_subMod;
+	}
+
+	// Right-click context menu
+	if (ImGui::BeginPopupContextItem("SubModContext")) {
+		if (ImGui::MenuItem("Rename...")) {
+			renamingSubMod = a_subMod;
+			strncpy_s(renameBuffer, a_subMod->GetName().c_str(), sizeof(renameBuffer) - 1);
+			ImGui::OpenPopup("RenameSubMod");
+		}
+		ImGui::Separator();
+		bool dis = a_subMod->IsDisabled();
+		if (ImGui::MenuItem(dis ? "Enable" : "Disable")) {
+			a_subMod->SetDisabled(!dis);
+			a_subMod->SetDirty(true);
+		}
+		ImGui::EndPopup();
 	}
 
 	ImGui::PopStyleColor();

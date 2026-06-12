@@ -1,5 +1,6 @@
 #include "Conditions.h"
 #include "Utils.h"
+#include "Hooks.h"
 #include "OpenAnimationReplacer.h"
 #include <imgui.h>
 #include <numbers>
@@ -809,6 +810,139 @@ bool IsFiringCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGener
 	if (!actor) return false;
 	auto gs = static_cast<std::uint32_t>(actor->gunState);
 	return gs == 7 || gs == 8;
+}
+
+// IsDryFiring — true when the engine has dispatched ActionFireEmpty to this actor.
+// Hooks Actor::NotifyAnimationGraphImpl and watches for the "ActionFireEmpty" event
+// that the engine sends when the player presses fire with no ammo. Returns true for
+// a short window (~1s) after the action fires. Pair with CurrentMagazineAmmo,
+// IsWeaponDrawn, etc. in your condition set as needed.
+bool IsDryFiringCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+	return WasFireEmptyRecent(a_refr->GetFormID());
+}
+
+// IsButtonHeld — checks if a user event's mapped key is currently pressed via BSInputDeviceManager.
+// Builds a cached list of all user event names from the game's ControlMap (main gameplay context).
+static const std::vector<std::string>& GetCachedUserEventNames()
+{
+	static std::vector<std::string> s_eventNames;
+	static bool s_initialized = false;
+
+	if (!s_initialized) {
+		s_initialized = true;
+		auto* controlMap = RE::ControlMap::GetSingleton();
+		if (controlMap) {
+			constexpr auto kMainGameplay = RE::UserEvents::INPUT_CONTEXT_ID::kMainGameplay;
+			auto* ctx = controlMap->controlMaps[static_cast<int>(kMainGameplay)];
+			if (ctx) {
+				// Collect unique event names across all device mappings
+				std::set<std::string> uniqueNames;
+				for (int devIdx = 0; devIdx < static_cast<int>(RE::INPUT_DEVICE::kSupported); ++devIdx) {
+					auto& mappings = ctx->deviceMappings[devIdx];
+					for (auto& mapping : mappings) {
+						const char* name = mapping.eventID.c_str();
+						if (name && name[0] != '\0') {
+							uniqueNames.insert(name);
+						}
+					}
+				}
+				s_eventNames.assign(uniqueNames.begin(), uniqueNames.end());
+			}
+		}
+		// Fallback list if ControlMap isn't ready yet
+		if (s_eventNames.empty()) {
+			s_eventNames = {
+				"Activate", "Attack", "AutoMove", "Back", "Block", "Favorites",
+				"Forward", "Grenade", "Jump", "Look", "Melee", "Move",
+				"PipBoy", "PipBoyLight", "ReadyWeapon", "Run", "Sneak",
+				"Sprint", "StrafeLeft", "StrafeRight", "TogglePOV",
+				"ToggleRun", "TweenMenu", "VATS", "ZoomIn", "ZoomOut"
+			};
+			s_initialized = false; // Try again next frame if ControlMap wasn't ready
+		}
+	}
+	return s_eventNames;
+}
+
+void IsButtonHeldCondition::DrawEditWidgets(bool& a_dirty)
+{
+	const auto& eventNames = GetCachedUserEventNames();
+
+	// Find current selection index
+	int currentIdx = -1;
+	for (int i = 0; i < static_cast<int>(eventNames.size()); ++i) {
+		if (eventNames[i] == userEvent) {
+			currentIdx = i;
+			break;
+		}
+	}
+
+	const char* preview = currentIdx >= 0 ? eventNames[currentIdx].c_str() : "(select event)";
+	ImGui::SetNextItemWidth(180);
+	if (ImGui::BeginCombo("User Event##btnheld", preview)) {
+		for (int i = 0; i < static_cast<int>(eventNames.size()); ++i) {
+			bool isSelected = (i == currentIdx);
+			if (ImGui::Selectable(eventNames[i].c_str(), isSelected)) {
+				userEvent = eventNames[i];
+				a_dirty = true;
+			}
+			if (isSelected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+}
+
+bool IsButtonHeldCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (userEvent.empty()) return false;
+
+	auto* controlMap = RE::ControlMap::GetSingleton();
+	if (!controlMap) return false;
+
+	auto* deviceMgr = RE::BSInputDeviceManager::GetSingleton();
+	if (!deviceMgr) return false;
+
+	// Resolve the user event to a key code from the main gameplay context
+	const RE::BSFixedString eventID(userEvent.c_str());
+	constexpr auto kMainGameplay = RE::UserEvents::INPUT_CONTEXT_ID::kMainGameplay;
+	auto* ctx = controlMap->controlMaps[static_cast<int>(kMainGameplay)];
+	if (!ctx) return false;
+
+	// Check each device type for a mapping, then check if that key is held
+	for (int devIdx = 0; devIdx < static_cast<int>(RE::INPUT_DEVICE::kSupported); ++devIdx) {
+		auto& mappings = ctx->deviceMappings[devIdx];
+		for (auto& mapping : mappings) {
+			if (mapping.eventID == eventID && mapping.inputKey >= 0) {
+				// Found the mapped key for this device — check if it's pressed
+				auto* device = deviceMgr->devices[devIdx];
+				if (!device) continue;
+
+				auto keyCode = static_cast<std::uint32_t>(mapping.inputKey);
+				auto it = device->deviceButtons.find(keyCode);
+				if (it != device->deviceButtons.end() && it->second) {
+					// heldDownSecs > 0 means the button is currently pressed
+					if (it->second->heldDownSecs > 0.f) {
+						return true;
+					}
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+void IsButtonHeldCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("userEvent")) userEvent = a_json["userEvent"].get<std::string>();
+}
+
+void IsButtonHeldCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["userEvent"] = userEvent;
 }
 
 // IsBlocking
@@ -3111,6 +3245,8 @@ void RegisterAllConditions()
 	factory->Register("IsAttacking", [] { return std::make_unique<IsAttackingCondition>(); });
 	factory->Register("IsReloading", [] { return std::make_unique<IsReloadingCondition>(); });
 	factory->Register("IsFiring", [] { return std::make_unique<IsFiringCondition>(); });
+	factory->Register("IsDryFiring", [] { return std::make_unique<IsDryFiringCondition>(); });
+	factory->Register("IsButtonHeld", [] { return std::make_unique<IsButtonHeldCondition>(); });
 	factory->Register("IsBlocking", [] { return std::make_unique<IsBlockingCondition>(); });
 	factory->Register("IsRunning", [] { return std::make_unique<IsRunningCondition>(); });
 	factory->Register("IsInInterior", [] { return std::make_unique<IsInInteriorCondition>(); });
