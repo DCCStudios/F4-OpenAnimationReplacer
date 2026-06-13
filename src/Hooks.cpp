@@ -20,23 +20,29 @@ static std::atomic<bool> s_hasActiveReplacements{ false };
 
 // ActionFireEmpty detection — tracks when the engine dispatches the "fire empty" action
 // to an actor's animation graph. Used by IsDryFiringCondition for reliable detection.
-// Stores the tick (steady_clock) when ActionFireEmpty was last dispatched per actor formID.
+struct FireEmptyEntry {
+	std::chrono::steady_clock::time_point timestamp;
+	uint32_t generation = 0;  // increments each time fire-empty occurs
+};
 static std::shared_mutex s_fireEmptyMutex;
-static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_fireEmptyTimestamps;
+static std::unordered_map<uint32_t, FireEmptyEntry> s_fireEmptyMap;
 
-// Window in which IsDryFiring reports true after ActionFireEmpty dispatch (ms).
-// Kept short — just a brief pulse to trigger the submod. Users can pair with
-// AnimationTime conditions to hold the replacement for longer if needed.
-static constexpr int64_t kFireEmptyWindowMs = 150;
-
-bool WasFireEmptyRecent(uint32_t a_formID)
+bool WasFireEmptyRecent(uint32_t a_formID, int64_t a_windowMs)
 {
 	std::shared_lock lock{ s_fireEmptyMutex };
-	auto it = s_fireEmptyTimestamps.find(a_formID);
-	if (it == s_fireEmptyTimestamps.end()) return false;
+	auto it = s_fireEmptyMap.find(a_formID);
+	if (it == s_fireEmptyMap.end()) return false;
 	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::steady_clock::now() - it->second).count();
-	return elapsed < kFireEmptyWindowMs;
+		std::chrono::steady_clock::now() - it->second.timestamp).count();
+	return elapsed < a_windowMs;
+}
+
+uint32_t GetFireEmptyGeneration(uint32_t a_formID)
+{
+	std::shared_lock lock{ s_fireEmptyMutex };
+	auto it = s_fireEmptyMap.find(a_formID);
+	if (it == s_fireEmptyMap.end()) return 0;
+	return it->second.generation;
 }
 
 // Per-clip bypass set: clips that failed pre-swap in Activate are skipped in Update
@@ -2702,9 +2708,10 @@ namespace
 		}
 
 		// "Interruptible" check: if the clip currently has an active replacement from
-		// a non-interruptible submod, skip condition re-evaluation UNLESS a loop or
-		// echo event occurred (matching Skyrim OAR behavior where non-interruptible
-		// clips still re-evaluate at loop/echo boundaries).
+		// a non-interruptible submod, skip condition re-evaluation but still continue
+		// to the replacement path for annotation firing and trigger maintenance.
+		bool skipConditionEval = false;
+		SubMod* lockedSubMod = nullptr;
 		{
 			std::shared_lock smLock(s_activeSubModMutex);
 			auto smIt = s_activeSubModMap.find(a_this);
@@ -2731,7 +2738,10 @@ namespace
 						}
 					}
 
-					if (!allowReeval) return;
+					if (!allowReeval) {
+						skipConditionEval = true;
+						lockedSubMod = smIt->second;
+					}
 				}
 			}
 		}
@@ -2741,7 +2751,17 @@ namespace
 		int totalCands = 0, disabledCands = 0, evalFalseCands = 0;
 		int noCondCands = 0;
 
-		if (playOnceLocked) {
+		if (skipConditionEval) {
+			// Non-interruptible active replacement — skip condition evaluation entirely.
+			// Assume replacement stays active; find the matching info for annotation/trigger logic.
+			shouldReplace = true;
+			for (auto* info : candidates) {
+				if (info && info->parentSubMod == lockedSubMod) {
+					winningInfo = info;
+					break;
+				}
+			}
+		} else if (playOnceLocked) {
 			shouldReplace = playOnceLockedResult;
 			if (shouldReplace) {
 				for (auto* info : candidates) {
@@ -2915,6 +2935,13 @@ namespace
 			// slot. Instead register the replacement so Generate can sample it per-bone.
 		bool useTrackFilter = winningInfo && winningInfo->parentSubMod &&
 			winningInfo->parentSubMod->trackFilter.enabled && replacement;
+
+			// Track-filtered clips ALWAYS fire replacement annotations. The original
+			// animation stays in the slot and its triggers fire normally for base events.
+			// The replacement's annotations (sounds, bone culls) must be fired manually
+			// regardless of the replaceAnnotations setting, since the replacement anim
+			// isn't in the slot and its triggers can't be read by the engine.
+			if (useTrackFilter) bReplaceAnnot = true;
 		if (useTrackFilter) {
 			{
 				std::unique_lock tfLock(s_trackFilterMutex);
@@ -3112,8 +3139,10 @@ namespace
 			s_activeReplacementByActor[actorID].insert(resolvedSuffix);
 		}
 
-		// Fire replacement annotations manually (only if replaceAnnotations is enabled).
-		// When disabled, original triggers are kept so the game handles sounds/events natively.
+		// Fire replacement annotations manually with dual-path emission.
+		// Phase 1: NotifyAnimationGraphImpl (behavior graph state transitions, bone cull)
+		// Phase 2: BSTEventSource::Notify (audio SoundPlay.*, plugin sinks)
+		// Only fires when ReplaceAnnotations is enabled for the submod (or forced for track filters).
 		if (bReplaceAnnot) {
 			const auto& annotSuffix = cacheSuffix;
 			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix);
@@ -3201,39 +3230,34 @@ namespace
 							// SoundPlay annotations: play directly through BSAudioManager
 							const char* soundName = text.c_str() + kSoundPlayLen;
 							PlaySoundDirect(soundName, refr);
-					} else {
-						// Behavior events (weaponFire, reloadComplete, etc.):
-						// fire via both behavior graph AND event sinks.
-						RE::BSFixedString evtName(text.c_str());
-						if (!SafeNotifyAnimGraph(refr, evtName)) {
-							static int s_notifyFailLog = 0;
-							if (s_notifyFailLog < 10) {
-								logger::error("[OAR-SEH] NotifyAnimationGraphImpl crash caught for event '{}' — stale graph data",
-									text);
-								s_notifyFailLog++;
-							}
-						}
-						SafeNotifyEventSinks(refr, evtName);
+						} else {
+							// All other annotations (CullBone, UncullBone, reloadComplete,
+							// initiateStart, etc.): fire via BOTH behavior graph AND event
+							// sinks. The graph handles bone visibility and state transitions;
+							// the sinks handle audio plugins and other listeners.
+							RE::BSFixedString evtName(text.c_str());
+							refr->NotifyAnimationGraphImpl(evtName);
+							NotifyEventSinks(refr, evtName);
 
-						// When the replacement annotation fires "ReloadEnd", also
-						// force isReloading=false and restore triggers so the state
-						// machine can transition (mirrors FPInertia Early ADS).
-						if (text == "ReloadEnd" || text == "reloadEnd") {
-							auto* actor = refr->As<RE::Actor>();
-							if (actor) {
-								SetHavokBool(actor, kHavokVar_IsReloading, false);
-							}
-							RestoreClipTriggers(a_this);
-							{
-								std::lock_guard rg(s_triggersRestoredMutex);
-								s_triggersRestoredSet.insert(a_this);
-							}
-							{
-								std::unique_lock poLock(s_playOnceDecisionMutex);
-								s_playOnceDecision.erase(a_this);
+							// When the replacement annotation fires "ReloadEnd", also
+							// force isReloading=false and restore triggers so the state
+							// machine can transition (mirrors FPInertia Early ADS).
+							if (text == "ReloadEnd" || text == "reloadEnd") {
+								auto* actor = refr->As<RE::Actor>();
+								if (actor) {
+									SetHavokBool(actor, kHavokVar_IsReloading, false);
+								}
+								RestoreClipTriggers(a_this);
+								{
+									std::lock_guard rg(s_triggersRestoredMutex);
+									s_triggersRestoredSet.insert(a_this);
+								}
+								{
+									std::unique_lock poLock(s_playOnceDecisionMutex);
+									s_playOnceDecision.erase(a_this);
+								}
 							}
 						}
-					}
 
 						static int s_annotFireLog = 0;
 						if (s_annotFireLog < 50) {
@@ -3313,30 +3337,10 @@ namespace
 			}
 		}
 
-		// Conditions failed — if this clip's suffix matches the active track
-		// filter's suffix, erase the ENTIRE entry. We can't rely on matching
-		// a_this against sourceClips because the behavior graph frequently
-		// creates new clip generator instances at different addresses for the
-		// same animation (state transitions), leaving stale entries in the set.
-		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
-			std::unique_lock tfLock(s_trackFilterMutex);
-			RE::TESObjectREFR* tfActor = refr;
-			if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
-			if (tfActor) {
-				auto it = s_charTrackFilterMap.find(tfActor);
-				if (it != s_charTrackFilterMap.end() &&
-					it->second.suffix == resolvedSuffix) {
-					static int s_cleanupLog = 0;
-					if (s_cleanupLog < 10) {
-						logger::info("[OAR-TrackFilter] Conditions false for '{}' — erasing track filter entry for actor {:X}",
-							resolvedSuffix, reinterpret_cast<uintptr_t>(tfActor));
-						s_cleanupLog++;
-					}
-					s_charTrackFilterMap.erase(it);
-					s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
-				}
-			}
-		}
+		// NOTE: Do NOT directly erase track filter entries here. The blend-out
+		// logic in HookedActorUpdate handles condition-false deactivation with
+		// a smooth blend. Erasing here would race with and defeat that blend,
+		// causing an instant snap instead of a smooth transition.
 
 		// Conditions failed — check if we should blend out or instant-restore.
 		if (originalAnim && *animSlot != originalAnim) {
@@ -3538,17 +3542,16 @@ namespace
 			}
 			// Remove this clip from any track filter source sets to prevent stale
 			// pointers from being used if a new clip is allocated at the same address.
+			// Do NOT erase the entry when sourceClips becomes empty — keep the cached
+			// override alive so non-source clips continue receiving the correct values
+			// during animation transitions (e.g., idle→fire→idle). The staleness
+			// mechanism (kTrackFilterStaleFrames) will clean up entries that never get
+			// a new source clip registered.
 			if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
 				std::unique_lock tfLock(s_trackFilterMutex);
-				for (auto it = s_charTrackFilterMap.begin(); it != s_charTrackFilterMap.end(); ) {
-					it->second.sourceClips.erase(a_this);
-					if (it->second.sourceClip == a_this) it->second.sourceClip = nullptr;
-					if (it->second.sourceClips.empty()) {
-						it = s_charTrackFilterMap.erase(it);
-						s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
-					} else {
-						++it;
-					}
+				for (auto& [actor, state] : s_charTrackFilterMap) {
+					state.sourceClips.erase(a_this);
+					if (state.sourceClip == a_this) state.sourceClip = nullptr;
 				}
 			}
 	}
@@ -3769,7 +3772,10 @@ namespace
 				// Skip sneak-related clips — let them keep natural bone positions.
 				if (!clipSuffix.empty()) {
 					auto leafView = GetSuffixLeaf(clipSuffix);
-					if (leafView.find("sneak") != std::string_view::npos) return;
+					// Only skip clips whose leaf STARTS with "sneak" (e.g., sneakoffset,
+					// sneakforward). Jiggle clips like "wpnafterjigglesneakdown" don't
+					// start with "sneak" and should still be processed (zeroed).
+					if (leafView.size() >= 5 && leafView.substr(0, 5) == "sneak") return;
 				}
 
 				const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
@@ -3777,6 +3783,17 @@ namespace
 				float weight = filterPtr->weight * state.blendAlpha;
 				if (weight <= 0.001f) return;
 				auto mode = filterPtr->mode;
+
+				// Diagnostic: confirm non-source clips are applying blend-out weight
+				if (state.blendingOut) {
+					static int s_nsBoLog = 0;
+					if (s_nsBoLog < 20) {
+						logger::info("[OAR-TrackFilter] NonSrc-FastPath BLEND-OUT: suffix='{}' clip={:X} additive={} weight={:.4f} alpha={:.4f} onFrac={:.3f}",
+							state.suffix, reinterpret_cast<uintptr_t>(a_this),
+							isAdditiveClip, weight, state.blendAlpha, poseHeader.onFraction);
+						s_nsBoLog++;
+					}
+				}
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
@@ -4092,7 +4109,7 @@ namespace
 			}
 			if (!clipSuffix.empty()) {
 				auto leafView = GetSuffixLeaf(clipSuffix);
-				if (leafView.find("sneak") != std::string_view::npos) return;
+				if (leafView.size() >= 5 && leafView.substr(0, 5) == "sneak") return;
 			}
 		}
 
@@ -4191,20 +4208,31 @@ namespace
 			std::unordered_set<RE::TESObjectREFR*> conditionsFalse;
 			for (auto& pe : toEval) {
 				if (pe.subMod->GetPlayOnceFullBody()) continue;
-				// Track-filtered submods always re-evaluate conditions regardless of
-				// the interruptible flag — they overlay bones and must deactivate
-				// immediately when conditions become false (e.g., player crouches).
-				// The interruptible flag is only meaningful for full-body replacements.
+				// Track-filtered submods always re-evaluate conditions. Unlike full-body
+				// replacements (where IsInterruptible prevents mid-animation interruption),
+				// track filters overlay bones and must deactivate via blend-out when
+				// conditions become false. The configured blendOutTime provides the smooth
+				// transition — not the interruptible flag.
 				if (!pe.subMod->EvaluateConditions(pe.actor, pe.sourceClip))
 					conditionsFalse.insert(pe.actor);
 			}
 
 			{
+				uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
 				std::unique_lock tfLock(s_trackFilterMutex);
 				for (auto it = s_charTrackFilterMap.begin(); it != s_charTrackFilterMap.end(); ) {
 					auto& state = it->second;
 					auto* filterPtr = state.filter;
 					bool condFalse = conditionsFalse.count(it->first) > 0;
+
+					// Staleness cleanup: if all source clips are gone and no source
+					// has generated for kTrackFilterStaleFrames, treat as condition-false
+					// to start blend-out. This handles the case where source clips
+					// deactivate and conditions are non-interruptible (never re-evaluated).
+					if (!condFalse && state.sourceClips.empty() && !state.blendingOut &&
+						curFrame - state.lastSourceFrame > kTrackFilterStaleFrames) {
+						condFalse = true;
+					}
 
 				if (condFalse && !state.blendingOut) {
 					float deactivDelay = state.parentSubMod ? state.parentSubMod->GetDeactivationDelay() : 0.0f;
@@ -4243,7 +4271,18 @@ namespace
 						state.blendElapsed += dt;
 						float t = std::clamp(state.blendElapsed / state.blendDuration, 0.0f, 1.0f);
 						state.blendAlpha = 1.0f - EaseInOutQuad(t);
+
+						// Diagnostic: log blend-out progress every ~0.1s
+						static float s_lastBlendLog = 0.0f;
+						if (state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f) {
+							logger::info("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
+								state.suffix, state.blendElapsed, state.blendDuration, t, state.blendAlpha, dt);
+							s_lastBlendLog = state.blendElapsed;
+						}
+
 						if (state.blendAlpha <= 0.001f) {
+							logger::info("[OAR-TrackFilter] Blend-out COMPLETE — erasing entry for '{}'", state.suffix);
+							s_lastBlendLog = 0.0f;
 							it = s_charTrackFilterMap.erase(it);
 							s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
 							continue;
@@ -4590,7 +4629,9 @@ namespace Hooks
 				if (refr) {
 					uint32_t formID = refr->GetFormID();
 					std::unique_lock lock{ s_fireEmptyMutex };
-					s_fireEmptyTimestamps[formID] = std::chrono::steady_clock::now();
+					auto& entry = s_fireEmptyMap[formID];
+					entry.timestamp = std::chrono::steady_clock::now();
+					entry.generation++;
 				}
 			}
 			return _OriginalNotify(a_this, a_eventName);
@@ -4623,7 +4664,9 @@ namespace Hooks
 			// We use formID 0x14 (player) since this only fires for the player character.
 			{
 				std::unique_lock lock{ s_fireEmptyMutex };
-				s_fireEmptyTimestamps[0x14] = std::chrono::steady_clock::now();
+				auto& entry = s_fireEmptyMap[0x14];
+				entry.timestamp = std::chrono::steady_clock::now();
+				entry.generation++;
 			}
 			// Call through so the game's normal logic (or other mod hooks) still runs
 			return _OriginalDoAction(a_arg1, a_arg2, a_arg3);

@@ -446,11 +446,24 @@ class IsDryFiringCondition : public ConditionBase
 {
 public:
 	std::string GetName() const override { return "IsDryFiring"; }
-	std::string GetDescription() const override { return "True when the engine fires the ActionFireEmpty event (player pressed fire with no ammo). Pure input detection — combine with CurrentMagazineAmmo, IsWeaponDrawn, etc. as needed."; }
+	std::string GetDescription() const override { return "True when the engine fires the ActionFireEmpty event (player pressed fire with no ammo). Duration controls how long the condition stays true. Retriggerable allows the animation to restart on subsequent presses."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
-	void InitializeImpl(const nlohmann::json&) override {}
-	void SerializeImpl(nlohmann::json&) const override {}
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	int32_t durationMs = 1000;      // how long condition stays true after input (ms)
+	bool retriggerable = false;     // if true, re-pressing restarts the animation
+
+	// Per-actor activation tracking.
+	struct ActorState {
+		uint32_t activationGen = 0;   // generation when we activated
+		std::chrono::steady_clock::time_point activationTime;
+		bool active = false;
+	};
+	mutable std::unordered_map<uint32_t, ActorState> m_actorState;
 };
 
 // IsButtonHeld — true when a specific user event's mapped button is currently pressed.

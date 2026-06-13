@@ -13,8 +13,12 @@ void RefreshWeaponAnimFolder();
 void RegisterWeaponEquipListener();
 
 // ActionFireEmpty detection — returns true if the engine dispatched ActionFireEmpty
-// to the given actor within the last ~1 second.
-bool WasFireEmptyRecent(uint32_t a_formID);
+// to the given actor within the last a_windowMs milliseconds.
+bool WasFireEmptyRecent(uint32_t a_formID, int64_t a_windowMs);
+
+// Returns a generation counter that increments each time ActionFireEmpty fires
+// for the given actor. Used by the retriggerable logic to detect new presses.
+uint32_t GetFireEmptyGeneration(uint32_t a_formID);
 
 namespace Hooks
 {

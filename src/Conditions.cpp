@@ -814,13 +814,84 @@ bool IsFiringCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGener
 
 // IsDryFiring — true when the engine has dispatched ActionFireEmpty to this actor.
 // Hooks Actor::NotifyAnimationGraphImpl and watches for the "ActionFireEmpty" event
-// that the engine sends when the player presses fire with no ammo. Returns true for
-// a short window (~1s) after the action fires. Pair with CurrentMagazineAmmo,
-// IsWeaponDrawn, etc. in your condition set as needed.
+// that the engine sends when the player presses fire with no ammo.
 bool IsDryFiringCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr) return false;
-	return WasFireEmptyRecent(a_refr->GetFormID());
+	uint32_t formID = a_refr->GetFormID();
+	uint32_t currentGen = GetFireEmptyGeneration(formID);
+	auto& state = m_actorState[formID];
+
+	if (!state.active) {
+		// Not currently active — check if a NEW press occurred
+		if (currentGen == 0 || currentGen == state.activationGen)
+			return false;  // no new press since last deactivation
+
+		// New press detected — activate
+		state.active = true;
+		state.activationGen = currentGen;
+		state.activationTime = std::chrono::steady_clock::now();
+		return true;
+	}
+
+	// Currently active — check if duration has elapsed
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - state.activationTime).count();
+
+	if (elapsed >= static_cast<int64_t>(durationMs)) {
+		// Timer expired — deactivate
+		state.active = false;
+		return false;
+	}
+
+	// Still within the active window
+	if (retriggerable && currentGen != state.activationGen) {
+		// Retriggerable: new press detected while active — trip a one-frame false
+		// to force the replacement system to restart the animation clip.
+		// Update activationGen and reset the timer for the new press.
+		state.activationGen = currentGen;
+		state.activationTime = std::chrono::steady_clock::now();
+		return false;
+	}
+
+	// Non-retriggerable: ignore any new presses, just ride out the timer
+	return true;
+}
+
+std::string IsDryFiringCondition::GetParameterString() const
+{
+	std::string result = std::format("{}ms", durationMs);
+	if (retriggerable) result += " retrig";
+	return result;
+}
+
+void IsDryFiringCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int dur = durationMs;
+	if (ImGui::SliderInt("Duration (ms)", &dur, 50, 5000)) {
+		durationMs = dur;
+		a_dirty = true;
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("How long the condition stays true after pressing fire with no ammo.");
+
+	if (ImGui::Checkbox("Retriggerable", &retriggerable)) {
+		a_dirty = true;
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("If checked, pressing fire again before the animation finishes will restart it from the beginning.");
+}
+
+void IsDryFiringCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("durationMs")) durationMs = a_json["durationMs"].get<int32_t>();
+	if (a_json.contains("retriggerable")) retriggerable = a_json["retriggerable"].get<bool>();
+}
+
+void IsDryFiringCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["durationMs"] = durationMs;
+	a_json["retriggerable"] = retriggerable;
 }
 
 // IsButtonHeld — checks if a user event's mapped key is currently pressed via BSInputDeviceManager.
