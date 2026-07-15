@@ -13,6 +13,9 @@ struct ActiveReplacementEntry
 	std::string clipSuffix;
 	std::string subModName;
 	std::string replacementPath;
+	// Full resolved on-disk path of the original animation (from the subgraph
+	// swap-array resolution), when known. Display-only.
+	std::string fullPath;
 	std::string actorName;
 	uint32_t actorFormID{ 0 };
 	bool conditionsPassed{ false };

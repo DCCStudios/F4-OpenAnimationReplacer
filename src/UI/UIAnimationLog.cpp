@@ -3,6 +3,8 @@
 #include "AnimationLog.h"
 
 #include <imgui.h>
+#include <algorithm>
+#include <format>
 
 uint32_t UIAnimationLog::GetConsoleTargetFormID() const
 {
@@ -15,6 +17,11 @@ void UIAnimationLog::DrawContents()
 	ImGui::Checkbox("Replace", &showReplace); ImGui::SameLine();
 	ImGui::Checkbox("Loop", &showLoop); ImGui::SameLine();
 	ImGui::Checkbox("Echo", &showEcho); ImGui::SameLine();
+
+	// Perspective filters: which animation graph the clip came from.
+	// Entries whose graph could not be classified are always shown.
+	ImGui::Checkbox("1st Person", &showFirstPerson); ImGui::SameLine();
+	ImGui::Checkbox("3rd Person", &showThirdPerson); ImGui::SameLine();
 
 	ImGui::Checkbox("Filter by Actor", &showOnlyConsoleTarget);
 
@@ -66,11 +73,20 @@ void UIAnimationLog::DrawContents()
 		default: break;
 		}
 
+		// Perspective filter: 1st person = path contains "_1stperson";
+		// everything else (including unclassified) counts as 3rd person.
+		if (e.perspective == AnimationLog::Perspective::kFirstPerson) {
+			if (!showFirstPerson) continue;
+		} else {
+			if (!showThirdPerson) continue;
+		}
+
 		if (showOnlyConsoleTarget && consoleTargetID != 0 && e.refrFormID != consoleTargetID) continue;
 
 		if (filterText[0] != '\0') {
 			if (!UICommon::FuzzyMatch(filterText, e.originalAnim.c_str()) &&
 				!UICommon::FuzzyMatch(filterText, e.replacementAnim.c_str()) &&
+				!UICommon::FuzzyMatch(filterText, e.fullPath.c_str()) &&
 				!UICommon::FuzzyMatch(filterText, e.refrName.c_str()) &&
 				!UICommon::FuzzyMatch(filterText, e.subModName.c_str())) {
 				continue;
@@ -96,29 +112,77 @@ void UIAnimationLog::DrawContents()
 			typeColor = UICommon::Colors::LogEvent; typeStr = "???"; break;
 		}
 
+		// Perspective tag shown next to the event type (unclassified counts as 3rd)
+		const char* perspStr =
+			e.perspective == AnimationLog::Perspective::kFirstPerson ? "[1st]" : "[3rd]";
+
+		// Compose the full-text lines up front so we can measure their wrapped
+		// heights and size the entry child exactly — nothing gets clipped.
+		std::string nameLine = "Name: " + e.originalAnim;
+		std::string pathLine;
+		if (!e.fullPath.empty()) {
+			pathLine = "Path: " + e.fullPath;
+		}
+		std::string modLine;
+		std::string replLine;
+		if (isReplaced && !e.replacementAnim.empty()) {
+			if (!e.subModName.empty()) {
+				modLine = "Mod: " + e.subModName;
+			}
+			replLine = "Replacement: " + e.replacementAnim;
+		}
+
+		const auto& style = ImGui::GetStyle();
+		// Wrap width = inner width of the entry child (its padding on both sides)
+		float wrapWidth = ImGui::GetContentRegionAvail().x - style.WindowPadding.x * 2.0f;
+		if (wrapWidth < 100.0f) wrapWidth = 100.0f;
+
+		float entryHeight = style.WindowPadding.y * 2.0f + ImGui::GetTextLineHeight();  // header row
+		auto addLineHeight = [&](const std::string& a_line) {
+			if (a_line.empty()) return;
+			entryHeight += style.ItemSpacing.y +
+				ImGui::CalcTextSize(a_line.c_str(), nullptr, false, wrapWidth).y;
+		};
+		addLineHeight(nameLine);
+		addLineHeight(pathLine);
+		addLineHeight(modLine);
+		addLineHeight(replLine);
+
 		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.14f, 0.17f, 1.0f));
-		float entryHeight = isReplaced ? 60.0f : 40.0f;
 		ImGui::BeginChild(ImGui::GetID(static_cast<const void*>(&e)), ImVec2(0, entryHeight), true);
 
+		// Header: event type, perspective tag, actor right-aligned
 		ImGui::TextColored(typeColor, "%s", typeStr);
-
-		std::string origShort = UICommon::ShortenAnimPath(e.originalAnim);
-		ImGui::SameLine(200);
-		ImGui::Text("Name: %s", origShort.c_str());
-
+		if (perspStr) {
+			ImGui::SameLine();
+			ImGui::TextColored(UICommon::Colors::Disabled, "%s", perspStr);
+		}
 		if (!e.refrName.empty()) {
-			ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 200);
-			ImGui::TextColored(UICommon::Colors::Disabled, "%s (0x%08X)", e.refrName.c_str(), e.refrFormID);
+			std::string actorText = std::format("{} (0x{:08X})", e.refrName, e.refrFormID);
+			float actorWidth = ImGui::CalcTextSize(actorText.c_str()).x;
+			// Right edge in local coords = cursor + remaining width on this line
+			ImGui::SameLine();
+			float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+			// Only right-align if it won't overlap the type/perspective tags
+			float actorPos = std::max(rightEdge - actorWidth, ImGui::GetCursorPosX() + style.ItemSpacing.x);
+			ImGui::SetCursorPosX(actorPos);
+			ImGui::TextColored(UICommon::Colors::Disabled, "%s", actorText.c_str());
 		}
 
-		if (isReplaced && !e.replacementAnim.empty()) {
-			std::string replShort = UICommon::ShortenAnimPath(e.replacementAnim);
-			if (!e.subModName.empty()) {
-				ImGui::Text("Mod: %s", e.subModName.c_str());
-				ImGui::SameLine(200);
-			}
-			ImGui::TextColored(UICommon::Colors::AccentBlue, "Path: %s", replShort.c_str());
+		// Full animation name + resolved on-disk path, wrapped so long paths
+		// are always fully visible.
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextUnformatted(nameLine.c_str());
+		if (!pathLine.empty()) {
+			ImGui::TextColored(UICommon::Colors::Disabled, "%s", pathLine.c_str());
 		}
+		if (!modLine.empty()) {
+			ImGui::TextUnformatted(modLine.c_str());
+		}
+		if (!replLine.empty()) {
+			ImGui::TextColored(UICommon::Colors::AccentBlue, "%s", replLine.c_str());
+		}
+		ImGui::PopTextWrapPos();
 
 		ImGui::EndChild();
 		ImGui::PopStyleColor();

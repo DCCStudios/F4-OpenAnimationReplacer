@@ -2,7 +2,9 @@
 
 void AnimationLog::AddEntry(EventType a_type, RE::TESObjectREFR* a_refr,
 	const std::string& a_origAnim, const std::string& a_replAnim,
-	const std::string& a_subModName)
+	const std::string& a_subModName,
+	const std::string& a_fullPath,
+	Perspective a_perspective)
 {
 	if (!enabled) return;
 
@@ -13,6 +15,8 @@ void AnimationLog::AddEntry(EventType a_type, RE::TESObjectREFR* a_refr,
 	entry.originalAnim = a_origAnim;
 	entry.replacementAnim = a_replAnim;
 	entry.subModName = a_subModName;
+	entry.fullPath = a_fullPath;
+	entry.perspective = a_perspective;
 	entry.timestamp = std::chrono::steady_clock::now();
 
 	std::lock_guard lock(mutex);

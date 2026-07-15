@@ -41,19 +41,27 @@ void UIDebugOverlay::DrawContents()
 
 			ImGui::TableNextColumn();
 			if (entry.actorFormID != 0) {
-				ImGui::Text("%s [%08X]", entry.actorName.c_str(), entry.actorFormID);
+				ImGui::TextWrapped("%s [%08X]", entry.actorName.c_str(), entry.actorFormID);
 			} else {
 				ImGui::TextDisabled("(unknown)");
 			}
 
+			// Wrap long clip names / paths at the column edge so the full text is
+			// always visible (rows grow vertically instead of clipping).
 			ImGui::TableNextColumn();
-			ImGui::TextUnformatted(entry.clipSuffix.c_str());
+			ImGui::TextWrapped("%s", entry.clipSuffix.c_str());
+			if (!entry.fullPath.empty()) {
+				// Full resolved on-disk path (from the subgraph resolution)
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
+				ImGui::TextWrapped("%s", entry.fullPath.c_str());
+				ImGui::PopStyleColor();
+			}
 
 			ImGui::TableNextColumn();
-			ImGui::TextUnformatted(entry.replacementPath.c_str());
+			ImGui::TextWrapped("%s", entry.replacementPath.c_str());
 
 			ImGui::TableNextColumn();
-			ImGui::TextUnformatted(entry.subModName.c_str());
+			ImGui::TextWrapped("%s", entry.subModName.c_str());
 
 			ImGui::TableNextColumn();
 			// Re-evaluate conditions live against the current game state

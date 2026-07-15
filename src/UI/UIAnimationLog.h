@@ -18,6 +18,8 @@ private:
 	bool showReplace{ true };
 	bool showLoop{ true };
 	bool showEcho{ true };
+	bool showFirstPerson{ true };
+	bool showThirdPerson{ true };
 	bool showOnlyConsoleTarget{ false };
 	bool scrollToBottom{ false };
 	uint32_t targetFormID{ 0 };

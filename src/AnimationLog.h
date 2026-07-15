@@ -12,6 +12,15 @@ public:
 		kAnimEvent,
 	};
 
+	// Which animation graph the clip came from (used for 1st/3rd person filters).
+	// Classified from the owning hkbCharacter's project data at log time.
+	enum class Perspective : uint8_t
+	{
+		kUnknown,
+		kFirstPerson,
+		kThirdPerson,
+	};
+
 	struct Entry
 	{
 		EventType type;
@@ -20,6 +29,10 @@ public:
 		std::string originalAnim;
 		std::string replacementAnim;
 		std::string subModName;
+		// Full resolved on-disk path of the original animation (from the
+		// subgraph swap-array resolution), when known. Display-only.
+		std::string fullPath;
+		Perspective perspective{ Perspective::kUnknown };
 		std::chrono::steady_clock::time_point timestamp;
 	};
 
@@ -31,7 +44,9 @@ public:
 
 	void AddEntry(EventType a_type, RE::TESObjectREFR* a_refr,
 		const std::string& a_origAnim, const std::string& a_replAnim,
-		const std::string& a_subModName);
+		const std::string& a_subModName,
+		const std::string& a_fullPath = {},
+		Perspective a_perspective = Perspective::kUnknown);
 
 	void AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_eventName);
 

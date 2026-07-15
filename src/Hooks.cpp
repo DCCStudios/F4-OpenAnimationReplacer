@@ -861,6 +861,53 @@ namespace
 	static std::shared_mutex s_clipSuffixMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipSuffixCache;
 
+	// Full on-disk animation path per clip, from the subgraph swap-array resolution
+	// (Source S). Display-only: lets the Animation Log show the authoritative path
+	// (e.g. "Actors\Character\_1stPerson\Animations\...") instead of just the suffix.
+	static std::shared_mutex s_clipRealPathMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipRealPathCache;
+
+	// Deferred subgraph resolution state. The Activate-time walk almost always
+	// fails because clips activate exactly while the behavior graph is mid-
+	// transition (stateOrTransitionChanged set, activeNodes rebuilding, nodeInfo
+	// not yet assigned) — GunMover only ever walks the graph from a per-frame
+	// hook OUTSIDE graph update. So we retry from the Update hook on subsequent
+	// frames until the walk succeeds or the attempt budget runs out.
+	//   - s_clipRealPathAuthoritative: clips whose cached path came from the
+	//     subgraph walk (as opposed to the authored-name display fallback).
+	//   - s_clipRealPathAttempts: failed Update-time attempts per clip.
+	//   - s_pendingActivateLog: kActivate anim-log entries held back until the
+	//     path resolves (or attempts are exhausted), so the log shows the real
+	//     on-disk path and correct 1st/3rd person tag instead of the authored
+	//     relative name.
+	struct PendingActivateLog
+	{
+		std::string suffix;
+		uint64_t frame{ 0 };  // s_currentFrame at Activate time (for the flush grace period)
+	};
+	static std::shared_mutex s_clipRealPathStateMutex;
+	static std::unordered_set<RE::hkbClipGenerator*> s_clipRealPathAuthoritative;
+	static std::unordered_map<RE::hkbClipGenerator*, uint16_t> s_clipRealPathAttempts;
+	static std::unordered_map<RE::hkbClipGenerator*, PendingActivateLog> s_pendingActivateLog;
+
+	// Player clip ownership, accumulated by PollPlayerGraphClips() (GunMover's
+	// GetAllClipInfo model: enumerate the PLAYER's graph manager's activeNodes,
+	// so membership — not the hkbContext, whose character is a static dummy in
+	// this runtime — decides which clips are the player's).
+	// Value = index of the player root graph the clip was found in.
+	//
+	// STICKY: entries are inserted when the poll sees a clip and only removed
+	// at Deactivate (or full state clear). The poll must skip a graph while it
+	// rebuilds its node list — exactly when clips activate — so a per-frame
+	// rebuild of this map would blank out membership at the moment the
+	// deferred log flush needs it. Deactivate-erase keeps it from going stale.
+	static std::shared_mutex s_playerClipMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, uint8_t> s_playerClipGraph;
+	// Learned index of the player's 1st-person root graph: set when a clip from
+	// that graph resolves to a "..._1stperson..." path. Lets us classify player
+	// clips whose own paths lack the marker (authored relative names).
+	static std::atomic<int32_t> s_firstPersonGraphIndex{ -1 };
+
 	// Per-clip variant suffix cache (for kOnEachPlay: each clip gets its own roll)
 	static std::shared_mutex s_clipVariantMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipVariantCache;
@@ -1275,6 +1322,20 @@ void ClearClipRuntimeState()
 		s_clipSuffixCache.clear();
 	}
 	{
+		std::unique_lock lock(s_clipRealPathMutex);
+		s_clipRealPathCache.clear();
+	}
+	{
+		std::unique_lock lock(s_clipRealPathStateMutex);
+		s_clipRealPathAuthoritative.clear();
+		s_clipRealPathAttempts.clear();
+		s_pendingActivateLog.clear();
+	}
+	{
+		std::unique_lock lock(s_playerClipMutex);
+		s_playerClipGraph.clear();
+	}
+	{
 		std::unique_lock lock(s_clipVariantMutex);
 		s_clipVariantCache.clear();
 	}
@@ -1361,6 +1422,33 @@ namespace
 		}
 
 		return nullptr;
+	}
+
+	// Classify a clip as 1st- or 3rd-person from its animation file path.
+	//
+	// Rule (user-confirmed, matches GunMover's displayed paths): first-person
+	// character animations live under "...\_1stPerson\..." and first-person
+	// WEAPON animations under "...\1stPerson<Weapon>\..." directory forms —
+	// so any "1stperson" occurrence marks 1st person. Everything else is
+	// treated as 3rd person (body, power armor, MT/idle animations, etc.).
+	//
+	// NOTE: classification via a_context->character->projectData is NOT viable
+	// here — verified in-game that the context's character is a static dummy
+	// with no project data, and even real graph characters have an empty
+	// hkbProjectStringData::animationPath in this runtime.
+	AnimationLog::Perspective ClassifyPerspectiveFromPath(const std::string& a_path)
+	{
+		using Perspective = AnimationLog::Perspective;
+
+		if (a_path.empty()) return Perspective::kUnknown;
+
+		std::string lower = a_path;
+		std::ranges::transform(lower, lower.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		std::ranges::replace(lower, '/', '\\');
+
+		return lower.find("1stperson") != std::string::npos ?
+			Perspective::kFirstPerson : Perspective::kThirdPerson;
 	}
 
 	// LoadedIdleAnimData: mirrors engine struct at REL::ID(762973)
@@ -1638,10 +1726,945 @@ namespace
 			loaded, failed, cache->GetCacheSize());
 	}
 
+	// ========================================================================
+	// Selected-subgraph animation path resolution (deterministic)
+	//
+	// Resolves the REAL on-disk animation path for a clip by reading the
+	// engine's "selected subgraph" data on the owning BShkbAnimationGraph.
+	// This is the same data the engine itself uses to decide which weapon
+	// animation directory to load clips from, so when it succeeds it is
+	// authoritative — no leaf-name guessing required.
+	//
+	// Algorithm (verified via RE; same technique as GunMover's subgraph path):
+	//   1. From the active clip context, get the active/current behavior graph.
+	//   2. Read behaviorGraph+0x30. In these subgraph cases this identifies the
+	//      selected subgraph/root and can also point back to the owning
+	//      BShkbAnimationGraph; validate against RE::VTABLE::BShkbAnimationGraph
+	//      if using it as a graph pointer.
+	//   3. On the owning BShkbAnimationGraph, read the selected subgraph swap
+	//      array at graph+0x3A0.
+	//   4. Iterate entries of size 0x48.
+	//   5. For each entry, read sharedData at entry+0x08.
+	//   6. Match the active behavior graph root id against sharedData+0xC0.
+	//   7. The selected data block is sharedData-0x40.
+	//   8. Read selected animation directory/file arrays from:
+	//        - data+0x178, count at +0x188
+	//        - fallback: data+0x160, count at +0x170
+	//      These arrays contain BSFixedString entries.
+	//   9. Take the leaf basename from clip->animationName, force .hkx, append
+	//      it to each selected directory, and probe with BSResourceNiBinaryStream.
+	//      The first existing resource is the real displayed path.
+	// ========================================================================
+
+	// Raw offsets for the selected-subgraph walk (see algorithm above)
+	constexpr uintptr_t kCtx_BehaviorGraph = 0x08;        // hkbContext -> active hkbBehaviorGraph
+	constexpr uintptr_t kBG_RootId = 0x30;                // hkbBehaviorGraph -> selected subgraph/root id
+	constexpr uintptr_t kGraph_SwapArrayPtr = 0x3A0;      // BShkbAnimationGraph -> swap array (BSTArray*)
+	constexpr uintptr_t kSwap_EntrySize = 0x48;           // stride of each swap array entry
+	constexpr uintptr_t kSwap_SharedData = 0x08;          // entry -> sharedData
+	constexpr uintptr_t kShared_RootId = 0xC0;            // sharedData -> owning root id (match vs kBG_RootId)
+	constexpr uintptr_t kShared_ToDataBlock = 0x40;       // data block = sharedData - 0x40
+	constexpr uintptr_t kData_FileArrayPrimary = 0x178;   // BSFixedString array (BSTArray: data +0, size +0x10)
+	constexpr uintptr_t kData_FileArrayFallback = 0x160;  // BSFixedString array (BSTArray: data +0, size +0x10)
+	constexpr uintptr_t kGraph_EmbeddedCharacter = 0x1C8; // BShkbAnimationGraph -> embedded hkbCharacter (the
+	                                                      // hkbContext::character for clips of this graph points here)
+
+	// Cache of resource-existence probes (normalized lowercase path -> exists)
+	// so each unique candidate is only probed once per session.
+	static std::shared_mutex s_subgraphProbeMutex;
+	static std::unordered_map<std::string, bool> s_subgraphProbeCache;
+
+	// Normalize separators to '\' and strip trailing slashes.
+	static std::string SubgraphNormalizePath(std::string a_path)
+	{
+		for (auto& ch : a_path) {
+			if (ch == '/') ch = '\\';
+		}
+		while (!a_path.empty() && a_path.back() == '\\') {
+			a_path.pop_back();
+		}
+		return a_path;
+	}
+
+	static std::string SubgraphToLower(std::string a_value)
+	{
+		std::ranges::transform(a_value, a_value.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return a_value;
+	}
+
+	// RAII probe for engine resource existence (archives + loose files).
+	// Our CommonLibF4 fork's BSResourceNiBinaryStream header hardcodes NG-only
+	// REL IDs (2269830/2269832), but this plugin targets pre-NG 1.10.163, so we
+	// construct the 0x30-byte stream object in a raw buffer using the pre-NG
+	// ctor/dtor IDs (cross-referenced from GunMover's dual-ID CommonLib fork:
+	// Ctor { 1198116, 2269830 }, Dtor { 1516202, 2269832 }).
+	struct SubgraphResourceProbe
+	{
+		alignas(8) uint8_t buffer[0x30]{};
+
+		explicit SubgraphResourceProbe(const char* a_path)
+		{
+			// void BSResourceNiBinaryStream::ctor(this, fileName, writeable, location, fullReadHint)
+			using Ctor_t = void (*)(void*, const char*, bool, void*, bool);
+			static REL::Relocation<Ctor_t> ctor{ REL::ID(1198116) };
+			ctor(buffer, a_path, false, nullptr, false);
+		}
+
+		~SubgraphResourceProbe()
+		{
+			using Dtor_t = void (*)(void*);
+			static REL::Relocation<Dtor_t> dtor{ REL::ID(1516202) };
+			dtor(buffer);
+		}
+
+		// The stream smart pointer at +0x10 is non-null when the resource exists
+		// (mirrors BSResourceNiBinaryStream::operator bool).
+		[[nodiscard]] bool exists() const
+		{
+			return *reinterpret_cast<void* const*>(buffer + 0x10) != nullptr;
+		}
+	};
+
+	// Returns true if the given path exists as an engine resource. Probes both
+	// the raw path and with a "Meshes\" prefix (animation paths are usually
+	// relative to Meshes). Results are cached.
+	static bool SubgraphResourceExists(const std::string& a_path)
+	{
+		if (a_path.empty()) return false;
+
+		const auto normalized = SubgraphNormalizePath(a_path);
+		const auto key = SubgraphToLower(normalized);
+		{
+			std::shared_lock lock(s_subgraphProbeMutex);
+			auto it = s_subgraphProbeCache.find(key);
+			if (it != s_subgraphProbeCache.end()) return it->second;
+		}
+
+		bool exists = false;
+		{
+			SubgraphResourceProbe probe(normalized.c_str());
+			exists = probe.exists();
+		}
+		if (!exists && !key.starts_with("meshes\\")) {
+			const auto meshesPath = std::string("Meshes\\") + normalized;
+			SubgraphResourceProbe probe(meshesPath.c_str());
+			exists = probe.exists();
+		}
+
+		{
+			std::unique_lock lock(s_subgraphProbeMutex);
+			s_subgraphProbeCache[key] = exists;
+		}
+		return exists;
+	}
+
+	// Extract lowercase leaf basename (no directories, no extension) from a path.
+	static std::string SubgraphGetLeaf(const char* a_path)
+	{
+		if (!a_path || a_path[0] == '\0') return {};
+		auto path = SubgraphNormalizePath(a_path);
+		const auto slash = path.rfind('\\');
+		if (slash != std::string::npos) path = path.substr(slash + 1);
+		const auto dot = path.rfind('.');
+		if (dot != std::string::npos) path = path.substr(0, dot);
+		return SubgraphToLower(path);
+	}
+
+	// Build a candidate full path from a selected-subgraph array entry and the
+	// clip's leaf name. Entries can be either directories ("Weapons\SCAR") or
+	// full file paths ("...\WPNReload.hkx"); handle both (step 9).
+	static std::string SubgraphBuildCandidate(const char* a_entryPath, const std::string& a_leaf)
+	{
+		if (a_leaf.empty() || !a_entryPath || a_entryPath[0] == '\0') return {};
+
+		auto entry = SubgraphNormalizePath(a_entryPath);
+		if (entry.empty()) return {};
+
+		const auto lowerEntry = SubgraphToLower(entry);
+		if (lowerEntry.ends_with(".hkx") || lowerEntry.ends_with(".hkt")) {
+			// Full file entry: only usable if its leaf matches the clip's leaf.
+			// Force the extension to .hkx (the on-disk form).
+			if (SubgraphGetLeaf(entry.c_str()) == a_leaf) {
+				const auto dot = entry.rfind('.');
+				return entry.substr(0, dot) + ".hkx";
+			}
+			return {};
+		}
+
+		// Directory entry: append leaf + ".hkx"
+		return entry + "\\" + a_leaf + ".hkx";
+	}
+
+	// Decode a BSStringPool::Entry* — the storage behind BSFixedString — to its
+	// character data. The selected-subgraph file arrays hold BSFixedStrings,
+	// whose single pointer member is NOT a char*: it points at a 0x18-byte pool
+	// entry header (left ptr +0x00, flags +0x08, crc +0x0A, length/right union
+	// +0x10) with the string bytes following the header. "Shallow" entries
+	// (flag 1<<14) chain via the +0x10 pointer to the leaf entry that owns the
+	// bytes. This mirrors BSFixedString::c_str() -> Entry::leaf()/u8().
+	// Reading the header bytes as text (the previous behavior) yields garbage,
+	// which is why the scan below never probed a real path. Returns nullptr on
+	// any invalid/wide entry.
+	static const char* SubgraphDecodePoolEntry(uintptr_t a_entry)
+	{
+		constexpr uint16_t kShallow = 1 << 14;
+		constexpr uint16_t kWide = 1 << 15;
+
+		for (int hops = 0; hops < 8; ++hops) {
+			if (!a_entry || a_entry < 0x10000 ||
+				IsBadReadPtr(reinterpret_cast<void*>(a_entry), 0x18)) {
+				return nullptr;
+			}
+			const auto flags = *reinterpret_cast<const uint16_t*>(a_entry + 0x08);
+			if (flags & kShallow) {
+				// Shallow entry: follow _right (+0x10) to the leaf
+				a_entry = *reinterpret_cast<const uintptr_t*>(a_entry + 0x10);
+				continue;
+			}
+			if (flags & kWide) {
+				// wchar_t entry — never expected for animation paths
+				return nullptr;
+			}
+			// Leaf entry: character data starts right after the 0x18-byte header
+			const auto* str = reinterpret_cast<const char*>(a_entry + 0x18);
+			return IsBadReadPtr(str, 1) ? nullptr : str;
+		}
+		return nullptr;
+	}
+
+	// Defined below (steps 8-9): scans the selected file arrays for the leaf.
+	static std::string SubgraphScanFileArrays(uintptr_t a_data, const std::string& a_leaf);
+
+	// Search ONE BShkbAnimationGraph's swap array (graph+0x3A0) for the entry
+	// whose sharedData root id (+0xC0) matches a_rootId. Returns the selected
+	// data block (sharedData-0x40) or 0. The graph pointer is vtable-validated.
+	static uintptr_t SubgraphFindSwapData(uintptr_t a_graph, uintptr_t a_rootId)
+	{
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+
+		if (!a_graph || !a_rootId || a_graph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(a_graph), kGraph_SwapArrayPtr + 8) ||
+			*reinterpret_cast<uintptr_t*>(a_graph) != bshkbVtbl.address()) {
+			return 0;
+		}
+
+		// Swap array pointer at graph+0x3A0 (BSTArray: data +0, size +0x10)
+		const auto swapArray = *reinterpret_cast<uintptr_t*>(a_graph + kGraph_SwapArrayPtr);
+		if (!swapArray || IsBadReadPtr(reinterpret_cast<void*>(swapArray), 0x18)) {
+			return 0;
+		}
+
+		const auto entries = *reinterpret_cast<uintptr_t*>(swapArray);
+		const auto count = *reinterpret_cast<uint32_t*>(swapArray + 0x10);
+		if (!entries || count == 0 || count > 0x100 ||
+			IsBadReadPtr(reinterpret_cast<void*>(entries), count * kSwap_EntrySize)) {
+			return 0;
+		}
+
+		for (uint32_t i = 0; i < count; ++i) {
+			const auto entry = entries + static_cast<uintptr_t>(i) * kSwap_EntrySize;
+			const auto sharedData = *reinterpret_cast<uintptr_t*>(entry + kSwap_SharedData);
+			if (!sharedData || IsBadReadPtr(reinterpret_cast<void*>(sharedData), kShared_RootId + 8)) {
+				continue;
+			}
+			if (*reinterpret_cast<uintptr_t*>(sharedData + kShared_RootId) == a_rootId) {
+				return sharedData - kShared_ToDataBlock;
+			}
+		}
+		return 0;
+	}
+
+	// Resolve one (owningGraph, nestedGraph) pair exactly like GunMover's
+	// ResolveFromSelectedSubgraphFiles: match the nested graph's root id
+	// (+0x30) against the owning graph's swap array, then scan+probe the
+	// selected file arrays. Empty result on any failure.
+	static std::string SubgraphResolvePair(uintptr_t a_owningGraph, uintptr_t a_nestedGraph, const std::string& a_leaf)
+	{
+		if (!a_nestedGraph || a_nestedGraph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(a_nestedGraph), kBG_RootId + 8)) {
+			return {};
+		}
+		const auto rootId = *reinterpret_cast<uintptr_t*>(a_nestedGraph + kBG_RootId);
+		if (!rootId) return {};
+
+		const auto dataBlock = SubgraphFindSwapData(a_owningGraph, rootId);
+		if (!dataBlock) return {};
+		return SubgraphScanFileArrays(dataBlock, a_leaf);
+	}
+
+	// GunMover's ResolveOwningGraphFromBehaviorGraph: the nested graph's root
+	// id (+0x30) can itself point back at the owning BShkbAnimationGraph —
+	// vtable-validate it and use it as the owner, else use the fallback graph.
+	static uintptr_t SubgraphResolveOwningGraph(uintptr_t a_nestedGraph, uintptr_t a_fallbackGraph)
+	{
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+
+		if (!a_nestedGraph || a_nestedGraph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(a_nestedGraph), kBG_RootId + 8)) {
+			return a_fallbackGraph;
+		}
+		const auto rootId = *reinterpret_cast<uintptr_t*>(a_nestedGraph + kBG_RootId);
+		if (!rootId || rootId < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(rootId), sizeof(void*)) ||
+			*reinterpret_cast<uintptr_t*>(rootId) != bshkbVtbl.address()) {
+			return a_fallbackGraph;
+		}
+		return rootId;
+	}
+
+	// GunMover's GetAllClipInfo walk, restricted to finding ONE clip: walk the
+	// root graph's hkbBehaviorGraph (+0x378) activeNodes array (+0xE0), find
+	// the hkbNodeInfo entry whose node IS a_clip (identity match), and resolve
+	// via that entry's nested behavior graph (+0x10). The owning graph is the
+	// nested graph's root id when it points back at a BShkbAnimationGraph,
+	// otherwise the walked root graph — exactly GunMover's owner resolution.
+	static std::string SubgraphResolveViaRootGraphWalk(uintptr_t a_rootGraph, RE::hkbClipGenerator* a_clip, const std::string& a_leaf)
+	{
+		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;  // BShkbAnimationGraph -> root hkbBehaviorGraph
+		constexpr uintptr_t kBG_ActiveNodes = 0xE0;      // hkbBehaviorGraph -> hkArray<hkbNodeInfo*>*
+
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+
+		if (!a_rootGraph || a_rootGraph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(a_rootGraph), kBShkb_HkRootGraph + 8) ||
+			*reinterpret_cast<uintptr_t*>(a_rootGraph) != bshkbVtbl.address()) {
+			return {};
+		}
+		const auto hkGraph = *reinterpret_cast<uintptr_t*>(a_rootGraph + kBShkb_HkRootGraph);
+		if (!hkGraph || hkGraph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+			return {};
+		}
+
+		// GunMover skips the walk while the graph is rebuilding its node list
+		// (updateActiveNodes at +0x1AC, stateOrTransitionChanged at +0x1AD).
+		if (*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+			*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0) {
+			return {};
+		}
+
+		// hkArray layout: data +0, size (int32) +8
+		const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kBG_ActiveNodes);
+		if (!activeNodes || IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
+			return {};
+		}
+		const auto data = *reinterpret_cast<uintptr_t*>(activeNodes);
+		const auto size = *reinterpret_cast<int32_t*>(activeNodes + 8);
+		if (!data || size <= 0 || size > 0x1000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(data), static_cast<size_t>(size) * sizeof(void*))) {
+			return {};
+		}
+
+		const auto clipAddr = reinterpret_cast<uintptr_t>(a_clip);
+		for (int32_t i = 0; i < size; ++i) {
+			const auto entry = *reinterpret_cast<uintptr_t*>(data + static_cast<uintptr_t>(i) * sizeof(void*));
+			if (!entry || IsBadReadPtr(reinterpret_cast<void*>(entry), 0x18)) {
+				continue;
+			}
+			// GunMover's SelectActiveClip: the entry itself may be the clip, or
+			// the clip sits at entry+0x08 (hkbNodeInfo::node). Identity match only.
+			const auto node = *reinterpret_cast<uintptr_t*>(entry + 0x08);
+			if (entry != clipAddr && node != clipAddr) {
+				continue;
+			}
+
+			// Found our clip's entry: nested behavior graph at +0x10
+			const auto nested = *reinterpret_cast<uintptr_t*>(entry + 0x10);
+			const auto owner = SubgraphResolveOwningGraph(nested, a_rootGraph);
+			return SubgraphResolvePair(owner, nested, a_leaf);
+		}
+		return {};
+	}
+
+	// Steps 8-9: scan the selected directory/file arrays and probe candidates.
+	// Returns the first candidate path that exists as an engine resource.
+	static std::string SubgraphScanFileArrays(uintptr_t a_data, const std::string& a_leaf)
+	{
+		const auto scanArray = [&](uintptr_t a_arrayOffset) -> std::string {
+			const auto array = a_data + a_arrayOffset;
+			if (IsBadReadPtr(reinterpret_cast<void*>(array), 0x18)) return {};
+
+			const auto entries = *reinterpret_cast<uintptr_t*>(array);
+			const auto size = *reinterpret_cast<uint32_t*>(array + 0x10);
+			if (!entries || size == 0 || size > 0x400 ||
+				IsBadReadPtr(reinterpret_cast<void*>(entries), size * sizeof(void*))) {
+				return {};
+			}
+
+			for (uint32_t i = 0; i < size; ++i) {
+				// Each element is a BSFixedString: one pointer to a string-pool
+				// entry, NOT to raw characters — decode it properly.
+				const auto strPtr = *reinterpret_cast<uintptr_t*>(entries + static_cast<uintptr_t>(i) * sizeof(void*));
+				const auto* entryPath = SubgraphDecodePoolEntry(strPtr);
+				if (!entryPath || entryPath[0] == '\0') continue;
+
+				auto candidate = SubgraphBuildCandidate(entryPath, a_leaf);
+				if (!candidate.empty() && SubgraphResourceExists(candidate)) {
+					return candidate;
+				}
+			}
+			return {};
+		};
+
+		// Primary array at data+0x178 (count at +0x188), fallback at data+0x160 (count at +0x170)
+		if (auto result = scanArray(kData_FileArrayPrimary); !result.empty()) return result;
+		if (auto result = scanArray(kData_FileArrayFallback); !result.empty()) return result;
+		return {};
+	}
+
+	// Full resolution: clip + context -> real on-disk animation path ("" on failure).
+	static std::string ResolveClipPathFromSubgraph(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
+	{
+		if (!a_this || !a_context ||
+			reinterpret_cast<uintptr_t>(a_context) < 0x10000 ||
+			IsBadReadPtr(a_context, kCtx_BehaviorGraph + 8)) {
+			return {};
+		}
+
+		// Step 9 input: leaf basename from the clip's authored animation name.
+		// At Update time animationName may already be cleared by the engine, so
+		// fall back to the authored path backfilled into the display cache at
+		// Activate time (non-authoritative entry).
+		auto leaf = SubgraphGetLeaf(a_this->animationName.data());
+		if (leaf.empty()) {
+			std::shared_lock plock(s_clipRealPathMutex);
+			auto pit = s_clipRealPathCache.find(a_this);
+			if (pit != s_clipRealPathCache.end()) {
+				leaf = SubgraphGetLeaf(pit->second.c_str());
+			}
+		}
+		if (leaf.empty()) return {};
+
+		// Faithful GunMover algorithm, per root graph: find THIS clip's entry in
+		// the root graph's activeNodes, take the nested behavior graph from that
+		// entry, resolve the owning graph from the nested graph's root id (with
+		// the walked root as fallback), and match/scan/probe. GunMover only
+		// walks the player's 3rd-person root (variableCache.graphToCacheFor);
+		// we walk BOTH player roots because OAR hooks clips from the 1st-person
+		// graph too — each walk is still a strict (owner, nested) pair, never a
+		// cross-product, so a clip resolves only through its own entry. This
+		// prevents wrong-weapon matches (e.g. stale "44pistol" directories from
+		// another subgraph's swap entry).
+		static REL::Relocation<uintptr_t> bshkbVtblLocal{ RE::VTABLE::BShkbAnimationGraph[0] };
+		if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+			RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+			if (player->GetAnimationGraphManagerImpl(manager) && manager) {
+				for (uint32_t i = 0; i < manager->graph.size() && i < 4; ++i) {
+					const auto root = reinterpret_cast<uintptr_t>(manager->graph[i].get());
+					if (auto path = SubgraphResolveViaRootGraphWalk(root, a_this, leaf); !path.empty()) {
+						return path;
+					}
+				}
+			}
+		}
+
+		// Clip not found in a player root graph's activeNodes (non-player actor,
+		// or activeNodes mid-rebuild). Same strict pair resolution via the
+		// clip's own hkbNodeInfo (identical object to the activeNodes entry:
+		// node at +0x08, nested graph at +0x10).
+		//
+		// Owner candidates, in order:
+		//   1. The nested graph's own root id when it points back at a real
+		//      BShkbAnimationGraph (GunMover's primary owner resolution).
+		//   2. The context's character-embedded graph (character - 0x1C8) when
+		//      it is a real BShkbAnimationGraph (GunMover's fallback owner).
+		//   3. Each of the player's root graphs. Safe even when wrong: the
+		//      swap-array lookup only accepts an entry whose sharedData root id
+		//      (+0xC0) EXACTLY equals this clip's nested-graph root id, so a
+		//      foreign owner simply yields no match — it can never return a
+		//      different weapon's directory set.
+		if (auto* nodeInfo = a_this->nodeInfo; nodeInfo &&
+			reinterpret_cast<uintptr_t>(nodeInfo) > 0x10000 &&
+			!IsBadReadPtr(nodeInfo, 0x18)) {
+			const auto base = reinterpret_cast<uintptr_t>(nodeInfo);
+			if (*reinterpret_cast<uintptr_t*>(base + 0x08) == reinterpret_cast<uintptr_t>(a_this)) {
+				const auto nested = *reinterpret_cast<uintptr_t*>(base + 0x10);
+
+				// Candidate 1: nested graph's root id as owner
+				const auto ownerFromRootId = SubgraphResolveOwningGraph(nested, 0);
+				if (ownerFromRootId) {
+					if (auto path = SubgraphResolvePair(ownerFromRootId, nested, leaf); !path.empty()) {
+						return path;
+					}
+				}
+
+				// Candidate 2: context's character-embedded graph
+				if (a_context->character &&
+					!IsBadReadPtr(a_context->character, sizeof(void*))) {
+					const auto candidate = reinterpret_cast<uintptr_t>(a_context->character) - kGraph_EmbeddedCharacter;
+					if (!IsBadReadPtr(reinterpret_cast<void*>(candidate), sizeof(void*)) &&
+						*reinterpret_cast<uintptr_t*>(candidate) == bshkbVtblLocal.address() &&
+						candidate != ownerFromRootId) {
+						if (auto path = SubgraphResolvePair(candidate, nested, leaf); !path.empty()) {
+							return path;
+						}
+					}
+				}
+
+				// Candidate 3: player's root graphs (exact root-id match keeps this safe)
+				if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+					RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+					if (player->GetAnimationGraphManagerImpl(manager) && manager) {
+						for (uint32_t i = 0; i < manager->graph.size() && i < 4; ++i) {
+							const auto root = reinterpret_cast<uintptr_t>(manager->graph[i].get());
+							if (!root || root == ownerFromRootId) continue;
+							if (auto path = SubgraphResolvePair(root, nested, leaf); !path.empty()) {
+								return path;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		return {};
+	}
+
+	// One-shot gate for poll failure diagnostics: the same few active clips
+	// fail every frame, so log each clip's failure only once.
+	static bool SubgraphShouldLogPollFailure(RE::hkbClipGenerator* a_clip)
+	{
+		static std::mutex s_mutex;
+		static std::unordered_set<RE::hkbClipGenerator*> s_logged;
+		std::lock_guard lock(s_mutex);
+		return s_logged.size() < 64 && s_logged.insert(a_clip).second;
+	}
+
+	// ======================================================================
+	// Per-frame player graph poll — faithful port of GunMover's GetAllClipInfo.
+	//
+	// GunMover never resolves clips from inside the Havok graph update; it
+	// enumerates the PLAYER's graph manager once per frame from a hook that
+	// runs OUTSIDE graph update, when activeNodes is complete and stable:
+	//
+	//     graphManager = player->currentProcess->middleHigh->animationGraphManager
+	//     graph        = graphManager->variableCache.graphToCacheFor
+	//     hkGraph      = *(graph + 0x378)
+	//     skip if hkGraph->updateActiveNodes || hkGraph->stateOrTransitionChanged
+	//     for each activeNodes entry:
+	//         clip   = entry itself, or *(entry+0x08), whichever has the
+	//                  hkbClipGenerator vtable            (SelectActiveClip)
+	//         nested = *(entry+0x10)                      (ReadNestedBehaviorGraph)
+	//         owner  = nested rootId if it is a BShkbAnimationGraph, else graph
+	//         path   = swap-array match + file-array scan + resource probe
+	//
+	// We do the same from HookedActorUpdate (runs right after
+	//     RunActorUpdatesOrig, i.e. after the Havok update cycle) and walk BOTH
+	// player root graphs (3rd-person body and 1st-person) since OAR cares about
+	// both. This gives us two things GunMover gets for free by starting from
+	// the player:
+	//   1. Ownership: every clip found here IS the player's (the hkbContext
+	//      character is a static dummy in this runtime, so context-based actor
+	//      attribution is impossible).
+	//   2. Perspective: the root graph the clip lives in tells 1st vs 3rd
+	//      person directly (learned via the first resolved _1stperson path).
+	// ======================================================================
+	static void PollPlayerGraphClips()
+	{
+		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
+		constexpr uintptr_t kBG_ActiveNodes = 0xE0;
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) return;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+		if (!player->GetAnimationGraphManagerImpl(manager) || !manager) return;
+
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+		const auto clipVtbl = Offsets::hkbClipGenerator_vtbl.address();
+
+		static std::atomic<int> s_pollDiagCount{ 0 };
+
+		for (uint32_t gi = 0; gi < manager->graph.size() && gi < 4; ++gi) {
+			const auto root = reinterpret_cast<uintptr_t>(manager->graph[gi].get());
+			if (!root || root < 0x10000 ||
+				IsBadReadPtr(reinterpret_cast<void*>(root), kBShkb_HkRootGraph + 8) ||
+				*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
+				continue;
+			}
+			const auto hkGraph = *reinterpret_cast<uintptr_t*>(root + kBShkb_HkRootGraph);
+			if (!hkGraph || hkGraph < 0x10000 ||
+				IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+				continue;
+			}
+
+			// Opportunistic: learn the 1st-person root graph from the graph's
+			// OWN project path ("Actors\Character\_1stPerson\..."). NOTE: in
+			// this runtime the project animationPath is usually EMPTY (see
+			// OAR-WeaponPath logs), so the primary learning signal is resolved
+			// clip paths carrying a "1stperson" marker (below); this block is
+			// a free extra chance in case some runtime/project provides it.
+			if (s_firstPersonGraphIndex.load(std::memory_order_relaxed) < 0) {
+				auto* character = reinterpret_cast<RE::hkbCharacter*>(root + kGraph_EmbeddedCharacter);
+				if (!IsBadReadPtr(character, 0xB0)) {
+					auto* projData = character->projectData._ptr;
+					if (projData && !IsBadReadPtr(projData, 0x30)) {
+						auto* projStrData = projData->stringData._ptr;
+						if (projStrData && !IsBadReadPtr(projStrData, 0x80)) {
+							const char* rawPath = projStrData->animationPath.data();
+							if (rawPath && reinterpret_cast<uintptr_t>(rawPath) > 0x10000 &&
+								!IsBadReadPtr(rawPath, 1) && rawPath[0] != '\0' &&
+								ClassifyPerspectiveFromPath(rawPath) == AnimationLog::Perspective::kFirstPerson) {
+								s_firstPersonGraphIndex.store(static_cast<int32_t>(gi), std::memory_order_relaxed);
+								logger::info("[OAR-Poll] Player root graph [{}] identified as 1st-person (project path '{}')",
+									gi, rawPath);
+							}
+						}
+					}
+				}
+			}
+
+			// GunMover: skip while the graph rebuilds its node list
+			if (*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+				*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0) {
+				continue;
+			}
+			const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kBG_ActiveNodes);
+			if (!activeNodes || IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
+				continue;
+			}
+			const auto data = *reinterpret_cast<uintptr_t*>(activeNodes);
+			const auto size = *reinterpret_cast<int32_t*>(activeNodes + 8);
+			if (!data || size <= 0 || size > 0x1000 ||
+				IsBadReadPtr(reinterpret_cast<void*>(data), static_cast<size_t>(size) * sizeof(void*))) {
+				continue;
+			}
+
+			for (int32_t i = 0; i < size; ++i) {
+				const auto entry = *reinterpret_cast<uintptr_t*>(data + static_cast<uintptr_t>(i) * sizeof(void*));
+				if (!entry || IsBadReadPtr(reinterpret_cast<void*>(entry), 0x18)) {
+					continue;
+				}
+
+				// GunMover's SelectActiveClip: entry itself, or entry+0x08,
+				// whichever carries the hkbClipGenerator vtable.
+				uintptr_t clipAddr = 0;
+				if (*reinterpret_cast<uintptr_t*>(entry) == clipVtbl) {
+					clipAddr = entry;
+				} else {
+					const auto candidate = *reinterpret_cast<uintptr_t*>(entry + 0x08);
+					if (candidate && candidate > 0x10000 &&
+						!IsBadReadPtr(reinterpret_cast<void*>(candidate), sizeof(void*)) &&
+						*reinterpret_cast<uintptr_t*>(candidate) == clipVtbl) {
+						clipAddr = candidate;
+					}
+				}
+				if (!clipAddr) continue;
+
+				auto* clip = reinterpret_cast<RE::hkbClipGenerator*>(clipAddr);
+				{
+					std::unique_lock lock(s_playerClipMutex);
+					s_playerClipGraph[clip] = static_cast<uint8_t>(gi);
+				}
+
+				// Already resolved authoritatively — nothing more to do.
+				{
+					std::shared_lock slock(s_clipRealPathStateMutex);
+					if (s_clipRealPathAuthoritative.contains(clip)) continue;
+				}
+
+				// Leaf from the clip's authored animation path; if the engine
+				// already cleared it, use the authored path backfilled into the
+				// display cache at Activate time.
+				auto leaf = SubgraphGetLeaf(clip->animationName.data());
+				if (leaf.empty()) {
+					std::shared_lock plock(s_clipRealPathMutex);
+					auto pit = s_clipRealPathCache.find(clip);
+					if (pit != s_clipRealPathCache.end()) {
+						leaf = SubgraphGetLeaf(pit->second.c_str());
+					}
+				}
+				if (leaf.empty()) continue;
+
+				// GunMover's resolution for this entry, with stage diagnostics
+				const auto nested = *reinterpret_cast<uintptr_t*>(entry + 0x10);
+				uintptr_t rootId = 0;
+				if (nested && nested > 0x10000 &&
+					!IsBadReadPtr(reinterpret_cast<void*>(nested), kBG_RootId + 8)) {
+					rootId = *reinterpret_cast<uintptr_t*>(nested + kBG_RootId);
+				}
+				const auto owner = SubgraphResolveOwningGraph(nested, root);
+				const auto dataBlock = rootId ? SubgraphFindSwapData(owner, rootId) : 0;
+				std::string path;
+				if (dataBlock) {
+					path = SubgraphScanFileArrays(dataBlock, leaf);
+				}
+
+				// GunMover matches every clip against ONE owner graph — the
+				// manager's main graph (variableCache.graphToCacheFor) — not
+				// the root the clip was found in. The 1st-person root's own
+				// swap array even produces FALSE matches for its clips (the
+				// matched block's "file arrays" hold garbage bytes; verified
+				// via OAR-PollDump). So when this clip's own (owner, rootId)
+				// pair yields nothing, retry graphToCacheFor and the other
+				// player root graphs as the owner. Safe against wrong-weapon
+				// results: the match key is still THIS clip's nested-graph
+				// root id, and only probe-verified (existing) paths are ever
+				// accepted.
+				if (path.empty() && rootId) {
+					uintptr_t altOwners[5]{};
+					size_t altCount = 0;
+					if (auto* cacheGraph = manager->variableCache.graphToCacheFor.get()) {
+						altOwners[altCount++] = reinterpret_cast<uintptr_t>(cacheGraph);
+					}
+					for (uint32_t gj = 0; gj < manager->graph.size() && gj < 4; ++gj) {
+						altOwners[altCount++] = reinterpret_cast<uintptr_t>(manager->graph[gj].get());
+					}
+					for (size_t a = 0; a < altCount && path.empty(); ++a) {
+						const auto altOwner = altOwners[a];
+						if (!altOwner || altOwner == owner) continue;
+						const auto altBlock = SubgraphFindSwapData(altOwner, rootId);
+						if (!altBlock || altBlock == dataBlock) continue;
+						path = SubgraphScanFileArrays(altBlock, leaf);
+					}
+				}
+
+				if (!path.empty()) {
+					{
+						std::unique_lock plock(s_clipRealPathMutex);
+						s_clipRealPathCache[clip] = path;
+					}
+					{
+						std::unique_lock slock(s_clipRealPathStateMutex);
+						s_clipRealPathAuthoritative.insert(clip);
+						s_clipRealPathAttempts.erase(clip);
+					}
+					// Learn which player root graph is the 1st-person one from
+					// the first resolved path carrying the _1stperson marker.
+					if (s_firstPersonGraphIndex.load(std::memory_order_relaxed) < 0 &&
+						ClassifyPerspectiveFromPath(path) == AnimationLog::Perspective::kFirstPerson) {
+						s_firstPersonGraphIndex.store(static_cast<int32_t>(gi), std::memory_order_relaxed);
+						logger::info("[OAR-Poll] Player root graph [{}] identified as 1st-person (via '{}')", gi, path);
+					}
+					static std::atomic<int> s_pollResolveLog{ 0 };
+					if (s_pollResolveLog.fetch_add(1) < 60) {
+						logger::info("[OAR-Poll] graph[{}] clip='{}' -> '{}'", gi, leaf, path);
+					}
+				} else if (SubgraphShouldLogPollFailure(clip) && s_pollDiagCount.fetch_add(1) < 30) {
+					// Stage diagnostics for the first failures (once per clip —
+					// the same few clips repeat every frame): exactly which
+					// stage broke (owner? swap match? file scan/probe?).
+					logger::info(
+						"[OAR-Poll] graph[{}] clip='{}' FAILED: nested={:X} rootId={:X} owner={:X}{} dataBlock={:X}{}",
+						gi, leaf, nested, rootId, owner,
+						owner == root ? " (fallback=root)" : "",
+						dataBlock,
+						dataBlock ? " (scan/probe found nothing)" : "");
+
+					// When the swap match worked but the scan/probe failed, dump
+					// the data block's file arrays once so we can see exactly
+					// what the engine has selected (and why nothing probed true).
+					if (dataBlock) {
+						static std::mutex s_dumpMutex;
+						static std::unordered_set<uintptr_t> s_dumpedBlocks;
+						bool doDump = false;
+						{
+							std::lock_guard dlock(s_dumpMutex);
+							doDump = s_dumpedBlocks.size() < 4 && s_dumpedBlocks.insert(dataBlock).second;
+						}
+						if (doDump) {
+							const auto dumpArray = [&](uintptr_t a_off, const char* a_label) {
+								const auto array = dataBlock + a_off;
+								if (IsBadReadPtr(reinterpret_cast<void*>(array), 0x18)) {
+									logger::info("[OAR-PollDump]   {} @+{:X}: unreadable", a_label, a_off);
+									return;
+								}
+								const auto entries = *reinterpret_cast<uintptr_t*>(array);
+								const auto size = *reinterpret_cast<uint32_t*>(array + 0x10);
+								logger::info("[OAR-PollDump]   {} @+{:X}: entries={:X} size={}", a_label, a_off, entries, size);
+								if (!entries || size == 0 || size > 0x400 ||
+									IsBadReadPtr(reinterpret_cast<void*>(entries), size * sizeof(void*))) {
+									return;
+								}
+								for (uint32_t k = 0; k < size && k < 16; ++k) {
+									const auto strPtr = *reinterpret_cast<uintptr_t*>(entries + static_cast<uintptr_t>(k) * sizeof(void*));
+									const char* s = SubgraphDecodePoolEntry(strPtr);
+									if (!s) s = "(null)";
+									// Show the candidate this entry yields for the failing leaf + probe result
+									auto cand = SubgraphBuildCandidate(s, leaf);
+									logger::info("[OAR-PollDump]     [{}] '{}' -> cand='{}' exists={}",
+										k, s, cand, !cand.empty() && SubgraphResourceExists(cand));
+								}
+							};
+							logger::info("[OAR-PollDump] dataBlock={:X} (for clip '{}')", dataBlock, leaf);
+							dumpArray(kData_FileArrayPrimary, "primary");
+							dumpArray(kData_FileArrayFallback, "fallback");
+						}
+					}
+				}
+			}
+		}
+
+	}
+
+	// Player ownership test that works AT Activate time — unlike the per-frame
+	// poll, which must skip a graph while it rebuilds its node list (exactly
+	// when clips activate). The hkbContext's character is a static dummy in
+	// this runtime, so instead we take the clip's hkbBehaviorGraph — from the
+	// context (+0x08) and/or the clip's hkbNodeInfo (+0x10) — and test it
+	// against each player root graph two ways:
+	//   1. It IS the root graph's own hkbBehaviorGraph (+0x378): top-level clip.
+	//   2. Its root id (+0x30) matches an entry in the root graph's subgraph
+	//      swap array: subgraph (weapon) clip. The swap array is graph-load
+	//      data, stable even while activeNodes rebuilds, and the root id is a
+	//      pointer unique to this actor's subgraph instance — a match on the
+	//      player's array can only mean a player-owned clip.
+	// Returns the player root graph index, or -1 (NPCs/creatures, bad data).
+	static int32_t PlayerGraphIndexForClip(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) return -1;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+		if (!player->GetAnimationGraphManagerImpl(manager) || !manager) return -1;
+
+		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;  // BShkbAnimationGraph -> root hkbBehaviorGraph
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+
+		// Collect the clip's behavior-graph candidates (context first, then nodeInfo)
+		uintptr_t candidates[2]{};
+		size_t candidateCount = 0;
+		if (a_context && reinterpret_cast<uintptr_t>(a_context) > 0x10000 &&
+			!IsBadReadPtr(a_context, kCtx_BehaviorGraph + 8)) {
+			const auto g = *reinterpret_cast<const uintptr_t*>(
+				reinterpret_cast<uintptr_t>(a_context) + kCtx_BehaviorGraph);
+			if (g && g > 0x10000) candidates[candidateCount++] = g;
+		}
+		if (a_clip && a_clip->nodeInfo &&
+			reinterpret_cast<uintptr_t>(a_clip->nodeInfo) > 0x10000 &&
+			!IsBadReadPtr(a_clip->nodeInfo, 0x18)) {
+			const auto g = *reinterpret_cast<uintptr_t*>(
+				reinterpret_cast<uintptr_t>(a_clip->nodeInfo) + 0x10);
+			if (g && g > 0x10000 && g != candidates[0]) candidates[candidateCount++] = g;
+		}
+		if (candidateCount == 0) return -1;
+
+		for (uint32_t i = 0; i < manager->graph.size() && i < 4; ++i) {
+			const auto root = reinterpret_cast<uintptr_t>(manager->graph[i].get());
+			if (!root || root < 0x10000 ||
+				IsBadReadPtr(reinterpret_cast<void*>(root), kBShkb_HkRootGraph + 8) ||
+				*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
+				continue;
+			}
+			const auto rootHkGraph = *reinterpret_cast<uintptr_t*>(root + kBShkb_HkRootGraph);
+
+			for (size_t c = 0; c < candidateCount; ++c) {
+				const auto nested = candidates[c];
+				// Test 1: top-level clip — the candidate is the root's own graph
+				if (rootHkGraph && nested == rootHkGraph) {
+					return static_cast<int32_t>(i);
+				}
+				// Test 2: subgraph clip — its root id is registered in this
+				// root's swap array (or points back at the root itself)
+				if (IsBadReadPtr(reinterpret_cast<void*>(nested), kBG_RootId + 8)) {
+					continue;
+				}
+				const auto rootId = *reinterpret_cast<uintptr_t*>(nested + kBG_RootId);
+				if (!rootId) continue;
+				if (rootId == root || SubgraphFindSwapData(root, rootId) != 0) {
+					return static_cast<int32_t>(i);
+				}
+			}
+		}
+		return -1;
+	}
+
+	// Actor attribution for anim-log entries. Player-graph membership (from the
+	// per-frame poll or from Activate-time context matching) is the primary
+	// player test; the embedded-character graph comparison covers clips the
+	// poll hasn't seen yet. Non-player clips fall back to the character cache
+	// and may legitimately return nullptr ("Unknown" in the log) — never the
+	// player.
+	static RE::TESObjectREFR* ResolveLogRefr(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context)
+	{
+		{
+			std::shared_lock lock(s_playerClipMutex);
+			if (s_playerClipGraph.contains(a_clip)) {
+				return RE::PlayerCharacter::GetSingleton();
+			}
+		}
+		// Membership can be missing when the poll hasn't seen this clip yet
+		// (graphs are skipped mid-rebuild — exactly when clips activate).
+		// Derive ownership from the clip's behavior graph instead and
+		// backfill the membership map so perspective classification works too.
+		if (const auto gi = PlayerGraphIndexForClip(a_clip, a_context); gi >= 0) {
+			{
+				std::unique_lock lock(s_playerClipMutex);
+				s_playerClipGraph[a_clip] = static_cast<uint8_t>(gi);
+			}
+			return RE::PlayerCharacter::GetSingleton();
+		}
+		return GetRefrFromContext(a_context);
+	}
+
+	// Perspective for anim-log entries. Player-graph membership is authoritative
+	// when the 1st-person graph index has been learned; otherwise fall back to
+	// the path marker rule (contains "_1stperson" => 1st person).
+	static AnimationLog::Perspective ClassifyClipPerspective(RE::hkbClipGenerator* a_clip, const std::string& a_path)
+	{
+		{
+			std::shared_lock lock(s_playerClipMutex);
+			auto it = s_playerClipGraph.find(a_clip);
+			if (it != s_playerClipGraph.end()) {
+				const auto fpIdx = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+				if (fpIdx >= 0) {
+					return it->second == static_cast<uint8_t>(fpIdx) ?
+						AnimationLog::Perspective::kFirstPerson :
+						AnimationLog::Perspective::kThirdPerson;
+				}
+			}
+		}
+		return ClassifyPerspectiveFromPath(a_path);
+	}
+
 	static std::string GetClipSuffixFromContext(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		static int s_sourceLogCount = 0;
 		static int s_diagLogCount = 0;
+
+		// ===== Source S: Selected-subgraph swap array (deterministic real path) =====
+		// When this resolves, it is the engine's own ground truth for which file
+		// the clip is playing — it takes precedence over all heuristic sources.
+		{
+			const auto realPath = ResolveClipPathFromSubgraph(a_this, a_context);
+			if (!realPath.empty()) {
+				// Remember the authoritative on-disk path for this clip so the
+				// Animation Log can display it in full (display-only cache).
+				{
+					std::unique_lock plock(s_clipRealPathMutex);
+					s_clipRealPathCache[a_this] = realPath;
+				}
+				{
+					std::unique_lock slock(s_clipRealPathStateMutex);
+					s_clipRealPathAuthoritative.insert(a_this);
+				}
+				auto suffix = ExtractAnimSuffix(realPath);
+				if (!suffix.empty()) {
+					bool registered;
+					{
+						std::shared_lock rlock(s_nameLookupMutex);
+						registered = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
+					}
+					if (s_sourceLogCount < 80) {
+						logger::info("[OAR-Suffix] SourceS-Subgraph: realPath='{}' -> suffix='{}' registered={}",
+							realPath, suffix, registered);
+						s_sourceLogCount++;
+					}
+					if (registered) {
+						return suffix;
+					}
+					// Not registered under the exact real-path suffix — bridge through
+					// the leaf table so existing replacer layouts keep working while the
+					// log above shows the authoritative path for verification.
+					auto resolved = ResolveOrLeafFallback(suffix);
+					if (resolved != suffix && s_sourceLogCount < 80) {
+						logger::info("[OAR-Suffix] SourceS-Subgraph: leaf-bridged '{}' -> '{}'",
+							suffix, resolved);
+						s_sourceLogCount++;
+					}
+					return resolved;
+				}
+			}
+		}
 
 		// ===== Source 0: Weapon graph animationPath + clip leaf name =====
 		// Uses the REAL weapon character from PlayerCharacter->graphManager (Options 1+2+3)
@@ -2207,10 +3230,19 @@ namespace
 			}
 		}
 
+		// Record player-graph membership straight from the clip's behavior
+		// graph. The poll can't see this clip until the graph stabilizes (it
+		// skips graphs mid-rebuild), but log attribution and perspective
+		// classification need the membership NOW — argument evaluation order
+		// in the AddEntry calls below is unspecified, so don't rely on
+		// ResolveLogRefr's backfill happening before ClassifyClipPerspective.
+		if (const auto playerGi = PlayerGraphIndexForClip(a_this, a_context); playerGi >= 0) {
+			std::unique_lock lock(s_playerClipMutex);
+			s_playerClipGraph[a_this] = static_cast<uint8_t>(playerGi);
+		}
+
 		// Log this activation to the Animation Log for the UI
 		if (AnimationLog::GetSingleton()->IsEnabled()) {
-			RE::TESObjectREFR* refr = GetRefrFromContext(a_context);
-			if (!refr) refr = RE::PlayerCharacter::GetSingleton();
 			std::string suffixCopy;
 			{
 				std::shared_lock rlock(s_clipSuffixMutex);
@@ -2218,9 +3250,52 @@ namespace
 				if (sit != s_clipSuffixCache.end()) suffixCopy = sit->second;
 			}
 			if (!suffixCopy.empty()) {
-				AnimationLog::GetSingleton()->AddEntry(
-					AnimationLog::EventType::kActivate,
-					refr, suffixCopy, "", "");
+				// Display path priority (mirrors GunMover's ResolveClipDisplayPath):
+				//  1. Subgraph swap-array resolution (cached by Source S above)
+				//  2. The clip's authored animation path (animationName — valid at
+				//     Activate time; this is the full authored path, e.g.
+				//     "Actors\Character\Animations\default\neutral\eyeblinkfull.hkx")
+				std::string displayPath;
+				bool authoritative = false;
+				{
+					std::shared_lock plock(s_clipRealPathMutex);
+					auto pit = s_clipRealPathCache.find(a_this);
+					if (pit != s_clipRealPathCache.end()) displayPath = pit->second;
+				}
+				{
+					std::shared_lock slock(s_clipRealPathStateMutex);
+					authoritative = s_clipRealPathAuthoritative.contains(a_this);
+				}
+				if (displayPath.empty() || !authoritative) {
+					const char* authored = a_this->animationName.data();
+					if (authored && reinterpret_cast<uintptr_t>(authored) > 0x10000 &&
+						!IsBadReadPtr(authored, 1) && authored[0] != '\0') {
+						displayPath = authored;
+						// Backfill the cache so the Active Replacements window
+						// (populated in Update, after animationName may be cleared)
+						// can show at least the authored path. NOT marked
+						// authoritative — the Update hook keeps retrying the
+						// subgraph walk and overwrites this on success.
+						std::unique_lock plock(s_clipRealPathMutex);
+						s_clipRealPathCache[a_this] = displayPath;
+					}
+				}
+				if (authoritative) {
+					AnimationLog::GetSingleton()->AddEntry(
+						AnimationLog::EventType::kActivate,
+						ResolveLogRefr(a_this, a_context), suffixCopy, "", "",
+						displayPath, ClassifyClipPerspective(a_this, displayPath));
+				} else {
+					// Subgraph walk can't succeed at Activate time (the graph is
+					// mid-transition; see the deferred-resolution comment at the
+					// cache declarations). Hold this entry back — the Update hook
+					// flushes it once the per-frame player-graph poll resolved
+					// the real path (or the grace period passes).
+					std::unique_lock slock(s_clipRealPathStateMutex);
+					s_pendingActivateLog[a_this] = PendingActivateLog{
+						suffixCopy, s_currentFrame.load(std::memory_order_relaxed)
+					};
+				}
 			}
 		}
 
@@ -2406,6 +3481,50 @@ namespace
 
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
+		}
+
+		// ===== Deferred kActivate anim-log flush =====
+		// Path resolution itself happens in PollPlayerGraphClips() (per-frame,
+		// outside graph update — GunMover's model). Here we only flush the
+		// held-back kActivate entry once the poll resolved this clip's real
+		// path, or after a short grace period (~10 frames) for clips that will
+		// never resolve (creature graphs with no swap array). Attribution and
+		// perspective come from player-graph membership, not the context.
+		// This must run BEFORE the bypass early-out below: bypassed clips are
+		// typically the player's own weapon clips (failed pre-swap), and their
+		// activations must still reach the log.
+		{
+			constexpr uint64_t kLogDeferGraceFrames = 10;
+
+			std::string pendingSuffix;
+			{
+				std::shared_lock slock(s_clipRealPathStateMutex);
+				auto pit = s_pendingActivateLog.find(a_this);
+				if (pit != s_pendingActivateLog.end()) {
+					const bool resolved = s_clipRealPathAuthoritative.contains(a_this);
+					const auto curFrame = s_currentFrame.load(std::memory_order_relaxed);
+					const bool graceOver = curFrame >= pit->second.frame + kLogDeferGraceFrames;
+					if (resolved || graceOver) pendingSuffix = pit->second.suffix;
+				}
+			}
+			if (!pendingSuffix.empty()) {
+				{
+					std::unique_lock slock(s_clipRealPathStateMutex);
+					s_pendingActivateLog.erase(a_this);
+				}
+				if (AnimationLog::GetSingleton()->IsEnabled()) {
+					std::string displayPath;
+					{
+						std::shared_lock plock(s_clipRealPathMutex);
+						auto pit = s_clipRealPathCache.find(a_this);
+						if (pit != s_clipRealPathCache.end()) displayPath = pit->second;
+					}
+					AnimationLog::GetSingleton()->AddEntry(
+						AnimationLog::EventType::kActivate,
+						ResolveLogRefr(a_this, a_context), pendingSuffix, "", "",
+						displayPath, ClassifyClipPerspective(a_this, displayPath));
+				}
+			}
 		}
 
 		// Per-clip bypass: if pre-swap failed in Activate, the animation control was
@@ -3042,9 +4161,17 @@ namespace
 						if (AnimationLog::GetSingleton()->IsEnabled() && winningInfo) {
 							std::string subModName = winningInfo->parentSubMod ?
 								winningInfo->parentSubMod->GetName() : "";
+							std::string realPathCopy;
+							{
+								std::shared_lock plock(s_clipRealPathMutex);
+								auto pit = s_clipRealPathCache.find(a_this);
+								if (pit != s_clipRealPathCache.end()) realPathCopy = pit->second;
+							}
 							AnimationLog::GetSingleton()->AddEntry(
 								AnimationLog::EventType::kReplace,
-								refr, resolvedSuffix, winningInfo->replacementPath, subModName);
+								ResolveLogRefr(a_this, a_context), resolvedSuffix,
+								winningInfo->replacementPath, subModName,
+								realPathCopy, ClassifyClipPerspective(a_this, realPathCopy));
 						}
 					}
 
@@ -3104,6 +4231,13 @@ namespace
 
 		ActiveReplacementEntry entry;
 		entry.clipSuffix = resolvedSuffix;
+		// Attach the full resolved on-disk path (when Source S resolved it) so
+		// the Active Replacements window can display the real animation path.
+		{
+			std::shared_lock plock(s_clipRealPathMutex);
+			auto pit = s_clipRealPathCache.find(a_this);
+			if (pit != s_clipRealPathCache.end()) entry.fullPath = pit->second;
+		}
 		entry.conditionsPassed = true;
 		if (winningInfo) {
 			if (!variantSuffix.empty()) {
@@ -3173,9 +4307,16 @@ namespace
 						bool looped = (curT < prevT - 0.01f);
 						if (looped) {
 							if (Settings::GetSingleton()->bLogLoop && AnimationLog::GetSingleton()->IsEnabled()) {
+								std::string loopPath;
+								{
+									std::shared_lock plock(s_clipRealPathMutex);
+									auto pit = s_clipRealPathCache.find(a_this);
+									if (pit != s_clipRealPathCache.end()) loopPath = pit->second;
+								}
 								AnimationLog::GetSingleton()->AddEntry(
 									AnimationLog::EventType::kLoop,
-									refr, suffix, annotSuffix, "");
+									ResolveLogRefr(a_this, a_context), suffix, annotSuffix, "",
+									loopPath, ClassifyClipPerspective(a_this, loopPath));
 							}
 							for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
 								auto& ann = (*annotations)[i];
@@ -3476,6 +4617,38 @@ namespace
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		if (a_this) {
+			// Flush a still-pending kActivate log entry BEFORE dropping the
+			// per-clip state below. Short-lived clips (fire animations,
+			// transition clips) often deactivate before the Update-hook grace
+			// period elapses — silently erasing the pending entry made them
+			// vanish from the Animation Log entirely.
+			{
+				std::string pendingSuffix;
+				{
+					std::shared_lock slock(s_clipRealPathStateMutex);
+					auto pit = s_pendingActivateLog.find(a_this);
+					if (pit != s_pendingActivateLog.end()) {
+						pendingSuffix = pit->second.suffix;
+					}
+				}
+				if (!pendingSuffix.empty() && AnimationLog::GetSingleton()->IsEnabled()) {
+					std::string displayPath;
+					{
+						std::shared_lock plock(s_clipRealPathMutex);
+						auto pit = s_clipRealPathCache.find(a_this);
+						if (pit != s_clipRealPathCache.end()) {
+							displayPath = pit->second;
+						}
+					}
+					AnimationLog::GetSingleton()->AddEntry(
+						AnimationLog::EventType::kActivate,
+						ResolveLogRefr(a_this, a_context),
+						pendingSuffix, "", "",
+						displayPath,
+						ClassifyClipPerspective(a_this, displayPath));
+				}
+			}
+
 			// Do NOT restore the original animation or triggers during deactivation.
 			// The clip is being freed and ALL backed-up pointers (animation, triggers)
 			// will become stale. If the address is recycled by a new clip, stale entries
@@ -3491,6 +4664,22 @@ namespace
 			{
 				std::unique_lock lock(s_clipSuffixMutex);
 				s_clipSuffixCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipRealPathMutex);
+				s_clipRealPathCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipRealPathStateMutex);
+				s_clipRealPathAuthoritative.erase(a_this);
+				s_clipRealPathAttempts.erase(a_this);
+				s_pendingActivateLog.erase(a_this);
+			}
+			{
+				// The per-frame poll rebuilds this map, but erase eagerly so a
+				// recycled clip address can't inherit stale player membership.
+				std::unique_lock lock(s_playerClipMutex);
+				s_playerClipGraph.erase(a_this);
 			}
 			{
 				std::unique_lock lock(s_clipVariantMutex);
@@ -4179,6 +5368,13 @@ namespace
 
 		// Fire deferred custom events now that the Havok update cycle is complete.
 		FlushDeferredEvents();
+
+		// Enumerate the player's active clips and resolve their real animation
+		// paths — GunMover's per-frame model; must run OUTSIDE the Havok update
+		// cycle (which has just completed) so activeNodes is stable.
+		if (s_gameFullyLoaded.load() && s_lookupBuilt) {
+			PollPlayerGraphClips();
+		}
 
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
 		static auto s_lastTick = std::chrono::high_resolution_clock::now();

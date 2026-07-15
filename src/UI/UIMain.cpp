@@ -1568,9 +1568,10 @@ void UIMain::DrawSettingsPanel()
 		}
 	}
 
-	float scale = ImGui::GetIO().FontGlobalScale;
+	// imgui 1.92 moved io.FontGlobalScale to style.FontScaleMain
+	float scale = ImGui::GetStyle().FontScaleMain;
 	if (ImGui::SliderFloat("UI Scale", &scale, 0.8f, 2.0f, "%.1f")) {
-		ImGui::GetIO().FontGlobalScale = scale;
+		ImGui::GetStyle().FontScaleMain = scale;
 	}
 
 	ImGui::SliderFloat("Left Panel %", &firstColumnPercent, 0.2f, 0.8f, "%.0f%%");
