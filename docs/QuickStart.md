@@ -10,50 +10,43 @@
 
 ## Creating a Replacement Mod
 
-### Folder Structure
+### The one rule
 
-Place your mod under any animation directory inside `Data/Meshes/`.  
-The plugin scans recursively for folders named `OpenAnimationReplacer`.
+**Mirror the path after `Animations\`.** Open the Animation Log, play the anim,
+then put that same relative path under your SubMod.
+
+| Game plays | Your file goes here |
+|------------|---------------------|
+| `...\Animations\SCAR\WPNReload.hkx` | `<SubMod>\SCAR\WPNReload.hkx` |
+| `...\Animations\MT_Idle.hkx` | `<SubMod>\MT_Idle.hkx` |
+
+Weapon anims usually live in a weapon folder (`SCAR\`, `44Pistol\`, …). Idle-style
+anims often sit directly under `Animations\` (no subfolder).
+
+### Folder layout
+
+Put an `OpenAnimationReplacer` folder inside the animation tree you target
+(1st person: `...\Character\_1stPerson\Animations\`, 3rd: `...\Character\Animations\`).
 
 ```
-Data/Meshes/
-└── Actors/
-    └── Character/
-        └── Animations/
-            └── OpenAnimationReplacer/
-                └── MyAnimPack/              ← Replacer Mod folder
-                    ├── config.json          ← (optional) mod metadata
-                    └── Combat Idle/         ← SubMod folder
-                        ├── config.json      ← conditions, priority & settings
-                        └── mt_idle.hkx      ← replacement .hkx file
+Data/Meshes/Actors/Character/Animations/
+└── OpenAnimationReplacer/
+    └── MyAnimPack/                 ← Replacer Mod (any name)
+        ├── config.json             ← optional pack metadata
+        └── Combat Idle/            ← SubMod (any name)
+            ├── config.json         ← conditions + priority
+            └── mt_idle.hkx         ← mirrors ...\Animations\mt_idle.hkx
 ```
 
-- **Replacer Mod folder** — any name. Groups related submods together.
-- **SubMod folder** — use a descriptive name (e.g. `Combat Idle`, `Sprint Override`, `FemaleOnly`). The priority is defined inside the submod's `config.json`, not by the folder name.
-- **`.hkx` files** — must mirror the relative path of the animation they replace. `mt_idle.hkx` in the submod root replaces `Actors/Character/Animations/mt_idle.hkx`.
+- Priority lives in the SubMod’s `config.json`, not the folder name.
+- Conditions decide *when*; the path decides *which* animation.
 
-### How Matching Works (Direct Path Matching)
+### Matching (short version)
 
-By default (`bDirectPathMatching=1`), OAR resolves the **real on-disk path** of every
-animation the game plays and matches your replacement against it **exactly**, using
-the part of the path after `Animations\`:
-
-- The game plays `Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx`
-  → matching key `scar\wpnreload` → your file must be at `<SubMod>\SCAR\WPNReload.hkx`.
-- The game plays `Actors\Character\Animations\MT_Idle.hkx`
-  → matching key `mt_idle` → your file goes at `<SubMod>\MT_Idle.hkx`.
-
-Weapon animations resolve to **weapon-specific subdirectories** (e.g. `SCAR\`,
-`44Pistol\`, `Common\`), so weapon replacements need the matching subfolder inside
-the submod. To discover the exact path an animation uses, open the in-game
-**Animation Log** — it displays the full resolved path of each playing clip — or
-check `[OAR-Poll]` / `[OAR-Suffix]` lines in the plugin log.
-
-**Leaf-name fallback:** for clips whose real path cannot be resolved, OAR falls
-back to matching by file name alone (the "leaf", e.g. `wpnreload`), using
-conditions and priority to pick between submods that share the name. Setting
-`bDirectPathMatching=0` (INI or the in-game Settings panel) restores this legacy
-leaf-matching behavior everywhere.
+1. **Default:** exact path match after `Animations\` (`bDirectPathMatching=1`).
+2. **Fallback:** if OAR can’t resolve the real path, match by filename only
+   (`wpnreload`). Conditions + priority break ties.
+3. **Legacy:** `bDirectPathMatching=0` uses filename matching for everything.
 
 ### Mod-Level `config.json` (Optional)
 
@@ -273,123 +266,57 @@ bVerboseLogging = false
 
 ---
 
-## Example: 1st Person Idle Replacement
+## Example: 1st Person Idle (ADS vs hipfire)
 
-This example replaces a first-person idle animation with a custom one when the player has a weapon drawn and is aiming down sights.
-
-FO4's vanilla animation tree uses these paths:
-
-- **1st person**: `Meshes/Actors/Character/_1stPerson/Animations/`
-- **3rd person**: `Meshes/Actors/Character/Animations/`
-
-Note the underscore — it's `_1stPerson`, not `1stPerson`.
-
-### Folder Layout
+Paths: 1st person uses `_1stPerson` (with underscore).  
+`mt_idle.hkx` in the SubMod root replaces `...\Animations\mt_idle.hkx`.
 
 ```
-Data/Meshes/
-└── Actors/
-    └── Character/
-        └── _1stPerson/
-            └── Animations/
-                └── OpenAnimationReplacer/
-                    └── ADS Idle Pack/
-                        ├── config.json
-                        ├── ADS Idle/
-                        │   ├── config.json
-                        │   └── mt_idle.hkx
-                        └── Hipfire Idle/
-                            ├── config.json
-                            └── mt_idle.hkx
+...\Character\_1stPerson\Animations\OpenAnimationReplacer\
+└── ADS Idle Pack/
+    ├── config.json
+    ├── ADS Idle/
+    │   ├── config.json          ← priority 2000, IsADS
+    │   └── mt_idle.hkx
+    └── Hipfire Idle/
+        ├── config.json          ← priority 1000, IsADS negated
+        └── mt_idle.hkx
 ```
 
-The `OpenAnimationReplacer` folder goes inside the animations directory you want to target. The replacement `.hkx` mirrors the original's relative path — so `mt_idle.hkx` in the submod root replaces `Actors/Character/_1stPerson/Animations/mt_idle.hkx`.
-
-### Mod `config.json`
-
-```json
-{
-  "name": "ADS Idle Pack",
-  "author": "YourName",
-  "description": "Custom 1st-person idle while aiming."
-}
-```
-
-### SubMod `config.json` (`ADS Idle/config.json`)
+**ADS Idle** `config.json`:
 
 ```json
 {
   "name": "ADS Idle",
-  "description": "Replaces 1st-person idle when aiming down sights with weapon drawn.",
   "priority": 2000,
   "interruptible": true,
   "replaceOnLoop": true,
   "conditions": [
-    {
-      "condition": "IsForm",
-      "Form": { "pluginName": "", "formID": "0x14" }
-    },
+    { "condition": "IsForm", "Form": { "pluginName": "", "formID": "0x14" } },
     { "condition": "IsWeaponDrawn" },
     { "condition": "IsADS" }
   ]
 }
 ```
 
-**What this does:**
+**Hipfire Idle** — same, but `"priority": 1000` and `"IsADS"` with `"negated": true`.
 
-- `IsForm` with formID `0x14` (empty plugin = absolute ID) targets the player character only.
-- `IsWeaponDrawn` ensures a weapon is out.
-- `IsADS` checks for aiming down sights.
-- `interruptible: true` means the replacement swaps in/out immediately as the player enters or exits ADS, rather than waiting for the animation to loop.
+ADS (2000) wins while aiming; hipfire takes over when sights drop.
 
-### SubMod `config.json` (`Hipfire Idle/config.json`)
+## Example: 3rd Person Pose (out of combat)
 
-```json
-{
-  "name": "Hipfire Idle",
-  "description": "Replaces 1st-person idle when weapon is drawn but not aiming.",
-  "priority": 1000,
-  "interruptible": true,
-  "replaceOnLoop": true,
-  "conditions": [
-    {
-      "condition": "IsForm",
-      "Form": { "pluginName": "", "formID": "0x14" }
-    },
-    { "condition": "IsWeaponDrawn" },
-    { "condition": "IsADS", "negated": true }
-  ]
-}
-```
-
-The `ADS Idle` submod has higher priority (2000) than `Hipfire Idle` (1000), so when both `IsWeaponDrawn` and `IsADS` are true, the ADS animation wins. When the player lowers their sights, the hipfire animation takes over. This layered approach lets you define multiple submods in the same mod folder with different priorities and conditions.
-
-## Example: 3rd Person Pose Replacement
-
-This example replaces a 3rd-person idle pose when the player is not in combat.
-
-### Folder Layout
+Subfolders under `Animations\` are preserved: `Player\PoseA_Idle1.hkx` →
+`<SubMod>\Player\PoseA_Idle1.hkx`.
 
 ```
-Data/Meshes/
-└── Actors/
-    └── Character/
-        └── Animations/
-            └── OpenAnimationReplacer/
-                └── Relaxed Poses/
-                    ├── config.json
-                    └── Out of Combat/
-                        ├── config.json
-                        ├── PoseA_Idle1.hkx
-                        ├── PoseA_IdleFlavor1.hkx
-                        ├── PoseA_IdleFlavor2.hkx
-                        └── Player/
-                            └── PoseA_Idle1.hkx
+...\Character\Animations\OpenAnimationReplacer\
+└── Relaxed Poses/
+    └── Out of Combat/
+        ├── config.json
+        ├── PoseA_Idle1.hkx
+        └── Player/
+            └── PoseA_Idle1.hkx
 ```
-
-3rd-person animations are directly under `Actors/Character/Animations/`. Subdirectories like `Player/` are preserved — `Player/PoseA_Idle1.hkx` in the submod replaces `Actors/Character/Animations/Player/PoseA_Idle1.hkx`.
-
-### SubMod `config.json` (`Out of Combat/config.json`)
 
 ```json
 {
@@ -402,125 +329,50 @@ Data/Meshes/
 }
 ```
 
-`negated: true` on `IsInCombat` means this only plays when the actor is **not** in combat. As soon as combat starts, the original animation takes over because `interruptible: true` allows mid-animation switching.
+## Example: 1st Person Reload (layered priorities)
 
-## Example: 1st Person Reload Replacement
-
-This example shows a multi-submod pack that replaces reload animations with different variants depending on game state. Higher-priority submods are evaluated first, so more specific conditions (sprinting) override more general ones (standard reload).
-
-### Folder Layout
+Game path example: `...\Animations\SCAR\WPNReload.hkx` → each SubMod has
+`SCAR\WPNReload.hkx`. Highest priority that passes wins.
 
 ```
-Data/Meshes/
-└── Actors/
-    └── Character/
-        └── _1stPerson/
-            └── Animations/
-                └── OpenAnimationReplacer/
-                    └── Custom Reload Pack/
-                        ├── config.json
-                        ├── Sprinting Reload/
-                        │   ├── config.json
-                        │   └── SCAR/
-                        │       └── WPNReload.hkx
-                        ├── Combat Quick Reload/
-                        │   ├── config.json
-                        │   └── SCAR/
-                        │       └── WPNReload.hkx
-                        └── Standard Reload/
-                            ├── config.json
-                            └── SCAR/
-                                └── WPNReload.hkx
+...\Character\_1stPerson\Animations\OpenAnimationReplacer\
+└── Custom Reload Pack/
+    ├── Sprinting Reload/     ← priority 4000, IsSprinting
+    │   └── SCAR/WPNReload.hkx
+    ├── Combat Quick Reload/  ← priority 3000, IsInCombat
+    │   └── SCAR/WPNReload.hkx
+    └── Standard Reload/      ← priority 2000, not in combat
+        └── SCAR/WPNReload.hkx
 ```
 
-Weapon animations resolve to weapon-specific subdirectories (here `SCAR\`), so
-each submod mirrors that folder. Check the Animation Log in-game for the exact
-path your weapon's reload uses — e.g.
-`Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx` → put your file at
-`<SubMod>\SCAR\WPNReload.hkx`.
-
-### Mod `config.json`
-
-```json
-{
-  "name": "Custom Reload Pack",
-  "author": "YourName",
-  "description": "Replaces 1st-person reload animations with custom variants."
-}
-```
-
-### SubMod `config.json` (`Sprinting Reload/config.json`)
+Example SubMod (`Sprinting Reload/config.json`):
 
 ```json
 {
   "name": "Sprinting Reload",
-  "description": "Stylized one-handed reload while sprinting.",
   "priority": 4000,
   "interruptible": false,
   "replaceOnLoop": false,
   "replaceOnEcho": true,
   "conditions": [
-    {
-      "condition": "IsForm",
-      "Form": { "pluginName": "Fallout4.esm", "formID": "0x14" }
-    },
+    { "condition": "IsForm", "Form": { "pluginName": "Fallout4.esm", "formID": "0x14" } },
     { "condition": "IsWeaponDrawn" },
     { "condition": "IsSprinting" }
   ]
 }
 ```
 
-### SubMod `config.json` (`Combat Quick Reload/config.json`)
-
-```json
-{
-  "name": "Combat Quick Reload",
-  "description": "Faster, snappier reload when in combat.",
-  "priority": 3000,
-  "interruptible": false,
-  "replaceOnLoop": false,
-  "replaceOnEcho": true,
-  "conditions": [
-    {
-      "condition": "IsForm",
-      "Form": { "pluginName": "Fallout4.esm", "formID": "0x14" }
-    },
-    { "condition": "IsWeaponDrawn" },
-    { "condition": "IsInCombat" }
-  ]
-}
-```
-
-### SubMod `config.json` (`Standard Reload/config.json`)
-
-```json
-{
-  "name": "Standard Reload",
-  "description": "General-purpose reload replacement when not in combat.",
-  "priority": 2000,
-  "interruptible": false,
-  "replaceOnLoop": false,
-  "replaceOnEcho": true,
-  "conditions": [
-    {
-      "condition": "IsForm",
-      "Form": { "pluginName": "Fallout4.esm", "formID": "0x14" }
-    },
-    { "condition": "IsWeaponDrawn" },
-    { "condition": "IsInCombat", "negated": true }
-  ]
-}
-```
-
-**Priority layering:** Sprinting Reload (4000) is evaluated first — if the player is sprinting, it wins regardless of combat state. Combat Quick Reload (3000) takes over during combat. Standard Reload (2000) is the fallback when neither of the above match. All three use `interruptible: false` because reloads are one-shot animations that shouldn't be cut short mid-clip.
+Combat Quick Reload: priority `3000` + `IsInCombat`.  
+Standard Reload: priority `2000` + `IsInCombat` negated.  
+Keep `interruptible: false` on one-shot reloads.
 
 ---
 
 ## Tips
 
-- **Priority matters.** The first submod whose conditions pass wins. Use higher numbers for more specific overrides.
-- **Use `interruptible = true`** for state-dependent animations (combat stance, sprinting) so they switch immediately when conditions change.
-- **Leave `interruptible = false`** for one-shot animations (draw weapon, jump) to avoid mid-animation pop.
-- **Test with the Animation Log** open — it shows exactly which submod triggered each replacement, and the **full resolved path** of every playing animation (use it to find where your replacement file must go).
-- **If a replacement stops matching** after enabling direct path matching, compare your submod's folder layout against the path shown in the Animation Log — or set `bDirectPathMatching=0` to restore legacy leaf matching.
-- Conditions marked *(stub)* parse and serialize correctly but always evaluate to `false` until a future update completes their FO4 API integration.
+- Higher **priority** wins when several SubMods match. Put the most specific rules highest.
+- `interruptible: true` for stance/sprint-style swaps; `false` for one-shots (reload, draw).
+- Use the **Animation Log** to find the real path and confirm which SubMod won.
+- Replacement not applying? Compare your SubMod folders to the log path, or try
+  `bDirectPathMatching=0` while debugging.
+- Conditions marked *(stub)* always evaluate false until their FO4 APIs are finished.
