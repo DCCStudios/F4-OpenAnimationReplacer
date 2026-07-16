@@ -8,6 +8,7 @@
 #include "AnimationCache.h"
 #include "AnimationLog.h"
 #include "ActiveReplacementTracker.h"
+#include "RE_Additions.h"
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -2596,6 +2597,34 @@ namespace
 		return GetRefrFromContext(a_context);
 	}
 
+	// Display path for a log entry, validated against the entry's animation.
+	// A clip generator address can be recycled or rebound to a different
+	// animation between an entry's creation (Activate) and its deferred flush
+	// (Update/Deactivate) — and the per-frame poll caches the path of whatever
+	// the clip is playing NOW. Blindly attaching the cached path produced
+	// entries like name 'idle' with path '...\SCAR\wpnpitchupreadyadd.hkx'.
+	// Real paths are built as <selected dir>\<authored leaf>.hkx, so the leaf
+	// must match the entry's suffix leaf; reject the path otherwise.
+	static std::string DisplayPathForEntry(RE::hkbClipGenerator* a_clip, const std::string& a_suffix)
+	{
+		std::string path;
+		{
+			std::shared_lock plock(s_clipRealPathMutex);
+			auto it = s_clipRealPathCache.find(a_clip);
+			if (it != s_clipRealPathCache.end()) path = it->second;
+		}
+		if (path.empty()) return path;
+
+		// Suffix forms: "dir\leaf", "leaf", or "multi:leaf"
+		std::string suffix = a_suffix;
+		if (suffix.rfind("multi:", 0) == 0) suffix = suffix.substr(6);
+		const auto suffixLeaf = SubgraphGetLeaf(suffix.c_str());
+		if (suffixLeaf.empty() || SubgraphGetLeaf(path.c_str()) != suffixLeaf) {
+			return {};
+		}
+		return path;
+	}
+
 	// Perspective for anim-log entries. Player-graph membership is authoritative
 	// when the 1st-person graph index has been learned; otherwise fall back to
 	// the path marker rule (contains "_1stperson" => 1st person).
@@ -3205,8 +3234,22 @@ namespace
 			}
 			// If the suffix changed for this clipGen pointer (engine reused the slot for a
 			// different logical clip), the cached "original" is now stale — clear it so the
-			// new original gets captured below.
+			// new original gets captured below. The cached real path may be stale too —
+			// but only drop it when its leaf doesn't match the NEW suffix, because
+			// GetClipSuffixFromContext above may have just cached a fresh, correct
+			// resolution for this activation (Source S).
 			if (suffixChanged) {
+				if (DisplayPathForEntry(a_this, suffix).empty()) {
+					{
+						std::unique_lock plock(s_clipRealPathMutex);
+						s_clipRealPathCache.erase(a_this);
+					}
+					{
+						std::unique_lock slock(s_clipRealPathStateMutex);
+						s_clipRealPathAuthoritative.erase(a_this);
+						s_clipRealPathAttempts.erase(a_this);
+					}
+				}
 				std::unique_lock olock(s_originalAnimMutex);
 				s_originalAnimMap.erase(a_this);
 				std::unique_lock alock(s_annotStateMutex);
@@ -3255,17 +3298,17 @@ namespace
 				//  2. The clip's authored animation path (animationName — valid at
 				//     Activate time; this is the full authored path, e.g.
 				//     "Actors\Character\Animations\default\neutral\eyeblinkfull.hkx")
-				std::string displayPath;
+				// Leaf-validated: a recycled clip address may still carry the
+				// previous animation's cached path (see DisplayPathForEntry).
+				std::string displayPath = DisplayPathForEntry(a_this, suffixCopy);
 				bool authoritative = false;
-				{
-					std::shared_lock plock(s_clipRealPathMutex);
-					auto pit = s_clipRealPathCache.find(a_this);
-					if (pit != s_clipRealPathCache.end()) displayPath = pit->second;
-				}
 				{
 					std::shared_lock slock(s_clipRealPathStateMutex);
 					authoritative = s_clipRealPathAuthoritative.contains(a_this);
 				}
+				// A stale (mismatching) cached path also invalidates the
+				// authoritative flag — it belongs to the previous animation.
+				if (displayPath.empty()) authoritative = false;
 				if (displayPath.empty() || !authoritative) {
 					const char* authored = a_this->animationName.data();
 					if (authored && reinterpret_cast<uintptr_t>(authored) > 0x10000 &&
@@ -3513,12 +3556,9 @@ namespace
 					s_pendingActivateLog.erase(a_this);
 				}
 				if (AnimationLog::GetSingleton()->IsEnabled()) {
-					std::string displayPath;
-					{
-						std::shared_lock plock(s_clipRealPathMutex);
-						auto pit = s_clipRealPathCache.find(a_this);
-						if (pit != s_clipRealPathCache.end()) displayPath = pit->second;
-					}
+					// Leaf-validated against the entry's own animation — the
+					// cache may hold a path for a different animation by now.
+					const auto displayPath = DisplayPathForEntry(a_this, pendingSuffix);
 					AnimationLog::GetSingleton()->AddEntry(
 						AnimationLog::EventType::kActivate,
 						ResolveLogRefr(a_this, a_context), pendingSuffix, "", "",
@@ -4632,14 +4672,9 @@ namespace
 					}
 				}
 				if (!pendingSuffix.empty() && AnimationLog::GetSingleton()->IsEnabled()) {
-					std::string displayPath;
-					{
-						std::shared_lock plock(s_clipRealPathMutex);
-						auto pit = s_clipRealPathCache.find(a_this);
-						if (pit != s_clipRealPathCache.end()) {
-							displayPath = pit->second;
-						}
-					}
+					// Leaf-validated against the entry's own animation — the
+					// cache may hold a path for a different animation by now.
+					const auto displayPath = DisplayPathForEntry(a_this, pendingSuffix);
 					AnimationLog::GetSingleton()->AddEntry(
 						AnimationLog::EventType::kActivate,
 						ResolveLogRefr(a_this, a_context),
@@ -5374,6 +5409,27 @@ namespace
 		// cycle (which has just completed) so activeNodes is stable.
 		if (s_gameFullyLoaded.load() && s_lookupBuilt) {
 			PollPlayerGraphClips();
+
+			// Register every loaded (high-process) actor's graph characters in
+			// the character->refr cache so GetRefrFromContext can attribute
+			// NPC/creature clips in the Animation Log. Without this, only the
+			// player was ever registered and every other actor showed as
+			// "Unknown (0x00000000)". Every 30 frames (~0.5s) is fresh enough:
+			// an actor's graphs persist for its lifetime, so at worst a newly
+			// spawned actor's first few entries are unattributed.
+			static uint64_t s_lastActorRegisterFrame = 0;
+			const auto curFrame = s_currentFrame.load(std::memory_order_relaxed);
+			if (curFrame - s_lastActorRegisterFrame >= 30) {
+				s_lastActorRegisterFrame = curFrame;
+				if (auto* processLists = OAR_RE::ProcessLists::GetSingleton()) {
+					for (auto& handle : processLists->highActorHandles) {
+						if (auto actorPtr = handle.get()) {
+							RegisterActorCharacter(actorPtr.get());
+						}
+					}
+				}
+				RegisterActorCharacter(RE::PlayerCharacter::GetSingleton());
+			}
 		}
 
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
