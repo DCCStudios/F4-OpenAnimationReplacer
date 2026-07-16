@@ -876,7 +876,10 @@ namespace
 	// frames until the walk succeeds or the attempt budget runs out.
 	//   - s_clipRealPathAuthoritative: clips whose cached path came from the
 	//     subgraph walk (as opposed to the authored-name display fallback).
-	//   - s_clipRealPathAttempts: failed Update-time attempts per clip.
+	//   - s_clipRealPathAttempts: per-clip frame counter for the direct-path
+	//     defer gate in hkbClipGenerator_Update — while a player clip's real
+	//     path is unresolved, replacement is held off until this counter
+	//     exhausts its budget (then leaf matching applies as the fallback).
 	//   - s_pendingActivateLog: kActivate anim-log entries held back until the
 	//     path resolves (or attempts are exhausted), so the log shows the real
 	//     on-disk path and correct 1st/3rd person tag instead of the authored
@@ -3238,7 +3241,22 @@ namespace
 				// including whenever the toggle is off.
 				std::string activeSuffix = DirectSuffixFromCachedPath(a_this);
 				if (activeSuffix.empty()) {
-					activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+					// Direct path matching: for clips in the PLAYER's graphs the
+					// per-frame poll resolves the real on-disk path within a few
+					// frames. Pre-swapping on the authored/leaf-derived guess can
+					// pick the WRONG submod (a bare-leaf registration hijacks
+					// folder-scoped animations — the '1911 Idle Empty' bug), so
+					// skip the pre-swap; the Update hook installs the correct
+					// replacement once the poll has resolved the path (see the
+					// direct-path defer gate there). Everything else (toggle off,
+					// non-player actors, unattributable clips) keeps the
+					// leaf-fallback pre-swap.
+					const bool deferForDirectPath =
+						Settings::GetSingleton()->bDirectPathMatching &&
+						PlayerGraphIndexForClip(a_this, a_context) >= 0;
+					if (!deferForDirectPath) {
+						activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+					}
 				}
 				if (!activeSuffix.empty()) {
 					// Check if this suffix has a registered replacement at all
@@ -3822,6 +3840,118 @@ namespace
 		}
 
 		if (suffix.empty()) return;
+
+		// ===== Direct-path defer gate =====
+		// For the first frames after Activate the cached suffix is only the
+		// authored/leaf-derived GUESS (the subgraph walk fails during graph
+		// transitions). Matching against that guess can install the WRONG
+		// submod's file: a bare-leaf registration (files at the submod root)
+		// hijacks folder-scoped animations — e.g. '1911 Idle Empty' registered
+		// under 'wpnidleready' replacing a clip whose real path is
+		// '1911anims\wpnidleready.hkx' (which has no registered replacement).
+		// Worse, once installed, EnsureDirectSuffixForClip refuses to re-key
+		// the clip (by design — re-keying mid-replacement desyncs restore
+		// state), so the wrong file stays locked in permanently.
+		//
+		// The per-frame poll can't help here: it only sees a fresh clip at the
+		// END of the frame, after this Update already ran. And Activate-time
+		// attribution (PlayerGraphIndexForClip) fails while the graph is
+		// mid-transition. So do the work synchronously HERE — at Update time
+		// the clip's nodeInfo is assigned, so both the player-graph membership
+		// test and the subgraph path resolution succeed:
+		//   1. Attribute the clip to a player root graph (retry briefly).
+		//   2. Player clip: resolve the REAL path now and match against its
+		//      exact suffix; if resolution fails (graph still rebuilding),
+		//      hold off for a short frame budget, then fall back to leaf
+		//      matching (the documented fallback for unresolvable clips).
+		//   3. Non-player clip (attribution exhausted): keep instant leaf
+		//      matching — NPC clips have no swap array to resolve against.
+		// Skipped when one of OUR replacements is already installed: the
+		// suffix was validated on a previous frame, and the maintenance logic
+		// below (annotation firing, restore-on-condition-fail) must keep
+		// running. Also skipped when no replacement is registered for the
+		// current guess — the match below exits as NoMatch anyway, so the
+		// attribution/resolution cost would buy nothing.
+		if (Settings::GetSingleton()->bDirectPathMatching) {
+			bool matchPossible = false;
+			{
+				std::shared_lock rlock(s_nameLookupMutex);
+				if (suffix.size() > 6 && suffix.compare(0, 6, "multi:") == 0) {
+					matchPossible = s_leafToFullSuffixes.find(suffix.substr(6)) != s_leafToFullSuffixes.end();
+				} else {
+					matchPossible = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
+				}
+			}
+			bool authoritative = false;
+			if (matchPossible) {
+				std::shared_lock slock(s_clipRealPathStateMutex);
+				authoritative = s_clipRealPathAuthoritative.contains(a_this);
+			}
+			if (matchPossible && !authoritative) {
+				auto** slotNow = a_this->GetAnimationSlot();
+				const bool ourInstalled = slotNow && *slotNow && cache->IsOurReplacement(*slotNow);
+				if (!ourInstalled) {
+					constexpr uint16_t kDirectPathDeferFrames = 20;  // resolution budget (player clips)
+					constexpr uint16_t kAttributionAttempts = 3;     // attribution budget (unknown clips)
+
+					uint16_t attemptsNow = 0;
+					{
+						std::shared_lock slock(s_clipRealPathStateMutex);
+						auto ait = s_clipRealPathAttempts.find(a_this);
+						if (ait != s_clipRealPathAttempts.end()) attemptsNow = ait->second;
+					}
+
+					bool isPlayerClip = false;
+					{
+						std::shared_lock plock(s_playerClipMutex);
+						isPlayerClip = s_playerClipGraph.find(a_this) != s_playerClipGraph.end();
+					}
+					if (!isPlayerClip && attemptsNow < kAttributionAttempts) {
+						if (const auto gi = PlayerGraphIndexForClip(a_this, a_context); gi >= 0) {
+							std::unique_lock plock(s_playerClipMutex);
+							s_playerClipGraph[a_this] = static_cast<uint8_t>(gi);
+							isPlayerClip = true;
+						}
+					}
+
+					if (isPlayerClip) {
+						// Resolve the real path NOW — the decision below must be
+						// made against the engine's ground truth, not the guess.
+						auto realPath = ResolveClipPathFromSubgraph(a_this, a_context);
+						if (!realPath.empty()) {
+							{
+								std::unique_lock plock(s_clipRealPathMutex);
+								s_clipRealPathCache[a_this] = realPath;
+							}
+							{
+								std::unique_lock slock(s_clipRealPathStateMutex);
+								s_clipRealPathAuthoritative.insert(a_this);
+								s_clipRealPathAttempts.erase(a_this);
+							}
+							EnsureDirectSuffixForClip(a_this, realPath);
+							if (auto exact = ExtractAnimSuffix(realPath); !exact.empty()) {
+								suffix = exact;  // match against the REAL path from this frame on
+							}
+						} else {
+							std::unique_lock slock(s_clipRealPathStateMutex);
+							auto& attempts = s_clipRealPathAttempts[a_this];
+							if (attempts < kDirectPathDeferFrames) {
+								++attempts;
+								return;
+							}
+						}
+					} else if (attemptsNow < kAttributionAttempts) {
+						// Attribution unknown (graph mid-transition) — hold off
+						// briefly rather than risk a wrong leaf-guess install.
+						std::unique_lock slock(s_clipRealPathStateMutex);
+						++s_clipRealPathAttempts[a_this];
+						return;
+					}
+					// Attribution exhausted: non-player clip — fall through to
+					// normal (leaf) matching.
+				}
+			}
+		}
 
 		// Diagnostic: log unique suffixes
 		{
