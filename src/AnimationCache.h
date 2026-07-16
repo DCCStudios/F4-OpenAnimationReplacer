@@ -40,12 +40,26 @@ public:
 		std::vector<uint8_t> runtimeStruct;
 		RE::hkaAnimation* runtimeAnimation{ nullptr };
 		RE::hkaAnimation* gameOriginal{ nullptr };
+
+		// Per-file identity: the SubMod that provided this file (opaque tag,
+		// only compared — never dereferenced) and its priority at load time.
+		// Several SubMods can replace the same original path, so one suffix
+		// maps to a LIST of cached files; lookups select by owner so the
+		// condition-winning SubMod's actual file is the one that plays.
+		const void* owner{ nullptr };
+		int32_t priority{ 0 };
 	};
 
-	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath);
+	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
+		const void* a_owner = nullptr, int32_t a_priority = 0);
 	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix) const;
-	RE::hkaAnimation* GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim);
-	const std::vector<ParsedAnnotation>* GetAnnotations(const std::string& a_suffix) const;
+	// a_owner: the winning SubMod (from condition evaluation). Selects that
+	// SubMod's file under the suffix; falls back to the highest-priority file
+	// when null or not found (pre-swap and legacy callers).
+	RE::hkaAnimation* GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim,
+		const void* a_owner = nullptr);
+	const std::vector<ParsedAnnotation>* GetAnnotations(const std::string& a_suffix,
+		const void* a_owner = nullptr) const;
 	void SetVtableFromGame(uintptr_t a_vtable);
 	uintptr_t GetGameAnimVtable() const { return m_gameAnimVtable.load(); }
 	size_t GetCacheSize() const;
@@ -62,7 +76,13 @@ private:
 	RE::hkaAnimation* FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable);
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 
+	// Caller must hold m_mutex (shared or unique).
+	CachedAnimation* SelectEntry(const std::string& a_suffix, const void* a_owner) const;
+
 	mutable std::shared_mutex m_mutex;
-	std::unordered_map<std::string, std::unique_ptr<CachedAnimation>> m_cache;
+	// One suffix -> all files registered for it (one per SubMod replacing the
+	// same original path; variants get their own suffixes but can still
+	// collide across SubMods). Sorted by priority, highest first.
+	std::unordered_map<std::string, std::vector<std::unique_ptr<CachedAnimation>>> m_cache;
 	std::atomic<uintptr_t> m_gameAnimVtable{ 0 };
 };

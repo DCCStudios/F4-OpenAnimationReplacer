@@ -23,6 +23,7 @@ void Settings::Load()
 	bDisablePreloading            = getB("General", "bDisablePreloading", bDisablePreloading);
 	bFilterOutDuplicateAnimations = getB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	bShowWelcomeBanner            = getB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
+	bDirectPathMatching           = getB("General", "bDirectPathMatching", bDirectPathMatching);
 
 	iToggleKey   = static_cast<std::uint32_t>(ini.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
@@ -52,8 +53,8 @@ void Settings::Load()
 		iLoadClipsAddressRVA = std::strtoull(rvaStr, nullptr, 16);
 	}
 
-	logger::info("[OAR] Settings loaded: enabled={}, UI={}, async={}, animLimit={}, verbose={}, loadClipsRVA=0x{:X}",
-		bEnabled, bEnableUI, bAsyncParsing, iAnimationLimit, bVerboseLogging, iLoadClipsAddressRVA);
+	logger::info("[OAR] Settings loaded: enabled={}, UI={}, async={}, animLimit={}, verbose={}, directPathMatching={}, loadClipsRVA=0x{:X}",
+		bEnabled, bEnableUI, bAsyncParsing, iAnimationLimit, bVerboseLogging, bDirectPathMatching, iLoadClipsAddressRVA);
 }
 
 void Settings::Save()
@@ -75,6 +76,7 @@ void Settings::Save()
 	setB("General", "bDisablePreloading", bDisablePreloading);
 	setB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	setB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
+	setB("General", "bDirectPathMatching", bDirectPathMatching);
 
 	setI("UI", "iToggleKey", static_cast<int>(iToggleKey));
 	setB("UI", "bRequireShift", bRequireShift);

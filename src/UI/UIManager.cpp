@@ -781,6 +781,28 @@ LRESULT CALLBACK UIManager::HookedWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPar
 		bool isFirstPress = (a_lParam & 0x40000000) == 0;
 		auto* settings = Settings::GetSingleton();
 		bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+		auto* mainUi = UIMain::GetSingleton();
+		const bool capturingKey = mainUi && mainUi->IsCapturingToggleKey();
+
+		// Settings "Change activation key" capture: next non-modifier keypress
+		// becomes the new toggle bind. Escape cancels without closing the menu.
+		if (capturingKey && isFirstPress) {
+			if (a_wParam == VK_ESCAPE) {
+				mainUi->SetCapturingToggleKey(false);
+				return 0;
+			}
+			// Ignore pure modifiers — they are controlled by "Require Shift".
+			const bool isModifier =
+				scanCode == DIK::kLeftShift || scanCode == DIK::kRightShift ||
+				scanCode == DIK::kLeftControl || scanCode == DIK::kRightControl ||
+				scanCode == DIK::kLeftAlt || scanCode == DIK::kRightAlt ||
+				scanCode == DIK::kLeftWin || scanCode == DIK::kRightWin;
+			if (!isModifier && scanCode != 0) {
+				mainUi->ApplyCapturedToggleKey(scanCode);
+				return 0;
+			}
+			return 0;
+		}
 
 		// Toggle key — open/close the main OAR editor
 		if (isFirstPress && scanCode == settings->iToggleKey &&

@@ -65,15 +65,33 @@ namespace
 	static constexpr uint32_t kVersion11      = 0x0B;
 }
 
-bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath)
+bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
+	const void* a_owner, int32_t a_priority)
 {
 	if (!std::filesystem::exists(a_absolutePath)) {
 		logger::warn("[OAR-Cache] File not found: '{}'", a_absolutePath.string());
 		return false;
 	}
 
+	// Already cached? One suffix can hold several files (one per SubMod that
+	// replaces the same original path) — dedupe on (owner, path).
+	{
+		std::shared_lock lock(m_mutex);
+		auto it = m_cache.find(a_suffix);
+		if (it != m_cache.end()) {
+			for (auto& existing : it->second) {
+				if (existing && existing->owner == a_owner &&
+					existing->filePath == a_absolutePath.string()) {
+					return true;
+				}
+			}
+		}
+	}
+
 	auto entry = std::make_unique<CachedAnimation>();
 	entry->filePath = a_absolutePath.string();
+	entry->owner = a_owner;
+	entry->priority = a_priority;
 
 	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
 	if (!file.is_open()) {
@@ -109,14 +127,52 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		return false;
 	}
 
-	logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={} path='{}'", 
-		a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_absolutePath.string());
+	logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
+		a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
+		a_absolutePath.string());
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
 
 	std::unique_lock lock(m_mutex);
-	m_cache[a_suffix] = std::move(entry);
+	auto& files = m_cache[a_suffix];
+	// Re-check for a duplicate under the exclusive lock (the early check above
+	// ran under a shared lock).
+	for (auto& existing : files) {
+		if (existing && existing->owner == a_owner && existing->filePath == entry->filePath) {
+			return true;
+		}
+	}
+	// Keep the list priority-sorted (highest first) so index 0 is the default
+	// choice for callers that don't know the winning SubMod yet (pre-swap).
+	auto insertAt = std::ranges::find_if(files, [&](const auto& e) {
+		return !e || e->priority < entry->priority;
+	});
+	files.insert(insertAt, std::move(entry));
 	return true;
+}
+
+// Select the cached file for a suffix: the given owner's file when present,
+// otherwise the highest-priority file (index 0). Caller must hold m_mutex.
+AnimationCache::CachedAnimation* AnimationCache::SelectEntry(const std::string& a_suffix, const void* a_owner) const
+{
+	auto it = m_cache.find(a_suffix);
+	if (it == m_cache.end() || it->second.empty()) return nullptr;
+
+	if (a_owner) {
+		for (auto& entry : it->second) {
+			if (entry && entry->owner == a_owner) return entry.get();
+		}
+		// The winner's own file isn't cached under this suffix (failed to
+		// load/parse). Fall back to the highest-priority file — matches the
+		// pre-per-file-cache behavior of always having SOME file to play.
+		static std::atomic<int> s_fallbackLog{ 0 };
+		if (s_fallbackLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+			logger::warn("[OAR-Cache] No cached file for suffix '{}' owned by {:X} — using highest-priority file '{}'",
+				a_suffix, reinterpret_cast<uintptr_t>(a_owner),
+				it->second[0] ? it->second[0]->filePath : "(null)");
+		}
+	}
+	return it->second[0].get();
 }
 
 void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
@@ -126,16 +182,18 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 
 	std::shared_lock lock(m_mutex);
 	int patched = 0;
-	for (auto& [key, entry] : m_cache) {
-		if (!entry || entry->fileData.empty()) continue;
-		uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
-		for (uint32_t off : entry->vtableFixupOffsets) {
-			*reinterpret_cast<uintptr_t*>(sectionData + off) = a_vtable;
-			patched++;
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (!entry || entry->fileData.empty()) continue;
+			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
+			for (uint32_t off : entry->vtableFixupOffsets) {
+				*reinterpret_cast<uintptr_t*>(sectionData + off) = a_vtable;
+				patched++;
+			}
 		}
 	}
 	if (patched > 0) {
-		logger::info("[OAR-Cache] Retroactively patched {} vtable slots across {} cached animations",
+		logger::info("[OAR-Cache] Retroactively patched {} vtable slots across {} cached suffixes",
 			patched, m_cache.size());
 	}
 }
@@ -143,20 +201,20 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix) const
 {
 	std::shared_lock lock(m_mutex);
-	auto it = m_cache.find(a_suffix);
-	if (it != m_cache.end() && it->second) {
-		return it->second->animation;
+	if (auto* entry = SelectEntry(a_suffix, nullptr)) {
+		return entry->animation;
 	}
 	return nullptr;
 }
 
-RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim)
+RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim,
+	const void* a_owner)
 {
 	std::unique_lock lock(m_mutex);
-	auto it = m_cache.find(a_suffix);
-	if (it == m_cache.end() || !it->second) return nullptr;
+	auto* selected = SelectEntry(a_suffix, a_owner);
+	if (!selected) return nullptr;
 
-	auto& entry = *it->second;
+	auto& entry = *selected;
 
 	// If clone exists but was built from a DIFFERENT game animation, the game reloaded
 	// animations (weapon switch). Rebuild from fresh data to avoid stale struct fields.
@@ -308,18 +366,22 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	entry.runtimeAnimation = reinterpret_cast<RE::hkaAnimation*>(cloneBase);
 	entry.gameOriginal = a_gameAnim;
 
-	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X}",
-		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim));
+	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}'",
+		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim),
+		entry.filePath);
 
 	return entry.runtimeAnimation;
 }
 
-const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotations(const std::string& a_suffix) const
+const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotations(const std::string& a_suffix,
+	const void* a_owner) const
 {
 	std::shared_lock lock(m_mutex);
-	auto it = m_cache.find(a_suffix);
-	if (it != m_cache.end() && it->second && !it->second->annotations.empty()) {
-		return &it->second->annotations;
+	// Annotations must come from the SAME file that is playing — never fall
+	// back to another SubMod's annotations, so require the selected entry to
+	// have parsed annotations itself (empty = no manual firing for this file).
+	if (auto* entry = SelectEntry(a_suffix, a_owner); entry && !entry->annotations.empty()) {
+		return &entry->annotations;
 	}
 	return nullptr;
 }
@@ -327,15 +389,21 @@ const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotati
 size_t AnimationCache::GetCacheSize() const
 {
 	std::shared_lock lock(m_mutex);
-	return m_cache.size();
+	size_t total = 0;
+	for (auto& [key, files] : m_cache) {
+		total += files.size();
+	}
+	return total;
 }
 
 bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 {
 	if (!a_anim) return false;
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, entry] : m_cache) {
-		if (entry && entry->runtimeAnimation == a_anim) return true;
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (entry && entry->runtimeAnimation == a_anim) return true;
+		}
 	}
 	return false;
 }
@@ -344,9 +412,11 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 {
 	if (!a_replacement) return nullptr;
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, entry] : m_cache) {
-		if (entry && entry->runtimeAnimation == a_replacement && entry->gameOriginal) {
-			return entry->gameOriginal;
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (entry && entry->runtimeAnimation == a_replacement && entry->gameOriginal) {
+				return entry->gameOriginal;
+			}
 		}
 	}
 	return nullptr;
@@ -356,12 +426,14 @@ void AnimationCache::InvalidateRuntimeClones()
 {
 	std::unique_lock lock(m_mutex);
 	int count = 0;
-	for (auto& [key, entry] : m_cache) {
-		if (entry && entry->runtimeAnimation) {
-			entry->runtimeAnimation = nullptr;
-			entry->runtimeStruct.clear();
-			entry->gameOriginal = nullptr;
-			count++;
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (entry && entry->runtimeAnimation) {
+				entry->runtimeAnimation = nullptr;
+				entry->runtimeStruct.clear();
+				entry->gameOriginal = nullptr;
+				count++;
+			}
 		}
 	}
 	if (count > 0) {

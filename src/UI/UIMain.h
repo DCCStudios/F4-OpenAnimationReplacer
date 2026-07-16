@@ -18,6 +18,13 @@ public:
 		return &singleton;
 	}
 
+	// True while the Settings panel is waiting for the next keypress to
+	// rebind the UI toggle hotkey. WndProc checks this so the press is
+	// captured as the new bind instead of toggling/closing the menu.
+	bool IsCapturingToggleKey() const { return capturingToggleKey; }
+	void SetCapturingToggleKey(bool a_capturing) { capturingToggleKey = a_capturing; }
+	void ApplyCapturedToggleKey(std::uint32_t a_dik);
+
 protected:
 	void DrawContents() override;
 	ImGuiWindowFlags GetWindowFlags() const override;
@@ -46,6 +53,7 @@ private:
 	uint32_t evalTargetFormID{ 0x14 };
 	SubMod* selectedSubMod{ nullptr };
 	bool showSettings{ false };
+	bool capturingToggleKey{ false };
 	float firstColumnPercent{ 0.45f };
 	std::string copiedConditionJson;
 

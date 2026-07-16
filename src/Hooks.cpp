@@ -933,6 +933,11 @@ namespace
 	{
 		float prevLocalTime{ -1.f };
 		std::string activeSuffix;
+		// The SubMod whose file's annotations are being tracked. Two SubMods can
+		// register the SAME suffix with different files (per-file cache) — when
+		// the winner flips mid-clip, lastFiredIndex would otherwise index into a
+		// different annotation list.
+		const void* activeOwner{ nullptr };
 		int32_t lastFiredIndex{ -1 };
 	};
 	static std::shared_mutex s_annotStateMutex;
@@ -1707,6 +1712,11 @@ namespace
 			auto suffix = ExtractAnimSuffix(mapKey);
 			if (suffix.empty()) continue;
 
+			// Load EVERY SubMod's file for this original path. The cache keys
+			// entries per (suffix, owning SubMod), so the Update hook can play
+			// the condition-winning SubMod's actual file — previously only one
+			// file per suffix was cached and a lower-priority mod's file could
+			// play under a higher-priority mod's name (or vice versa).
 			for (auto& info : replacementInfos) {
 				if (info.absoluteDiskPath.empty()) {
 					logger::warn("[OAR-Preload] No absolute path for suffix '{}'", suffix);
@@ -1714,12 +1724,12 @@ namespace
 					continue;
 				}
 
-				if (cache->LoadAnimation(suffix, info.absoluteDiskPath)) {
+				if (cache->LoadAnimation(suffix, info.absoluteDiskPath, info.parentSubMod,
+						info.parentSubMod ? info.parentSubMod->GetPriority() : 0)) {
 					loaded++;
 				} else {
 					failed++;
 				}
-				break;
 			}
 		}
 
@@ -2261,6 +2271,49 @@ namespace
 	//   2. Perspective: the root graph the clip lives in tells 1st vs 3rd
 	//      person directly (learned via the first resolved _1stperson path).
 	// ======================================================================
+	// Direct path matching: re-key a clip's matching suffix to the exact suffix
+	// of its resolved REAL path. At Activate time the subgraph walk usually
+	// fails (the graph is mid-rebuild), so the cached suffix was derived from
+	// the authored template name (e.g. "44pistol\wpnreload") and possibly
+	// leaf-bridged; once the per-frame poll has resolved the true on-disk path,
+	// the Update hook must match replacements against THAT path instead.
+	// No-op when: the toggle is off, the suffix already matches, or one of OUR
+	// replacements is currently installed in the clip's animation slot — the
+	// restore/tracking state is keyed by the old suffix and re-keying
+	// mid-replacement would desync it (the re-key happens on a later poll pass
+	// once the replacement is uninstalled, or on the clip's next activation).
+	static void EnsureDirectSuffixForClip(RE::hkbClipGenerator* a_clip, const std::string& a_realPath)
+	{
+		if (!Settings::GetSingleton()->bDirectPathMatching || a_realPath.empty()) return;
+
+		const auto exactSuffix = ExtractAnimSuffix(a_realPath);
+		if (exactSuffix.empty()) return;
+
+		{
+			std::shared_lock lock(s_clipSuffixMutex);
+			auto it = s_clipSuffixCache.find(a_clip);
+			if (it != s_clipSuffixCache.end() && it->second == exactSuffix) return;
+		}
+
+		if (auto** slot = a_clip->GetAnimationSlot(); slot && *slot &&
+			AnimationCache::GetSingleton()->IsOurReplacement(*slot)) {
+			return;
+		}
+
+		std::string oldSuffix;
+		{
+			std::unique_lock lock(s_clipSuffixMutex);
+			auto it = s_clipSuffixCache.find(a_clip);
+			if (it != s_clipSuffixCache.end()) oldSuffix = it->second;
+			s_clipSuffixCache[a_clip] = exactSuffix;
+		}
+		static std::atomic<int> s_rekeyLog{ 0 };
+		if (s_rekeyLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+			logger::info("[OAR-DirectPath] Re-keyed clip {:X} suffix '{}' -> '{}' (real path '{}')",
+				reinterpret_cast<uintptr_t>(a_clip), oldSuffix, exactSuffix, a_realPath);
+		}
+	}
+
 	static void PollPlayerGraphClips()
 	{
 		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
@@ -2358,10 +2411,26 @@ namespace
 					s_playerClipGraph[clip] = static_cast<uint8_t>(gi);
 				}
 
-				// Already resolved authoritatively — nothing more to do.
+				// Already resolved authoritatively — just keep the matching suffix
+				// keyed to the real path (a re-Activate may have overwritten it
+				// with the authored/leaf-bridged suffix when the subgraph walk
+				// failed at Activate time), then move on.
 				{
-					std::shared_lock slock(s_clipRealPathStateMutex);
-					if (s_clipRealPathAuthoritative.contains(clip)) continue;
+					bool authoritative = false;
+					{
+						std::shared_lock slock(s_clipRealPathStateMutex);
+						authoritative = s_clipRealPathAuthoritative.contains(clip);
+					}
+					if (authoritative) {
+						std::string cachedPath;
+						{
+							std::shared_lock plock(s_clipRealPathMutex);
+							auto pit = s_clipRealPathCache.find(clip);
+							if (pit != s_clipRealPathCache.end()) cachedPath = pit->second;
+						}
+						EnsureDirectSuffixForClip(clip, cachedPath);
+						continue;
+					}
 				}
 
 				// Leaf from the clip's authored animation path; if the engine
@@ -2430,6 +2499,9 @@ namespace
 						s_clipRealPathAuthoritative.insert(clip);
 						s_clipRealPathAttempts.erase(clip);
 					}
+					// Direct path matching: switch the clip's matching suffix to
+					// the real path's exact suffix from now on (see the helper).
+					EnsureDirectSuffixForClip(clip, path);
 					// Learn which player root graph is the 1st-person one from
 					// the first resolved path carrying the _1stperson marker.
 					if (s_firstPersonGraphIndex.load(std::memory_order_relaxed) < 0 &&
@@ -2645,6 +2717,30 @@ namespace
 		return ClassifyPerspectiveFromPath(a_path);
 	}
 
+	// Direct path matching: the exact suffix from a clip's previously resolved
+	// (authoritative) real path. Leaf-validated against the clip's current
+	// authored animation name — a recycled clip-generator address can carry a
+	// stale cache entry for a different animation. Returns empty when the
+	// toggle is off or no validated path is available.
+	static std::string DirectSuffixFromCachedPath(RE::hkbClipGenerator* a_clip)
+	{
+		if (!Settings::GetSingleton()->bDirectPathMatching) return {};
+		{
+			std::shared_lock slock(s_clipRealPathStateMutex);
+			if (!s_clipRealPathAuthoritative.contains(a_clip)) return {};
+		}
+		std::string cachedPath;
+		{
+			std::shared_lock plock(s_clipRealPathMutex);
+			auto it = s_clipRealPathCache.find(a_clip);
+			if (it != s_clipRealPathCache.end()) cachedPath = it->second;
+		}
+		if (cachedPath.empty()) return {};
+		const auto clipLeaf = SubgraphGetLeaf(a_clip->animationName.data());
+		if (clipLeaf.empty() || SubgraphGetLeaf(cachedPath.c_str()) != clipLeaf) return {};
+		return ExtractAnimSuffix(cachedPath);
+	}
+
 	static std::string GetClipSuffixFromContext(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		static int s_sourceLogCount = 0;
@@ -2681,9 +2777,17 @@ namespace
 					if (registered) {
 						return suffix;
 					}
-					// Not registered under the exact real-path suffix — bridge through
-					// the leaf table so existing replacer layouts keep working while the
-					// log above shows the authoritative path for verification.
+					// Not registered under the exact real-path suffix.
+					// Direct path matching (default): the real path is the engine's
+					// ground truth — if no replacement is registered under it, there
+					// is NO replacement for this clip. Leaf matching stays available
+					// only as a fallback for clips whose real path can't be resolved
+					// (it never reaches here in that case — Source S failed).
+					if (Settings::GetSingleton()->bDirectPathMatching) {
+						return suffix;
+					}
+					// Legacy behavior: bridge through the leaf table so replacer
+					// layouts that only match by leaf name keep working.
 					auto resolved = ResolveOrLeafFallback(suffix);
 					if (resolved != suffix && s_sourceLogCount < 80) {
 						logger::info("[OAR-Suffix] SourceS-Subgraph: leaf-bridged '{}' -> '{}'",
@@ -2692,6 +2796,26 @@ namespace
 					}
 					return resolved;
 				}
+			}
+		}
+
+		// ===== Source S': previously resolved real path (per-frame player poll) =====
+		// The fresh subgraph walk above usually FAILS at Activate time (the graph
+		// is mid-rebuild), but the per-frame poll may have already resolved this
+		// clip's real path on an earlier frame. With direct path matching enabled,
+		// reuse it so a re-Activate doesn't silently fall back to the authored
+		// template name (and through it, to leaf matching). Leaf-validated: a
+		// recycled clip-generator address can carry a stale cache entry for a
+		// different animation — only trust the path when its leaf matches the
+		// clip's current authored leaf.
+		{
+			auto suffix = DirectSuffixFromCachedPath(a_this);
+			if (!suffix.empty()) {
+				if (s_sourceLogCount < 80) {
+					logger::info("[OAR-Suffix] SourceS-Cached: suffix='{}' (poll-resolved real path)", suffix);
+					s_sourceLogCount++;
+				}
+				return suffix;
 			}
 		}
 
@@ -3059,6 +3183,43 @@ namespace
 		return {};
 	}
 
+	// Evaluate candidates in priority order (the lookup vectors are pre-sorted
+	// highest priority first) and return the first whose SubMod is enabled and
+	// whose conditions pass — an empty condition set passes unconditionally.
+	// Returns nullptr when nothing matches. Mirrors the Update hook's winner
+	// selection loop so the Activate-time pre-swap picks the SAME file that
+	// Update will install, instead of guessing the highest-priority one.
+	static ReplacementAnimFileInfo* EvaluateWinningInfo(
+		const std::vector<ReplacementAnimFileInfo*>& a_candidates,
+		RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen)
+	{
+		// A non-interruptible SubMod already active on this clip stays the winner
+		// (the Update hook skips re-evaluation for it) — honor that here so the
+		// pre-swap doesn't build the control from a different file on re-Activate.
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto smIt = s_activeSubModMap.find(a_clipGen);
+			if (smIt != s_activeSubModMap.end() && smIt->second &&
+				!smIt->second->IsInterruptible() && !smIt->second->IsDisabled()) {
+				for (auto* info : a_candidates) {
+					if (info && info->parentSubMod == smIt->second) return info;
+				}
+			}
+		}
+
+		for (auto* info : a_candidates) {
+			if (!info || !info->parentSubMod) continue;
+			if (info->parentSubMod->IsDisabled()) continue;
+			auto* cs = info->parentSubMod->GetConditionSet();
+			if (!cs || cs->IsEmpty()) return info;
+			if (!a_refr) continue;
+			try {
+				if (info->parentSubMod->EvaluateConditions(a_refr, a_clipGen)) return info;
+			} catch (...) { continue; }
+		}
+		return nullptr;
+	}
+
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
@@ -3071,7 +3232,14 @@ namespace
 		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt) {
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
-				std::string activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+				// Direct path matching: prefer the exact suffix of the clip's
+				// poll-resolved real path (leaf-validated). Falls back to the
+				// authored-name/leaf-matching derivation when unavailable —
+				// including whenever the toggle is off.
+				std::string activeSuffix = DirectSuffixFromCachedPath(a_this);
+				if (activeSuffix.empty()) {
+					activeSuffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
+				}
 				if (!activeSuffix.empty()) {
 					// Check if this suffix has a registered replacement at all
 					bool hasRegistered = false;
@@ -3092,18 +3260,56 @@ namespace
 							auto* cachePre = AnimationCache::GetSingleton();
 							RE::hkaAnimation* replacement = nullptr;
 
+							// Evaluate conditions NOW (same loop as the Update hook) so the
+							// animation control is built from the winning SubMod's file rather
+							// than a highest-priority guess that Update corrects later. When
+							// no winner can be determined here (actor unresolvable, or all
+							// conditions currently false), fall back to the highest-priority
+							// file — pre-swapping SOMETHING keeps the control built from a
+							// clone with nulled annotation tracks, which is the crash guard
+							// this pre-swap exists for, and covers conditions that flip true
+							// a few frames into the clip.
+							RE::TESObjectREFR* refrPre = GetRefrFromContext(a_context);
+							if (!refrPre) refrPre = RE::PlayerCharacter::GetSingleton();
+
 							if (activeSuffix.size() > 6 && activeSuffix.substr(0, 6) == "multi:") {
 								std::string leafName = activeSuffix.substr(6);
 								std::shared_lock rlock(s_nameLookupMutex);
 								auto leafIt = s_leafToFullSuffixes.find(leafName);
 								if (leafIt != s_leafToFullSuffixes.end()) {
+									// Pass 1: first suffix (most specific first — the vector is
+									// pre-sorted) with a condition-passing winner.
 									for (const auto& fullSuffix : leafIt->second) {
-										replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
-										if (replacement) break;
+										auto candIt = s_suffixToInfos.find(fullSuffix);
+										if (candIt == s_suffixToInfos.end()) continue;
+										if (auto* winner = EvaluateWinningInfo(candIt->second, refrPre, a_this)) {
+											replacement = cachePre->GetOrBuildRuntimeAnim(
+												fullSuffix, *animSlotPre, winner->parentSubMod);
+											if (replacement) break;
+										}
+									}
+									// Pass 2 (fallback): no winner anywhere — old behavior, first
+									// suffix with any cached file.
+									if (!replacement) {
+										for (const auto& fullSuffix : leafIt->second) {
+											replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
+											if (replacement) break;
+										}
 									}
 								}
 							} else {
-								replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre);
+								ReplacementAnimFileInfo* winner = nullptr;
+								{
+									std::shared_lock rlock(s_nameLookupMutex);
+									auto candIt = s_suffixToInfos.find(activeSuffix);
+									if (candIt != s_suffixToInfos.end()) {
+										winner = EvaluateWinningInfo(candIt->second, refrPre, a_this);
+									}
+								}
+								// winner==nullptr falls back to the highest-priority file inside
+								// the cache (owner=nullptr selects entries[0]).
+								replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre,
+									winner ? winner->parentSubMod : nullptr);
 							}
 
 							if (replacement) {
@@ -3597,16 +3803,21 @@ namespace
 		}
 
 		if (suffix.empty()) {
-			const char* clipName = a_this->animationName.data();
-			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
-				suffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
-				// Backfill the cache so Generate can find this clip's suffix later.
-				// Clips that missed Activate (already active at hook install time) are
-				// caught here.
-				if (!suffix.empty()) {
-					std::unique_lock lock(s_clipSuffixMutex);
-					s_clipSuffixCache[a_this] = suffix;
+			// Direct path matching first: the per-frame poll may have already
+			// resolved this clip's real path even though Activate was missed.
+			suffix = DirectSuffixFromCachedPath(a_this);
+			if (suffix.empty()) {
+				const char* clipName = a_this->animationName.data();
+				if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
+					suffix = ResolveOrLeafFallback(ExtractAnimSuffix(std::string(clipName)));
 				}
+			}
+			// Backfill the cache so Generate can find this clip's suffix later.
+			// Clips that missed Activate (already active at hook install time) are
+			// caught here.
+			if (!suffix.empty()) {
+				std::unique_lock lock(s_clipSuffixMutex);
+				s_clipSuffixCache[a_this] = suffix;
 			}
 		}
 
@@ -4085,7 +4296,11 @@ namespace
 			}
 
 			const std::string& cacheSuffix = variantSuffix.empty() ? resolvedSuffix : variantSuffix;
-			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim);
+			// Select the winning SubMod's own file under this suffix — several
+			// SubMods can register the same suffix (and variant suffixes can
+			// collide across SubMods too), each with a different .hkx.
+			const void* winningOwner = winningInfo ? winningInfo->parentSubMod : nullptr;
+			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim, winningOwner);
 			bool bReplaceAnnot = winningInfo && winningInfo->parentSubMod ?
 				winningInfo->parentSubMod->GetReplaceAnnotations() : true;
 
@@ -4319,7 +4534,9 @@ namespace
 		// Only fires when ReplaceAnnotations is enabled for the submod (or forced for track filters).
 		if (bReplaceAnnot) {
 			const auto& annotSuffix = cacheSuffix;
-			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix);
+			// Same owner selection as the animation itself — the fired
+			// annotations must come from the file that is actually playing.
+			auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(annotSuffix, winningOwner);
 			if (annotations && !annotations->empty() && refr) {
 				float localTime = a_this->GetLocalTime();
 				std::vector<std::string> toFire;
@@ -4328,8 +4545,9 @@ namespace
 					std::unique_lock alock(s_annotStateMutex);
 					auto& astate = s_annotStateMap[a_this];
 
-					if (astate.activeSuffix != annotSuffix) {
+					if (astate.activeSuffix != annotSuffix || astate.activeOwner != winningOwner) {
 						astate.activeSuffix = annotSuffix;
+						astate.activeOwner = winningOwner;
 						astate.prevLocalTime = 0.f;
 						astate.lastFiredIndex = -1;
 						static int s_annotInitLog = 0;

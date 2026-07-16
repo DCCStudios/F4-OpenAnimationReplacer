@@ -43,7 +43,12 @@ void UIMain::DrawContents()
 	DrawTabBar();
 	DrawBottomBar();
 
-	if (showSettings) DrawSettingsPanel();
+	if (showSettings) {
+		DrawSettingsPanel();
+	} else {
+		// Closing Settings (button or window X) cancels an in-progress rebind.
+		capturingToggleKey = false;
+	}
 }
 
 void UIMain::DrawFilterBar()
@@ -1532,6 +1537,16 @@ void UIMain::DrawBottomBar()
 	if (ImGui::SmallButton("Settings")) showSettings = !showSettings;
 }
 
+void UIMain::ApplyCapturedToggleKey(std::uint32_t a_dik)
+{
+	auto* settings = Settings::GetSingleton();
+	settings->iToggleKey = a_dik;
+	settings->Save();
+	capturingToggleKey = false;
+	logger::info("[OAR-UI] Toggle key rebound to DIK 0x{:X} ({})",
+		a_dik, UICommon::DIKCodeToName(a_dik));
+}
+
 void UIMain::DrawSettingsPanel()
 {
 	ImGui::SetNextWindowSize(ImVec2(350, 500), ImGuiCond_FirstUseEver);
@@ -1545,11 +1560,54 @@ void UIMain::DrawSettingsPanel()
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "General");
 	dirty |= ImGui::Checkbox("Enabled", &settings->bEnabled);
+	dirty |= ImGui::Checkbox("Direct Path Matching", &settings->bDirectPathMatching);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Match replacements against the clip's resolved on-disk animation path\n"
+			"(e.g. Weapons\\SCAR\\WPNReload.hkx) instead of by leaf file name.\n"
+			"Leaf-name matching is only used as a fallback for clips whose real\n"
+			"path cannot be resolved. Disable to restore the legacy leaf-matching\n"
+			"behavior everywhere.");
+	}
 	dirty |= ImGui::Checkbox("Verbose Logging", &settings->bVerboseLogging);
 
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "UI");
+
+	// Toggle hotkey — click the button, then press the new key. Escape cancels.
+	{
+		std::string currentLabel;
+		if (settings->bRequireShift) currentLabel += "Shift+";
+		currentLabel += UICommon::DIKCodeToName(settings->iToggleKey);
+
+		ImGui::TextUnformatted("Activation Key");
+		ImGui::SameLine();
+		UICommon::HelpMarker(
+			"Hotkey that opens and closes the OAR editor overlay.\n"
+			"Click Change, then press the new key. Escape cancels.\n"
+			"Default is F2 (no Shift required).");
+
+		if (capturingToggleKey) {
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.35f, 0.1f, 1.0f));
+			if (ImGui::Button("Press a key... (Esc to cancel)##toggleKey")) {
+				capturingToggleKey = false;
+			}
+			ImGui::PopStyleColor();
+		} else {
+			std::string btn = "Change (" + currentLabel + ")##toggleKey";
+			if (ImGui::Button(btn.c_str())) {
+				capturingToggleKey = true;
+			}
+		}
+
+		dirty |= ImGui::Checkbox("Require Shift", &settings->bRequireShift);
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("When enabled, Shift must be held together with the activation key.");
+		}
+
+		ImGui::TextDisabled("Current: %s", currentLabel.c_str());
+	}
 
 	{
 		bool wasPausing = settings->bPauseOnMenuOpen;

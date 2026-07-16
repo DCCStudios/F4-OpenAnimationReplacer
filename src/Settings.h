@@ -19,8 +19,20 @@ public:
 	bool  bFilterOutDuplicateAnimations{ true };
 	bool  bShowWelcomeBanner{ true };
 
-	std::uint32_t iToggleKey{ 0x18 };
-	bool  bRequireShift{ true };
+	// Direct path matching (default). When true, a clip whose REAL on-disk
+	// animation path has been resolved (subgraph swap-array walk / per-frame
+	// player poll) is matched against replacements by that exact path suffix
+	// only — leaf-name matching is disabled for it, so a mod registered under
+	// "scar\wpnreload" can no longer be applied to e.g. a 10mm reload just
+	// because the leaf name matches. Leaf matching remains the FALLBACK for
+	// clips whose real path could not be resolved (heuristic sources).
+	// When false, the legacy leaf-matching behavior is used everywhere.
+	bool  bDirectPathMatching{ true };
+
+	// DIK scan code for the UI toggle hotkey. Default 0x3C = F2.
+	std::uint32_t iToggleKey{ 0x3C };
+	// When true, Shift must also be held with iToggleKey. Default off so F2 alone opens the UI.
+	bool  bRequireShift{ false };
 	bool  bPauseOnMenuOpen{ true };
 	int   iEditorMode{ 0 };
 

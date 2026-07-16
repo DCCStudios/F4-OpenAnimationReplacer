@@ -65,4 +65,7 @@ namespace UICommon
 	bool FuzzyMatch(const char* a_pattern, const char* a_str);
 
 	std::string ShortenAnimPath(const std::string& a_path);
+
+	// DirectInput (DIK) scan-code helpers used by the toggle hotkey UI.
+	const char* DIKCodeToName(std::uint32_t a_dik);
 }

@@ -36,7 +36,8 @@ Use it to replace weapon reloads, idles, sprints, and other gameplay animations 
 | **SubMod** | One logical replacement rule set (conditions + settings + `.hkx` files) |
 | **Replacement animation** | A `.hkx` file that replaces a vanilla animation when conditions pass |
 | **Suffix** | Internal matching key -- the part of an animation path after `Animations\` minus the extension (e.g. `scar\wpnreload`). OAR matches replacements to playing clips by suffix. |
-| **Leaf fallback** | When no exact suffix match exists, OAR matches on filename alone (e.g. `wpnreload`). Conditions disambiguate if multiple replacements share a leaf. |
+| **Direct path matching** | Default matching method (`bDirectPathMatching=1`). OAR resolves the clip's REAL on-disk path (subgraph swap-array walk + per-frame player poll) and matches by that exact suffix. |
+| **Leaf fallback** | For clips whose real path cannot be resolved (or always, when `bDirectPathMatching=0`), OAR matches on filename alone (e.g. `wpnreload`). Conditions disambiguate if multiple replacements share a leaf. |
 | **Variant** | Multiple `.hkx` files grouped as `base`, `base_1`, `base_2`, ... with random/sequential selection |
 | **Conditions** | AND-logic rules that determine WHEN a SubMod's replacement should activate (e.g. specific weapon equipped, specific actor, in combat) |
 | **Priority** | Integer value -- when multiple SubMods match the same animation, highest priority wins |
@@ -59,9 +60,12 @@ flowchart TB
     end
 
     subgraph runtime ["Per-frame Update hook"]
-        F[Extract clip suffix from active animation] --> G{Registered replacements exist for suffix}
-        G -->|No| G2{Leaf fallback: single match on filename}
-        G2 -->|No| H[Play vanilla]
+        F[Resolve clip's real on-disk path] --> F2{Path resolved}
+        F2 -->|Yes| G{Registered replacements exist for exact path suffix}
+        F2 -->|No| F3[Heuristic suffix from authored name] --> G
+        G -->|No, path resolved| H[Play vanilla]
+        G -->|No, heuristic| G2{Leaf fallback: match on filename}
+        G2 -->|No| H
         G2 -->|Yes| I
         G -->|Yes| I[Evaluate SubMod conditions by priority]
         I --> J{Winner found}
@@ -78,15 +82,16 @@ flowchart TB
 
 ### Matching mechanism
 
-OAR uses a **suffix-based matching** system with a **leaf fallback**:
+OAR uses **direct path matching** by default, with **leaf matching as the fallback**
+(`bDirectPathMatching`, default `1` -- INI or the in-game Settings panel):
 
 1. **Suffix extraction:** From each registered `.hkx`, OAR computes a suffix by taking the path after `Animations\` and stripping the extension. Example: `scar\wpnreload`.
 
-2. **Runtime resolution:** When a clip plays, OAR extracts the same kind of suffix from the active animation using multiple sources (weapon graph path, behavior string data, idle anim data, animationName field).
+2. **Real path resolution (primary):** OAR resolves the REAL on-disk path of the playing clip from the engine's selected-subgraph data -- at clip activation when the graph is stable, and otherwise via a per-frame poll of the player's graphs (`PollPlayerGraphClips`). Example: `Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx` -> suffix `scar\wpnreload`. When the real path is known, the clip is matched against replacements registered under that **exact** suffix only -- a mod registered under `scar\wpnreload` can no longer be applied to a different weapon's reload just because the leaf name matches. If the poll resolves the path after the clip already activated, the clip's matching key is re-keyed to the exact suffix on the fly (`EnsureDirectSuffixForClip`), unless one of OAR's replacements is currently installed in the clip's slot (it re-keys on the next opportunity instead).
 
-3. **Leaf fallback:** If the full suffix (e.g. `44pistol\wpnreload`) has no registered replacement, OAR falls back to just the filename/leaf (e.g. `wpnreload`). If exactly one replacement is registered for that leaf, it matches. If multiple share it, all are evaluated via conditions.
+3. **Heuristic fallback:** For clips whose real path could NOT be resolved, OAR extracts a suffix from heuristic sources (weapon graph path, behavior string data, idle anim data, the authored `animationName` template) and applies the **leaf fallback**: if the full suffix (e.g. `44pistol\wpnreload`) has no registered replacement, it falls back to just the filename/leaf (e.g. `wpnreload`). If exactly one replacement is registered for that leaf, it matches. If multiple share it, all are evaluated via conditions. With `bDirectPathMatching=0` this legacy behavior applies to ALL clips, including ones whose real path resolved.
 
-4. **Condition evaluation:** Among candidates, SubMods are tried in priority order (highest first). The first whose conditions all pass wins.
+4. **Condition evaluation:** Among candidates, SubMods are tried in priority order (highest first). The first whose conditions all pass wins. The animation cache stores every SubMod's file separately (keyed per suffix + owning SubMod), so the winning SubMod's own `.hkx` — and its annotations — are what actually play, even when several SubMods replace the same original path.
 
 ### Data hierarchy
 
@@ -120,8 +125,8 @@ sequenceDiagram
 
     Game->>Clip: Activate vanilla hkx
     Clip->>OAR: Update each frame
-    OAR->>OAR: Extract suffix from clip context
-    OAR->>OAR: Leaf fallback if no direct match
+    OAR->>OAR: Resolve real path (subgraph walk / player poll)
+    OAR->>OAR: Exact path suffix match, or leaf fallback for unresolved clips
     OAR->>OAR: Pick winning SubMod by priority + conditions
     alt Full-body replacement
         OAR->>Cache: GetOrBuildRuntimeAnim
@@ -162,16 +167,17 @@ sequenceDiagram
 
 ### How animation matching works
 
-OAR does **not** require you to replicate the full vanilla folder structure. Matching is based on the **animation filename** (the "leaf name") combined with **conditions** -- not on mirroring exact directory paths.
+OAR matches replacements against the **real on-disk path** of the playing animation by default (**direct path matching**, `bDirectPathMatching=1`). Your SubMod's folder layout should **mirror the path of the animation you replace**, relative to its `Animations\` folder -- the same model as the original Skyrim OAR.
 
-At startup, OAR extracts a **suffix** from each `.hkx` file you provide. At runtime, it extracts the same kind of suffix from the animation the game is currently playing and looks for a match. The matching uses a **leaf fallback**: if multiple replacements share the same filename, conditions and priority determine which one wins.
+At startup, OAR extracts a **suffix** from each `.hkx` file you provide (the path after `Animations\`, extension stripped). At runtime it resolves the playing clip's real path and computes the same kind of suffix; the two must match **exactly**. For clips whose real path cannot be resolved, matching falls back to the **leaf name** (filename alone), disambiguated by conditions and priority.
 
 **In practice this means:**
 
-1. Your `.hkx` filename must match the animation filename the game uses (e.g. `WPNReload.hkx` to replace a reload animation named `WPNReload.hkx`).
-2. **Conditions** are the primary mechanism for targeting -- use them to specify which weapon, actor, or game state triggers your replacement.
-3. Folder structure within your SubMod is optional and only provides disambiguation when multiple mods target the same filename. If your filename is unique across all installed OAR mods, folders don't matter.
+1. Your `.hkx` file's path inside the SubMod must mirror the real animation path after `Animations\`. Weapon animations resolve to weapon-specific subdirectories -- e.g. the game plays `Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx`, so your file goes at `<SubMod>\SCAR\WPNReload.hkx`. Animations directly under `Animations\` (e.g. `MT_Idle.hkx`) go in the SubMod root.
+2. **Find the real path in the Animation Log** -- it displays the full resolved path of every playing clip. The plugin log's `[OAR-Poll]` / `[OAR-Suffix]` lines show the same data.
+3. **Conditions** control WHEN the replacement applies (actor, game state); the path controls WHICH animation it replaces.
 4. **Priority** (integer in `config.json`) resolves conflicts when multiple SubMods match the same clip -- highest value wins.
+5. A flat, leaf-only layout (e.g. `WPNReload.hkx` in the SubMod root) still works for clips whose real path can't be resolved, and everywhere when `bDirectPathMatching=0` -- but with direct path matching enabled it will NOT match clips that resolve to a subdirectory (e.g. `scar\wpnreload`).
 
 ### Folder structure
 
@@ -189,38 +195,42 @@ Data/Meshes/
                         +-- SCAR Reload Test/       <-- SubMod
                             |-- config.json         <-- conditions, priority, variants, trackFilter
                             |-- user.json           <-- optional user overrides (GUI-written)
-                            |-- WPNReload.hkx       <-- flat layout works fine
-                            |-- WPNReload_1.hkx
-                            |-- WPNReload_2.hkx
-                            +-- WPNReload_3.hkx
+                            +-- SCAR/               <-- mirrors the resolved animation directory
+                                |-- WPNReload.hkx
+                                |-- WPNReload_1.hkx
+                                |-- WPNReload_2.hkx
+                                +-- WPNReload_3.hkx
 ```
 
-You can also organize files into subfolders within the SubMod for clarity or disambiguation:
+The subfolder mirrors the directory of the animation being replaced: the SCAR's reload resolves to `...\Animations\SCAR\WPNReload.hkx`, so the file lives under `SCAR\` and the matching suffix is `scar\wpnreload`.
 
-```
-+-- SCAR Reload Test/
-    |-- config.json
-    +-- SCAR/                <-- optional subfolder for disambiguation
-        |-- WPNReload.hkx
-        +-- WPNReload_1.hkx
-```
-
-When a subfolder is used, the matching suffix becomes `scar\wpnreload` instead of just `wpnreload`. This is useful when multiple weapons share the same animation filename and you need OAR to distinguish them.
+A flat layout (files directly in the SubMod root, suffix = just `wpnreload`) matches animations that live directly under `Animations\`, and otherwise only applies through the leaf fallback -- i.e. for clips whose real path could not be resolved, or everywhere when `bDirectPathMatching=0`.
 
 ### Matching rules summary
+
+With **direct path matching** (default, `bDirectPathMatching=1`):
+
+| Scenario | What happens |
+|----------|-------------|
+| The clip's real path resolves to `...\Animations\SCAR\WPNReload.hkx` and your file is at `SCAR/WPNReload.hkx` | Exact suffix match (`scar\wpnreload`) -- replacement is evaluated |
+| The clip's real path resolves, but no SubMod is registered under that exact suffix | **No replacement** -- leaf matching is NOT applied to path-resolved clips |
+| The clip's real path could not be resolved | Heuristic suffix + leaf fallback (legacy behavior) applies |
+| Multiple SubMods register the same suffix | All are evaluated; **conditions + priority** determine the winner |
+| Conditions are empty (`"conditions": []`) | SubMod always matches (acts as a universal default for that animation) |
+
+With `bDirectPathMatching=0` (legacy leaf matching everywhere):
 
 | Scenario | What happens |
 |----------|-------------|
 | Your file is `WPNReload.hkx` and only one SubMod targets that name | Matches via leaf fallback -- no subfolder needed |
 | Multiple SubMods all have `WPNReload.hkx` | All are evaluated; **conditions + priority** determine the winner |
-| You put your file under `SCAR/WPNReload.hkx` | Suffix becomes `scar\wpnreload` -- only matches clips whose full path contains that |
-| Conditions are empty (`"conditions": []`) | SubMod always matches (acts as a universal default for that animation) |
+| You put your file under `SCAR/WPNReload.hkx` | Suffix becomes `scar\wpnreload` -- exact matches take precedence; otherwise leaf-bridged |
 
 ### Step-by-step setup guide
 
-1. **Identify the animation to replace.** Enable `bVerboseLogging=1` in `OpenAnimationReplacer.ini`, then perform the action in-game. Check the log for `[OAR-Suffix]` lines -- the suffix shown is what OAR will try to match against.
+1. **Identify the animation to replace.** Open the in-game **Animation Log** (UI -> View menu) and perform the action -- the log shows the full resolved path of every playing clip (e.g. `Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx`). The plugin log's `[OAR-Poll]` and `[OAR-Suffix]` lines show the same paths.
 
-2. **Name your `.hkx` file to match.** The filename must correspond to the leaf part of the suffix from step 1. For example, if the log shows suffix `scar\wpnreload`, your file should be named `WPNReload.hkx` (case-insensitive).
+2. **Mirror the path after `Animations\` in your SubMod.** For the example above the matching suffix is `scar\wpnreload`, so your file goes at `<SubMod>\SCAR\WPNReload.hkx` (case-insensitive). Animations directly under `Animations\` go in the SubMod root.
 
 3. **Create the folder structure:**
    ```
@@ -228,7 +238,8 @@ When a subfolder is used, the matching suffix becomes `scar\wpnreload` instead o
    +-- Your Mod Name/           <-- Replacer Mod (any name)
        +-- Your SubMod Name/    <-- SubMod (any name, or a number for default priority)
            |-- config.json      <-- conditions + settings
-           +-- WPNReload.hkx    <-- your replacement animation
+           +-- SCAR/            <-- mirrors the resolved animation directory
+               +-- WPNReload.hkx    <-- your replacement animation
    ```
 
 4. **Write conditions in `config.json`** to target the specific situation (weapon, actor state, etc.). Without conditions, the SubMod will replace that animation for everyone always.
@@ -352,8 +363,9 @@ Players can override author settings without editing `config.json`. The in-game 
 | | `bAsyncParsing` | `1` | Background parse at load |
 | | `bDisablePreloading` | `0` | Skip upfront `.hkx` preload |
 | | `bFilterOutDuplicateAnimations` | `1` | Dedupe registration |
-| **UI** | `iToggleKey` | `24` (`0x18`) | DIK scan code for UI toggle |
-| | `bRequireShift` | `1` | Require Shift + toggle key |
+| | `bDirectPathMatching` | `1` | Match by the clip's resolved on-disk path (exact suffix); leaf matching only as fallback for unresolved clips. `0` = legacy leaf matching everywhere. Also toggleable in the in-game Settings panel |
+| **UI** | `iToggleKey` | `60` (`0x3C`) | DIK scan code for UI toggle (default **F2**; rebind in Settings) |
+| | `bRequireShift` | `0` | Require Shift + toggle key |
 | **AnimationLog** | `bLogReplace` | `1` | Log replacements in overlay |
 | | `iMaxLogEntries` | `100` | Log buffer size |
 | **Limits** | `iAnimationLimit` | `16384` | Max registered replacements |
@@ -533,7 +545,7 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 
 | Input | Action |
 |-------|--------|
-| **Shift + O** (default) | Toggle main overlay (`iToggleKey=0x18`, `bRequireShift=1`) |
+| **F2** (default) | Toggle main overlay (`iToggleKey=0x3C`, `bRequireShift=0`). Rebind in Settings → Activation Key. |
 
 ### Modes
 

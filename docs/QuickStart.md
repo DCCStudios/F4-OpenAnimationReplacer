@@ -32,6 +32,29 @@ Data/Meshes/
 - **SubMod folder** — use a descriptive name (e.g. `Combat Idle`, `Sprint Override`, `FemaleOnly`). The priority is defined inside the submod's `config.json`, not by the folder name.
 - **`.hkx` files** — must mirror the relative path of the animation they replace. `mt_idle.hkx` in the submod root replaces `Actors/Character/Animations/mt_idle.hkx`.
 
+### How Matching Works (Direct Path Matching)
+
+By default (`bDirectPathMatching=1`), OAR resolves the **real on-disk path** of every
+animation the game plays and matches your replacement against it **exactly**, using
+the part of the path after `Animations\`:
+
+- The game plays `Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx`
+  → matching key `scar\wpnreload` → your file must be at `<SubMod>\SCAR\WPNReload.hkx`.
+- The game plays `Actors\Character\Animations\MT_Idle.hkx`
+  → matching key `mt_idle` → your file goes at `<SubMod>\MT_Idle.hkx`.
+
+Weapon animations resolve to **weapon-specific subdirectories** (e.g. `SCAR\`,
+`44Pistol\`, `Common\`), so weapon replacements need the matching subfolder inside
+the submod. To discover the exact path an animation uses, open the in-game
+**Animation Log** — it displays the full resolved path of each playing clip — or
+check `[OAR-Poll]` / `[OAR-Suffix]` lines in the plugin log.
+
+**Leaf-name fallback:** for clips whose real path cannot be resolved, OAR falls
+back to matching by file name alone (the "leaf", e.g. `wpnreload`), using
+conditions and priority to pick between submods that share the name. Setting
+`bDirectPathMatching=0` (INI or the in-game Settings panel) restores this legacy
+leaf-matching behavior everywhere.
+
 ### Mod-Level `config.json` (Optional)
 
 ```json
@@ -214,7 +237,7 @@ The in-game GUI saves user changes to `user.json` automatically.
 
 ## In-Game GUI
 
-Press **Shift + O** (scan code `0x18`) to toggle the overlay.
+Press **F2** (default) to toggle the overlay. Rebind it in **Settings → Activation Key**, or set `iToggleKey` / `bRequireShift` in the INI.
 
 - **Inspect mode** — read-only view of all loaded mods, conditions, and their live evaluation results.
 - **User mode** — toggle submods, change priorities, save to `user.json`.
@@ -232,10 +255,13 @@ The **Animation Log** (View menu) shows replacements as they happen in real time
 [General]
 bEnabled = true
 bEnableUI = true
+; Match replacements against the clip's resolved on-disk animation path
+; (default). Set to false to restore legacy leaf-name matching everywhere.
+bDirectPathMatching = true
 
 [UI]
-iToggleKey = 0x18    ; O key scan code
-bRequireShift = true
+iToggleKey = 0x3C    ; F2 (DIK scan code). Rebind in-game via Settings.
+bRequireShift = false
 
 [AnimationLog]
 bLogReplace = true
@@ -395,14 +421,23 @@ Data/Meshes/
                         ├── config.json
                         ├── Sprinting Reload/
                         │   ├── config.json
-                        │   └── ReloadA.hkx
+                        │   └── SCAR/
+                        │       └── WPNReload.hkx
                         ├── Combat Quick Reload/
                         │   ├── config.json
-                        │   └── ReloadA.hkx
+                        │   └── SCAR/
+                        │       └── WPNReload.hkx
                         └── Standard Reload/
                             ├── config.json
-                            └── ReloadA.hkx
+                            └── SCAR/
+                                └── WPNReload.hkx
 ```
+
+Weapon animations resolve to weapon-specific subdirectories (here `SCAR\`), so
+each submod mirrors that folder. Check the Animation Log in-game for the exact
+path your weapon's reload uses — e.g.
+`Actors\Character\_1stPerson\Animations\SCAR\WPNReload.hkx` → put your file at
+`<SubMod>\SCAR\WPNReload.hkx`.
 
 ### Mod `config.json`
 
@@ -486,5 +521,6 @@ Data/Meshes/
 - **Priority matters.** The first submod whose conditions pass wins. Use higher numbers for more specific overrides.
 - **Use `interruptible = true`** for state-dependent animations (combat stance, sprinting) so they switch immediately when conditions change.
 - **Leave `interruptible = false`** for one-shot animations (draw weapon, jump) to avoid mid-animation pop.
-- **Test with the Animation Log** open — it shows exactly which submod triggered each replacement.
+- **Test with the Animation Log** open — it shows exactly which submod triggered each replacement, and the **full resolved path** of every playing animation (use it to find where your replacement file must go).
+- **If a replacement stops matching** after enabling direct path matching, compare your submod's folder layout against the path shown in the Animation Log — or set `bDirectPathMatching=0` to restore legacy leaf matching.
 - Conditions marked *(stub)* parse and serialize correctly but always evaluate to `false` until a future update completes their FO4 API integration.
