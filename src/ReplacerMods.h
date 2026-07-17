@@ -33,6 +33,20 @@ public:
 	bool GetKeepRandomResultsOnLoop() const { return keepRandomResultsOnLoop; }
 	bool GetShareRandomResults() const { return shareRandomResults; }
 	bool GetReplaceAnnotations() const { return replaceAnnotations; }
+	// True when the given annotation text must NOT be fired for this SubMod's
+	// replacements. Matches the FULL annotation text case-insensitively (e.g.
+	// "WeaponFire" or "SoundPlay.WPNRifleFire"). suppressAllAnnotations mutes
+	// everything the replacement file carries.
+	bool IsAnnotationSuppressed(const std::string& a_text) const
+	{
+		if (suppressAllAnnotations) return true;
+		for (const auto& s : suppressedAnnotations) {
+			if (s.size() == a_text.size() && _stricmp(s.c_str(), a_text.c_str()) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
 	float GetCustomBlendTimeOnInterrupt() const { return customBlendTimeOnInterrupt; }
 	float GetCustomBlendTimeOnLoop() const { return customBlendTimeOnLoop; }
 	float GetCustomBlendTimeOnEcho() const { return customBlendTimeOnEcho; }
@@ -73,6 +87,13 @@ public:
 	bool keepRandomResultsOnLoop{ false };
 	bool shareRandomResults{ false };
 	bool replaceAnnotations{ true };
+	// Annotation suppression: config "suppressAnnotations" accepts true (mute
+	// ALL annotations of the replacement file) or an array of annotation names
+	// to mute selectively. Only applies while this SubMod's replacement is
+	// active with replaceAnnotations enabled (the default) — that's the mode
+	// where OAR controls annotation emission.
+	bool suppressAllAnnotations{ false };
+	std::vector<std::string> suppressedAnnotations;
 	float customBlendTimeOnInterrupt{ -1.0f };
 	float customBlendTimeOnLoop{ -1.0f };
 	float customBlendTimeOnEcho{ -1.0f };

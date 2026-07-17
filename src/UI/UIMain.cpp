@@ -528,6 +528,55 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		ImGui::Spacing();
 		DrawEventList("Events on End", a_subMod->eventsOnEnd, "evtEnd");
 
+		// --- Annotation suppression ---
+		ImGui::Spacing();
+		bool suppressAll = a_subMod->suppressAllAnnotations;
+		if (ImGui::Checkbox("Suppress ALL annotations (?)", &suppressAll)) {
+			a_subMod->suppressAllAnnotations = suppressAll;
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Mute every annotation of the replacement file while this SubMod's\n"
+			"replacement plays — no sounds or events are fired by OAR.\n"
+			"Requires 'Replace Annotations' ON (that is the mode where OAR\n"
+			"controls annotation emission).");
+
+		if (!a_subMod->suppressAllAnnotations) {
+			ImGui::PushID("suppressAnnot");
+			ImGui::Text("Suppressed annotations (?):");
+			if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+				"Annotations with these exact names (case-insensitive) are muted\n"
+				"when the replacement plays. Example: add 'WeaponFire' for a\n"
+				"dry-fire animation whose source file still carries the fire\n"
+				"annotation. Full text must match, e.g. 'SoundPlay.WPNRifleFire'.");
+			for (int i = 0; i < (int)a_subMod->suppressedAnnotations.size(); ++i) {
+				ImGui::PushID(i);
+				ImGui::Text("  %s", a_subMod->suppressedAnnotations[i].c_str());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("X")) {
+					a_subMod->suppressedAnnotations.erase(a_subMod->suppressedAnnotations.begin() + i);
+					a_subMod->SetDirty(true);
+					ImGui::PopID();
+					break;
+				}
+				ImGui::PopID();
+			}
+			static char suppressBuf[128] = "";
+			ImGui::SetNextItemWidth(200);
+			ImGui::InputTextWithHint("##suppressCustom", "Annotation name (e.g. WeaponFire)",
+				suppressBuf, sizeof(suppressBuf));
+			ImGui::SameLine();
+			if (ImGui::Button("Add##suppress")) {
+				std::string s(suppressBuf);
+				if (!s.empty()) {
+					a_subMod->suppressedAnnotations.push_back(s);
+					a_subMod->SetDirty(true);
+					suppressBuf[0] = '\0';
+				}
+			}
+			ImGui::PopID();
+		}
+
 	} else {
 		ImGui::Text("Priority: %d", a_subMod->GetPriority());
 		ImGui::SameLine(200);
@@ -552,6 +601,13 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			std::string endStr = "Events on End:";
 			for (auto& e : a_subMod->eventsOnEnd) endStr += " " + e;
 			ImGui::Text("%s", endStr.c_str());
+		}
+		if (a_subMod->suppressAllAnnotations) {
+			ImGui::Text("Suppress annotations: ALL");
+		} else if (!a_subMod->suppressedAnnotations.empty()) {
+			std::string supStr = "Suppressed annotations:";
+			for (auto& s : a_subMod->suppressedAnnotations) supStr += " " + s;
+			ImGui::Text("%s", supStr.c_str());
 		}
 	}
 
@@ -608,6 +664,11 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["keepRandomResultsOnLoop"] = a_subMod->GetKeepRandomResultsOnLoop();
 				json["shareRandomResults"] = a_subMod->GetShareRandomResults();
 				json["replaceAnnotations"] = a_subMod->GetReplaceAnnotations();
+			// Round-trip annotation suppression so a UI save can't drop it.
+			if (a_subMod->suppressAllAnnotations)
+				json["suppressAnnotations"] = true;
+			else if (!a_subMod->suppressedAnnotations.empty())
+				json["suppressAnnotations"] = a_subMod->suppressedAnnotations;
 			if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
 				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
 			if (a_subMod->GetDeactivationDelay() > 0.0f)

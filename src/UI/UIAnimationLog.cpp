@@ -165,7 +165,9 @@ void UIAnimationLog::DrawContents()
 			float rightEdge = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
 			// Only right-align if it won't overlap the type/perspective tags
 			float actorPos = std::max(rightEdge - actorWidth, ImGui::GetCursorPosX() + style.ItemSpacing.x);
-			ImGui::SetCursorPosX(actorPos);
+			// SameLine, not SetCursorPosX — see UICommon::DrawConditionEvalResult
+			// for why (avoids ImGui's SetCursorPos-boundary debug log spam).
+			ImGui::SameLine(actorPos);
 			ImGui::TextColored(UICommon::Colors::Disabled, "%s", actorText.c_str());
 		}
 

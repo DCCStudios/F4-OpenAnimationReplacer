@@ -352,6 +352,10 @@ namespace
 		case F4SE::MessagingInterface::kPreLoadGame:
 			logger::info("[OAR] kPreLoadGame - clearing runtime state");
 			SetGameFullyLoaded(false);
+			// Un-replace everything while the recorded originals are still
+			// valid — clips that carry a replacement across the load become
+			// unrecoverable orphans otherwise (see RestoreAllActiveReplacements).
+			RestoreAllActiveReplacements();
 			ActiveClipManager::GetSingleton()->ClearAll();
 			ClearCharacterCache();
 			ClearClipRuntimeState();

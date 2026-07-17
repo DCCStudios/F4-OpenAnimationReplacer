@@ -65,6 +65,10 @@ public:
 	size_t GetCacheSize() const;
 	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
 	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
+	// The freshest game original recorded for this suffix (set whenever any
+	// clip rebuilds a clone). Used to opportunistically re-arm orphaned clips
+	// whose own original was lost to an invalidation. May be null.
+	RE::hkaAnimation* GetGameOriginalForSuffix(const std::string& a_suffix) const;
 	void InvalidateRuntimeClones();
 	void Clear();
 
@@ -79,7 +83,38 @@ private:
 	// Caller must hold m_mutex (shared or unique).
 	CachedAnimation* SelectEntry(const std::string& a_suffix, const void* a_owner) const;
 
+	// Move a clone buffer into the keep-alive retirement list and reset the
+	// entry's runtime fields. Caller must hold m_mutex (unique).
+	//
+	// WHY: active hkbClipGenerators hold a raw pointer into runtimeStruct.
+	// Clearing/reusing that buffer while the game's render-job thread is still
+	// generating from it zero-fills the clone's vtable in place -> the game
+	// tail-calls through a null vtable (crash at decompressAnimation,
+	// "jmp [rdx+0x28]" with rdx=0). A retired clone stays fully playable: its
+	// vtable is the game's and its data pointers target fileData, which the
+	// cache never frees — so a stale-referencing clip keeps playing it safely
+	// until it deactivates.
+	void RetireCloneLocked(CachedAnimation& a_entry);
+
 	mutable std::shared_mutex m_mutex;
+	// Retired clone buffers, kept alive because clips may still reference them
+	// after invalidation (weapon switch, save load). Capped; oldest dropped
+	// first — by the time hundreds of invalidations have passed, no clip from
+	// the oldest one can still be active.
+	//
+	// clonePtr is remembered so IsOurReplacement() still recognizes a retired
+	// clone sitting in a clip's animation slot. Without it, the Update hook
+	// misclassifies the stale clone as a GAME animation (its vtable is the
+	// game's, memcpy'd at build time), adopts it as the clip's "original", and
+	// feeds it back into the clone builder as the copy source — the exact
+	// self-memcpy that zeroed a clone's vtable and crashed in
+	// decompressAnimation (crash-2026-07-17-00-10-31: base == gameStruct).
+	struct RetiredClone
+	{
+		std::vector<uint8_t> buffer;
+		RE::hkaAnimation* clonePtr{ nullptr };
+	};
+	std::vector<RetiredClone> m_retiredClones;
 	// One suffix -> all files registered for it (one per SubMod replacing the
 	// same original path; variants get their own suffixes but can still
 	// collide across SubMods). Sorted by priority, highest first.

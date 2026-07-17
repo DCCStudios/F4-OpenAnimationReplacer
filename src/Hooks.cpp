@@ -1320,6 +1320,67 @@ void RegisterWeaponEquipListener()
 	logger::info("[OAR-Equip] Using inline weapon-change detection in Activate hook");
 }
 
+// Restore every hooked clip's original animation and triggers while the
+// recorded original pointers are STILL VALID. Must run at kPreLoadGame BEFORE
+// ClearClipRuntimeState()/InvalidateRuntimeClones() wipe the bookkeeping.
+//
+// WHY: a clip that carries our replacement across a save load becomes an
+// unrecoverable orphan — the wiped maps mean we can never un-replace it, so
+// condition changes mid-clip stop working for it ([OAR-RecoveryFail]).
+// Restoring here means no clip carries a replacement across the load at all.
+// Not safe for the weapon-switch invalidation path (old originals may already
+// be freed there) — this is save-load only, where the engine hasn't torn
+// anything down yet at the time the message arrives.
+void RestoreAllActiveReplacements()
+{
+	auto* cache = AnimationCache::GetSingleton();
+	size_t restoredAnims = 0;
+
+	{
+		std::unique_lock lock(s_originalAnimMutex);
+		for (auto& [clip, original] : s_originalAnimMap) {
+			if (!clip || !original) continue;
+			// Deactivated clips erase their map entries, so entries should be
+			// live — but guard reads anyway (same policy as the Update hook).
+			if (IsBadReadPtr(clip, sizeof(uintptr_t))) continue;
+			auto** slot = clip->GetAnimationSlot();
+			if (!slot || IsBadReadPtr(slot, sizeof(uintptr_t))) continue;
+			// Only touch slots that currently hold OUR replacement.
+			if (!cache->IsOurReplacement(*slot)) continue;
+			// Validate the original before writing it back.
+			if (IsBadReadPtr(original, sizeof(uintptr_t))) continue;
+			auto vtbl = *reinterpret_cast<uintptr_t*>(original);
+			auto expected = cache->GetGameAnimVtable();
+			if (expected != 0 && vtbl != expected) continue;
+			// Single aligned pointer write — same operation as a normal swap.
+			// Benign vs the render thread: both old and new pointers stay
+			// valid (the clone buffer is retired, not freed, right after).
+			*slot = original;
+			restoredAnims++;
+		}
+	}
+
+	// Restore all NULL'd triggers so native annotations work after the load.
+	size_t restoredTriggers = 0;
+	{
+		std::unique_lock lock(s_triggersBackupMutex);
+		for (auto& [clip, backup] : s_triggersBackup) {
+			if (!clip || !backup.nulled) continue;
+			if (IsBadReadPtr(clip, sizeof(uintptr_t))) continue;
+			auto* bytes = reinterpret_cast<uint8_t*>(clip);
+			*reinterpret_cast<void**>(bytes + kClipGenTriggersOffset) = backup.triggers;
+			*reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset) = backup.originalTriggers;
+			restoredTriggers++;
+		}
+		// ClearClipRuntimeState (called right after) clears the map itself.
+	}
+
+	if (restoredAnims > 0 || restoredTriggers > 0) {
+		logger::info("[OAR-PreLoad] Restored {} animation slots and {} trigger sets before state wipe",
+			restoredAnims, restoredTriggers);
+	}
+}
+
 void ClearClipRuntimeState()
 {
 	{
@@ -3232,6 +3293,14 @@ namespace
 		RE::hkaAnimation* preSwapOriginal = nullptr;
 		bool preSwapAttempted = false;
 		bool preSwapSucceeded = false;
+		// Condition-passing winner from the pre-swap evaluation (null when the
+		// pre-swap fell back to the highest-priority file with no winner).
+		// Used to NULL the clip's triggers immediately at activation: the first
+		// _Update processes the [0, dt] trigger window BEFORE the Update hook's
+		// post-code runs, so without this the ORIGINAL animation's t~0
+		// annotations (WeaponFire on fire clips) fire once on every activation
+		// even though a replacement is about to install.
+		ReplacementAnimFileInfo* preSwapWinner = nullptr;
 		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt) {
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
@@ -3303,7 +3372,10 @@ namespace
 										if (auto* winner = EvaluateWinningInfo(candIt->second, refrPre, a_this)) {
 											replacement = cachePre->GetOrBuildRuntimeAnim(
 												fullSuffix, *animSlotPre, winner->parentSubMod);
-											if (replacement) break;
+											if (replacement) {
+												preSwapWinner = winner;
+												break;
+											}
 										}
 									}
 									// Pass 2 (fallback): no winner anywhere — old behavior, first
@@ -3328,6 +3400,7 @@ namespace
 								// the cache (owner=nullptr selects entries[0]).
 								replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre,
 									winner ? winner->parentSubMod : nullptr);
+								if (replacement && winner) preSwapWinner = winner;
 							}
 
 							if (replacement) {
@@ -3365,6 +3438,26 @@ namespace
 			auto** animSlotPost = a_this->GetAnimationSlot();
 			if (animSlotPost) {
 				*animSlotPost = preSwapOriginal;
+			}
+		}
+
+		// A condition-passing winner means the Update hook WILL install this
+		// replacement — NULL the triggers now so the very first _Update (which
+		// runs before our post-code can do it) doesn't natively fire the
+		// ORIGINAL animation's t~0 annotations (WeaponFire on fire clips).
+		// Deliberately NOT done for the no-winner fallback pre-swap: there the
+		// Update hook may decide against replacing, and NULLing would eat the
+		// original's t=0 events for that first frame (missed real WeaponFire).
+		if (preSwapSucceeded && preSwapWinner && preSwapWinner->parentSubMod &&
+			preSwapWinner->parentSubMod->GetReplaceAnnotations() &&
+			!preSwapWinner->parentSubMod->GetPlayOnceFullBody()) {
+			InstallReplacementTriggers(a_this, "");
+			static int s_actNullLog = 0;
+			if (s_actNullLog < 20) {
+				logger::info("[OAR-Triggers] Activation pre-NULL for clipGen={:X} (winner '{}')",
+					reinterpret_cast<uintptr_t>(a_this),
+					preSwapWinner->parentSubMod->GetName());
+				s_actNullLog++;
 			}
 		}
 
@@ -4153,6 +4246,46 @@ namespace
 					}
 				}
 				if (!originalAnim) {
+					// Opportunistic re-arm: another clip (typically the other
+					// perspective's graph, or this animation re-activating
+					// elsewhere) may have rebuilt a clone for this suffix since
+					// the invalidation, teaching the cache the FRESH game
+					// original. Adopt it so condition changes work again for
+					// this orphaned clip. Guards: vtable must be the game's,
+					// and the track count must match the clone we're currently
+					// playing (rejects an original from an incompatible
+					// skeleton that merely shares the suffix).
+					if (RE::hkaAnimation* fresh = cache->GetGameOriginalForSuffix(resolvedSuffix);
+						fresh && fresh != current && !IsBadReadPtr(fresh, 0x20) &&
+						!IsBadReadPtr(current, 0x20)) {
+						auto vtbl = *reinterpret_cast<uintptr_t*>(fresh);
+						auto expected = cache->GetGameAnimVtable();
+						bool vtblOk = (expected != 0) ? (vtbl == expected)
+							: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
+						// hkaAnimation: +0x18 = numTransformTracks
+						auto freshTracks = *reinterpret_cast<int32_t*>(
+							reinterpret_cast<uint8_t*>(fresh) + 0x18);
+						auto currentTracks = *reinterpret_cast<int32_t*>(
+							reinterpret_cast<uint8_t*>(current) + 0x18);
+						if (vtblOk && freshTracks == currentTracks) {
+							originalAnim = fresh;
+							std::unique_lock olock(s_originalAnimMutex);
+							auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, fresh);
+							if (!inserted) {
+								originalAnim = it->second;
+							}
+							static int s_rearmLog = 0;
+							if (s_rearmLog < 20) {
+								logger::info("[OAR-Rearm] Adopted fresh original {:X} for orphaned clip {:X} ('{}', {} tracks)",
+									reinterpret_cast<uintptr_t>(fresh),
+									reinterpret_cast<uintptr_t>(a_this),
+									resolvedSuffix, freshTracks);
+								s_rearmLog++;
+							}
+						}
+					}
+				}
+				if (!originalAnim) {
 					static int s_recoveryFailLog = 0;
 					if (s_recoveryFailLog < 20) {
 						logger::warn("[OAR-RecoveryFail] Can't recover valid original for '{}' clipGen={:X} current={:X}",
@@ -4746,7 +4879,26 @@ namespace
 					}
 					astate.prevLocalTime = localTime;
 				}
-				// Lock released — now fire annotations
+				// Lock released — drop suppressed annotations before firing.
+				// "suppressAnnotations" in the winning SubMod's config mutes
+				// specific annotation texts (or all of them) — e.g. muting
+				// "WeaponFire" for a dry-fire replacement whose source file
+				// still carries the fire annotation.
+				if (!toFire.empty() && winningInfo && winningInfo->parentSubMod) {
+					auto* annotSubMod = winningInfo->parentSubMod;
+					std::erase_if(toFire, [&](const std::string& t) {
+						if (annotSubMod->IsAnnotationSuppressed(t)) {
+							static int s_suppressLog = 0;
+							if (s_suppressLog < 30) {
+								logger::info("[OAR-Annot] Suppressed '{}' (submod '{}')",
+									t, annotSubMod->GetName());
+								s_suppressLog++;
+							}
+							return true;
+						}
+						return false;
+					});
+				}
 				if (!toFire.empty()) {
 					s_oarFiringAnnotations = true;
 					for (auto& text : toFire) {
@@ -4815,7 +4967,18 @@ namespace
 					duration = *reinterpret_cast<float*>(
 						reinterpret_cast<uint8_t*>(curAnim) + 0x14);
 				}
-				if (duration > 0.01f && localTime >= duration - 0.01f) {
+				// NEVER restore on completion for LOOPING clips (auto-fire, idles).
+				// The engine processes the t=0 wrap inside _Update with whatever
+				// trigger array is installed at that moment — restoring here hands
+				// the ORIGINAL animation's t~0 annotations (WeaponFire on fire
+				// clips!) back to the engine, which then fires natively on EVERY
+				// loop pass, e.g. a dry-fire replacement kept shooting the SCAR.
+				// Looping states exit via game action events (attackStop on
+				// trigger release), not via their own clip triggers, so they
+				// don't need this restore; the uninstall/deactivate paths restore
+				// triggers when the replacement actually ends.
+				const bool isLoopingClip = (a_this->mode == RE::MODE_LOOPING);
+				if (!isLoopingClip && duration > 0.01f && localTime >= duration - 0.01f) {
 					tLock.unlock();
 					RestoreClipTriggers(a_this);
 					{
@@ -5739,6 +5902,37 @@ namespace
 		if (a_this) {
 			std::unique_lock leLock(s_loopEchoFlagMutex);
 			s_clipEchoPending[a_this] = true;
+		}
+
+		// An echo restarts the clip's time from ~0 WITHOUT a Deactivate/Activate
+		// cycle. If a replacement is active and the completion-restore already
+		// put the ORIGINAL triggers back (single-play clips), the engine would
+		// natively fire the original's t~0 annotations (WeaponFire!) on the
+		// replay. Re-NULL before the next Update processes the restarted time.
+		if (a_this) {
+			bool replacementActive = false;
+			{
+				std::shared_lock smLock(s_activeSubModMutex);
+				auto smIt = s_activeSubModMap.find(a_this);
+				replacementActive = (smIt != s_activeSubModMap.end() && smIt->second &&
+					smIt->second->GetReplaceAnnotations());
+			}
+			if (replacementActive) {
+				bool wasRestored = false;
+				{
+					std::lock_guard rg(s_triggersRestoredMutex);
+					wasRestored = s_triggersRestoredSet.erase(a_this) > 0;
+				}
+				if (wasRestored) {
+					InstallReplacementTriggers(a_this, "");
+					static int s_echoRenullLog = 0;
+					if (s_echoRenullLog < 20) {
+						logger::info("[OAR-Triggers] Echo restart — re-NULL'd triggers for clipGen={:X}",
+							reinterpret_cast<uintptr_t>(a_this));
+						s_echoRenullLog++;
+					}
+				}
+			}
 		}
 	}
 

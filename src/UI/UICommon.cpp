@@ -69,7 +69,13 @@ namespace UICommon
 	{
 		ImGui::SameLine();
 		float rightEdge = ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX();
-		ImGui::SetCursorPosX(rightEdge - 15.f);
+		// SameLine (not SetCursorPosX) to reach the right edge: on a row's first
+		// wide jump this frame, SetCursorPosX would trip ImGui's
+		// ErrorCheckUsingSetCursorPosToExtendParentBoundaries debug log (spams
+		// "Code uses SetCursorPos()/SetCursorScreenPos() to extend window/parent
+		// boundaries" once per condition row). SameLine reaches the identical
+		// position without that check.
+		ImGui::SameLine(rightEdge - 15.f);
 		ImVec2 indicatorCenter = ImGui::GetCursorScreenPos();
 		const float offset = ImGui::GetTextLineHeightWithSpacing() * 0.25f;
 		indicatorCenter.y += offset * 2.f;

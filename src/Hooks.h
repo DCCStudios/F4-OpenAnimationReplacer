@@ -5,6 +5,10 @@
 void RegisterActorCharacter(RE::TESObjectREFR* a_refr);
 void ClearCharacterCache();
 void ClearClipRuntimeState();
+// Save-load only: restore all hooked clips' originals/triggers while the
+// recorded pointers are still valid. Call BEFORE ClearClipRuntimeState() and
+// InvalidateRuntimeClones() at kPreLoadGame.
+void RestoreAllActiveReplacements();
 void SetGameFullyLoaded(bool a_loaded);
 void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();

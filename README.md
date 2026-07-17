@@ -327,6 +327,7 @@ OAR also scans `Actors/<race>/Character/Animations/` and, if needed, all of `Dat
 | `replaceOnLoop` | bool | true | Re-evaluate when clip loops |
 | `replaceOnEcho` | bool | true | Re-evaluate on echo / blend |
 | `replaceAnnotations` | bool | true | Use replacement annotations (may null triggers + manual fire) |
+| `suppressAnnotations` | bool or string[] | -- | `true` mutes ALL of the replacement file's annotations; an array (e.g. `["WeaponFire", "SoundPlay.WPNRifleFire"]`) mutes only those, case-insensitive. Needs `replaceAnnotations: true`. Use for dry-fire/silent replacements whose source `.hkx` still carries annotations |
 | `playOnceFullBody` | bool | false | Keep vanilla triggers until anim completes (state machine exit) |
 | `deactivationDelay` | float | 0 | Seconds to hold replacement after conditions fail |
 | `conditions` | array | `[]` | AND list; empty = always match |

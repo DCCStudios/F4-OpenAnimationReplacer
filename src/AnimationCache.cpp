@@ -219,12 +219,12 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	// If clone exists but was built from a DIFFERENT game animation, the game reloaded
 	// animations (weapon switch). Rebuild from fresh data to avoid stale struct fields.
 	if (entry.runtimeAnimation && entry.gameOriginal != a_gameAnim && a_gameAnim != nullptr) {
-		logger::info("[OAR-Cache] Game animation changed for '{}': old={:X} new={:X} — rebuilding clone",
+		logger::info("[OAR-Cache] Game animation changed for '{}': old={:X} new={:X} — rebuilding clone (old buffer retired)",
 			a_suffix, reinterpret_cast<uintptr_t>(entry.gameOriginal),
 			reinterpret_cast<uintptr_t>(a_gameAnim));
-		entry.runtimeAnimation = nullptr;
-		entry.runtimeStruct.clear();
-		entry.gameOriginal = nullptr;
+		// Retire (don't clear) — another still-active clip may reference the
+		// old clone; rebuilding in place would zero its vtable mid-generate.
+		RetireCloneLocked(entry);
 	}
 
 	if (entry.runtimeAnimation) return entry.runtimeAnimation;
@@ -405,7 +405,25 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 			if (entry && entry->runtimeAnimation == a_anim) return true;
 		}
 	}
+	// Retired clones are still "ours": a clip that held a clone across an
+	// invalidation must not mistake it for a game animation (see RetiredClone
+	// comment in the header). Recovery for such clips intentionally fails —
+	// they keep playing the retired buffer (kept alive) until they deactivate.
+	for (auto& retired : m_retiredClones) {
+		if (retired.clonePtr == a_anim) return true;
+	}
 	return false;
+}
+
+RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_suffix) const
+{
+	std::shared_lock lock(m_mutex);
+	auto it = m_cache.find(a_suffix);
+	if (it == m_cache.end()) return nullptr;
+	for (auto& entry : it->second) {
+		if (entry && entry->gameOriginal) return entry->gameOriginal;
+	}
+	return nullptr;
 }
 
 RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const
@@ -422,6 +440,25 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 	return nullptr;
 }
 
+void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry)
+{
+	// See header comment: the buffer must survive intact because active clips
+	// may still hold a pointer into it. Move it to the keep-alive list instead
+	// of clearing it in place.
+	if (!a_entry.runtimeStruct.empty()) {
+		constexpr size_t kMaxRetiredClones = 256;
+		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			m_retiredClones.erase(m_retiredClones.begin());
+		}
+		m_retiredClones.push_back({ std::move(a_entry.runtimeStruct), a_entry.runtimeAnimation });
+	}
+	// Guarantee the entry gets a FRESH allocation on next build (moved-from
+	// vector state is unspecified; assign a new empty one explicitly).
+	a_entry.runtimeStruct = std::vector<uint8_t>{};
+	a_entry.runtimeAnimation = nullptr;
+	a_entry.gameOriginal = nullptr;
+}
+
 void AnimationCache::InvalidateRuntimeClones()
 {
 	std::unique_lock lock(m_mutex);
@@ -429,15 +466,14 @@ void AnimationCache::InvalidateRuntimeClones()
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
 			if (entry && entry->runtimeAnimation) {
-				entry->runtimeAnimation = nullptr;
-				entry->runtimeStruct.clear();
-				entry->gameOriginal = nullptr;
+				RetireCloneLocked(*entry);
 				count++;
 			}
 		}
 	}
 	if (count > 0) {
-		logger::info("[OAR-Cache] Invalidated {} runtime clones (gameOriginal reset)", count);
+		logger::info("[OAR-Cache] Invalidated {} runtime clones (retired buffers kept alive: {})",
+			count, m_retiredClones.size());
 	}
 }
 

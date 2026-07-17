@@ -86,6 +86,7 @@ This is where all the behavior lives.
 | `interruptible` | bool | false | Re-evaluate conditions every frame (allows mid-animation switching) |
 | `replaceOnLoop` | bool | true | Re-evaluate when the clip loops |
 | `replaceOnEcho` | bool | true | Re-evaluate on echo (transition blend) |
+| `suppressAnnotations` | bool or array | — | Mute annotations from the replacement file: `true` = all, or a list of names, e.g. `["WeaponFire"]` (case-insensitive). Great for dry-fire / silent animations whose source `.hkx` still carries annotations |
 | `conditions` | array | [] | All must pass (AND logic). Empty = always matches |
 
 ---

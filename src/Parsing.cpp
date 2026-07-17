@@ -473,6 +473,28 @@ namespace Parsing
 		if (json.contains("shareRandomResults")) a_subMod->SetShareRandomResults(json["shareRandomResults"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
 
+		// "suppressAnnotations": true mutes ALL annotations of the replacement
+		// file; an array of strings mutes only those (case-insensitive, full
+		// text — e.g. "WeaponFire" or "SoundPlay.WPNRifleFire").
+		if (json.contains("suppressAnnotations")) {
+			const auto& sa = json["suppressAnnotations"];
+			if (sa.is_boolean()) {
+				a_subMod->suppressAllAnnotations = sa.get<bool>();
+			} else if (sa.is_array()) {
+				a_subMod->suppressAllAnnotations = false;
+				a_subMod->suppressedAnnotations.clear();
+				for (const auto& e : sa) {
+					if (e.is_string()) a_subMod->suppressedAnnotations.push_back(e.get<std::string>());
+				}
+			}
+			if (a_subMod->suppressAllAnnotations || !a_subMod->suppressedAnnotations.empty()) {
+				logger::info("[OAR] SubMod '{}' suppresses annotations: {}",
+					a_subMod->GetName(),
+					a_subMod->suppressAllAnnotations ? "ALL"
+						: fmt::format("{} entries", a_subMod->suppressedAnnotations.size()));
+			}
+		}
+
 		if (json.contains("customBlendTimeOnInterrupt"))
 			a_subMod->customBlendTimeOnInterrupt = json["customBlendTimeOnInterrupt"].get<float>();
 		if (json.contains("customBlendTimeOnLoop"))
@@ -577,6 +599,18 @@ namespace Parsing
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
+		if (json.contains("suppressAnnotations")) {
+			const auto& sa = json["suppressAnnotations"];
+			if (sa.is_boolean()) {
+				a_subMod->suppressAllAnnotations = sa.get<bool>();
+			} else if (sa.is_array()) {
+				a_subMod->suppressAllAnnotations = false;
+				a_subMod->suppressedAnnotations.clear();
+				for (const auto& e : sa) {
+					if (e.is_string()) a_subMod->suppressedAnnotations.push_back(e.get<std::string>());
+				}
+			}
+		}
 		if (json.contains("deactivationDelay"))
 			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
 		if (json.contains("playOnceFullBody"))
