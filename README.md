@@ -564,7 +564,10 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 
 ## Plugin API (for developers)
 
-OAR exposes a C++ API that allows other F4SE plugins to register custom condition types at runtime. This means you can add entirely new conditions without modifying OAR's source code.
+OAR exposes two C++ APIs for other F4SE plugins:
+
+- **Conditions API** (`RequestPluginAPI_Conditions`) — register custom condition types at runtime, adding entirely new conditions without modifying OAR's source code.
+- **Clips API** (`RequestPluginAPI_Clips`) — query live data about the animation clips OAR handles: names, resolved file paths, durations, playback state, perspective, replacement attribution, annotations, and more. See [Clips API](#clips-api--query-live-clip-data) below.
 
 ### Architecture
 
@@ -772,11 +775,129 @@ void DrawEditWidgets(bool& a_dirty) override {
 }
 ```
 
+### Clips API — query live clip data
+
+Besides registering conditions, plugins can query everything OAR knows about the animation clips playing on an actor: authored names, resolved on-disk paths, playback state, perspective, replacement attribution, annotations, plus the active-replacement list and global stats.
+
+**Setup:** copy `src/API/OpenAnimationReplacerAPI-Clips.h` into your project. It is fully self-contained — no CommonLibF4 or nlohmann-json required.
+
+```cpp
+#include "OAR/OpenAnimationReplacerAPI-Clips.h"
+
+// MAIN THREAD ONLY — the queries walk live Havok graphs.
+void DumpPlayerClips()
+{
+    auto* api = OAR::Clips::GetAPI();     // nullptr if OAR isn't loaded
+    if (!api) return;
+
+    OAR::Clips::ClipInfo clips[64];
+    uint32_t total = api->GetActorClips(0 /* 0 = player */, clips, 64);
+    for (uint32_t i = 0; i < std::min<uint32_t>(total, 64); ++i) {
+        auto& c = clips[i];
+        // c.animationName   — authored clip path (may be a template until resolved)
+        // c.resolvedPath    — real on-disk path ("" until the engine data resolves)
+        // c.duration        — length (s) of the animation currently playing
+        // c.localTime       — current playback position (s)
+        // c.playbackMode    — single-play / looping / user / ping-pong
+        // c.perspective     — first person / third person / unknown
+        // c.replacementKind — none / full-body swap / track filter
+        // c.subModName, c.modName, c.subModPriority, c.replacementPath
+    }
+}
+```
+
+**Interface** (`OAR::Clips::IClipsAPI`, version 1):
+
+| Method | Purpose |
+|--------|---------|
+| `GetActorClips(formID, buf, max)` | Enumerate active clips on an actor (`0`/`0x14` = player). Returns the TOTAL count, fills up to `max`. |
+| `FindClip(formID, nameOrLeaf, out)` | Find one clip by file-name leaf (case-insensitive, `.hkx` optional), matched against suffix, authored name, and resolved path. |
+| `GetClipAnnotations(clipHandle, buf, max)` | Annotations `(time, text)` of the animation the clip is *currently* playing — the replacement's when replaced. |
+| `GetActiveReplacements(formID, buf, max)` | Snapshot of applied replacements (`0` = all actors) with submod, paths, actor name. |
+| `GetStats(&stats)` | Loaded mod/submod/animation counts, runtime cache size, active replacement count. |
+
+#### `ClipInfo` field reference
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `clipHandle` | `uint64_t` | Opaque clip generator id. **Valid only within the frame it was returned** — pass it to `GetClipAnnotations` the same frame, never store it. |
+| `actorFormID` | `uint32_t` | Owning actor's form ID (`0x14` = player). |
+| `graphIndex` | `uint8_t` | Which of the actor's animation graphs the clip lives in (the player has separate 1st/3rd-person graphs). |
+| `perspective` | `uint8_t` | `kPerspectiveFirstPerson`, `kPerspectiveThirdPerson`, or `kPerspectiveUnknown`. |
+| `playbackMode` | `uint8_t` | `kModeSinglePlay`, `kModeLooping`, `kModeUserControlled`, `kModePingPong`. |
+| `replacementKind` | `uint8_t` | `kReplacementNone`, `kReplacementFullBody` (OAR swapped the slot animation), or `kReplacementTrackFilter` (OAR overlays specific bones; slot holds the original). |
+| `duration` | `float` | Length in seconds of the animation **currently playing** (the replacement's length when replaced). |
+| `localTime` | `float` | Current playback position in seconds. `localTime / duration` gives normalized progress. |
+| `playbackSpeed` | `float` | Clip playback rate multiplier. |
+| `originalDuration` | `float` | The original animation's length. Equals `duration` when unreplaced; `0` when unknown. |
+| `subModPriority` | `int32_t` | Priority of the active submod (`0` when none). |
+| `animationName` | `char[128]` | Authored clip animation path. May be a **template** (e.g. `44pistol\wpnfire.hkx`) until the engine's real path resolves. |
+| `resolvedPath` | `char[260]` | Real on-disk path resolved from the engine's subgraph data. Empty until resolution succeeds (player weapon clips resolve within a few frames of activation). |
+| `suffix` | `char[128]` | OAR's matching suffix: the path after `Animations\`, no extension. This is the key OAR matches replacement folders against. |
+| `subModName` / `modName` | `char[128]` | Active replacement's submod and its parent replacer mod. Empty when no replacement is active. |
+| `replacementPath` | `char[260]` | The replacement `.hkx` path being played. Empty when none. |
+
+All strings are null-terminated and truncated to the buffer size when longer. Empty string means "not known / not applicable", never garbage.
+
+#### More query examples
+
+React to the annotations of whatever animation is actually playing (replacement annotations included):
+
+```cpp
+OAR::Clips::ClipInfo clip;
+if (api->FindClip(0, "wpnfiresingleready", &clip)) {
+    OAR::Clips::ClipAnnotation annots[32];
+    uint32_t n = api->GetClipAnnotations(clip.clipHandle, annots, 32);
+    for (uint32_t i = 0; i < std::min<uint32_t>(n, 32); ++i) {
+        // annots[i].time (seconds from clip start), annots[i].text ("WeaponFire", ...)
+        // e.g. schedule something for when playback reaches the annotation:
+        float secondsUntil = (annots[i].time - clip.localTime) / std::max(clip.playbackSpeed, 0.001f);
+    }
+}
+```
+
+Check whether OAR is currently replacing anything on an actor (e.g. to avoid conflicting with it):
+
+```cpp
+uint32_t count = api->GetActiveReplacements(someActorFormID, nullptr, 0); // count only
+if (count > 0) {
+    std::vector<OAR::Clips::ActiveReplacementInfo> reps(count);
+    api->GetActiveReplacements(someActorFormID, reps.data(), count);
+    // reps[i].subModName, reps[i].replacementPath, reps[i].clipSuffix, ...
+}
+```
+
+Two-call pattern for buffers of unknown size (works for all enumeration methods — they return the TOTAL count regardless of how much was written):
+
+```cpp
+uint32_t total = api->GetActorClips(0, nullptr, 0);       // 1st call: count
+std::vector<OAR::Clips::ClipInfo> clips(total);
+api->GetActorClips(0, clips.data(), total);               // 2nd call: fill
+```
+
+Global stats (e.g. for a diagnostics overlay):
+
+```cpp
+OAR::Clips::Stats stats{};
+if (api->GetStats(&stats)) {
+    // stats.replacerModCount, stats.subModCount, stats.replacementAnimCount,
+    // stats.cachedAnimFileCount, stats.activeReplacementCount
+}
+```
+
+**Rules:**
+
+- Call every method from the **game's main thread** (e.g. an F4SE task or your own update hook). The clip queries walk live Havok graph structures; calling from another thread races the engine.
+- `clipHandle` values are only valid within the frame they were returned — don't store them.
+- `GetAPI()` works at `kPostLoad` or later; the returned pointer may be cached for the session.
+- Queries are on-demand walks, not cached — cheap enough per frame for one actor, but don't enumerate every loaded actor every frame.
+- Check `GetAPIVersion()` once after `GetAPI()` if you depend on fields added in later versions (current: 1).
+
 ### Build Requirements for API Plugins
 
 - Visual Studio 2022 (MSVC, x64)
-- CommonLibF4 (same version OAR links against)
-- nlohmann-json (header-only, same version)
+- CommonLibF4 (same version OAR links against; **not** needed for the Clips API header)
+- nlohmann-json (header-only, same version; **not** needed for the Clips API header)
 - C++23 standard
 - `x64-windows-static-md` vcpkg triplet (matching OAR)
 

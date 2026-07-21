@@ -16,3 +16,8 @@
 // The exported function returns a pointer to the IConditionsAPI implementation.
 // Plugin authors access it via OAR::Conditions::GetAPI() in the SDK header.
 extern "C" OAR_API void* RequestPluginAPI_Conditions();
+
+// Returns a pointer to the IClipsAPI implementation (clip/replacement queries).
+// Plugin authors access it via OAR::Clips::GetAPI() in the SDK header
+// (OpenAnimationReplacerAPI-Clips.h).
+extern "C" OAR_API void* RequestPluginAPI_Clips();

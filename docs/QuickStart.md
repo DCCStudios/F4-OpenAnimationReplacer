@@ -377,3 +377,20 @@ Keep `interruptible: false` on one-shot reloads.
 - Replacement not applying? Compare your SubMod folders to the log path, or try
   `bDirectPathMatching=0` while debugging.
 - Conditions marked *(stub)* always evaluate false until their FO4 APIs are finished.
+
+---
+
+## For Plugin Developers
+
+OAR exposes two C++ APIs to other F4SE plugins (full documentation with examples in the
+main `README.md`, section **Plugin API**):
+
+- **Conditions API** — register your own condition types at runtime; they become usable
+  in SubMod `config.json` files and show up in the in-game editor.
+  SDK headers: `src/API/OpenAnimationReplacerAPI-Conditions.h` + `OpenAnimationReplacer-ConditionTypes.h`.
+- **Clips API** — query live data about the clips OAR handles on any actor: authored
+  names, resolved on-disk paths, duration, playback position and mode, 1st/3rd-person
+  perspective, replacement attribution (submod, mod, priority, file), annotations of the
+  animation actually playing, active-replacement snapshots, and global stats.
+  SDK header: `src/API/OpenAnimationReplacerAPI-Clips.h` (self-contained — no
+  CommonLibF4 or JSON dependency). Call from the game's main thread only.

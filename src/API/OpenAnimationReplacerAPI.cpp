@@ -1,5 +1,9 @@
 #include "API/OpenAnimationReplacerAPI.h"
 #include "BaseConditions.h"
+#include "Hooks.h"
+#include "ActiveReplacementTracker.h"
+#include "OpenAnimationReplacer.h"
+#include "AnimationCache.h"
 
 namespace
 {
@@ -100,6 +104,243 @@ namespace
 	};
 
 	static ConditionsAPIImpl g_conditionsAPI;
+
+	// =========================================================================
+	// Clips API — clip/replacement data queries for external plugins
+	// =========================================================================
+	// The POD structs and the vtable layout here MUST match the redistributable
+	// SDK header (OpenAnimationReplacerAPI-Clips.h) exactly. External plugins
+	// cast the void* from RequestPluginAPI_Clips to their IClipsAPI*.
+
+	// Mirrors OAR::Clips::ClipInfo
+	struct ClipInfoPOD
+	{
+		uint64_t clipHandle;
+		uint32_t actorFormID;
+		uint8_t graphIndex;
+		uint8_t perspective;
+		uint8_t playbackMode;
+		uint8_t replacementKind;
+		float duration;
+		float localTime;
+		float playbackSpeed;
+		float originalDuration;
+		int32_t subModPriority;
+		char animationName[128];
+		char resolvedPath[260];
+		char suffix[128];
+		char subModName[128];
+		char modName[128];
+		char replacementPath[260];
+	};
+
+	// Mirrors OAR::Clips::ClipAnnotation
+	struct ClipAnnotationPOD
+	{
+		float time;
+		char text[124];
+	};
+
+	// Mirrors OAR::Clips::ActiveReplacementInfo
+	struct ActiveReplacementInfoPOD
+	{
+		uint32_t actorFormID;
+		bool conditionsPassed;
+		char clipSuffix[128];
+		char subModName[128];
+		char replacementPath[260];
+		char originalPath[260];
+		char actorName[64];
+	};
+
+	// Mirrors OAR::Clips::Stats
+	struct StatsPOD
+	{
+		uint32_t replacerModCount;
+		uint32_t subModCount;
+		uint32_t replacementAnimCount;
+		uint32_t cachedAnimFileCount;
+		uint32_t activeReplacementCount;
+	};
+
+	class IClipsAPIInternal
+	{
+	public:
+		virtual ~IClipsAPIInternal() = default;
+		virtual uint32_t GetAPIVersion() const = 0;
+		virtual uint32_t GetActorClips(uint32_t a_actorFormID, ClipInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual bool FindClip(uint32_t a_actorFormID, const char* a_nameOrLeaf, ClipInfoPOD* a_out) = 0;
+		virtual uint32_t GetClipAnnotations(uint64_t a_clipHandle, ClipAnnotationPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual uint32_t GetActiveReplacements(uint32_t a_actorFormID, ActiveReplacementInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual bool GetStats(StatsPOD* a_out) = 0;
+	};
+
+	// Truncating copy into a fixed buffer, always null-terminated.
+	template <size_t N>
+	static void CopyToBuf(char (&a_dst)[N], const std::string& a_src)
+	{
+		const size_t n = std::min(a_src.size(), N - 1);
+		std::memcpy(a_dst, a_src.data(), n);
+		a_dst[n] = '\0';
+	}
+
+	// Path leaf (after the last slash), lowercased for case-insensitive compare.
+	static std::string LeafLower(std::string_view a_path)
+	{
+		const auto pos = a_path.find_last_of("\\/");
+		std::string leaf{ pos == std::string_view::npos ? a_path : a_path.substr(pos + 1) };
+		// Drop a trailing ".hkx" so "wpnfire.hkx" and "wpnfire" both match.
+		if (leaf.size() > 4 && _stricmp(leaf.c_str() + leaf.size() - 4, ".hkx") == 0) {
+			leaf.resize(leaf.size() - 4);
+		}
+		std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return leaf;
+	}
+
+	static RE::TESObjectREFR* ResolveQueryActor(uint32_t a_formID)
+	{
+		if (a_formID == 0 || a_formID == 0x14) {
+			return RE::PlayerCharacter::GetSingleton();
+		}
+		auto* form = RE::TESForm::GetFormByID(a_formID);
+		return form ? form->As<RE::TESObjectREFR>() : nullptr;
+	}
+
+	static void FillClipInfoPOD(ClipInfoPOD& a_dst, const OARClipQueryData& a_src)
+	{
+		a_dst.clipHandle = a_src.clipHandle;
+		a_dst.actorFormID = a_src.actorFormID;
+		a_dst.graphIndex = a_src.graphIndex;
+		a_dst.perspective = a_src.perspective;
+		a_dst.playbackMode = a_src.playbackMode;
+		a_dst.replacementKind = a_src.replacementKind;
+		a_dst.duration = a_src.duration;
+		a_dst.localTime = a_src.localTime;
+		a_dst.playbackSpeed = a_src.playbackSpeed;
+		a_dst.originalDuration = a_src.originalDuration;
+		a_dst.subModPriority = a_src.subModPriority;
+		CopyToBuf(a_dst.animationName, a_src.animationName);
+		CopyToBuf(a_dst.resolvedPath, a_src.resolvedPath);
+		CopyToBuf(a_dst.suffix, a_src.suffix);
+		CopyToBuf(a_dst.subModName, a_src.subModName);
+		CopyToBuf(a_dst.modName, a_src.modName);
+		CopyToBuf(a_dst.replacementPath, a_src.replacementPath);
+	}
+
+	class ClipsAPIImpl : public IClipsAPIInternal
+	{
+	public:
+		uint32_t GetAPIVersion() const override
+		{
+			return 1;
+		}
+
+		uint32_t GetActorClips(uint32_t a_actorFormID, ClipInfoPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return 0;
+
+			std::vector<OARClipQueryData> clips;
+			CollectActorClipQueryData(refr, clips);
+
+			if (a_outBuffer && a_maxCount > 0) {
+				const uint32_t n = std::min<uint32_t>(a_maxCount, static_cast<uint32_t>(clips.size()));
+				for (uint32_t i = 0; i < n; ++i) {
+					FillClipInfoPOD(a_outBuffer[i], clips[i]);
+				}
+			}
+			return static_cast<uint32_t>(clips.size());
+		}
+
+		bool FindClip(uint32_t a_actorFormID, const char* a_nameOrLeaf, ClipInfoPOD* a_out) override
+		{
+			if (!a_nameOrLeaf || !a_out) return false;
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return false;
+
+			const std::string wanted = LeafLower(a_nameOrLeaf);
+			if (wanted.empty()) return false;
+
+			std::vector<OARClipQueryData> clips;
+			CollectActorClipQueryData(refr, clips);
+
+			for (const auto& c : clips) {
+				if (LeafLower(c.suffix) == wanted ||
+					LeafLower(c.animationName) == wanted ||
+					LeafLower(c.resolvedPath) == wanted) {
+					FillClipInfoPOD(*a_out, c);
+					return true;
+				}
+			}
+			return false;
+		}
+
+		uint32_t GetClipAnnotations(uint64_t a_clipHandle, ClipAnnotationPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			std::vector<std::pair<float, std::string>> annots;
+			CollectClipAnnotations(static_cast<uintptr_t>(a_clipHandle), annots);
+
+			if (a_outBuffer && a_maxCount > 0) {
+				const uint32_t n = std::min<uint32_t>(a_maxCount, static_cast<uint32_t>(annots.size()));
+				for (uint32_t i = 0; i < n; ++i) {
+					a_outBuffer[i].time = annots[i].first;
+					CopyToBuf(a_outBuffer[i].text, annots[i].second);
+				}
+			}
+			return static_cast<uint32_t>(annots.size());
+		}
+
+		uint32_t GetActiveReplacements(uint32_t a_actorFormID, ActiveReplacementInfoPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			const auto snapshot = ActiveReplacementTracker::GetSingleton()->GetSnapshot();
+
+			uint32_t total = 0;
+			uint32_t written = 0;
+			for (const auto& e : snapshot) {
+				// a_actorFormID == 0 means "all actors" here (unlike the clip
+				// queries, where 0 is a player shorthand — replacements are
+				// global state, clips need one concrete graph to walk).
+				if (a_actorFormID != 0 && e.actorFormID != a_actorFormID) continue;
+				total++;
+				if (a_outBuffer && written < a_maxCount) {
+					auto& dst = a_outBuffer[written++];
+					dst.actorFormID = e.actorFormID;
+					dst.conditionsPassed = e.conditionsPassed;
+					CopyToBuf(dst.clipSuffix, e.clipSuffix);
+					CopyToBuf(dst.subModName, e.subModName);
+					CopyToBuf(dst.replacementPath, e.replacementPath);
+					CopyToBuf(dst.originalPath, e.fullPath);
+					CopyToBuf(dst.actorName, e.actorName);
+				}
+			}
+			return total;
+		}
+
+		bool GetStats(StatsPOD* a_out) override
+		{
+			if (!a_out) return false;
+
+			auto* oar = OpenAnimationReplacer::GetSingleton();
+			uint32_t mods = 0;
+			uint32_t subMods = 0;
+			{
+				std::shared_lock lock(oar->GetModsMutex());
+				mods = static_cast<uint32_t>(oar->GetReplacerMods().size());
+				for (const auto& mod : oar->GetReplacerMods()) {
+					subMods += static_cast<uint32_t>(mod->GetSubMods().size());
+				}
+			}
+			a_out->replacerModCount = mods;
+			a_out->subModCount = subMods;
+			a_out->replacementAnimCount = static_cast<uint32_t>(oar->GetTotalReplacementCount());
+			a_out->cachedAnimFileCount = static_cast<uint32_t>(AnimationCache::GetSingleton()->GetCacheSize());
+			a_out->activeReplacementCount = static_cast<uint32_t>(ActiveReplacementTracker::GetSingleton()->GetCount());
+			return true;
+		}
+	};
+
+	static ClipsAPIImpl g_clipsAPI;
 }
 
 // =============================================================================
@@ -110,4 +351,10 @@ extern "C" OAR_API void* RequestPluginAPI_Conditions()
 {
 	logger::info("[OAR-API] Conditions API requested (version 2)");
 	return static_cast<IConditionsAPIInternal*>(&g_conditionsAPI);
+}
+
+extern "C" OAR_API void* RequestPluginAPI_Clips()
+{
+	logger::info("[OAR-API] Clips API requested (version 1)");
+	return static_cast<IClipsAPIInternal*>(&g_clipsAPI);
 }

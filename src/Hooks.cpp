@@ -7214,3 +7214,245 @@ namespace Hooks
 		}
 	}
 }
+
+// =============================================================================
+// Clip query collectors — back the external Clips API (RequestPluginAPI_Clips).
+//
+// Defined at the end of the TU so every file-static map/mutex and helper
+// (suffix/path caches, active submod map, perspective classifier, validated
+// original lookup) declared above is in scope. MAIN THREAD ONLY: the graph
+// walk reads live Havok structures exactly like PollPlayerGraphClips does,
+// with the same vtable + IsBadReadPtr guards.
+// =============================================================================
+
+size_t CollectActorClipQueryData(RE::TESObjectREFR* a_refr, std::vector<OARClipQueryData>& a_out)
+{
+	a_out.clear();
+	if (!a_refr) return 0;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return 0;
+
+	// Same layout constants as PollPlayerGraphClips (verified against GunMover).
+	constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
+	constexpr uintptr_t kBG_ActiveNodes = 0xE0;
+
+	static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+	const auto clipVtbl = Offsets::hkbClipGenerator_vtbl.address();
+	const uint32_t formID = a_refr->GetFormID();
+
+	auto* cache = AnimationCache::GetSingleton();
+
+	// One tracker snapshot for replacement-path lookups (keyed actorID+suffix).
+	const auto replacementSnapshot = ActiveReplacementTracker::GetSingleton()->GetSnapshot();
+
+	for (uint32_t gi = 0; gi < manager->graph.size() && gi < 4; ++gi) {
+		const auto root = reinterpret_cast<uintptr_t>(manager->graph[gi].get());
+		if (!root || root < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(root), kBShkb_HkRootGraph + 8) ||
+			*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
+			continue;
+		}
+		const auto hkGraph = *reinterpret_cast<uintptr_t*>(root + kBShkb_HkRootGraph);
+		if (!hkGraph || hkGraph < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+			continue;
+		}
+		// Skip while the graph rebuilds its node list (same gate as the poll).
+		if (*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+			*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0) {
+			continue;
+		}
+		const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kBG_ActiveNodes);
+		if (!activeNodes || IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
+			continue;
+		}
+		const auto data = *reinterpret_cast<uintptr_t*>(activeNodes);
+		const auto size = *reinterpret_cast<int32_t*>(activeNodes + 8);
+		if (!data || size <= 0 || size > 0x1000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(data), static_cast<size_t>(size) * sizeof(void*))) {
+			continue;
+		}
+
+		for (int32_t i = 0; i < size; ++i) {
+			const auto entry = *reinterpret_cast<uintptr_t*>(data + static_cast<uintptr_t>(i) * sizeof(void*));
+			if (!entry || IsBadReadPtr(reinterpret_cast<void*>(entry), 0x18)) {
+				continue;
+			}
+
+			// Node entry itself, or entry+0x08, whichever carries the clip vtable.
+			uintptr_t clipAddr = 0;
+			if (*reinterpret_cast<uintptr_t*>(entry) == clipVtbl) {
+				clipAddr = entry;
+			} else {
+				const auto candidate = *reinterpret_cast<uintptr_t*>(entry + 0x08);
+				if (candidate && candidate > 0x10000 &&
+					!IsBadReadPtr(reinterpret_cast<void*>(candidate), sizeof(void*)) &&
+					*reinterpret_cast<uintptr_t*>(candidate) == clipVtbl) {
+					clipAddr = candidate;
+				}
+			}
+			if (!clipAddr) continue;
+
+			auto* clip = reinterpret_cast<RE::hkbClipGenerator*>(clipAddr);
+
+			auto& d = a_out.emplace_back();
+			d.clipHandle = clipAddr;
+			d.actorFormID = formID;
+			d.graphIndex = static_cast<uint8_t>(gi);
+			d.playbackMode = static_cast<uint8_t>(clip->mode);
+			d.playbackSpeed = clip->playbackSpeed;
+
+			// Authored animation path — may be a template (e.g. "44pistol\...")
+			// until the subgraph resolution provides the real directory.
+			if (const char* an = clip->animationName.data();
+				an && reinterpret_cast<uintptr_t>(an) > 0x10000 && !IsBadReadPtr(an, 1)) {
+				d.animationName = an;
+			}
+
+			// Runtime playback state exists only after activation.
+			if (clip->GetAnimationControlRaw()) {
+				d.localTime = clip->GetLocalTime();
+				if (auto* anim = clip->GetAnimation(); anim && !IsBadReadPtr(anim, 0x20)) {
+					d.duration = anim->duration;
+					if (cache->IsOurReplacement(anim)) {
+						d.replacementKind = 1;  // full-body swap in the slot
+						if (auto* orig = GetValidOriginal(clip)) {
+							d.originalDuration = orig->duration;
+						}
+					} else {
+						d.originalDuration = d.duration;
+					}
+				}
+			}
+
+			// OAR-resolved data from the per-clip caches.
+			{
+				std::shared_lock lock(s_clipSuffixMutex);
+				auto it = s_clipSuffixCache.find(clip);
+				if (it != s_clipSuffixCache.end()) d.suffix = it->second;
+			}
+			{
+				std::shared_lock lock(s_clipRealPathMutex);
+				auto it = s_clipRealPathCache.find(clip);
+				if (it != s_clipRealPathCache.end()) d.resolvedPath = it->second;
+			}
+			d.perspective = static_cast<uint8_t>(ClassifyClipPerspective(clip, d.resolvedPath));
+
+			// Active replacement attribution (also set for track-filtered clips,
+			// whose slot still holds the original animation).
+			SubMod* activeSubMod = nullptr;
+			{
+				std::shared_lock smLock(s_activeSubModMutex);
+				auto it = s_activeSubModMap.find(clip);
+				if (it != s_activeSubModMap.end()) activeSubMod = it->second;
+			}
+			if (activeSubMod) {
+				d.subModName = activeSubMod->GetName();
+				d.subModPriority = activeSubMod->GetPriority();
+				if (d.replacementKind == 0 && activeSubMod->trackFilter.enabled) {
+					d.replacementKind = 2;  // partial-bone override, no slot swap
+				}
+				// Parent replacer mod: search the registry (SubMod stores no
+				// back-pointer). Registry is small; this runs on demand only.
+				auto* oar = OpenAnimationReplacer::GetSingleton();
+				std::shared_lock modsLock(oar->GetModsMutex());
+				for (const auto& mod : oar->GetReplacerMods()) {
+					bool found = false;
+					for (const auto& sub : mod->GetSubMods()) {
+						if (sub.get() == activeSubMod) {
+							d.modName = mod->GetName();
+							found = true;
+							break;
+						}
+					}
+					if (found) break;
+				}
+				// Replacement file path from the tracker (keyed actor+suffix).
+				for (const auto& rep : replacementSnapshot) {
+					if (rep.actorFormID == formID && rep.clipSuffix == d.suffix) {
+						d.replacementPath = rep.replacementPath;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	return a_out.size();
+}
+
+size_t CollectClipAnnotations(uintptr_t a_clipHandle, std::vector<std::pair<float, std::string>>& a_out)
+{
+	a_out.clear();
+
+	auto* clip = reinterpret_cast<RE::hkbClipGenerator*>(a_clipHandle);
+	if (!IsLiveClipGenerator(clip)) return 0;
+
+	auto* anim = clip->GetAnimation();
+	if (!anim || IsBadReadPtr(anim, 0x40)) return 0;
+
+	// Replaced clip: the clone's embedded annotation tracks are deliberately
+	// nulled (OAR fires annotations manually), so read the parsed annotations
+	// from the cache — the same list the manual firing uses.
+	auto* cache = AnimationCache::GetSingleton();
+	if (cache->IsOurReplacement(anim)) {
+		std::string suffix;
+		{
+			std::shared_lock lock(s_clipSuffixMutex);
+			auto it = s_clipSuffixCache.find(clip);
+			if (it != s_clipSuffixCache.end()) suffix = it->second;
+		}
+		if (suffix.empty()) return 0;
+		SubMod* owner = nullptr;
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto it = s_activeSubModMap.find(clip);
+			if (it != s_activeSubModMap.end()) owner = it->second;
+		}
+		if (const auto* annots = cache->GetAnnotations(suffix, owner)) {
+			for (const auto& a : *annots) {
+				a_out.emplace_back(a.time, a.text);
+			}
+		}
+		return a_out.size();
+	}
+
+	// Game animation: parse the raw hkaAnnotationTrack array (same guarded
+	// offsets as the Activate-time original-annotation cache: tracks at
+	// anim+0x28/count +0x30; per track annotations ptr +0x08 / count +0x10;
+	// per annotation time +0x00 / text +0x08 with the low flag bit masked).
+	auto* animBytes = reinterpret_cast<uint8_t*>(anim);
+	auto* trackPtr = *reinterpret_cast<uint8_t**>(animBytes + 0x28);
+	int32_t trackCount = *reinterpret_cast<int32_t*>(animBytes + 0x30);
+	if (!trackPtr || trackCount <= 0 || trackCount > 0x200 ||
+		reinterpret_cast<uintptr_t>(trackPtr) < 0x10000 ||
+		IsBadReadPtr(trackPtr, static_cast<size_t>(trackCount) * 0x18)) {
+		return 0;
+	}
+
+	constexpr size_t kAnnotTrackSize = 0x18;
+	constexpr size_t kAnnotationSize = 0x10;
+
+	for (int32_t t = 0; t < trackCount; ++t) {
+		auto* trackBase = trackPtr + (t * kAnnotTrackSize);
+		auto* annots = *reinterpret_cast<uint8_t**>(trackBase + 0x08);
+		int32_t annotCount = *reinterpret_cast<int32_t*>(trackBase + 0x10);
+		if (!annots || annotCount <= 0 || annotCount > 0x1000 ||
+			reinterpret_cast<uintptr_t>(annots) < 0x10000 ||
+			IsBadReadPtr(annots, static_cast<size_t>(annotCount) * kAnnotationSize)) {
+			continue;
+		}
+		for (int32_t a = 0; a < annotCount; ++a) {
+			auto* annBase = annots + (a * kAnnotationSize);
+			float time = *reinterpret_cast<float*>(annBase + 0x00);
+			auto rawTxt = *reinterpret_cast<uintptr_t*>(annBase + 0x08) & ~uintptr_t(1);
+			auto* txt = reinterpret_cast<const char*>(rawTxt);
+			if (txt && rawTxt > 0x10000 && !IsBadReadPtr(txt, 1) && txt[0] != '\0') {
+				a_out.emplace_back(time, std::string(txt));
+			}
+		}
+	}
+
+	return a_out.size();
+}
