@@ -133,9 +133,11 @@ struct CharTrackFilterState {
 	// Per-character bone-name → index resolution (rebuilt when filter version changes).
 	std::unordered_map<RE::hkbCharacter*, CharResolved> resolvedByChar;
 
-	// Frame counter at the last source-clip Generate. Used to invalidate the cache
-	// when source clips stop generating (without firing a Deactivate hook).
-	uint64_t lastSourceFrame = 0;
+	// Wall-clock time (seconds, from s_tfTimeSec) of the last source-clip
+	// Generate. Used to detect that source clips stopped generating (without
+	// firing a Deactivate hook). Time-based, NOT frame-based, so the staleness
+	// window is identical at any framerate.
+	float lastSourceTimeSec = 0.0f;
 
 	// Temporal blend state: ramps effectiveAlpha toward 1.0 (active) or 0.0 (deactivating)
 	float blendAlpha = 0.0f;        // current interpolated alpha [0, 1]
@@ -148,8 +150,25 @@ struct CharTrackFilterState {
 	float deactivationDelayRemaining = 0.0f;
 };
 static std::shared_mutex s_trackFilterMutex;
-static std::unordered_map<RE::TESObjectREFR*, CharTrackFilterState> s_charTrackFilterMap;
+// Multiple track-filtered submods can be active on one actor at the same time
+// (e.g. a bolt-lock filter from "Idle Empty" plus an arms filter from "Super
+// Sprint"). Each gets its own independent state — sharing a single slot per
+// actor made concurrent filters evict each other and skip blend-in (the slot
+// was "not new", so blendAlpha stayed at the previous filter's value).
+static std::unordered_map<RE::TESObjectREFR*, std::vector<CharTrackFilterState>> s_charTrackFilterMap;
 static std::atomic<int> s_trackFilterActiveCount{ 0 };
+
+// Find the state for a specific filter on an actor. Returns nullptr if absent.
+// Caller must hold s_trackFilterMutex (shared or unique).
+static CharTrackFilterState* FindTrackFilterState(RE::TESObjectREFR* a_actor, const SubMod::TrackFilter* a_filter)
+{
+	auto it = s_charTrackFilterMap.find(a_actor);
+	if (it == s_charTrackFilterMap.end()) return nullptr;
+	for (auto& state : it->second) {
+		if (state.filter == a_filter) return &state;
+	}
+	return nullptr;
+}
 
 // Play Once (Full Body): tracks the initial replacement decision per clip generator.
 // When a clip has a playOnceFullBody candidate, the first evaluation result is locked
@@ -159,9 +178,15 @@ static std::unordered_map<RE::hkbClipGenerator*, bool> s_playOnceDecision;
 
 // Per-frame counter, incremented in HookedActorUpdate. Used for staleness detection.
 static std::atomic<uint64_t> s_currentFrame{ 0 };
-// Threshold: if no source clip has fired Generate for this many frames, the entry
+// Wall-clock seconds since plugin init, updated once per HookedActorUpdate.
+// Track filter lifetime decisions use THIS, never frame counts — a frame-count
+// window shrinks in wall time as the framerate rises (300 frames is 5s at
+// 60fps but ~1.5s at 200fps), which made cached overrides drop out early on
+// fast/inconsistent framerates.
+static std::atomic<float> s_tfNowSec{ 0.0f };
+// Threshold: if no source clip has fired Generate for this long, the entry
 // is considered stale and erased (so non-source clips stop applying old cached pose).
-static constexpr uint64_t kTrackFilterStaleFrames = 300;
+static constexpr float kTrackFilterStaleSeconds = 5.0f;
 
 // --- Full-body replacement blend state ---
 // Uses a cached pose snapshot so we NEVER call _Generate twice per frame.
@@ -1331,20 +1356,52 @@ void RegisterWeaponEquipListener()
 // Not safe for the weapon-switch invalidation path (old originals may already
 // be freed there) — this is save-load only, where the engine hasn't torn
 // anything down yet at the time the message arrives.
+// Returns true only if a_clip still looks like a LIVE hkbClipGenerator:
+// readable through the fields we touch AND carrying the correct vtable.
+// The vtable check is the load-bearing part — a save load can free clip
+// generators WITHOUT firing our Deactivate hook (wholesale graph teardown),
+// and IsBadReadPtr alone passes for freed-but-still-mapped allocator pages.
+// Crash-2026-07-21-05-33-55: clip+0xD0 held FLT_MAX bit-pattern garbage from
+// a recycled allocation; the vtable of recycled memory won't match ours.
+static bool IsLiveClipGenerator(const RE::hkbClipGenerator* a_clip)
+{
+	// Cover the full range of fields we read/write (vtable .. originalTriggers @0xD8).
+	if (!a_clip || IsBadReadPtr(a_clip, 0xE0)) return false;
+	const auto vtbl = *reinterpret_cast<const uintptr_t*>(a_clip);
+	return vtbl == Offsets::hkbClipGenerator_vtbl.address();
+}
+
+// GetAnimationSlot() with every interior pointer validated before dereference.
+// Mirrors hkbClipGenerator::GetAnimationSlot (animCtrl@+0xD0 -> binding@+0x38
+// -> animation slot@+0x18) but never trusts a hop blindly.
+static RE::hkaAnimation** SafeGetAnimationSlot(const RE::hkbClipGenerator* a_clip)
+{
+	auto* bytes = reinterpret_cast<const uint8_t*>(a_clip);
+	auto* ctrl = *reinterpret_cast<uint8_t* const*>(bytes + 0xD0);
+	if (!ctrl || IsBadReadPtr(ctrl, 0x40)) return nullptr;
+	auto* bind = *reinterpret_cast<uint8_t* const*>(ctrl + 0x38);
+	if (!bind || IsBadReadPtr(bind, 0x20)) return nullptr;
+	auto** slot = reinterpret_cast<RE::hkaAnimation**>(const_cast<uint8_t*>(bind) + 0x18);
+	if (IsBadReadPtr(slot, sizeof(void*))) return nullptr;
+	return slot;
+}
+
 void RestoreAllActiveReplacements()
 {
 	auto* cache = AnimationCache::GetSingleton();
 	size_t restoredAnims = 0;
+	size_t skippedDead = 0;
 
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		for (auto& [clip, original] : s_originalAnimMap) {
 			if (!clip || !original) continue;
-			// Deactivated clips erase their map entries, so entries should be
-			// live — but guard reads anyway (same policy as the Update hook).
-			if (IsBadReadPtr(clip, sizeof(uintptr_t))) continue;
-			auto** slot = clip->GetAnimationSlot();
-			if (!slot || IsBadReadPtr(slot, sizeof(uintptr_t))) continue;
+			// A save load can tear down graphs (freeing clip generators) without
+			// our Deactivate hook firing, so map entries may be dangling here.
+			// Only touch clips that still carry the hkbClipGenerator vtable.
+			if (!IsLiveClipGenerator(clip)) { skippedDead++; continue; }
+			auto** slot = SafeGetAnimationSlot(clip);
+			if (!slot) continue;
 			// Only touch slots that currently hold OUR replacement.
 			if (!cache->IsOurReplacement(*slot)) continue;
 			// Validate the original before writing it back.
@@ -1366,13 +1423,19 @@ void RestoreAllActiveReplacements()
 		std::unique_lock lock(s_triggersBackupMutex);
 		for (auto& [clip, backup] : s_triggersBackup) {
 			if (!clip || !backup.nulled) continue;
-			if (IsBadReadPtr(clip, sizeof(uintptr_t))) continue;
+			// Same liveness rule as above — writing triggers into freed/recycled
+			// memory would silently corrupt whatever now lives there.
+			if (!IsLiveClipGenerator(clip)) { skippedDead++; continue; }
 			auto* bytes = reinterpret_cast<uint8_t*>(clip);
 			*reinterpret_cast<void**>(bytes + kClipGenTriggersOffset) = backup.triggers;
 			*reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset) = backup.originalTriggers;
 			restoredTriggers++;
 		}
 		// ClearClipRuntimeState (called right after) clears the map itself.
+	}
+
+	if (skippedDead > 0) {
+		logger::info("[OAR-PreLoad] Skipped {} dead/freed clip entries during restore", skippedDead);
 	}
 
 	if (restoredAnims > 0 || restoredTriggers > 0) {
@@ -4585,30 +4648,31 @@ namespace
 				RE::TESObjectREFR* tfActor = refr;
 				if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
 				if (tfActor) {
-					bool isNew = (s_charTrackFilterMap.find(tfActor) == s_charTrackFilterMap.end());
-					auto& state = s_charTrackFilterMap[tfActor];
-					// If the FILTER itself changed (different bone set), drop bone resolution cache.
-					// Note: resolvedByChar only depends on skeleton + filter bone names, NOT on
-					// which replacement animation is active. Don't clear it on replacement change.
-					if (state.filter != &winningInfo->parentSubMod->trackFilter) {
-						state.resolvedByChar.clear();
-						state.cachedRepByName.clear();
-						state.cachedBaseByName.clear();
-						state.cacheValid = false;
-					} else if (state.replacement != replacement) {
-						// Replacement changed but filter is the same — only invalidate animation
-						// sample caches, not bone resolution
-						state.cachedRepByName.clear();
-						state.cachedBaseByName.clear();
-						state.cacheValid = false;
+					// Per-filter state: each track-filtered submod active on this actor
+					// gets its own entry so concurrent filters never evict each other
+					// (and each blends in/out with ITS OWN configured times).
+					auto* filterKey = &winningInfo->parentSubMod->trackFilter;
+					auto* statePtr = FindTrackFilterState(tfActor, filterKey);
+					const bool isNew = (statePtr == nullptr);
+					if (isNew) {
+						statePtr = &s_charTrackFilterMap[tfActor].emplace_back();
+						statePtr->filter = filterKey;
 					}
+					auto& state = *statePtr;
+					// NOTE: when the replacement pointer changes (variant re-roll on
+					// clip re-activation, clone rebuild), the sample caches are kept
+					// — NOT cleared. Clearing them made every non-source clip skip
+					// application until the source clip's next Generate, a 1-2 frame
+					// dropout that is invisible at high framerate but a visible pop
+					// during frame hitches. The stale values are same-filter/same-bone
+					// (typically a different variant of the same pose) and get
+					// overwritten by the source clip's very next Generate anyway.
 					state.replacement = replacement;
-					state.filter = &winningInfo->parentSubMod->trackFilter;
 					state.parentSubMod = winningInfo->parentSubMod;
 					state.sourceClip = a_this;
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
-					state.lastSourceFrame = s_currentFrame.load(std::memory_order_relaxed);
+					state.lastSourceTimeSec = s_tfNowSec.load(std::memory_order_relaxed);
 					// Store the original animation pointer for blend-sibling identification.
 					// Track filter doesn't swap the animation slot, so the source clip's
 					// current animation IS the original.
@@ -5284,9 +5348,11 @@ namespace
 			// a new source clip registered.
 			if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
 				std::unique_lock tfLock(s_trackFilterMutex);
-				for (auto& [actor, state] : s_charTrackFilterMap) {
-					state.sourceClips.erase(a_this);
-					if (state.sourceClip == a_this) state.sourceClip = nullptr;
+				for (auto& [actor, states] : s_charTrackFilterMap) {
+					for (auto& state : states) {
+						state.sourceClips.erase(a_this);
+						if (state.sourceClip == a_this) state.sourceClip = nullptr;
+					}
 				}
 			}
 	}
@@ -5453,23 +5519,42 @@ namespace
 			s_poseHdrLog++;
 		}
 
+		// Snapshot which filters are registered for this actor, and bail out
+		// entirely if this clip's slot currently holds ANY registered replacement
+		// — that means we're inside a swap-fallback's recursive _Generate and
+		// must not re-enter our own logic.
+		std::vector<const SubMod::TrackFilter*> actorFilters;
+		{
+			std::shared_lock tfShared(s_trackFilterMutex);
+			auto mapIt = s_charTrackFilterMap.find(actor);
+			if (mapIt == s_charTrackFilterMap.end()) return;
+			auto** slotOuter = a_this->GetAnimationSlot();
+			actorFilters.reserve(mapIt->second.size());
+			for (auto& st : mapIt->second) {
+				if (slotOuter && *slotOuter && st.replacement && *slotOuter == st.replacement) return;
+				if (st.filter) actorFilters.push_back(st.filter);
+			}
+		}
+
+		// Apply every active filter independently — each has its own bone set,
+		// weight, blend alpha and cached poses. Overlapping bones resolve in
+		// registration order (later filters win). Inside the lambda, `return`
+		// means "done with THIS filter", not "done with the clip".
+		auto processFilter = [&](const SubMod::TrackFilter* filterKey) {
 		// --- Try shared_lock first for the fast non-source path ---
 		// Non-source clips only READ cached data. We avoid unique_lock contention
 		// that causes freezes when many clips fire during weapon events.
 		{
 			std::shared_lock tfShared(s_trackFilterMutex);
-			auto it = s_charTrackFilterMap.find(actor);
-			if (it == s_charTrackFilterMap.end()) return;
+			auto* statePtr = FindTrackFilterState(actor, filterKey);
+			if (!statePtr) return;
 
-			auto& state = it->second;
+			auto& state = *statePtr;
 			auto* filterPtr = state.filter;
 			auto* replacement = state.replacement;
 			if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
 			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
-			auto** animSlot = a_this->GetAnimationSlot();
-			bool inRecursion = (animSlot && *animSlot == replacement);
-			if (inRecursion) return;
 
 			// Non-source clips with valid cache and already-resolved bones:
 			// handle entirely under shared_lock (no writes to shared state).
@@ -5578,10 +5663,10 @@ namespace
 		// Acquire UNIQUE lock for source clips, first-time resolution, or stale checks.
 		std::unique_lock tfLock(s_trackFilterMutex);
 
-		auto it = s_charTrackFilterMap.find(actor);
-		if (it == s_charTrackFilterMap.end()) return;
+		auto* statePtr = FindTrackFilterState(actor, filterKey);
+		if (!statePtr) return;
 
-		auto& state = it->second;
+		auto& state = *statePtr;
 		auto* filterPtr = state.filter;
 		auto* replacement = state.replacement;
 		if (!filterPtr || !filterPtr->enabled || !replacement) return;
@@ -5598,22 +5683,18 @@ namespace
 		float weight = filterPtr->weight * state.blendAlpha;
 		if (weight <= 0.001f) return;
 		auto mode = filterPtr->mode;
-		uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
+		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
 		auto** animSlot = a_this->GetAnimationSlot();
-		bool inRecursion = (animSlot && *animSlot == replacement);
 
 		static int s_genEntryLog = 0;
 		if (s_genEntryLog < 6) {
-			logger::info("[OAR-TrackFilter] Generate: char={:X} a_this={:X} isSource={} inRec={} bones={}",
+			logger::info("[OAR-TrackFilter] Generate: char={:X} a_this={:X} isSource={} bones={}",
 				reinterpret_cast<uintptr_t>(character),
 				reinterpret_cast<uintptr_t>(a_this),
-				isSourceClip, inRecursion, cr.nameAndIndex.size());
+				isSourceClip, cr.nameAndIndex.size());
 			s_genEntryLog++;
 		}
-
-		// Don't re-enter our logic during the swap-fallback's recursive _Generate.
-		if (inRecursion) return;
 
 		// =====================================================================
 		// SOURCE CLIP PATH
@@ -5725,7 +5806,7 @@ namespace
 				// onFraction is > 0 here (source path has an early-out at the top).
 
 				state.cacheValid = true;
-				state.lastSourceFrame = curFrame;
+				state.lastSourceTimeSec = nowSec;
 
 				static int s_finalLog = 0;
 				if (s_finalLog < 5) {
@@ -5770,24 +5851,28 @@ namespace
 
 			*animSlot = originalInSlot;
 
-			it = s_charTrackFilterMap.find(actor);
-			if (it == s_charTrackFilterMap.end()) {
+			// Re-find EVERYTHING after the unlock window: other threads may have
+			// erased this state or reallocated the actor's state vector (which
+			// invalidates both `state` and `cr` references captured above).
+			auto* statePtr2 = FindTrackFilterState(actor, filterKey);
+			if (!statePtr2) {
 				memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
 				return;
 			}
-			auto& state2 = it->second;
+			auto& state2 = *statePtr2;
+			auto& cr2 = state2.resolvedByChar[character];
 
-			for (auto& [name, idx] : cr.nameAndIndex) {
+			for (auto& [name, idx] : cr2.nameAndIndex) {
 				if (idx < 0 || idx >= numOutputBones) continue;
 				state2.cachedRepByName[name] = outputPose[idx];
 				state2.cachedBaseByName[name] = tl_fullBasePose[idx];
 			}
 			state2.cacheValid = true;
-			state2.lastSourceFrame = curFrame;
+			state2.lastSourceTimeSec = nowSec;
 
 			memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
 
-			for (auto& [name, idx] : cr.nameAndIndex) {
+			for (auto& [name, idx] : cr2.nameAndIndex) {
 				if (idx < 0 || idx >= numOutputBones) continue;
 				auto rIt = state2.cachedRepByName.find(name);
 				if (rIt == state2.cachedRepByName.end()) continue;
@@ -5804,7 +5889,7 @@ namespace
 
 			static int s_fbFinalLog = 0;
 			if (s_fbFinalLog < 10) {
-				for (auto& [name, idx] : cr.nameAndIndex) {
+				for (auto& [name, idx] : cr2.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
 					auto& f = outputPose[idx];
 					auto bIt = state2.cachedBaseByName.find(name);
@@ -5891,6 +5976,11 @@ namespace
 			}
 			s_nonSrcFinalLog++;
 		}
+		}; // end processFilter lambda
+
+		for (auto* filterKey : actorFilters) {
+			processFilter(filterKey);
+		}
 	}
 
 	void hkbClipGenerator_StartEcho(RE::hkbClipGenerator* a_this, float a_duration)
@@ -5975,16 +6065,22 @@ namespace
 		}
 
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
-		static auto s_lastTick = std::chrono::high_resolution_clock::now();
+		static const auto s_initTick = std::chrono::high_resolution_clock::now();
+		static auto s_lastTick = s_initTick;
 		auto now = std::chrono::high_resolution_clock::now();
 		float dt = std::chrono::duration<float>(now - s_lastTick).count();
 		dt = std::clamp(dt, 0.0001f, 0.1f);
 		s_lastTick = now;
 
+		// Publish wall-clock "now" for the Generate hook's staleness stamps.
+		s_tfNowSec.store(std::chrono::duration<float>(now - s_initTick).count(),
+			std::memory_order_relaxed);
+
 		// --- Track filter blend update ---
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
 			struct PendingEval {
 				RE::TESObjectREFR* actor;
+				const SubMod::TrackFilter* filter;  // identifies the state within the actor
 				SubMod* subMod;
 				std::string suffix;
 				RE::hkbClipGenerator* sourceClip;
@@ -5993,13 +6089,17 @@ namespace
 			{
 				std::shared_lock tfShared(s_trackFilterMutex);
 				toEval.reserve(s_charTrackFilterMap.size());
-				for (auto& [actor, state] : s_charTrackFilterMap) {
-					if (state.parentSubMod && actor)
-						toEval.push_back({ actor, state.parentSubMod, state.suffix, state.sourceClip });
+				for (auto& [actor, states] : s_charTrackFilterMap) {
+					for (auto& state : states) {
+						if (state.parentSubMod && actor)
+							toEval.push_back({ actor, state.filter, state.parentSubMod, state.suffix, state.sourceClip });
+					}
 				}
 			}
 
-			std::unordered_set<RE::TESObjectREFR*> conditionsFalse;
+			// Conditions are evaluated per (actor, filter) pair — multiple filters
+			// can be active on one actor and each deactivates independently.
+			std::set<std::pair<RE::TESObjectREFR*, const SubMod::TrackFilter*>> conditionsFalse;
 			for (auto& pe : toEval) {
 				if (pe.subMod->GetPlayOnceFullBody()) continue;
 				// Track-filtered submods always re-evaluate conditions. Unlike full-body
@@ -6008,90 +6108,102 @@ namespace
 				// conditions become false. The configured blendOutTime provides the smooth
 				// transition — not the interruptible flag.
 				if (!pe.subMod->EvaluateConditions(pe.actor, pe.sourceClip))
-					conditionsFalse.insert(pe.actor);
+					conditionsFalse.insert({ pe.actor, pe.filter });
 			}
 
 			{
-				uint64_t curFrame = s_currentFrame.load(std::memory_order_relaxed);
+				const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 				std::unique_lock tfLock(s_trackFilterMutex);
-				for (auto it = s_charTrackFilterMap.begin(); it != s_charTrackFilterMap.end(); ) {
-					auto& state = it->second;
-					auto* filterPtr = state.filter;
-					bool condFalse = conditionsFalse.count(it->first) > 0;
+				for (auto mapIt = s_charTrackFilterMap.begin(); mapIt != s_charTrackFilterMap.end(); ) {
+					auto& states = mapIt->second;
+					for (auto stIt = states.begin(); stIt != states.end(); ) {
+						auto& state = *stIt;
+						auto* filterPtr = state.filter;
+						bool condFalse = conditionsFalse.count({ mapIt->first, filterPtr }) > 0;
 
-					// Staleness cleanup: if all source clips are gone and no source
-					// has generated for kTrackFilterStaleFrames, treat as condition-false
-					// to start blend-out. This handles the case where source clips
-					// deactivate and conditions are non-interruptible (never re-evaluated).
-					if (!condFalse && state.sourceClips.empty() && !state.blendingOut &&
-						curFrame - state.lastSourceFrame > kTrackFilterStaleFrames) {
-						condFalse = true;
-					}
-
-				if (condFalse && !state.blendingOut) {
-					float deactivDelay = state.parentSubMod ? state.parentSubMod->GetDeactivationDelay() : 0.0f;
-					if (deactivDelay > 0.0f && !state.deactivationDelayActive) {
-						state.deactivationDelayActive = true;
-						state.deactivationDelayRemaining = deactivDelay;
-					}
-
-					if (!state.deactivationDelayActive || state.deactivationDelayRemaining <= 0.0f) {
-						state.deactivationDelayActive = false;
-						state.blendingOut = true;
-						state.blendElapsed = 0.0f;
-						state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
-						static int s_boLog = 0;
-						if (s_boLog < 10) {
-							logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
-								state.suffix, state.blendDuration);
-							s_boLog++;
-						}
-					}
-				} else if (!condFalse) {
-					state.deactivationDelayActive = false;
-					state.deactivationDelayRemaining = 0.0f;
-				}
-
-				if (state.deactivationDelayActive) {
-					state.deactivationDelayRemaining -= dt;
-				}
-
-					if (state.blendingOut) {
-						if (state.blendDuration <= 0.0f) {
-							it = s_charTrackFilterMap.erase(it);
-							s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
-							continue;
-						}
-						state.blendElapsed += dt;
-						float t = std::clamp(state.blendElapsed / state.blendDuration, 0.0f, 1.0f);
-						state.blendAlpha = 1.0f - EaseInOutQuad(t);
-
-						// Diagnostic: log blend-out progress every ~0.1s
-						static float s_lastBlendLog = 0.0f;
-						if (state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f) {
-							logger::info("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
-								state.suffix, state.blendElapsed, state.blendDuration, t, state.blendAlpha, dt);
-							s_lastBlendLog = state.blendElapsed;
+						// Staleness cleanup: if all source clips are gone and no source
+						// has generated for kTrackFilterStaleSeconds (wall-clock — frame
+						// counts would shrink the window at high framerates), treat as
+						// condition-false to start blend-out. This handles the case where
+						// source clips deactivate and conditions are non-interruptible
+						// (never re-evaluated).
+						if (!condFalse && state.sourceClips.empty() && !state.blendingOut &&
+							nowSec - state.lastSourceTimeSec > kTrackFilterStaleSeconds) {
+							condFalse = true;
 						}
 
-						if (state.blendAlpha <= 0.001f) {
-							logger::info("[OAR-TrackFilter] Blend-out COMPLETE — erasing entry for '{}'", state.suffix);
-							s_lastBlendLog = 0.0f;
-							it = s_charTrackFilterMap.erase(it);
-							s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
-							continue;
+						if (condFalse && !state.blendingOut) {
+							float deactivDelay = state.parentSubMod ? state.parentSubMod->GetDeactivationDelay() : 0.0f;
+							if (deactivDelay > 0.0f && !state.deactivationDelayActive) {
+								state.deactivationDelayActive = true;
+								state.deactivationDelayRemaining = deactivDelay;
+							}
+
+							if (!state.deactivationDelayActive || state.deactivationDelayRemaining <= 0.0f) {
+								state.deactivationDelayActive = false;
+								state.blendingOut = true;
+								state.blendElapsed = 0.0f;
+								state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
+								static int s_boLog = 0;
+								if (s_boLog < 10) {
+									logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
+										state.suffix, state.blendDuration);
+									s_boLog++;
+								}
+							}
+						} else if (!condFalse) {
+							state.deactivationDelayActive = false;
+							state.deactivationDelayRemaining = 0.0f;
 						}
-					} else {
-						float blendInTime = filterPtr ? filterPtr->blendInTime : 0.0f;
-						if (blendInTime <= 0.0f || state.blendAlpha >= 1.0f) {
-							state.blendAlpha = 1.0f;
-						} else {
+
+						if (state.deactivationDelayActive) {
+							state.deactivationDelayRemaining -= dt;
+						}
+
+						if (state.blendingOut) {
+							if (state.blendDuration <= 0.0f) {
+								stIt = states.erase(stIt);
+								s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+								continue;
+							}
 							state.blendElapsed += dt;
-							float t = std::clamp(state.blendElapsed / blendInTime, 0.0f, 1.0f);
-							state.blendAlpha = EaseInOutQuad(t);
+							float t = std::clamp(state.blendElapsed / state.blendDuration, 0.0f, 1.0f);
+							state.blendAlpha = 1.0f - EaseInOutQuad(t);
+
+							// Diagnostic: log blend-out progress every ~0.1s
+							static float s_lastBlendLog = 0.0f;
+							if (state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f) {
+								logger::info("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
+									state.suffix, state.blendElapsed, state.blendDuration, t, state.blendAlpha, dt);
+								s_lastBlendLog = state.blendElapsed;
+							}
+
+							if (state.blendAlpha <= 0.001f) {
+								logger::info("[OAR-TrackFilter] Blend-out COMPLETE — erasing entry for '{}'", state.suffix);
+								s_lastBlendLog = 0.0f;
+								stIt = states.erase(stIt);
+								s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+								continue;
+							}
+						} else {
+							float blendInTime = filterPtr ? filterPtr->blendInTime : 0.0f;
+							if (blendInTime <= 0.0f || state.blendAlpha >= 1.0f) {
+								state.blendAlpha = 1.0f;
+							} else {
+								state.blendElapsed += dt;
+								float t = std::clamp(state.blendElapsed / blendInTime, 0.0f, 1.0f);
+								state.blendAlpha = EaseInOutQuad(t);
+							}
 						}
+						++stIt;
 					}
-					++it;
+
+					// Drop the actor entry once its last filter state is gone.
+					if (states.empty()) {
+						mapIt = s_charTrackFilterMap.erase(mapIt);
+					} else {
+						++mapIt;
+					}
 				}
 			}
 		}
