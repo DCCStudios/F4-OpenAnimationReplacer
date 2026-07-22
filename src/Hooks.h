@@ -57,6 +57,38 @@ struct OARClipQueryData
 // walks live Havok graph structures the way the per-frame poll does.
 size_t CollectActorClipQueryData(RE::TESObjectREFR* a_refr, std::vector<OARClipQueryData>& a_out);
 
+// Internal representation of one animation graph on an actor.
+struct OARGraphQueryData
+{
+	uint32_t actorFormID{ 0 };
+	uint8_t graphIndex{ 0 };
+	bool isFirstPerson{ false };    // player-only knowledge (learned 1st-person graph)
+	bool isRebuilding{ false };     // engine is rebuilding this graph's node list
+	uint32_t activeNodeCount{ 0 };
+	uint32_t activeClipCount{ 0 };  // clip generators among the active nodes
+	uint32_t boneCount{ 0 };        // animation skeleton bone count
+	uint32_t animationNameCount{ 0 }; // registered animation paths (character string data)
+	uint32_t eventNameCount{ 0 };   // behavior event names (project string data)
+	std::string characterName;      // Havok character name
+	std::string projectAnimationPath; // project's animation root (often empty in FO4)
+	std::string behaviorPath;       // project's behavior root
+};
+
+// One skeleton bone: name + parent index (-1 = root).
+struct OARBoneQueryData
+{
+	int16_t index{ 0 };
+	int16_t parentIndex{ -1 };
+	std::string name;
+};
+
+// Graph-level collectors backing the Clips API v2 graph queries.
+// All MAIN THREAD ONLY (same live-structure walk as the clip collector).
+size_t CollectActorGraphQueryData(RE::TESObjectREFR* a_refr, std::vector<OARGraphQueryData>& a_out);
+size_t CollectGraphBones(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<OARBoneQueryData>& a_out);
+size_t CollectGraphAnimationNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out);
+size_t CollectGraphEventNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out);
+
 // Fills a_out with (time, text) annotations of the animation currently playing
 // on the given clip (replacement annotations when a replacement is installed).
 // a_clipHandle must come from CollectActorClipQueryData in the same frame.

@@ -7456,3 +7456,282 @@ size_t CollectClipAnnotations(uintptr_t a_clipHandle, std::vector<std::pair<floa
 
 	return a_out.size();
 }
+
+// =============================================================================
+// Graph query collectors — back the Clips API v2 graph-level queries.
+// Same safety model as the clip collectors: every hop through live Havok
+// structures is vtable- and IsBadReadPtr-guarded. MAIN THREAD ONLY.
+// =============================================================================
+
+namespace
+{
+	// BShkbAnimationGraph layout constants shared by the graph queries
+	// (identical to the locals used by PollPlayerGraphClips / the clip collector).
+	constexpr uintptr_t kQuery_HkRootGraph = 0x378;   // BShkb -> hkbBehaviorGraph
+	constexpr uintptr_t kQuery_ActiveNodes = 0xE0;    // hkbBehaviorGraph -> active node array
+
+	// Validates manager->graph[gi] as a live BShkbAnimationGraph. Returns the
+	// root address or 0.
+	uintptr_t QueryValidateGraphRoot(RE::BSAnimationGraphManager* a_manager, uint32_t a_gi)
+	{
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+		if (a_gi >= a_manager->graph.size()) return 0;
+		const auto root = reinterpret_cast<uintptr_t>(a_manager->graph[a_gi].get());
+		if (!root || root < 0x10000 ||
+			IsBadReadPtr(reinterpret_cast<void*>(root), kQuery_HkRootGraph + 8) ||
+			*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
+			return 0;
+		}
+		return root;
+	}
+
+	// The graph's embedded hkbCharacter (at +0x1C8), or nullptr when unreadable.
+	RE::hkbCharacter* QueryGraphCharacter(uintptr_t a_root)
+	{
+		auto* character = reinterpret_cast<RE::hkbCharacter*>(a_root + kGraph_EmbeddedCharacter);
+		if (IsBadReadPtr(character, sizeof(RE::hkbCharacter))) return nullptr;
+		return character;
+	}
+
+	// Guarded hkStringPtr-style read: masks the low ownership-flag bit and
+	// validates the pointer before treating it as a C string.
+	std::string QueryReadHkString(uintptr_t a_rawPtrValue)
+	{
+		const auto masked = a_rawPtrValue & ~uintptr_t(1);
+		auto* str = reinterpret_cast<const char*>(masked);
+		if (!str || masked < 0x10000 || IsBadReadPtr(str, 1) || str[0] == '\0') return {};
+		return std::string(str);
+	}
+
+	// character -> setup -> animationSkeleton, with guards. Returns nullptr
+	// when any hop is unreadable.
+	uint8_t* QueryGraphSkeleton(RE::hkbCharacter* a_character)
+	{
+		auto* setup = a_character->setup._ptr;
+		if (!setup || reinterpret_cast<uintptr_t>(setup) < 0x10000 || IsBadReadPtr(setup, 0x50)) return nullptr;
+		auto* skeleton = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr);
+		if (!skeleton || reinterpret_cast<uintptr_t>(skeleton) < 0x10000 || IsBadReadPtr(skeleton, 0x40)) return nullptr;
+		return skeleton;
+	}
+
+	// character -> setup -> data -> stringData (hkbCharacterStringData), guarded.
+	RE::hkbCharacterStringData* QueryGraphStringData(RE::hkbCharacter* a_character)
+	{
+		auto* setup = a_character->setup._ptr;
+		if (!setup || reinterpret_cast<uintptr_t>(setup) < 0x10000 || IsBadReadPtr(setup, 0x50)) return nullptr;
+		auto* data = setup->data._ptr;
+		if (!data || reinterpret_cast<uintptr_t>(data) < 0x10000 || IsBadReadPtr(data, 0xC0)) return nullptr;
+		auto* stringData = data->stringData._ptr;
+		if (!stringData || reinterpret_cast<uintptr_t>(stringData) < 0x10000 || IsBadReadPtr(stringData, 0x80)) return nullptr;
+		return stringData;
+	}
+
+	// character -> projectData -> stringData (hkbProjectStringData), guarded.
+	RE::hkbProjectStringData* QueryGraphProjectStrings(RE::hkbCharacter* a_character)
+	{
+		auto* projData = a_character->projectData._ptr;
+		if (!projData || reinterpret_cast<uintptr_t>(projData) < 0x10000 || IsBadReadPtr(projData, 0x30)) return nullptr;
+		auto* projStrData = projData->stringData._ptr;
+		if (!projStrData || reinterpret_cast<uintptr_t>(projStrData) < 0x10000 || IsBadReadPtr(projStrData, 0x80)) return nullptr;
+		return projStrData;
+	}
+}
+
+size_t CollectActorGraphQueryData(RE::TESObjectREFR* a_refr, std::vector<OARGraphQueryData>& a_out)
+{
+	a_out.clear();
+	if (!a_refr) return 0;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return 0;
+
+	const auto clipVtbl = Offsets::hkbClipGenerator_vtbl.address();
+	const uint32_t formID = a_refr->GetFormID();
+	const bool isPlayer = (a_refr == RE::PlayerCharacter::GetSingleton());
+
+	for (uint32_t gi = 0; gi < manager->graph.size() && gi < 4; ++gi) {
+		const auto root = QueryValidateGraphRoot(manager.get(), gi);
+		if (!root) continue;
+
+		auto& d = a_out.emplace_back();
+		d.actorFormID = formID;
+		d.graphIndex = static_cast<uint8_t>(gi);
+		d.isFirstPerson = isPlayer &&
+			s_firstPersonGraphIndex.load(std::memory_order_relaxed) == static_cast<int32_t>(gi);
+
+		// Behavior graph state: rebuild flags + active node/clip counts.
+		const auto hkGraph = *reinterpret_cast<uintptr_t*>(root + kQuery_HkRootGraph);
+		if (hkGraph && hkGraph > 0x10000 &&
+			!IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+			d.isRebuilding = *reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+				*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0;
+
+			const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kQuery_ActiveNodes);
+			if (activeNodes && !IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
+				const auto nodeData = *reinterpret_cast<uintptr_t*>(activeNodes);
+				const auto nodeSize = *reinterpret_cast<int32_t*>(activeNodes + 8);
+				if (nodeData && nodeSize > 0 && nodeSize <= 0x1000 &&
+					!IsBadReadPtr(reinterpret_cast<void*>(nodeData), static_cast<size_t>(nodeSize) * sizeof(void*))) {
+					d.activeNodeCount = static_cast<uint32_t>(nodeSize);
+					for (int32_t i = 0; i < nodeSize; ++i) {
+						const auto entry = *reinterpret_cast<uintptr_t*>(nodeData + static_cast<uintptr_t>(i) * sizeof(void*));
+						if (!entry || IsBadReadPtr(reinterpret_cast<void*>(entry), 0x18)) continue;
+						if (*reinterpret_cast<uintptr_t*>(entry) == clipVtbl) {
+							d.activeClipCount++;
+						} else {
+							const auto candidate = *reinterpret_cast<uintptr_t*>(entry + 0x08);
+							if (candidate && candidate > 0x10000 &&
+								!IsBadReadPtr(reinterpret_cast<void*>(candidate), sizeof(void*)) &&
+								*reinterpret_cast<uintptr_t*>(candidate) == clipVtbl) {
+								d.activeClipCount++;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		auto* character = QueryGraphCharacter(root);
+		if (!character) continue;
+
+		// Havok character name (hkStringPtr member — read raw to mask the flag bit).
+		d.characterName = QueryReadHkString(
+			*reinterpret_cast<const uintptr_t*>(reinterpret_cast<const uint8_t*>(&character->name)));
+
+		// Skeleton bone count.
+		if (auto* skeleton = QueryGraphSkeleton(character)) {
+			auto* bonesArr = reinterpret_cast<RE::hkArrayRawLayout*>(skeleton + RE::kSkeletonOffset_bones);
+			if (bonesArr->data && bonesArr->size > 0 && bonesArr->size < 0x1000) {
+				d.boneCount = static_cast<uint32_t>(bonesArr->size);
+			}
+		}
+
+		// Registered animation path count (character string data).
+		if (auto* stringData = QueryGraphStringData(character)) {
+			auto* arrBase = reinterpret_cast<const uint8_t*>(&stringData->animationNames);
+			const int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
+			if (nameSize > 0 && nameSize < 0x4000) {
+				d.animationNameCount = static_cast<uint32_t>(nameSize);
+			}
+		}
+
+		// Project strings: animation/behavior roots + event name count.
+		if (auto* projStrData = QueryGraphProjectStrings(character)) {
+			d.projectAnimationPath = QueryReadHkString(
+				*reinterpret_cast<const uintptr_t*>(reinterpret_cast<const uint8_t*>(&projStrData->animationPath)));
+			d.behaviorPath = QueryReadHkString(
+				*reinterpret_cast<const uintptr_t*>(reinterpret_cast<const uint8_t*>(&projStrData->behaviorPath)));
+			auto* evBase = reinterpret_cast<const uint8_t*>(&projStrData->eventNames);
+			const int32_t evSize = *reinterpret_cast<const int32_t*>(evBase + 8);
+			if (evSize > 0 && evSize < 0x4000) {
+				d.eventNameCount = static_cast<uint32_t>(evSize);
+			}
+		}
+	}
+
+	return a_out.size();
+}
+
+size_t CollectGraphBones(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<OARBoneQueryData>& a_out)
+{
+	a_out.clear();
+	if (!a_refr) return 0;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return 0;
+
+	const auto root = QueryValidateGraphRoot(manager.get(), a_graphIndex);
+	if (!root) return 0;
+	auto* character = QueryGraphCharacter(root);
+	if (!character) return 0;
+	auto* skeleton = QueryGraphSkeleton(character);
+	if (!skeleton) return 0;
+
+	auto* bonesArr = reinterpret_cast<RE::hkArrayRawLayout*>(skeleton + RE::kSkeletonOffset_bones);
+	auto* parentArr = reinterpret_cast<RE::hkArrayRawLayout*>(skeleton + RE::kSkeletonOffset_parentIndices);
+	if (!bonesArr->data || bonesArr->size <= 0 || bonesArr->size >= 0x1000) return 0;
+	if (IsBadReadPtr(bonesArr->data, static_cast<size_t>(bonesArr->size) * RE::kHkaBoneStride)) return 0;
+
+	const int32_t numBones = bonesArr->size;
+	auto* boneData = reinterpret_cast<uint8_t*>(bonesArr->data);
+	const int16_t* parents = nullptr;
+	if (parentArr->data && parentArr->size >= numBones &&
+		!IsBadReadPtr(parentArr->data, static_cast<size_t>(numBones) * sizeof(int16_t))) {
+		parents = reinterpret_cast<const int16_t*>(parentArr->data);
+	}
+
+	a_out.reserve(static_cast<size_t>(numBones));
+	for (int32_t i = 0; i < numBones; ++i) {
+		auto& b = a_out.emplace_back();
+		b.index = static_cast<int16_t>(i);
+		b.parentIndex = parents ? parents[i] : int16_t(-1);
+		b.name = QueryReadHkString(*reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride));
+	}
+
+	return a_out.size();
+}
+
+size_t CollectGraphAnimationNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out)
+{
+	a_out.clear();
+	if (!a_refr) return 0;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return 0;
+
+	const auto root = QueryValidateGraphRoot(manager.get(), a_graphIndex);
+	if (!root) return 0;
+	auto* character = QueryGraphCharacter(root);
+	if (!character) return 0;
+	auto* stringData = QueryGraphStringData(character);
+	if (!stringData) return 0;
+
+	// hkArray<FileNameMeshNamePair>: data ptr +0, size +8; pair = 2 hkStringPtrs.
+	auto* arrBase = reinterpret_cast<const uint8_t*>(&stringData->animationNames);
+	auto* nameData = *reinterpret_cast<uint8_t* const*>(arrBase);
+	const int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
+	if (!nameData || nameSize <= 0 || nameSize >= 0x4000 ||
+		IsBadReadPtr(nameData, static_cast<size_t>(nameSize) * 0x10)) {
+		return 0;
+	}
+
+	a_out.reserve(static_cast<size_t>(nameSize));
+	for (int32_t i = 0; i < nameSize; ++i) {
+		// fileName is the first hkStringPtr of the pair.
+		a_out.push_back(QueryReadHkString(*reinterpret_cast<const uintptr_t*>(nameData + i * 0x10)));
+	}
+
+	return a_out.size();
+}
+
+size_t CollectGraphEventNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out)
+{
+	a_out.clear();
+	if (!a_refr) return 0;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
+	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return 0;
+
+	const auto root = QueryValidateGraphRoot(manager.get(), a_graphIndex);
+	if (!root) return 0;
+	auto* character = QueryGraphCharacter(root);
+	if (!character) return 0;
+	auto* projStrData = QueryGraphProjectStrings(character);
+	if (!projStrData) return 0;
+
+	// hkArray<hkStringPtr>: data ptr +0, size +8; each element is one hkStringPtr.
+	auto* evBase = reinterpret_cast<const uint8_t*>(&projStrData->eventNames);
+	auto* evData = *reinterpret_cast<uint8_t* const*>(evBase);
+	const int32_t evSize = *reinterpret_cast<const int32_t*>(evBase + 8);
+	if (!evData || evSize <= 0 || evSize >= 0x4000 ||
+		IsBadReadPtr(evData, static_cast<size_t>(evSize) * sizeof(void*))) {
+		return 0;
+	}
+
+	a_out.reserve(static_cast<size_t>(evSize));
+	for (int32_t i = 0; i < evSize; ++i) {
+		a_out.push_back(QueryReadHkString(*reinterpret_cast<const uintptr_t*>(evData + i * sizeof(void*))));
+	}
+
+	return a_out.size();
+}

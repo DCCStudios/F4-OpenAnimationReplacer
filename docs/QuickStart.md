@@ -391,6 +391,9 @@ main `README.md`, section **Plugin API**):
 - **Clips API** — query live data about the clips OAR handles on any actor: authored
   names, resolved on-disk paths, duration, playback position and mode, 1st/3rd-person
   perspective, replacement attribution (submod, mod, priority, file), annotations of the
-  animation actually playing, active-replacement snapshots, and global stats.
-  SDK header: `src/API/OpenAnimationReplacerAPI-Clips.h` (self-contained — no
+  animation actually playing, active-replacement snapshots, and global stats. Version 2
+  adds animation-graph queries: per-graph info (character name, project paths,
+  1st-person flag, active node/clip counts), skeleton bone hierarchies (great for
+  finding `trackFilter` bone names), registered animation paths, and behavior event
+  names. SDK header: `src/API/OpenAnimationReplacerAPI-Clips.h` (self-contained — no
   CommonLibF4 or JSON dependency). Call from the game's main thread only.

@@ -163,6 +163,38 @@ namespace
 		uint32_t activeReplacementCount;
 	};
 
+	// Mirrors OAR::Clips::GraphInfo
+	struct GraphInfoPOD
+	{
+		uint32_t actorFormID;
+		uint8_t graphIndex;
+		uint8_t isFirstPerson;
+		uint8_t isRebuilding;
+		uint8_t _pad0;
+		uint32_t activeNodeCount;
+		uint32_t activeClipCount;
+		uint32_t boneCount;
+		uint32_t animationNameCount;
+		uint32_t eventNameCount;
+		char characterName[64];
+		char projectAnimationPath[260];
+		char behaviorPath[260];
+	};
+
+	// Mirrors OAR::Clips::BoneInfo
+	struct BoneInfoPOD
+	{
+		int16_t index;
+		int16_t parentIndex;
+		char name[92];
+	};
+
+	// Mirrors OAR::Clips::NameEntry
+	struct NameEntryPOD
+	{
+		char name[260];
+	};
+
 	class IClipsAPIInternal
 	{
 	public:
@@ -173,6 +205,11 @@ namespace
 		virtual uint32_t GetClipAnnotations(uint64_t a_clipHandle, ClipAnnotationPOD* a_outBuffer, uint32_t a_maxCount) = 0;
 		virtual uint32_t GetActiveReplacements(uint32_t a_actorFormID, ActiveReplacementInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
 		virtual bool GetStats(StatsPOD* a_out) = 0;
+		// v2 additions — appended, never reordered (ABI compatibility with v1 consumers)
+		virtual uint32_t GetActorGraphs(uint32_t a_actorFormID, GraphInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual uint32_t GetGraphBones(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, BoneInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual uint32_t GetGraphAnimationNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) = 0;
 	};
 
 	// Truncating copy into a fixed buffer, always null-terminated.
@@ -228,12 +265,27 @@ namespace
 		CopyToBuf(a_dst.replacementPath, a_src.replacementPath);
 	}
 
+	// Copies a paged window [a_startIndex, a_startIndex + a_maxCount) of a
+	// name list into fixed NameEntry buffers. Returns the TOTAL list size.
+	static uint32_t CopyNamePage(const std::vector<std::string>& a_names,
+		uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount)
+	{
+		const auto total = static_cast<uint32_t>(a_names.size());
+		if (a_outBuffer && a_maxCount > 0 && a_startIndex < total) {
+			const uint32_t n = std::min<uint32_t>(a_maxCount, total - a_startIndex);
+			for (uint32_t i = 0; i < n; ++i) {
+				CopyToBuf(a_outBuffer[i].name, a_names[a_startIndex + i]);
+			}
+		}
+		return total;
+	}
+
 	class ClipsAPIImpl : public IClipsAPIInternal
 	{
 	public:
 		uint32_t GetAPIVersion() const override
 		{
-			return 1;
+			return 2;
 		}
 
 		uint32_t GetActorClips(uint32_t a_actorFormID, ClipInfoPOD* a_outBuffer, uint32_t a_maxCount) override
@@ -338,6 +390,79 @@ namespace
 			a_out->activeReplacementCount = static_cast<uint32_t>(ActiveReplacementTracker::GetSingleton()->GetCount());
 			return true;
 		}
+
+		uint32_t GetActorGraphs(uint32_t a_actorFormID, GraphInfoPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return 0;
+
+			std::vector<OARGraphQueryData> graphs;
+			CollectActorGraphQueryData(refr, graphs);
+
+			if (a_outBuffer && a_maxCount > 0) {
+				const uint32_t n = std::min<uint32_t>(a_maxCount, static_cast<uint32_t>(graphs.size()));
+				for (uint32_t i = 0; i < n; ++i) {
+					auto& dst = a_outBuffer[i];
+					const auto& src = graphs[i];
+					dst.actorFormID = src.actorFormID;
+					dst.graphIndex = src.graphIndex;
+					dst.isFirstPerson = src.isFirstPerson ? 1 : 0;
+					dst.isRebuilding = src.isRebuilding ? 1 : 0;
+					dst._pad0 = 0;
+					dst.activeNodeCount = src.activeNodeCount;
+					dst.activeClipCount = src.activeClipCount;
+					dst.boneCount = src.boneCount;
+					dst.animationNameCount = src.animationNameCount;
+					dst.eventNameCount = src.eventNameCount;
+					CopyToBuf(dst.characterName, src.characterName);
+					CopyToBuf(dst.projectAnimationPath, src.projectAnimationPath);
+					CopyToBuf(dst.behaviorPath, src.behaviorPath);
+				}
+			}
+			return static_cast<uint32_t>(graphs.size());
+		}
+
+		uint32_t GetGraphBones(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, BoneInfoPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return 0;
+
+			std::vector<OARBoneQueryData> bones;
+			CollectGraphBones(refr, a_graphIndex, bones);
+
+			const auto total = static_cast<uint32_t>(bones.size());
+			if (a_outBuffer && a_maxCount > 0 && a_startIndex < total) {
+				const uint32_t n = std::min<uint32_t>(a_maxCount, total - a_startIndex);
+				for (uint32_t i = 0; i < n; ++i) {
+					const auto& src = bones[a_startIndex + i];
+					auto& dst = a_outBuffer[i];
+					dst.index = src.index;
+					dst.parentIndex = src.parentIndex;
+					CopyToBuf(dst.name, src.name);
+				}
+			}
+			return total;
+		}
+
+		uint32_t GetGraphAnimationNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return 0;
+
+			std::vector<std::string> names;
+			CollectGraphAnimationNames(refr, a_graphIndex, names);
+			return CopyNamePage(names, a_startIndex, a_outBuffer, a_maxCount);
+		}
+
+		uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) override
+		{
+			auto* refr = ResolveQueryActor(a_actorFormID);
+			if (!refr) return 0;
+
+			std::vector<std::string> names;
+			CollectGraphEventNames(refr, a_graphIndex, names);
+			return CopyNamePage(names, a_startIndex, a_outBuffer, a_maxCount);
+		}
 	};
 
 	static ClipsAPIImpl g_clipsAPI;
@@ -355,6 +480,6 @@ extern "C" OAR_API void* RequestPluginAPI_Conditions()
 
 extern "C" OAR_API void* RequestPluginAPI_Clips()
 {
-	logger::info("[OAR-API] Clips API requested (version 1)");
+	logger::info("[OAR-API] Clips API requested (version 2)");
 	return static_cast<IClipsAPIInternal*>(&g_clipsAPI);
 }

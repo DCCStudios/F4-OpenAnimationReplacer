@@ -567,7 +567,7 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 OAR exposes two C++ APIs for other F4SE plugins:
 
 - **Conditions API** (`RequestPluginAPI_Conditions`) — register custom condition types at runtime, adding entirely new conditions without modifying OAR's source code.
-- **Clips API** (`RequestPluginAPI_Clips`) — query live data about the animation clips OAR handles: names, resolved file paths, durations, playback state, perspective, replacement attribution, annotations, and more. See [Clips API](#clips-api--query-live-clip-data) below.
+- **Clips API** (`RequestPluginAPI_Clips`) — query live data about the animation clips OAR handles: names, resolved file paths, durations, playback state, perspective, replacement attribution, annotations — plus the animation graphs themselves: skeleton bone hierarchies, registered animation paths, and behavior event names. See [Clips API](#clips-api--query-live-clip-data) below.
 
 ### Architecture
 
@@ -777,7 +777,7 @@ void DrawEditWidgets(bool& a_dirty) override {
 
 ### Clips API — query live clip data
 
-Besides registering conditions, plugins can query everything OAR knows about the animation clips playing on an actor: authored names, resolved on-disk paths, playback state, perspective, replacement attribution, annotations, plus the active-replacement list and global stats.
+Besides registering conditions, plugins can query everything OAR knows about the animation clips playing on an actor: authored names, resolved on-disk paths, playback state, perspective, replacement attribution, annotations, plus the active-replacement list and global stats. Version 2 adds graph-level queries: per-graph info (character name, project paths, 1st-person flag, active node/clip counts), the full skeleton bone hierarchy, registered animation paths, and behavior event names.
 
 **Setup:** copy `src/API/OpenAnimationReplacerAPI-Clips.h` into your project. It is fully self-contained — no CommonLibF4 or nlohmann-json required.
 
@@ -806,7 +806,7 @@ void DumpPlayerClips()
 }
 ```
 
-**Interface** (`OAR::Clips::IClipsAPI`, version 1):
+**Interface** (`OAR::Clips::IClipsAPI`, version 2):
 
 | Method | Purpose |
 |--------|---------|
@@ -815,6 +815,10 @@ void DumpPlayerClips()
 | `GetClipAnnotations(clipHandle, buf, max)` | Annotations `(time, text)` of the animation the clip is *currently* playing — the replacement's when replaced. |
 | `GetActiveReplacements(formID, buf, max)` | Snapshot of applied replacements (`0` = all actors) with submod, paths, actor name. |
 | `GetStats(&stats)` | Loaded mod/submod/animation counts, runtime cache size, active replacement count. |
+| `GetActorGraphs(formID, buf, max)` *(v2)* | Enumerate the actor's animation graphs — see `GraphInfo` below. |
+| `GetGraphBones(formID, graphIdx, start, buf, max)` *(v2)* | Skeleton bones of one graph: name + parent index (`-1` = root). Paged via `start`; returns the TOTAL bone count. |
+| `GetGraphAnimationNames(formID, graphIdx, start, buf, max)` *(v2)* | Animation paths registered on the graph's character — the list replacement candidates are validated against. Paged. |
+| `GetGraphEventNames(formID, graphIdx, start, buf, max)` *(v2)* | Behavior event names of the graph's project (events you can send to the graph, e.g. `ReloadEnd`, `SprintStop`). Paged. |
 
 #### `ClipInfo` field reference
 
@@ -838,6 +842,53 @@ void DumpPlayerClips()
 | `replacementPath` | `char[260]` | The replacement `.hkx` path being played. Empty when none. |
 
 All strings are null-terminated and truncated to the buffer size when longer. Empty string means "not known / not applicable", never garbage.
+
+#### `GraphInfo` field reference (v2)
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `actorFormID` | `uint32_t` | Owning actor. |
+| `graphIndex` | `uint8_t` | Pass this to `GetGraphBones` / `GetGraphAnimationNames` / `GetGraphEventNames`. The player has separate 1st- and 3rd-person graphs; most actors have one. |
+| `isFirstPerson` | `uint8_t` | `1` when this is the player's learned 1st-person graph (always `0` for NPCs — the engine gives them no 1st-person graph). |
+| `isRebuilding` | `uint8_t` | `1` while the engine rebuilds the graph's node list (e.g. during weapon swaps); clip data may be briefly unavailable. |
+| `activeNodeCount` | `uint32_t` | Behavior nodes active right now. |
+| `activeClipCount` | `uint32_t` | Clip generators among the active nodes (what `GetActorClips` returns for this graph). |
+| `boneCount` | `uint32_t` | Animation skeleton bone count (total for `GetGraphBones`). |
+| `animationNameCount` | `uint32_t` | Registered animation paths (total for `GetGraphAnimationNames`). |
+| `eventNameCount` | `uint32_t` | Behavior event names (total for `GetGraphEventNames`). |
+| `characterName` | `char[64]` | Havok character name. |
+| `projectAnimationPath` | `char[260]` | Project's animation root. Often empty in FO4 — resolved clip paths are the reliable path source. |
+| `behaviorPath` | `char[260]` | Project's behavior root. |
+
+#### Graph query examples (v2)
+
+Walk the player's graphs and dump the skeleton of the 1st-person one — for example to discover the exact bone names a track filter (`trackFilter.boneNames` in a submod config) should target:
+
+```cpp
+OAR::Clips::GraphInfo graphs[4];
+uint32_t graphCount = api->GetActorGraphs(0, graphs, 4);
+for (uint32_t g = 0; g < std::min<uint32_t>(graphCount, 4); ++g) {
+    if (!graphs[g].isFirstPerson) continue;
+
+    // Page through the bones (returns TOTAL; page with the start index)
+    OAR::Clips::BoneInfo bones[64];
+    uint32_t total = graphs[g].boneCount;
+    for (uint32_t start = 0; start < total; start += 64) {
+        uint32_t got = std::min<uint32_t>(64, total - start);
+        api->GetGraphBones(0, graphs[g].graphIndex, start, bones, got);
+        for (uint32_t i = 0; i < got; ++i) {
+            // bones[i].name, bones[i].index, bones[i].parentIndex (-1 = root)
+        }
+    }
+}
+```
+
+Discover which behavior events a graph understands (useful before sending events like `ReloadEnd` or `SprintStop` from your own plugin):
+
+```cpp
+OAR::Clips::NameEntry events[128];
+uint32_t total = api->GetGraphEventNames(0, 0 /* graph index */, 0, events, 128);
+```
 
 #### More query examples
 

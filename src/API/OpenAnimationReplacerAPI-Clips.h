@@ -13,6 +13,12 @@
 // file), the annotations of the animation that is actually playing, the
 // active-replacement list, and global statistics.
 //
+// Since v2 it also exposes the actor's animation GRAPHS: per-graph info
+// (character name, project paths, 1st-person flag, active node/clip counts),
+// the full skeleton bone hierarchy (name + parent index — handy for authoring
+// track filters), the animation paths registered on the character, and the
+// behavior event names of the project.
+//
 // THREADING: call every method from the GAME'S MAIN THREAD only (e.g. inside
 // a task queued via F4SE's task interface, or your own main-thread hook).
 // The clip queries walk live Havok graph structures.
@@ -46,8 +52,11 @@
 
 namespace OAR::Clips
 {
-	// API version — bump on breaking changes
-	inline constexpr uint32_t kAPIVersion = 1;
+	// API version — bump on breaking changes.
+	// v2: added graph-level queries (GetActorGraphs, GetGraphBones,
+	//     GetGraphAnimationNames, GetGraphEventNames), appended to the vtable —
+	//     consumers compiled against v1 keep working.
+	inline constexpr uint32_t kAPIVersion = 2;
 
 	// ClipInfo::perspective values
 	enum : uint8_t
@@ -133,6 +142,42 @@ namespace OAR::Clips
 		uint32_t activeReplacementCount;// replacements applied right now
 	};
 
+	// One animation graph on an actor (the player has separate 1st- and
+	// 3rd-person graphs; most actors have one).
+	struct GraphInfo
+	{
+		uint32_t actorFormID;
+		uint8_t graphIndex;          // pass to the GetGraph* queries below
+		uint8_t isFirstPerson;       // 1 = the player's learned 1st-person graph
+		uint8_t isRebuilding;        // 1 = engine is rebuilding the node list
+		                             // (clip data may be briefly unavailable)
+		uint8_t _pad0;
+		uint32_t activeNodeCount;    // active behavior nodes right now
+		uint32_t activeClipCount;    // clip generators among the active nodes
+		uint32_t boneCount;          // animation skeleton bone count
+		uint32_t animationNameCount; // registered animation paths on the character
+		uint32_t eventNameCount;     // behavior event names in the project
+		char characterName[64];      // Havok character name
+		char projectAnimationPath[260]; // project's animation root (often "" in FO4)
+		char behaviorPath[260];      // project's behavior root
+	};
+
+	// One skeleton bone. parentIndex chains to other entries of the same
+	// enumeration (-1 = root), letting you rebuild the full bone hierarchy —
+	// useful for authoring track filters (partial-body replacements).
+	struct BoneInfo
+	{
+		int16_t index;
+		int16_t parentIndex;
+		char name[92];
+	};
+
+	// A single name entry (registered animation path or behavior event name).
+	struct NameEntry
+	{
+		char name[260];
+	};
+
 	// =========================================================================
 	// IClipsAPI — virtual interface returned by RequestPluginAPI_Clips
 	// =========================================================================
@@ -171,6 +216,27 @@ namespace OAR::Clips
 
 		// Global counters. Returns false only when a_out is null.
 		virtual bool GetStats(Stats* a_out) = 0;
+
+		// ===== v2 additions (check GetAPIVersion() >= 2 before calling) =====
+
+		// Enumerate an actor's animation graphs (`0`/`0x14` = player).
+		// Returns the total graph count, fills up to a_maxCount.
+		virtual uint32_t GetActorGraphs(uint32_t a_actorFormID, GraphInfo* a_outBuffer, uint32_t a_maxCount) = 0;
+
+		// Enumerate the animation skeleton bones of one graph (name + parent
+		// index). a_startIndex allows paging through large skeletons. Returns
+		// the TOTAL bone count regardless of how many entries were written.
+		virtual uint32_t GetGraphBones(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, BoneInfo* a_outBuffer, uint32_t a_maxCount) = 0;
+
+		// Enumerate the animation paths registered on the graph's character
+		// (the list replacement candidates are validated against). Paged via
+		// a_startIndex; returns the TOTAL count.
+		virtual uint32_t GetGraphAnimationNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntry* a_outBuffer, uint32_t a_maxCount) = 0;
+
+		// Enumerate the behavior event names of the graph's project (events
+		// you can send to the graph, e.g. "ReloadEnd", "SprintStop"). Paged
+		// via a_startIndex; returns the TOTAL count.
+		virtual uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntry* a_outBuffer, uint32_t a_maxCount) = 0;
 	};
 
 	// =========================================================================
