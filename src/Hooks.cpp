@@ -988,11 +988,19 @@ namespace
 	// restore them when conditions stop matching. Without this, the engine's native annotation
 	// processor fires the ORIGINAL animation's annotations (e.g., 44pistol sounds) regardless
 	// of which hkaAnimation we swapped in — because triggers are keyed by binding, not anim.
+	struct OARBuiltTriggerArray;  // defined below (REPLACEMENT TRIGGER BUILDER)
 	struct TriggersBackup
 	{
 		void* triggers{ nullptr };          // raw hkRefPtr value (stored as void* — lifetime managed by Havok refcount)
 		void* originalTriggers{ nullptr };
 		bool nulled{ false };
+		// The FILTERED trigger array we installed in place of the originals:
+		// behavior-authored triggers kept (isAnnotation == false), annotation
+		// triggers dropped (we fire the replacement's annotations manually).
+		// Null when the original arrays carried no behavior triggers — then the
+		// slots are NULL'd outright as before. Shared_ptr so retirement can
+		// keep the memory alive after the backup entry is erased.
+		std::shared_ptr<OARBuiltTriggerArray> filteredKeepAlive;
 	};
 	static std::shared_mutex s_triggersBackupMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, TriggersBackup> s_triggersBackup;
@@ -1116,10 +1124,196 @@ namespace
 		return result;
 	}
 
-	// NULL the clip generator's triggers to prevent the engine from firing the ORIGINAL
-	// animation's annotation events.  The clone's annotationTracks are zeroed (size=0),
-	// so the engine cannot rebuild triggers from them.  We fire replacement annotations
-	// manually via the dual-path emission system below.
+	// Keep-alive for filtered trigger arrays that were replaced/abandoned while
+	// a clip might still reference them (same pattern as the retired animation
+	// clones). Capped; by the time the oldest half is dropped, no clip from
+	// that era can still be active.
+	static std::mutex s_retiredTrigMutex;
+	static std::vector<std::shared_ptr<OARBuiltTriggerArray>> s_retiredFilteredTriggers;
+
+	static void RetireFilteredTriggers(std::shared_ptr<OARBuiltTriggerArray>&& a_arr)
+	{
+		if (!a_arr) return;
+		std::lock_guard g(s_retiredTrigMutex);
+		if (s_retiredFilteredTriggers.size() >= 256) {
+			s_retiredFilteredTriggers.erase(
+				s_retiredFilteredTriggers.begin(),
+				s_retiredFilteredTriggers.begin() + 128);
+		}
+		s_retiredFilteredTriggers.push_back(std::move(a_arr));
+	}
+
+	// Collect the annotation text strings of an hkaAnimation (raw guarded parse,
+	// same offsets as the Activate-time original-annotation cache). Used to
+	// recognize annotation-derived triggers even if the isAnnotation flag is
+	// not reliably set by this runtime's loader.
+	static std::unordered_set<std::string> CollectAnimAnnotationTexts(RE::hkaAnimation* a_anim)
+	{
+		std::unordered_set<std::string> result;
+		if (!a_anim || IsBadReadPtr(a_anim, 0x40)) return result;
+
+		auto* bytes = reinterpret_cast<uint8_t*>(a_anim);
+		auto* trackPtr = *reinterpret_cast<uint8_t**>(bytes + 0x28);
+		int32_t trackCount = *reinterpret_cast<int32_t*>(bytes + 0x30);
+		if (!trackPtr || trackCount <= 0 || trackCount > 0x200 ||
+			reinterpret_cast<uintptr_t>(trackPtr) < 0x10000 ||
+			IsBadReadPtr(trackPtr, static_cast<size_t>(trackCount) * 0x18)) {
+			return result;
+		}
+
+		for (int32_t t = 0; t < trackCount; ++t) {
+			auto* trackBase = trackPtr + (t * 0x18);
+			auto* annots = *reinterpret_cast<uint8_t**>(trackBase + 0x08);
+			int32_t annotCount = *reinterpret_cast<int32_t*>(trackBase + 0x10);
+			if (!annots || annotCount <= 0 || annotCount > 0x1000 ||
+				reinterpret_cast<uintptr_t>(annots) < 0x10000 ||
+				IsBadReadPtr(annots, static_cast<size_t>(annotCount) * 0x10)) {
+				continue;
+			}
+			for (int32_t a = 0; a < annotCount; ++a) {
+				auto rawTxt = *reinterpret_cast<uintptr_t*>(annots + a * 0x10 + 0x08) & ~uintptr_t(1);
+				auto* txt = reinterpret_cast<const char*>(rawTxt);
+				if (txt && rawTxt > 0x10000 && !IsBadReadPtr(txt, 1) && txt[0] != '\0') {
+					result.insert(txt);
+				}
+			}
+		}
+		return result;
+	}
+
+	// Read a trigger's event text from its payload, when the payload is an
+	// hkbStringEventPayload (string at +0x10). Returns nullptr otherwise.
+	static const char* TriggerPayloadText(const uint8_t* a_trigger)
+	{
+		auto* payload = *reinterpret_cast<uint8_t* const*>(a_trigger + 0x10);
+		if (!payload || reinterpret_cast<uintptr_t>(payload) < 0x10000 ||
+			IsBadReadPtr(payload, 0x18)) {
+			return nullptr;
+		}
+		// Only trust +0x10 as a string when the vtable says StringEventPayload.
+		const auto payVtbl = s_vtableStringEventPayload.load();
+		if (payVtbl == 0 || *reinterpret_cast<const uintptr_t*>(payload) != payVtbl) {
+			return nullptr;
+		}
+		auto rawTxt = *reinterpret_cast<const uintptr_t*>(payload + 0x10) & ~uintptr_t(1);
+		auto* txt = reinterpret_cast<const char*>(rawTxt);
+		if (!txt || rawTxt < 0x10000 || IsBadReadPtr(txt, 1) || txt[0] == '\0') {
+			return nullptr;
+		}
+		return txt;
+	}
+
+	// Build a filtered copy of a live hkbClipTriggerArray that KEEPS the
+	// behavior-authored triggers and DROPS the annotation-derived ones.
+	//
+	// WHY: the trigger array carries two kinds of entries. Annotation triggers
+	// (isAnnotation == true) are built from the animation's annotation tracks —
+	// sounds, WeaponFire — and must be muted during replacement (OAR fires the
+	// REPLACEMENT's annotations manually). Behavior triggers (isAnnotation ==
+	// false) come from the behavior graph itself and drive the state machine
+	// AND engine-side actions: on equip clips, the weapon attach/draw event and
+	// the equip-complete transition. The previous implementation NULL'd the
+	// whole array, which silenced those too — replacing wpnequip made the
+	// weapon invisible and the graph fall back to the fast-equip path even
+	// with a byte-identical replacement file.
+	//
+	// A trigger is treated as annotation-derived when EITHER its isAnnotation
+	// flag is set OR its payload text matches one of the original animation's
+	// annotation texts (belt-and-suspenders in case this runtime's loader
+	// doesn't set the flag).
+	//
+	// Returns nullptr when the source has no behavior triggers to keep — the
+	// caller then installs NULL, exactly the old behavior.
+	static std::shared_ptr<OARBuiltTriggerArray> BuildBehaviorOnlyTriggers(
+		void* a_src, const std::unordered_set<std::string>& a_origAnnotTexts)
+	{
+		if (!a_src || reinterpret_cast<uintptr_t>(a_src) < 0x10000 ||
+			IsBadReadPtr(a_src, 0x20)) {
+			return nullptr;
+		}
+
+		constexpr size_t kTriggerSize = 0x20;
+		auto* srcBytes = reinterpret_cast<uint8_t*>(a_src);
+		auto* srcData = *reinterpret_cast<uint8_t**>(srcBytes + 0x10);
+		const int32_t srcCount = *reinterpret_cast<int32_t*>(srcBytes + 0x18);
+		if (!srcData || srcCount <= 0 || srcCount > 0x400 ||
+			reinterpret_cast<uintptr_t>(srcData) < 0x10000 ||
+			IsBadReadPtr(srcData, static_cast<size_t>(srcCount) * kTriggerSize)) {
+			return nullptr;
+		}
+
+		static int s_dumpLog = 0;
+		const bool dump = (s_dumpLog < 8);
+		if (dump) s_dumpLog++;
+
+		std::vector<int32_t> keep;
+		keep.reserve(static_cast<size_t>(srcCount));
+		for (int32_t i = 0; i < srcCount; ++i) {
+			const uint8_t* trig = srcData + i * kTriggerSize;
+			const bool isAnnotFlag = trig[0x1A] != 0;  // hkbClipTrigger::isAnnotation
+			const char* text = TriggerPayloadText(trig);
+			const bool matchesOrigAnnot = text && a_origAnnotTexts.count(text) > 0;
+			const bool drop = isAnnotFlag || matchesOrigAnnot;
+			if (!drop) keep.push_back(i);
+			if (dump) {
+				logger::info("[OAR-TrigFilter]   [{}] t={:.3f} id={} isAnnot={} text='{}' -> {}",
+					i, *reinterpret_cast<const float*>(trig),
+					*reinterpret_cast<const int32_t*>(trig + 0x08),
+					isAnnotFlag, text ? text : "(none)", drop ? "DROP" : "KEEP");
+			}
+		}
+		if (dump) {
+			logger::info("[OAR-TrigFilter] src={:X}: {} triggers, kept {} behavior triggers",
+				reinterpret_cast<uintptr_t>(a_src), srcCount, keep.size());
+		}
+		if (keep.empty()) return nullptr;
+
+		// Vtable: prefer the REL::ID-resolved one; fall back to the source's own.
+		uintptr_t arrVtbl = s_vtableClipTriggerArray.load();
+		if (!arrVtbl) arrVtbl = *reinterpret_cast<uintptr_t*>(a_src);
+
+		auto built = std::make_shared<OARBuiltTriggerArray>();
+		built->triggerEntries = new uint8_t[keep.size() * kTriggerSize]();
+		built->arrayHeader = new uint8_t[0x20]();
+
+		// Shallow-copy the kept triggers. Their payload pointers stay valid:
+		// the backup holds the reference the clip previously owned on the
+		// source array (we never decrement it), so the source and its payloads
+		// outlive this filtered copy.
+		for (size_t k = 0; k < keep.size(); ++k) {
+			std::memcpy(built->triggerEntries + k * kTriggerSize,
+				srcData + static_cast<size_t>(keep[k]) * kTriggerSize, kTriggerSize);
+		}
+
+		uint8_t* aMem = built->arrayHeader;
+		*reinterpret_cast<uintptr_t*>(aMem + 0x00) = arrVtbl;
+		// refCount/memSize pattern: huge refcount + "not heap-owned" so the
+		// engine can addRef/release freely without ever deallocating our memory.
+		*reinterpret_cast<uint32_t*>(aMem + 0x08) = 0x80000000u | 0x7FFF;
+		*reinterpret_cast<uint8_t**>(aMem + 0x10) = built->triggerEntries;
+		*reinterpret_cast<int32_t*>(aMem + 0x18) = static_cast<int32_t>(keep.size());
+		*reinterpret_cast<uint32_t*>(aMem + 0x1C) = static_cast<uint32_t>(keep.size()) | 0x80000000u;
+		return built;
+	}
+
+	// The original animation for annotation-text matching: the validated map
+	// entry when present, else the animation currently in the slot as long as
+	// it is not our replacement.
+	static RE::hkaAnimation* OriginalAnimForTriggerFilter(RE::hkbClipGenerator* a_clipGen)
+	{
+		if (auto* orig = GetValidOriginal(a_clipGen)) return orig;
+		auto** slot = a_clipGen->GetAnimationSlot();
+		if (slot && *slot && !AnimationCache::GetSingleton()->IsOurReplacement(*slot)) {
+			return *slot;
+		}
+		return nullptr;
+	}
+
+	// Replace the clip generator's triggers with a filtered array that keeps
+	// behavior-authored triggers but drops annotation-derived ones (see
+	// BuildBehaviorOnlyTriggers). The replacement's annotations are fired
+	// manually via the dual-path emission system below; behavior triggers
+	// (weapon attach on equip, state-machine transitions) keep firing natively.
 	static void InstallReplacementTriggers(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
 	{
 		if (!a_clipGen) return;
@@ -1133,21 +1327,30 @@ namespace
 			backup.triggers = *triggersPtr;
 			backup.originalTriggers = *origTriggersPtr;
 			backup.nulled = true;
+
+			const auto origAnnotTexts = CollectAnimAnnotationTexts(OriginalAnimForTriggerFilter(a_clipGen));
+			backup.filteredKeepAlive = BuildBehaviorOnlyTriggers(
+				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts);
+
 			static int s_installLog = 0;
 			if (s_installLog < 30) {
-				logger::info("[OAR-Triggers] NULL'd clipGen={:X} orig triggers={:X}/{:X}",
+				logger::info("[OAR-Triggers] Filtered clipGen={:X} orig triggers={:X}/{:X} -> behaviorOnly={:X}",
 					reinterpret_cast<uintptr_t>(a_clipGen),
 					reinterpret_cast<uintptr_t>(backup.triggers),
-					reinterpret_cast<uintptr_t>(backup.originalTriggers));
+					reinterpret_cast<uintptr_t>(backup.originalTriggers),
+					backup.filteredKeepAlive ?
+						reinterpret_cast<uintptr_t>(backup.filteredKeepAlive->GetTriggerArray()) : 0);
 				s_installLog++;
 			}
 		}
 
-		*triggersPtr = nullptr;
-		*origTriggersPtr = nullptr;
+		void* filtered = backup.filteredKeepAlive ? backup.filteredKeepAlive->GetTriggerArray() : nullptr;
+		*triggersPtr = filtered;
+		*origTriggersPtr = filtered;
 	}
 
-	// Every frame: ensure triggers stay NULL'd (engine may restore originals between frames).
+	// Every frame: ensure the filtered triggers stay installed (engine may
+	// restore originals between frames).
 	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
 	{
 		if (!a_clipGen) return;
@@ -1155,17 +1358,24 @@ namespace
 		auto* triggersPtr = reinterpret_cast<void**>(bytes + kClipGenTriggersOffset);
 		auto* origTriggersPtr = reinterpret_cast<void**>(bytes + kClipGenOriginalTriggersOffset);
 
-		if (!*triggersPtr && !*origTriggersPtr) return;
-
 		std::unique_lock lock(s_triggersBackupMutex);
 		auto& backup = s_triggersBackup[a_clipGen];
-		if (!backup.nulled) {
+		void* filtered = nullptr;
+		if (backup.nulled) {
+			filtered = backup.filteredKeepAlive ? backup.filteredKeepAlive->GetTriggerArray() : nullptr;
+			if (*triggersPtr == filtered && *origTriggersPtr == filtered) return;  // already ours
+		} else {
+			if (!*triggersPtr && !*origTriggersPtr) return;
 			backup.triggers = *triggersPtr;
 			backup.originalTriggers = *origTriggersPtr;
 			backup.nulled = true;
+			const auto origAnnotTexts = CollectAnimAnnotationTexts(OriginalAnimForTriggerFilter(a_clipGen));
+			backup.filteredKeepAlive = BuildBehaviorOnlyTriggers(
+				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts);
+			filtered = backup.filteredKeepAlive ? backup.filteredKeepAlive->GetTriggerArray() : nullptr;
 		}
-		*triggersPtr = nullptr;
-		*origTriggersPtr = nullptr;
+		*triggersPtr = filtered;
+		*origTriggersPtr = filtered;
 	}
 
 	static void RestoreClipTriggers(RE::hkbClipGenerator* a_clipGen)
@@ -1188,6 +1398,9 @@ namespace
 					reinterpret_cast<uintptr_t>(it->second.originalTriggers));
 				s_restoreLog++;
 			}
+			// Keep the filtered array alive briefly — the engine may still hold
+			// the pointer within the current update cycle.
+			RetireFilteredTriggers(std::move(it->second.filteredKeepAlive));
 			s_triggersBackup.erase(it);
 		}
 	}
@@ -1490,6 +1703,12 @@ void ClearClipRuntimeState()
 	}
 	{
 		std::unique_lock lock(s_triggersBackupMutex);
+		// Retire installed filtered trigger arrays instead of freeing them:
+		// surviving clips may still have their trigger slots pointing at these
+		// buffers (a NULL slot was always safe; a freed buffer is not).
+		for (auto& [clip, backup] : s_triggersBackup) {
+			RetireFilteredTriggers(std::move(backup.filteredKeepAlive));
+		}
 		s_triggersBackup.clear();
 	}
 	{
