@@ -827,6 +827,21 @@ namespace
 	// stored pointer is freed/stale (IsBadReadPtr or vtable mismatch). This prevents
 	// the crash scenario where weapon switch frees old animations but the map still
 	// holds dangling pointers.
+	// FO4 ships multiple hkaAnimation subclasses (spline-compressed, interleaved,
+	// etc.), each with its own vtable in the game EXE. We capture ONE vtable for
+	// packfile fixups (AnimationCache::SetVtableFromGame), but originals must
+	// accept ANY plausible game-module vtable — exact-match-only previously
+	// erased valid originals whose type differed from the first-seen one, so
+	// GetOrBuildRuntimeAnim got a null template and never built (conditions
+	// passed, track filter / swap silently no-op'd — e.g. 1911 Idle Empty).
+	static bool IsPlausibleGameAnimVtable(uintptr_t a_vtbl)
+	{
+		if (a_vtbl == 0) return false;
+		auto expected = AnimationCache::GetSingleton()->GetGameAnimVtable();
+		if (expected != 0 && a_vtbl == expected) return true;
+		return a_vtbl >= 0x7FF000000000ull && a_vtbl <= 0x7FFF00000000ull;
+	}
+
 	static RE::hkaAnimation* GetValidOriginal(RE::hkbClipGenerator* a_clip)
 	{
 		std::shared_lock olock(s_originalAnimMutex);
@@ -855,30 +870,14 @@ namespace
 			return nullptr;
 		}
 
-		// Verify vtable matches the game's known hkaAnimation vtable (exact match, not range)
 		auto vtbl = *reinterpret_cast<uintptr_t*>(candidate);
-		auto expectedVtbl = AnimationCache::GetSingleton()->GetGameAnimVtable();
-		if (expectedVtbl != 0 && vtbl != expectedVtbl) {
+		if (!IsPlausibleGameAnimVtable(vtbl)) {
 			static int s_vtblLog = 0;
 			if (s_vtblLog < 30) {
-				logger::warn("[OAR-ValidOrig] originalAnim={:X} vtbl={:X} != expected={:X} for clipGen={:X} — erasing",
-					reinterpret_cast<uintptr_t>(candidate), vtbl, expectedVtbl,
+				logger::warn("[OAR-ValidOrig] originalAnim={:X} vtbl={:X} not a game anim vtable for clipGen={:X} — erasing",
+					reinterpret_cast<uintptr_t>(candidate), vtbl,
 					reinterpret_cast<uintptr_t>(a_clip));
 				s_vtblLog++;
-			}
-			olock.unlock();
-			std::unique_lock wlock(s_originalAnimMutex);
-			s_originalAnimMap.erase(a_clip);
-			return nullptr;
-		}
-
-		// Fallback range check when exact vtable not yet captured
-		if (expectedVtbl == 0 && (vtbl < 0x7FF000000000ull || vtbl > 0x7FFF00000000ull)) {
-			static int s_rangeLog = 0;
-			if (s_rangeLog < 30) {
-				logger::warn("[OAR-ValidOrig] originalAnim={:X} vtbl={:X} out of range for clipGen={:X} — erasing",
-					reinterpret_cast<uintptr_t>(candidate), vtbl, reinterpret_cast<uintptr_t>(a_clip));
-				s_rangeLog++;
 			}
 			olock.unlock();
 			std::unique_lock wlock(s_originalAnimMutex);
@@ -4418,8 +4417,7 @@ namespace
 							auto* recovered = cache->GetOriginalFromReplacement(*animSlot);
 							if (recovered && !IsBadReadPtr(recovered, sizeof(uintptr_t))) {
 								auto vtbl = *reinterpret_cast<uintptr_t*>(recovered);
-								auto expected = cache->GetGameAnimVtable();
-								if (expected != 0 && vtbl == expected) {
+								if (IsPlausibleGameAnimVtable(vtbl)) {
 									originalToRestore = recovered;
 								}
 							}
@@ -4508,18 +4506,24 @@ namespace
 			auto* cache = AnimationCache::GetSingleton();
 			RE::hkaAnimation* current = *animSlot;
 			if (!cache->IsOurReplacement(current)) {
-				// Current slot holds a game animation — validate before storing
+				// Current slot holds a game animation — accept any game-module
+				// hkaAnimation vtable (spline / interleaved / …), not only the
+				// single type captured for packfile fixups.
 				if (!IsBadReadPtr(current, sizeof(uintptr_t))) {
 					auto vtbl = *reinterpret_cast<uintptr_t*>(current);
-					auto expected = cache->GetGameAnimVtable();
-					bool vtblOk = (expected != 0) ? (vtbl == expected)
-						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
-					if (vtblOk) {
+					if (IsPlausibleGameAnimVtable(vtbl)) {
 						originalAnim = current;
 						std::unique_lock olock(s_originalAnimMutex);
-						auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, originalAnim);
-						if (!inserted) {
-							originalAnim = it->second;
+						// Overwrite any stale map entry — GetValidOriginal already
+						// rejected it (that's why we're here). Do not re-read the
+						// map under this lock via GetValidOriginal (non-recursive).
+						s_originalAnimMap[a_this] = current;
+					} else {
+						static int s_rejectLog = 0;
+						if (s_rejectLog < 20) {
+							logger::warn("[OAR-OrigReject] current={:X} vtbl={:X} not plausible game anim ('{}')",
+								reinterpret_cast<uintptr_t>(current), vtbl, resolvedSuffix);
+							s_rejectLog++;
 						}
 					}
 				}
@@ -4528,16 +4532,10 @@ namespace
 				RE::hkaAnimation* recovered = cache->GetOriginalFromReplacement(current);
 				if (recovered && !IsBadReadPtr(recovered, sizeof(uintptr_t))) {
 					auto vtbl = *reinterpret_cast<uintptr_t*>(recovered);
-					auto expected = cache->GetGameAnimVtable();
-					bool vtblOk = (expected != 0) ? (vtbl == expected)
-						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
-					if (vtblOk) {
+					if (IsPlausibleGameAnimVtable(vtbl)) {
 						originalAnim = recovered;
 						std::unique_lock olock(s_originalAnimMutex);
-						auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, recovered);
-						if (!inserted) {
-							originalAnim = it->second;
-						}
+						s_originalAnimMap[a_this] = recovered;
 					}
 				}
 				if (!originalAnim) {
@@ -4546,29 +4544,23 @@ namespace
 					// elsewhere) may have rebuilt a clone for this suffix since
 					// the invalidation, teaching the cache the FRESH game
 					// original. Adopt it so condition changes work again for
-					// this orphaned clip. Guards: vtable must be the game's,
-					// and the track count must match the clone we're currently
-					// playing (rejects an original from an incompatible
+					// this orphaned clip. Guards: vtable must look like a game
+					// anim, and the track count must match the clone we're
+					// currently playing (rejects an original from an incompatible
 					// skeleton that merely shares the suffix).
 					if (RE::hkaAnimation* fresh = cache->GetGameOriginalForSuffix(resolvedSuffix);
 						fresh && fresh != current && !IsBadReadPtr(fresh, 0x20) &&
 						!IsBadReadPtr(current, 0x20)) {
 						auto vtbl = *reinterpret_cast<uintptr_t*>(fresh);
-						auto expected = cache->GetGameAnimVtable();
-						bool vtblOk = (expected != 0) ? (vtbl == expected)
-							: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
 						// hkaAnimation: +0x18 = numTransformTracks
 						auto freshTracks = *reinterpret_cast<int32_t*>(
 							reinterpret_cast<uint8_t*>(fresh) + 0x18);
 						auto currentTracks = *reinterpret_cast<int32_t*>(
 							reinterpret_cast<uint8_t*>(current) + 0x18);
-						if (vtblOk && freshTracks == currentTracks) {
+						if (IsPlausibleGameAnimVtable(vtbl) && freshTracks == currentTracks) {
 							originalAnim = fresh;
 							std::unique_lock olock(s_originalAnimMutex);
-							auto [it, inserted] = s_originalAnimMap.try_emplace(a_this, fresh);
-							if (!inserted) {
-								originalAnim = it->second;
-							}
+							s_originalAnimMap[a_this] = fresh;
 							static int s_rearmLog = 0;
 							if (s_rearmLog < 20) {
 								logger::info("[OAR-Rearm] Adopted fresh original {:X} for orphaned clip {:X} ('{}', {} tracks)",
@@ -4591,6 +4583,19 @@ namespace
 					return;
 				}
 			}
+		}
+
+		// Still no template to clone from — cannot swap / register track filter.
+		// Log loudly; previously this fell through and silently no-op'd after
+		// conditions passed (looked like "conditions met but idle empty never applied").
+		if (!originalAnim) {
+			static int s_noOrigLog = 0;
+			if (s_noOrigLog < 30) {
+				logger::warn("[OAR-NoOriginal] No game-anim template for '{}' clipGen={:X} — skip replace this frame",
+					resolvedSuffix, reinterpret_cast<uintptr_t>(a_this));
+				s_noOrigLog++;
+			}
+			return;
 		}
 
 		// Evaluate conditions
@@ -4859,6 +4864,15 @@ namespace
 			// collide across SubMods too), each with a different .hkx.
 			const void* winningOwner = winningInfo ? winningInfo->parentSubMod : nullptr;
 			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim, winningOwner);
+			if (!replacement) {
+				static int s_buildFailLog = 0;
+				if (s_buildFailLog < 30) {
+					logger::warn("[OAR-BuildFail] GetOrBuildRuntimeAnim('{}') returned null (original={:X} owner={:X})",
+						cacheSuffix, reinterpret_cast<uintptr_t>(originalAnim),
+						reinterpret_cast<uintptr_t>(winningOwner));
+					s_buildFailLog++;
+				}
+			}
 			bool bReplaceAnnot = winningInfo && winningInfo->parentSubMod ?
 				winningInfo->parentSubMod->GetReplaceAnnotations() : true;
 
@@ -5462,10 +5476,7 @@ namespace
 			if (!startedBlendOut) {
 				if (!IsBadReadPtr(originalAnim, sizeof(uintptr_t))) {
 					auto vtbl = *reinterpret_cast<uintptr_t*>(originalAnim);
-					auto expected = cache->GetGameAnimVtable();
-					bool ok = (expected != 0) ? (vtbl == expected)
-						: (vtbl >= 0x7FF000000000ull && vtbl <= 0x7FFF00000000ull);
-					if (ok) {
+					if (IsPlausibleGameAnimVtable(vtbl)) {
 						// Fire custom "on end" events before restoring
 						{
 							std::shared_lock smLock(s_activeSubModMutex);
