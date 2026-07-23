@@ -86,7 +86,9 @@ This is where all the behavior lives.
 | `interruptible` | bool | false | Re-evaluate conditions every frame (allows mid-animation switching) |
 | `replaceOnLoop` | bool | true | Re-evaluate when the clip loops |
 | `replaceOnEcho` | bool | true | Re-evaluate on echo (transition blend) |
-| `suppressAnnotations` | bool or array | — | Mute annotations from the replacement file: `true` = all, or a list of names, e.g. `["WeaponFire"]` (case-insensitive). Great for dry-fire / silent animations whose source `.hkx` still carries annotations |
+| `replaceAnnotations` | bool | true | Play the replacement file's annotations (sounds, WeaponFire, etc.). Behavior triggers (weapon attach on equip) stay active |
+| `suppressAnnotations` | bool or array | — | Mute annotations from the replacement file: `true` = all, or a list of names, e.g. `["WeaponFire"]` (case-insensitive). Needs `replaceAnnotations: true`. Great for dry-fire / silent animations whose source `.hkx` still carries annotations |
+| `playOnceFullBody` | bool | false | Keep vanilla triggers until the anim finishes (helps some state-machine exits) |
 | `conditions` | array | [] | All must pass (AND logic). Empty = always matches |
 
 ---
@@ -376,6 +378,10 @@ Keep `interruptible: false` on one-shot reloads.
 - Use the **Animation Log** to find the real path and confirm which SubMod won.
 - Replacement not applying? Compare your SubMod folders to the log path, or try
   `bDirectPathMatching=0` while debugging.
+- Replacing **equip / draw** (`wpnequip`, `wpnequipfast`): path + conditions are enough —
+  OAR keeps behavior triggers (weapon attach) while swapping annotations.
+- **Dry-fire / silent** replacements: use `suppressAnnotations` if the replacement `.hkx`
+  still has `WeaponFire` or sounds you do not want.
 - Conditions marked *(stub)* always evaluate false until their FO4 APIs are finished.
 
 ---

@@ -28,6 +28,12 @@ struct FireEmptyEntry {
 static std::shared_mutex s_fireEmptyMutex;
 static std::unordered_map<uint32_t, FireEmptyEntry> s_fireEmptyMap;
 
+// Nesting depth of IAnimationGraphManagerHolder::NotifyAnimationGraphImpl on this
+// thread. Maintained by the Actor/PlayerCharacter vfunc hook. Replacement annotation
+// firing consults this so it never nests a second notify inside an outer one
+// (that path crashed collectActiveNodes with rdx=0 — crash-2026-07-23-00-04-17).
+static thread_local int s_notifyAnimGraphDepth = 0;
+
 bool WasFireEmptyRecent(uint32_t a_formID, int64_t a_windowMs)
 {
 	std::shared_lock lock{ s_fireEmptyMutex };
@@ -1224,6 +1230,13 @@ namespace
 	//
 	// Returns nullptr when the source has no behavior triggers to keep — the
 	// caller then installs NULL, exactly the old behavior.
+	//
+	// FUTURE REDESIGN HOOK: this is where replacement annotations could be
+	// appended as native trigger entries (times from the replacement file,
+	// event IDs/payload layout cloned from the original's annotation triggers)
+	// so the ENGINE fires them instead of our manual replay in the Update hook.
+	// See the "FUTURE REDESIGN NOTE" above the annotation-firing block in
+	// hkbClipGenerator_Update for the full rationale.
 	static std::shared_ptr<OARBuiltTriggerArray> BuildBehaviorOnlyTriggers(
 		void* a_src, const std::unordered_set<std::string>& a_origAnnotTexts)
 	{
@@ -4051,10 +4064,12 @@ namespace
 		}
 	}
 
-	// Deferred custom event queue — events are queued during hkbClipGenerator hooks
-	// and fired AFTER RunActorUpdatesOrig() completes to avoid re-entrant graph traversal.
+	// Deferred custom event queue — eventsOnStart / eventsOnEnd only. Fired AFTER
+	// RunActorUpdatesOrig() so custom events never nest inside Havok update.
+	// Replacement annotations are NOT deferred (that desynced equip/melee timing);
+	// they fire synchronously with a reentrancy guard + SEH instead.
 	struct DeferredEvent {
-		RE::TESObjectREFR* refr;
+		RE::TESObjectREFR* refr{ nullptr };
 		std::string eventName;
 		std::string label;
 	};
@@ -4072,7 +4087,7 @@ namespace
 		}
 	}
 
-	// Process all queued events (call from outside Havok update, e.g. HookedActorUpdate).
+	// Process all queued custom events (call from outside Havok update).
 	static void FlushDeferredEvents()
 	{
 		std::vector<DeferredEvent> batch;
@@ -4087,8 +4102,6 @@ namespace
 			SafeNotifyAnimGraph(de.refr, evtName);
 			SafeNotifyEventSinks(de.refr, evtName);
 
-			// When ReloadEnd fires as a custom event, also force isReloading=false
-			// so the state machine can transition (mirrors FPInertia Early ADS).
 			if (de.eventName == "ReloadEnd" || de.eventName == "reloadEnd") {
 				auto* actor = de.refr->As<RE::Actor>();
 				if (actor) {
@@ -5078,6 +5091,33 @@ namespace
 		// Phase 1: NotifyAnimationGraphImpl (behavior graph state transitions, bone cull)
 		// Phase 2: BSTEventSource::Notify (audio SoundPlay.*, plugin sinks)
 		// Only fires when ReplaceAnnotations is enabled for the submod (or forced for track filters).
+		//
+		// ============================ FUTURE REDESIGN NOTE ============================
+		// This whole manual-firing system (localTime tracker, catch-up, seek heuristic,
+		// nested-notify suppression, reentrancy depth guard) exists to REPLAY the
+		// replacement file's annotations by hand — and every guard below patches a way
+		// manual replay diverges from native behavior (ghost activations, time
+		// teleports, nested notifies; see crash-2026-07-23-00-04-17 and the phantom
+		// equipfast SoundPlay bug).
+		//
+		// The structurally better design, if annotation edge cases keep appearing
+		// (missing sounds during frame hitches, echo-restart timing oddities):
+		// LET THE ENGINE FIRE THEM. We already install a hand-built filtered
+		// hkbClipTriggerArray (see BuildBehaviorOnlyTriggers — keeps behavior triggers,
+		// drops annotation triggers). Extend it to also APPEND trigger entries built
+		// from the replacement file's annotations: correct localTimes, reusing the
+		// event IDs + hkbStringEventPayload layout of the original's annotation
+		// triggers (the [OAR-TrigFilter] dump proves they're readable — e.g. sound
+		// annotations are id=74 with a string payload). The engine then fires the
+		// replacement's annotations through its native trigger path, which already
+		// handles everything the guards below approximate: ghosts don't fire, loops/
+		// echoes process at the right point in the update cycle, and there's no
+		// reentrancy or localTime bookkeeping at all. Manual firing would remain only
+		// for what triggers can't do: PlaySoundDirect fallback, suppressAnnotations
+		// filtering (apply at build time instead), and ReloadEnd side-effects.
+		// Kept as-is for now because this battle-tested path also feeds dry-fire,
+		// suppression, and track-filter forced annotations — migrate deliberately.
+		// ==============================================================================
 		if (bReplaceAnnot) {
 			const auto& annotSuffix = cacheSuffix;
 			// Same owner selection as the animation itself — the fired
@@ -5087,6 +5127,27 @@ namespace
 				float localTime = a_this->GetLocalTime();
 				std::vector<std::string> toFire;
 
+				// Ghost activations: during an outer NotifyAnimationGraphImpl the
+				// state machine briefly Updates clips that aren't really playing
+				// (e.g. wpnequipfast while melee resolves). Their localTime often
+				// jumps 0 → end in one frame; catch-up then dumps every SoundPlay.
+				// Skip ALL emission (including SoundPlay) while nested, and seek
+				// the tracker forward so the next real Update doesn't catch-up-dump.
+				const bool nestedNotify = (s_notifyAnimGraphDepth > 0);
+				// Max gap we'll still treat as continuous playback (~3 frames at 30fps).
+				// Larger jumps = seek without firing (time teleport / ghost complete).
+				constexpr float kMaxAnnotCatchUpSec = 0.12f;
+				constexpr float kInitSeekThresholdSec = 0.05f;
+
+				auto seekIndexToTime = [&](float t) -> int32_t {
+					int32_t idx = -1;
+					for (int32_t i = 0; i < static_cast<int32_t>(annotations->size()); ++i) {
+						if ((*annotations)[i].time <= t) idx = i;
+						else break;
+					}
+					return idx;
+				};
+
 				{
 					std::unique_lock alock(s_annotStateMutex);
 					auto& astate = s_annotStateMap[a_this];
@@ -5094,17 +5155,24 @@ namespace
 					if (astate.activeSuffix != annotSuffix || astate.activeOwner != winningOwner) {
 						astate.activeSuffix = annotSuffix;
 						astate.activeOwner = winningOwner;
-						astate.prevLocalTime = 0.f;
-						astate.lastFiredIndex = -1;
 						static int s_annotInitLog = 0;
 						if (s_annotInitLog < 30) {
-							logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f})",
-								annotSuffix, annotations->size(), localTime);
+							logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f}, nested={})",
+								annotSuffix, annotations->size(), localTime, nestedNotify);
 							s_annotInitLog++;
+						}
+						// Late join / ghost activate already past the start: seek
+						// silently so we don't dump every annotation up to localTime.
+						if (nestedNotify || localTime > kInitSeekThresholdSec) {
+							astate.prevLocalTime = localTime;
+							astate.lastFiredIndex = seekIndexToTime(localTime);
+						} else {
+							astate.prevLocalTime = 0.f;
+							astate.lastFiredIndex = -1;
 						}
 					}
 
-					if (localTime >= 0.f) {
+					if (localTime >= 0.f && !nestedNotify) {
 						float prevT = astate.prevLocalTime;
 						float curT = localTime;
 
@@ -5122,10 +5190,14 @@ namespace
 									ResolveLogRefr(a_this, a_context), suffix, annotSuffix, "",
 									loopPath, ClassifyClipPerspective(a_this, loopPath));
 							}
-							for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
-								auto& ann = (*annotations)[i];
-								if (ann.time >= prevT) {
-									toFire.push_back(ann.text);
+							// Loop wrap: only fire the remaining tail if the gap is
+							// small; a huge wrap after a teleport is a seek, not a play.
+							if ((astate.prevLocalTime - curT) <= kMaxAnnotCatchUpSec) {
+								for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
+									auto& ann = (*annotations)[i];
+									if (ann.time >= prevT) {
+										toFire.push_back(ann.text);
+									}
 								}
 							}
 							astate.lastFiredIndex = -1;
@@ -5151,13 +5223,36 @@ namespace
 							}
 						}
 
-						for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
-							auto& ann = (*annotations)[i];
-							if (ann.time > curT) break;
-							if (ann.time >= prevT) {
-								toFire.push_back(ann.text);
-								astate.lastFiredIndex = i;
+						const float dt = curT - prevT;
+						if (dt > kMaxAnnotCatchUpSec) {
+							// Time jumped (ghost complete / scrub) — seek, don't dump.
+							static int s_seekLog = 0;
+							if (s_seekLog < 30) {
+								logger::info("[OAR-Annot] Seek (no fire) '{}' prev={:.3f} cur={:.3f} (dt={:.3f})",
+									annotSuffix, prevT, curT, dt);
+								s_seekLog++;
 							}
+							astate.lastFiredIndex = seekIndexToTime(curT);
+						} else {
+							for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
+								auto& ann = (*annotations)[i];
+								if (ann.time > curT) break;
+								if (ann.time >= prevT) {
+									toFire.push_back(ann.text);
+									astate.lastFiredIndex = i;
+								}
+							}
+						}
+					} else if (nestedNotify) {
+						// Keep tracker aligned with the ghost clip's time so a later
+						// real Update doesn't treat the whole anim as a catch-up gap.
+						astate.prevLocalTime = localTime;
+						astate.lastFiredIndex = seekIndexToTime(localTime);
+						static int s_nestSkipLog = 0;
+						if (s_nestSkipLog < 30) {
+							logger::info("[OAR-Annot] Nested Update — suppressed all annots for '{}' at t={:.3f}",
+								annotSuffix, localTime);
+							s_nestSkipLog++;
 						}
 					}
 					astate.prevLocalTime = localTime;
@@ -5183,6 +5278,10 @@ namespace
 					});
 				}
 				if (!toFire.empty()) {
+					// Also skip graph notify if this clip has no animation control
+					// yet — Activate can call Update before the control exists.
+					const bool ctrlReady = (a_this->GetAnimationControlRaw() != nullptr);
+
 					s_oarFiringAnnotations = true;
 					for (auto& text : toFire) {
 						static constexpr const char* kSoundPlayPrefix = "SoundPlay.";
@@ -5191,21 +5290,18 @@ namespace
 						if (text.size() > kSoundPlayLen &&
 							_strnicmp(text.c_str(), kSoundPlayPrefix, kSoundPlayLen) == 0)
 						{
-							// SoundPlay annotations: play directly through BSAudioManager
+							// SoundPlay: direct audio — never touches the behavior graph.
 							const char* soundName = text.c_str() + kSoundPlayLen;
 							PlaySoundDirect(soundName, refr);
 						} else {
-							// All other annotations (CullBone, UncullBone, reloadComplete,
-							// initiateStart, etc.): fire via BOTH behavior graph AND event
-							// sinks. The graph handles bone visibility and state transitions;
-							// the sinks handle audio plugins and other listeners.
+							// Graph + sink notify, synchronous (correct clip timing).
+							// SEH in SafeNotify catches residual AVs.
 							RE::BSFixedString evtName(text.c_str());
-							refr->NotifyAnimationGraphImpl(evtName);
-							NotifyEventSinks(refr, evtName);
+							if (ctrlReady) {
+								SafeNotifyAnimGraph(refr, evtName);
+							}
+							SafeNotifyEventSinks(refr, evtName);
 
-							// When the replacement annotation fires "ReloadEnd", also
-							// force isReloading=false and restore triggers so the state
-							// machine can transition (mirrors FPInertia Early ADS).
 							if (text == "ReloadEnd" || text == "reloadEnd") {
 								auto* actor = refr->As<RE::Actor>();
 								if (actor) {
@@ -6733,13 +6829,28 @@ namespace
 
 namespace Hooks
 {
-	// === ActionFireEmpty hook via Actor vtable ===
+	// === NotifyAnimationGraphImpl hook via Actor + PlayerCharacter vtables ===
 	// IAnimationGraphManagerHolder::NotifyAnimationGraphImpl is vfunc index 1
-	// on the IAnimationGraphManagerHolder vtable (Actor vtable entry index 5).
+	// on the IAnimationGraphManagerHolder vtable (Actor / PlayerCharacter vtable
+	// array index 5). Dual purpose:
+	//   1) ActionFireEmpty detection for IsDryFiringCondition
+	//   2) Thread-local nesting depth so replacement annotation firing can refuse
+	//      to nest a second Notify inside an outer one (collectActiveNodes CTD).
 	namespace ActionFireEmptyHook
 	{
 		using NotifyFn = bool(*)(RE::IAnimationGraphManagerHolder*, const RE::BSFixedString&);
 		static NotifyFn _OriginalNotify = nullptr;
+
+		// SEH wrapper must live in its own function — MSVC forbids __try in the
+		// same function as C++ objects with destructors (unique_lock below).
+		static bool CallOriginalNotifySEH(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		{
+			__try {
+				return _OriginalNotify(a_this, a_eventName);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 
 		static bool HookedNotifyAnimGraph(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
 		{
@@ -6759,16 +6870,35 @@ namespace Hooks
 					entry.generation++;
 				}
 			}
-			return _OriginalNotify(a_this, a_eventName);
+
+			// Depth wraps the original call so any clip Update/Activate that runs
+			// as a consequence of this notify sees s_notifyAnimGraphDepth > 0.
+			++s_notifyAnimGraphDepth;
+			const bool result = CallOriginalNotifySEH(a_this, a_eventName);
+			--s_notifyAnimGraphDepth;
+			return result;
 		}
 
 		void Install()
 		{
-			// Actor's IAnimationGraphManagerHolder vtable is at index 5 in the Actor vtable array
+			// Actor IAnimationGraphManagerHolder vtable = Actor VTABLE array index 5
 			REL::Relocation<uintptr_t> actorAnimGraphVtbl{ REL::ID(453840) };
 			_OriginalNotify = reinterpret_cast<NotifyFn>(
 				actorAnimGraphVtbl.write_vfunc(1, &HookedNotifyAnimGraph));
-			logger::info("[OAR] ActionFireEmpty vtable hook installed (Actor::NotifyAnimationGraphImpl)");
+
+			// PlayerCharacter has its own copy of that interface vtable (array index 5).
+			// Hook it too so player-side notifies (the crash path) update the depth.
+			REL::Relocation<uintptr_t> playerAnimGraphVtbl{ REL::ID(1276847) };
+			auto* playerPrev = reinterpret_cast<NotifyFn>(
+				playerAnimGraphVtbl.write_vfunc(1, &HookedNotifyAnimGraph));
+			if (playerPrev != _OriginalNotify && playerPrev != &HookedNotifyAnimGraph) {
+				logger::warn("[OAR] PlayerCharacter NotifyAnimationGraphImpl differs from Actor "
+					"({:X} vs {:X}) — depth tracking uses Actor original",
+					reinterpret_cast<uintptr_t>(playerPrev),
+					reinterpret_cast<uintptr_t>(_OriginalNotify));
+			}
+
+			logger::info("[OAR] NotifyAnimationGraphImpl hooks installed (Actor + PlayerCharacter; ActionFireEmpty + reentrancy depth)");
 		}
 	}
 

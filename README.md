@@ -158,11 +158,12 @@ sequenceDiagram
         OAR->>Cache: GetOrBuildRuntimeAnim
         Cache-->>OAR: Return runtime clone
         OAR->>Clip: Swap animSlot to replacement
+        OAR->>Clip: Filter annotation triggers keep behavior triggers
     else Track filter path
         OAR->>Cache: Register replacement for Generate
         OAR->>Clip: Keep vanilla slot blend bones in Generate
     end
-    OAR->>OAR: Fire annotations if needed
+    OAR->>OAR: Fire replacement annotations if needed
     Game->>Clip: Deactivate
     OAR->>OAR: Cleanup state and variant cache
 ```
@@ -326,9 +327,9 @@ OAR also scans `Actors/<race>/Character/Animations/` and, if needed, all of `Dat
 | `interruptible` | bool | false | Re-evaluate conditions every frame |
 | `replaceOnLoop` | bool | true | Re-evaluate when clip loops |
 | `replaceOnEcho` | bool | true | Re-evaluate on echo / blend |
-| `replaceAnnotations` | bool | true | Use replacement annotations (may null triggers + manual fire) |
+| `replaceAnnotations` | bool | true | Use the replacement `.hkx`'s annotations (sounds, WeaponFire, CullBone, etc.). Behavior-authored triggers (weapon attach on equip, state-machine transitions) stay installed and fire natively; only annotation-derived triggers are filtered out. OAR then fires the replacement's annotations manually |
 | `suppressAnnotations` | bool or string[] | -- | `true` mutes ALL of the replacement file's annotations; an array (e.g. `["WeaponFire", "SoundPlay.WPNRifleFire"]`) mutes only those, case-insensitive. Needs `replaceAnnotations: true`. Use for dry-fire/silent replacements whose source `.hkx` still carries annotations |
-| `playOnceFullBody` | bool | false | Keep vanilla triggers until anim completes (state machine exit) |
+| `playOnceFullBody` | bool | false | Keep vanilla triggers until anim completes (state machine exit). Prefer this for clips whose behavior graph needs its own exit signal |
 | `deactivationDelay` | float | 0 | Seconds to hold replacement after conditions fail |
 | `conditions` | array | `[]` | AND list; empty = always match |
 | `variants` | object | -- | Variant selection settings (see below) |
@@ -442,7 +443,15 @@ flowchart TD
 
 ### Duration and annotations
 
-Each variant loads its own `.hkx` into `AnimationCache` with its own **duration**, **tracks**, and **annotations**. Full-body replacement patches the cloned `hkaAnimation` duration so the engine loops at the replacement length. Annotation events (reload stages, sounds) are fired manually from the replacement clip's annotation list.
+Each variant loads its own `.hkx` into `AnimationCache` with its own **duration**, **tracks**, and **annotations**. Full-body replacement patches the cloned `hkaAnimation` duration so the engine loops at the replacement length.
+
+With `replaceAnnotations: true` (default):
+
+- **Annotation-derived triggers** from the original clip (sounds, `WeaponFire`, bone cull, etc.) are filtered out so the vanilla soundtrack does not play.
+- **Behavior-authored triggers** stay installed — these drive engine actions the annotation list does not cover (weapon attach/draw on equip, some state-machine exits). Replacing `wpnequip` / `wpnequipfast` with an identical file still needs these; NULLing the whole trigger array made weapons disappear and fall through to fast-equip.
+- OAR fires the **replacement** file's annotations manually from the clip's `localTime` tracker. Ghost activations during nested graph events (brief Update of a clip that is not really playing) are suppressed so their SoundPlays do not dump out of context.
+
+Use `suppressAnnotations` when the replacement `.hkx` itself still carries events you do not want (e.g. dry-fire keeping `WeaponFire`).
 
 ---
 
@@ -465,7 +474,10 @@ flowchart LR
 - Replacement **duration** and spline metadata are patched on the clone.
 - Best for complete reload / idle / locomotion overrides.
 
-**Caveat:** Hardcoded behavior graph **transitions** (e.g. "exit reload at 2.5s") still follow the `.hkb` graph, not your clip length. Use `playOnceFullBody` or `eventsOnEnd` where needed.
+**Caveats:**
+
+- Hardcoded behavior graph **transitions** (e.g. "exit reload at 2.5s") still follow the `.hkb` graph, not your clip length. Use `playOnceFullBody` or `eventsOnEnd` where needed.
+- Equip / draw clips rely on **behavior triggers** for weapon attach. OAR keeps those when replacing annotations; you normally do not need a special config for `wpnequip` beyond a correct path and conditions.
 
 ### Partial-body (track filter)
 
@@ -1026,15 +1038,18 @@ Dependencies are declared in `vcpkg.json` (e.g. `spdlog`, `nlohmann-json`, `imgu
 
 | Symptom | Things to check |
 |---------|------------------|
-| **No replacement in game** | `bEnabled=1`; conditions in log (`OpenAnimationReplacer.log`); priority vs other SubMods; correct `_1stPerson` path |
+| **No replacement in game** | `bEnabled=1`; conditions in log (`OpenAnimationReplacer.log`); priority vs other SubMods; correct `_1stPerson` path; with direct path matching, mirror the path after `Animations\` (use the Animation Log) |
 | **Only one variant plays** | `variants.enabled`; `rerollPolicy`; ensure multiple `_N` files + base exist |
 | **Reload anim cancels mid-play** | Often interruptible SubMod or competing priority; check transition logs |
 | **Ammo updates but no visible anim** | Conditions pass but clip swap failed -- check cache load errors in log |
-| **No sound / reload events** | `replaceAnnotations`; annotation times in replacement `.hkx`; `eventsOnEnd` |
+| **No sound / reload events** | `replaceAnnotations`; annotation times in replacement `.hkx`; `eventsOnEnd`; confirm `[OAR-Annot] Fired` / `Nested Update — suppressed` in the log |
+| **Weapon vanishes / jumps to fast equip when replacing draw** | Usually fixed in current builds (behavior triggers kept). Confirm you are on a build after the equip trigger-filter fix; check `[OAR-TrigFilter]` KEEP lines for non-annotation triggers |
+| **Dry-fire / silent replace still fires WeaponFire** | Set `suppressAnnotations: true` or `["WeaponFire"]`; looping fire clips must not restore original triggers mid-loop (current builds skip that) |
+| **Phantom equip / draw sounds during melee or other actions** | Ghost clip Updates during nested graph events — current builds suppress all annot emission (including SoundPlay) while nested and seek on large `localTime` jumps. Look for `[OAR-Annot] Nested Update` / `Seek (no fire)` |
 | **Crash at startup in ReadBoundAnimDataBinary** | Usually corrupt/unrelated `.hkx` in load order -- not OAR hook code; test without animation packs |
-| **Track filter looks wrong** | Bone names must match skeleton; try `override` vs `additive`; check blend times |
+| **Track filter looks wrong / drops during hitches** | Bone names must match skeleton; try `override` vs `additive`; check blend times. Concurrent filters per actor and wall-clock staleness are supported in current builds |
 
-Enable `bVerboseLogging=1` and inspect `[OAR-Transition]`, `[OAR-Variant]`, `[OAR-Cache]` lines.
+Enable `bVerboseLogging=1` and inspect `[OAR-Transition]`, `[OAR-Variant]`, `[OAR-Cache]`, `[OAR-TrigFilter]`, `[OAR-Annot]` lines.
 
 ---
 
