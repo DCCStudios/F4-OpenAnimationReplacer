@@ -1629,11 +1629,13 @@ void RestoreAllActiveReplacements()
 			if (!slot) continue;
 			// Only touch slots that currently hold OUR replacement.
 			if (!cache->IsOurReplacement(*slot)) continue;
-			// Validate the original before writing it back.
+			// Validate the original before writing it back. Accept ANY plausible
+			// game-module hkaAnimation vtable (spline / interleaved / ...), not
+			// only the single captured type — exact matching skipped valid
+			// originals during restore (same fix as GetValidOriginal).
 			if (IsBadReadPtr(original, sizeof(uintptr_t))) continue;
 			auto vtbl = *reinterpret_cast<uintptr_t*>(original);
-			auto expected = cache->GetGameAnimVtable();
-			if (expected != 0 && vtbl != expected) continue;
+			if (!IsPlausibleGameAnimVtable(vtbl)) continue;
 			// Single aligned pointer write — same operation as a normal swap.
 			// Benign vs the render thread: both old and new pointers stay
 			// valid (the clone buffer is retired, not freed, right after).
@@ -1756,6 +1758,86 @@ void ClearClipRuntimeState()
 	s_lastWeaponSubGraphID.store(0);
 	ActiveReplacementTracker::GetSingleton()->Clear();
 	logger::info("[OAR] Cleared clip runtime state (preserved LoadClips/CreateFile path maps)");
+}
+
+// ===== Global enable/disable (Settings > General > "Enabled") =================
+// The Settings checkbox is ticked on the UI (render) thread, but restoring
+// animation slots and trigger arrays must happen on the game thread — the same
+// rule every other swap we perform follows. So the toggle only raises a flag;
+// HookedActorUpdate drains it on the next frame and performs the real restore.
+static std::atomic<bool> s_pendingGlobalDisableRestore{ false };
+
+// Runs ON THE GAME THREAD (from HookedActorUpdate). Puts every hooked clip
+// back on its vanilla animation and clears all replacement-active state so
+// nothing keeps applying while disabled. Path caches and lookup tables are
+// deliberately preserved: re-enabling resumes replacement on the next clip
+// update without waiting for paths to re-resolve.
+static void PerformGlobalDisableRestore()
+{
+	// 1) Write game originals back into every clip slot that still holds our
+	//    clone, and re-install original trigger arrays (validated — same code
+	//    path as the save-load restore).
+	RestoreAllActiveReplacements();
+
+	// 2) Drop the trigger backups: the originals are physically back in place.
+	//    Installed filtered arrays are retired (kept alive), not freed — the
+	//    engine may still hold a pointer within the current update cycle.
+	{
+		std::unique_lock lock(s_triggersBackupMutex);
+		for (auto& [clip, backup] : s_triggersBackup) {
+			RetireFilteredTriggers(std::move(backup.filteredKeepAlive));
+		}
+		s_triggersBackup.clear();
+	}
+	{
+		std::lock_guard lock(s_triggersRestoredMutex);
+		s_triggersRestoredSet.clear();
+	}
+
+	// 3) Stop track filters and full-body blends immediately — the Generate
+	//    and actor-update paths early-out once these counts hit zero.
+	{
+		std::unique_lock lock(s_trackFilterMutex);
+		s_charTrackFilterMap.clear();
+		s_trackFilterActiveCount.store(0, std::memory_order_relaxed);
+	}
+	{
+		std::unique_lock lock(s_fullBodyBlendMutex);
+		s_fullBodyBlendMap.clear();
+		s_fullBodyBlendActiveCount.store(0, std::memory_order_relaxed);
+	}
+
+	// 4) Clear per-clip replacement bookkeeping (active submods, annotation
+	//    cursors, and the "Active Replacements" UI/API views).
+	{
+		std::unique_lock lock(s_activeSubModMutex);
+		s_activeSubModMap.clear();
+	}
+	{
+		std::unique_lock lock(s_annotStateMutex);
+		s_annotStateMap.clear();
+	}
+	{
+		std::unique_lock lock(s_activeReplacementSuffixMutex);
+		s_activeReplacementSuffixes.clear();
+	}
+	{
+		std::unique_lock lock(s_activeReplacementActorMutex);
+		s_activeReplacementByActor.clear();
+	}
+	ActiveReplacementTracker::GetSingleton()->Clear();
+
+	logger::info("[OAR] Global disable: restored all replaced clips to vanilla animations");
+}
+
+void OnGlobalEnabledChanged(bool a_enabled)
+{
+	if (a_enabled) {
+		logger::info("[OAR] Global enable toggled ON — replacement resumes on the next clip update");
+		return;
+	}
+	logger::info("[OAR] Global enable toggled OFF — queueing vanilla restore on the game thread");
+	s_pendingGlobalDisableRestore.store(true);
 }
 
 namespace
@@ -3595,7 +3677,11 @@ namespace
 		// annotations (WeaponFire on fire clips) fire once on every activation
 		// even though a replacement is about to install.
 		ReplacementAnimFileInfo* preSwapWinner = nullptr;
-		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt) {
+		// The global "Enabled" toggle gates the pre-swap too — while disabled the
+		// control must be built from the vanilla animation. (Anim-log entries are
+		// registered further down regardless: the log is a monitoring tool.)
+		if (s_gameFullyLoaded.load() && s_hasActiveReplacements.load() && a_this && s_lookupBuilt &&
+			Settings::GetSingleton()->bEnabled) {
 			const char* clipName = a_this->animationName.data();
 			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
 				// Direct path matching: prefer the exact suffix of the clip's
@@ -4176,6 +4262,31 @@ namespace
 						displayPath, ClassifyClipPerspective(a_this, displayPath));
 				}
 			}
+		}
+
+		// Global runtime toggle (Settings > General > "Enabled"): when off, do
+		// no replacement work at all (the anim-log flush above stays active —
+		// the log is a monitoring tool, the toggle governs replacement). The
+		// bulk vanilla restore ran when the box was unticked
+		// (PerformGlobalDisableRestore, game thread); this per-clip check
+		// catches stragglers that still hold our clone — e.g. a clip that
+		// swapped on the very frame of the toggle, or one whose original was
+		// unreadable during the bulk pass.
+		if (!Settings::GetSingleton()->bEnabled) {
+			auto** slot = a_this->GetAnimationSlot();
+			if (slot && *slot && AnimationCache::GetSingleton()->IsOurReplacement(*slot)) {
+				if (auto* orig = GetValidOriginal(a_this)) {
+					*slot = orig;
+					RestoreClipTriggers(a_this);
+					static int s_disableRestoreLog = 0;
+					if (s_disableRestoreLog < 20) {
+						logger::info("[OAR-Disable] Straggler clip {:X} restored to vanilla",
+							reinterpret_cast<uintptr_t>(a_this));
+						s_disableRestoreLog++;
+					}
+				}
+			}
+			return;
 		}
 
 		// Per-clip bypass: if pre-swap failed in Activate, the animation control was
@@ -6359,6 +6470,13 @@ namespace
 		// Process the original actor updates FIRST so game state is current.
 		Hooks::UpdateHooks::RunActorUpdatesOrig();
 
+		// The Settings "Enabled" box was just unticked on the UI thread:
+		// perform the vanilla restore here on the game thread, outside the
+		// Havok update cycle (see OnGlobalEnabledChanged).
+		if (s_pendingGlobalDisableRestore.exchange(false)) {
+			PerformGlobalDisableRestore();
+		}
+
 		// Fire deferred custom events now that the Havok update cycle is complete.
 		FlushDeferredEvents();
 
@@ -7492,8 +7610,10 @@ namespace Hooks
 							}
 						}
 
-						// File redirect (existing behavior)
-						if (s_fileMapBuilt) {
+						// File redirect (existing behavior). Honors the global
+						// "Enabled" toggle: while disabled the engine must load
+						// the VANILLA file, not the replacement.
+						if (s_fileMapBuilt && Settings::GetSingleton()->bEnabled) {
 							std::shared_lock lock(s_fileMapMutex);
 
 							for (auto& [origSuffix, replacePath] : s_fileRedirectMap) {

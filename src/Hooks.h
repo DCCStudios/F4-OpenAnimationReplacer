@@ -12,6 +12,11 @@ void ClearClipRuntimeState();
 // recorded pointers are still valid. Call BEFORE ClearClipRuntimeState() and
 // InvalidateRuntimeClones() at kPreLoadGame.
 void RestoreAllActiveReplacements();
+// Global "Enabled" checkbox (Settings > General). Call whenever the value
+// flips at runtime. Disabling queues a full vanilla restore that runs on the
+// game thread on the next frame; enabling lets replacement resume on the next
+// clip update. Safe to call from the UI (render) thread.
+void OnGlobalEnabledChanged(bool a_enabled);
 void SetGameFullyLoaded(bool a_loaded);
 void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();

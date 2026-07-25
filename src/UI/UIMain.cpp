@@ -6,6 +6,7 @@
 #include "BaseConditions.h"
 #include "Conditions.h"
 #include "AnimationLog.h"
+#include "Hooks.h"
 #include "Jobs.h"
 #include "Parsing.h"
 #include "Settings.h"
@@ -1620,7 +1621,22 @@ void UIMain::DrawSettingsPanel()
 	bool dirty = false;
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "General");
-	dirty |= ImGui::Checkbox("Enabled", &settings->bEnabled);
+	{
+		// Master switch. Disabling queues a restore on the game thread that puts
+		// every replaced clip back on its vanilla animation; enabling lets
+		// replacement resume on the next clip update. See OnGlobalEnabledChanged.
+		const bool enabledChanged = ImGui::Checkbox("Enabled", &settings->bEnabled);
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(
+				"Master switch for animation replacement. Unticking stops all\n"
+				"replacement and restores the vanilla animations immediately\n"
+				"(no reload needed). The Animation Log keeps working either way.");
+		}
+		if (enabledChanged) {
+			dirty = true;
+			OnGlobalEnabledChanged(settings->bEnabled);
+		}
+	}
 	dirty |= ImGui::Checkbox("Direct Path Matching", &settings->bDirectPathMatching);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip(
