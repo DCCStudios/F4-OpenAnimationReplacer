@@ -4,11 +4,6 @@
 #include "OpenAnimationReplacer.h"
 #include <imgui.h>
 #include <numbers>
-#include "RE/Bethesda/ActorValueInfo.h"
-#include "RE/Bethesda/Calendar.h"
-#include "RE/Bethesda/PlayerCharacter.h"
-#include "RE/Bethesda/TESBoundObjects.h"
-#include "RE/Bethesda/UI.h"
 #include "UI/UIFormPicker.h"
 #include "RE_Additions.h"
 
@@ -195,7 +190,7 @@ bool IsFemaleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGener
 	// Use graph variable approach: bIsFemale
 	bool isFemale = false;
 	static const RE::BSFixedString kVarName("bIsFemale");
-	actor->GetGraphVariableImpl(kVarName, isFemale);
+	actor->GetGraphVariableImplBool(kVarName, isFemale);
 	return isFemale;
 }
 
@@ -333,7 +328,7 @@ bool LevelCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerato
 	// Try graph variable iLevel first
 	int32_t intLevel = 0;
 	static const RE::BSFixedString kLevelVar("iLevel");
-	if (actor->GetGraphVariableImpl(kLevelVar, intLevel) && intLevel > 0) {
+	if (actor->GetGraphVariableImplInt(kLevelVar, intLevel) && intLevel > 0) {
 		return CompareValues(static_cast<float>(intLevel), comparison, numericValue.GetValue(a_refr));
 	}
 	// Fallback: use NPC base's level field via GetBaseActorValue if an AV exists
@@ -1457,7 +1452,7 @@ bool IsMovementDirectionCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::h
 	// 0 = forward, 1/-1 = backward, 0.5 = right, -0.5 = left
 	float directionVal = 0.f;
 	static const RE::BSFixedString kDirection("Direction");
-	actor->GetGraphVariableImpl(kDirection, directionVal);
+	actor->GetGraphVariableImplFloat(kDirection, directionVal);
 	// direction enum: 0=forward, 1=right, 2=back, 3=left
 	switch (direction) {
 	case 0: return (directionVal > -0.25f && directionVal < 0.25f);
@@ -1548,17 +1543,17 @@ bool HasGraphVariableCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbC
 	switch (varType) {
 	case VarType::kFloat: {
 		float val = 0.f;
-		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		if (!a_refr->GetGraphVariableImplFloat(dynVarName, val)) return false;
 		return CompareValues(val, comparison, floatValue);
 	}
 	case VarType::kInt: {
 		int32_t val = 0;
-		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		if (!a_refr->GetGraphVariableImplInt(dynVarName, val)) return false;
 		return CompareValues(static_cast<float>(val), comparison, static_cast<float>(intValue));
 	}
 	case VarType::kBool: {
 		bool val = false;
-		if (!a_refr->GetGraphVariableImpl(dynVarName, val)) return false;
+		if (!a_refr->GetGraphVariableImplBool(dynVarName, val)) return false;
 		return val == boolValue;
 	}
 	}
@@ -2360,7 +2355,7 @@ bool FallDistanceCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipG
 	if (!a_refr) return false;
 	float fallDist = 0.f;
 	static const RE::BSFixedString kVarName("fFallDistance");
-	a_refr->GetGraphVariableImpl(kVarName, fallDist);
+	a_refr->GetGraphVariableImplFloat(kVarName, fallDist);
 	return CompareValues(fallDist, comparison, numericValue.GetValue(a_refr));
 }
 

@@ -37,10 +37,12 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plu
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins")
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../PluginTemplate/CommonLibF4/cmake")
-
+# Multi-runtime CommonLibF4 (Dear-Modding fork, vendored). One DLL supports
+# OG 1.10.163 / NG 1.10.980-984 / AE 1.11.x via runtime-indexed REL::IDs
+# (COMMONLIB_RUNTIMECOUNT=3, slot picked by REX::FModule at load time).
+# Same stack and CMake shim as F4SE-Menu-Framework-3.
 if (NOT TARGET CommonLibF4)
-	add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../PluginTemplate/CommonLibF4/CommonLibF4" CommonLibF4)
+	add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/extern/commonlibf4" CommonLibF4)
 endif()
 
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -50,6 +52,7 @@ find_package(imgui CONFIG REQUIRED)
 set(SOURCES
 	src/PCH.cpp
 	src/main.cpp
+	src/LogSetup.cpp
 	src/Settings.cpp
 	src/Offsets.h
 	src/HavokTypes.h

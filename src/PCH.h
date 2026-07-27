@@ -13,9 +13,13 @@
 
 #define DLLEXPORT __declspec(dllexport)
 
+#include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 
-namespace logger = F4SE::log;
+// The multi-runtime CommonLibF4 fork has no F4SE::log wrapper; logger:: call
+// sites map 1:1 onto spdlog's free functions (default logger installed by
+// InitializeLogging() in main.cpp). Same pattern as F4SE Menu Framework 3.
+namespace logger = spdlog;
 
 using namespace std::literals;
 

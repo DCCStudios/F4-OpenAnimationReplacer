@@ -387,18 +387,119 @@ void UIManager::ShowWelcomeBanner()
 // Hook installation
 // ============================================================================
 
+namespace
+{
+	// Returns the game's IAT slot holding the resolved address of
+	// dllName!funcName, or nullptr. Walks the executable's import descriptors
+	// by name, so it works identically on every runtime (no Address Library).
+	// Borrowed from F4SE Menu Framework 3.
+	std::uintptr_t* FindGameIATSlot(const char* a_dllName, const char* a_funcName)
+	{
+		auto* base = reinterpret_cast<std::uint8_t*>(::GetModuleHandleW(nullptr));
+		if (!base) return nullptr;
+		auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+		auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+		auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!dir.VirtualAddress) return nullptr;
+
+		auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+		for (; desc->Name; ++desc) {
+			const char* modName = reinterpret_cast<const char*>(base + desc->Name);
+			if (_stricmp(modName, a_dllName) != 0) continue;
+
+			auto* thunkName = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+			auto* thunkAddr = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+			for (; thunkName->u1.AddressOfData; ++thunkName, ++thunkAddr) {
+				if (thunkName->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+				auto* import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + thunkName->u1.AddressOfData);
+				if (std::strcmp(reinterpret_cast<const char*>(import->Name), a_funcName) == 0) {
+					return reinterpret_cast<std::uintptr_t*>(&thunkAddr->u1.Function);
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// Scans the game module's writable data sections for cached copies of a
+	// resolved import address (globals the game filled at static-init time)
+	// and replaces each with `a_replacement`. Returns the number patched.
+	// Borrowed from F4SE Menu Framework 3 (needed for the NG import strategy).
+	int PatchCachedImportPointers(std::uintptr_t a_importAddr, std::uintptr_t a_replacement)
+	{
+		auto* base = reinterpret_cast<std::uint8_t*>(::GetModuleHandleW(nullptr));
+		if (!base || !a_importAddr) return 0;
+		auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+		auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+		auto* section = IMAGE_FIRST_SECTION(nt);
+
+		int patched = 0;
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+			// Cached import pointers live in initialized, writable data.
+			if (!(section->Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+			if (!(section->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA)) continue;
+
+			auto* begin = reinterpret_cast<std::uintptr_t*>(base + section->VirtualAddress);
+			auto* end = reinterpret_cast<std::uintptr_t*>(
+				base + section->VirtualAddress + section->Misc.VirtualSize - sizeof(std::uintptr_t) + 1);
+			for (auto* p = begin; p < end; ++p) {
+				if (*p == a_importAddr) {
+					REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(p), a_replacement);
+					++patched;
+				}
+			}
+		}
+		return patched;
+	}
+}
+
 void UIManager::InstallHooks()
 {
-	auto& trampoline = F4SE::GetTrampoline();
+	// D3D11CreateDeviceAndSwapChain hook (must run in F4SEPlugin_Load, before
+	// the game creates its device). Per-runtime strategy borrowed from F4SE
+	// Menu Framework 3:
+	//  - OG 1.10.163: write_call<5> on the CALL inside the renderer-init
+	//    function, Address Library ID 224250 + 0x419.
+	//  - AE 1.11.137+: same call site, ID 4492363 + 0x410 (GunMover's
+	//    field-tested pair; present in every 1.11.x bin).
+	//  - NG 1.10.980/984: those address libraries never received an ID for
+	//    this function, so patch the import instead: the IAT slot plus every
+	//    cached copy of the resolved pointer in writable data.
+	if (!REX::FModule::IsRuntimeNG()) {
+		// NG slot is a placeholder that is never resolved (REL aborts the
+		// process on a missing-ID lookup, so we must not even ask).
+		static const REL::ID kRendererInitFn{ 224250, 0, 4492363 };
+		const std::ptrdiff_t callOffset = REX::FModule::IsRuntimeOG() ? 0x419 : 0x410;
+		const std::uintptr_t callSite = kRendererInitFn.address() + callOffset;
+		auto& trampoline = REL::GetTrampoline();
+		OriginalD3D11Create = reinterpret_cast<D3D11CreateFn>(
+			trampoline.write_call<5>(callSite, reinterpret_cast<uintptr_t>(&HookedD3D11CreateDeviceAndSwapChain)));
+		logger::info("[OAR] D3D11CreateDeviceAndSwapChain call-site hook at {:X}", callSite);
+	} else {
+		HMODULE d3d11 = ::GetModuleHandleW(L"d3d11.dll");
+		if (!d3d11) d3d11 = ::LoadLibraryW(L"d3d11.dll");
+		const auto realFn = d3d11
+			? reinterpret_cast<std::uintptr_t>(::GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain"))
+			: 0;
+		if (!realFn) {
+			logger::error("[OAR] d3d11.dll!D3D11CreateDeviceAndSwapChain not resolvable - overlay disabled");
+		} else {
+			OriginalD3D11Create = reinterpret_cast<D3D11CreateFn>(realFn);
 
-	// D3D11CreateDeviceAndSwapChain call-site hook (must run before device creation)
-	OriginalD3D11Create = reinterpret_cast<D3D11CreateFn>(
-		trampoline.write_call<5>(
-			Offsets::ptr_D3D11CreateDevice.address() + Offsets::D3D11Create_Offset,
-			reinterpret_cast<uintptr_t>(&HookedD3D11CreateDeviceAndSwapChain)
-		)
-	);
-	logger::info("[OAR] D3D11CreateDeviceAndSwapChain hook installed");
+			int patched = 0;
+			if (auto* slot = FindGameIATSlot("d3d11.dll", "D3D11CreateDeviceAndSwapChain")) {
+				REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(slot),
+					reinterpret_cast<std::uintptr_t>(&HookedD3D11CreateDeviceAndSwapChain));
+				++patched;
+			}
+			patched += PatchCachedImportPointers(realFn,
+				reinterpret_cast<std::uintptr_t>(&HookedD3D11CreateDeviceAndSwapChain));
+			if (patched > 0) {
+				logger::info("[OAR] D3D11CreateDeviceAndSwapChain import hook installed on NG runtime ({} pointer(s) patched)", patched);
+			} else {
+				logger::error("[OAR] No D3D11CreateDeviceAndSwapChain import pointers found on NG runtime - overlay disabled");
+			}
+		}
+	}
 
 	HookClipCursor();
 	HookSetCursorPos();
@@ -406,27 +507,26 @@ void UIManager::InstallHooks()
 
 void UIManager::HookClipCursor()
 {
-	try {
-		REL::Relocation<std::uintptr_t> iatEntry{ REL::ID(641385) };
-		auto iatAddr = iatEntry.address();
-
-		// Save whatever is currently in the IAT entry (may be user32!ClipCursor
-		// or another plugin's hook — we chain through it either way).
-		OriginalClipCursor = reinterpret_cast<ClipCursorFn>(
-			*reinterpret_cast<std::uintptr_t*>(iatAddr));
-
-		if (!OriginalClipCursor) {
-			logger::warn("[OAR] ClipCursor IAT entry is null, skipping hook");
-			return;
-		}
-
-		REL::safe_write(iatAddr, reinterpret_cast<std::uintptr_t>(&HookedClipCursor));
-		logger::info("[OAR] ClipCursor IAT hook installed (chaining through {:X})",
-			reinterpret_cast<std::uintptr_t>(OriginalClipCursor));
-	} catch (...) {
-		logger::warn("[OAR] ClipCursor IAT hook failed (REL::ID lookup), skipping");
-		OriginalClipCursor = nullptr;
+	// Find the game's user32!ClipCursor IAT slot by walking the import table
+	// (works on every runtime; replaces the old OG-only Address Library ID).
+	auto* slot = FindGameIATSlot("user32.dll", "ClipCursor");
+	if (!slot) {
+		logger::warn("[OAR] ClipCursor not found in game IAT, skipping hook");
+		return;
 	}
+
+	// Save whatever is currently in the IAT entry (may be user32!ClipCursor
+	// or another plugin's hook — we chain through it either way).
+	OriginalClipCursor = reinterpret_cast<ClipCursorFn>(*slot);
+	if (!OriginalClipCursor) {
+		logger::warn("[OAR] ClipCursor IAT entry is null, skipping hook");
+		return;
+	}
+
+	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(slot),
+		reinterpret_cast<std::uintptr_t>(&HookedClipCursor));
+	logger::info("[OAR] ClipCursor IAT hook installed (chaining through {:X})",
+		reinterpret_cast<std::uintptr_t>(OriginalClipCursor));
 }
 
 void UIManager::HookSetCursorPos()
@@ -595,6 +695,24 @@ HRESULT WINAPI UIManager::HookedD3D11CreateDeviceAndSwapChain(
 
 	logger::info("[OAR] D3D11 device created — hooking Present");
 
+	// Capture the authoritative device/context/window now. When a swap-chain
+	// proxy mod (Frame Generation / Upscaling) is active, *ppSwapChain is its
+	// custom object and asking IT for the device later returns null — but
+	// *ppDevice / *ppImmediateContext are always the real D3D11 objects.
+	// (F4SE Menu Framework 3 pattern; this was exactly what kept the overlay
+	// from initializing on AE setups with an upscaler proxy.)
+	if (ppDevice && *ppDevice) {
+		CapturedDevice = *ppDevice;
+		CapturedDevice->AddRef();
+	}
+	if (ppImmediateContext && *ppImmediateContext) {
+		CapturedContext = *ppImmediateContext;
+		CapturedContext->AddRef();
+	}
+	if (pSwapChainDesc) {
+		CapturedWindow = pSwapChainDesc->OutputWindow;
+	}
+
 	// Hook IDXGISwapChain::Present via VTable[8]
 	auto* vtbl = *reinterpret_cast<void***>(*ppSwapChain);
 	OriginalPresent = reinterpret_cast<PresentFn>(vtbl[8]);
@@ -603,6 +721,9 @@ HRESULT WINAPI UIManager::HookedD3D11CreateDeviceAndSwapChain(
 	VirtualProtect(&vtbl[8], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
 	vtbl[8] = reinterpret_cast<void*>(&HookedPresent);
 	VirtualProtect(&vtbl[8], sizeof(void*), oldProtect, &oldProtect);
+
+	logger::info("[OAR] IDXGISwapChain::Present vtable hook installed (device captured: {}, context captured: {})",
+		CapturedDevice != nullptr, CapturedContext != nullptr);
 
 	return hr;
 }
@@ -633,18 +754,51 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 {
 	if (initialized.load()) return;
 
-	// Get device & context from the swap chain (released after init — ImGui
-	// backends hold their own AddRef'd copies internally)
-	ID3D11Device* dev = nullptr;
-	a_swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev));
-	if (!dev) return;
+	// Prefer the device/context captured at creation time. Swap-chain proxy
+	// mods (Frame Generation / Upscaling) hand the game a custom object whose
+	// GetDevice() returns null — asking the swap chain here was exactly what
+	// silently kept the overlay from initializing on AE (mirrors MF3's fix).
+	// `ownsRefs`: only the GetDevice fallback takes references that must be
+	// released after init; the captured objects are process-lifetime refs.
+	bool ownsRefs = false;
+	ID3D11Device* dev = CapturedDevice;
+	ID3D11DeviceContext* ctx = CapturedContext;
+	if (!dev) {
+		a_swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev));
+		if (!dev) {
+			static bool s_warned = false;
+			if (!s_warned) {
+				s_warned = true;
+				logger::error("[OAR] ImGui init failed: no captured device and swap chain GetDevice returned null (swap-chain proxy?)");
+			}
+			return;
+		}
+		dev->GetImmediateContext(&ctx);
+		ownsRefs = true;
+		logger::info("[OAR] ImGui init using device from swapChain->GetDevice (no capture)");
+	} else {
+		logger::info("[OAR] ImGui init using device captured at creation time");
+		if (!ctx) {
+			dev->GetImmediateContext(&ctx);  // AddRefs; keep as the process-lifetime ref
+			CapturedContext = ctx;
+		}
+	}
 
-	ID3D11DeviceContext* ctx = nullptr;
-	dev->GetImmediateContext(&ctx);
-
+	// Window handle: GetDesc works on real swap chains and known proxies
+	// (they forward it), but fall back to the creation-time HWND if a proxy
+	// returns nothing.
 	DXGI_SWAP_CHAIN_DESC desc{};
 	a_swapChain->GetDesc(&desc);
+	if (!desc.OutputWindow) {
+		desc.OutputWindow = CapturedWindow;
+		logger::info("[OAR] Swap chain GetDesc gave no window — using captured HWND");
+	}
 	gameWindow = desc.OutputWindow;
+	if (!gameWindow) {
+		logger::error("[OAR] ImGui init failed: no game window from swap chain or capture");
+		if (ownsRefs) { dev->Release(); ctx->Release(); }
+		return;
+	}
 
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
@@ -660,29 +814,30 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 	io.ConfigWindowsMoveFromTitleBarOnly = true;
 
 	if (!ImGui_ImplWin32_Init(gameWindow)) {
-		dev->Release();
-		ctx->Release();
+		logger::error("[OAR] ImGui initialization failed (Win32)");
+		if (ownsRefs) { dev->Release(); ctx->Release(); }
 		return;
 	}
 	if (!ImGui_ImplDX11_Init(dev, ctx)) {
-		dev->Release();
-		ctx->Release();
+		logger::error("[OAR] ImGui initialization failed (DX11)");
+		if (ownsRefs) { dev->Release(); ctx->Release(); }
 		return;
 	}
 
 	// Save the full window rect for ClipCursor override — prevents cursor
 	// from escaping the game window (mirrors F4SE Menu Framework 3)
-	if (gameWindow) {
-		GetWindowRect(gameWindow, &savedWindowRect);
-	}
+	GetWindowRect(gameWindow, &savedWindowRect);
 
 	// Subclass the game's WndProc for toggle key / input forwarding
 	originalWndProc = reinterpret_cast<WNDPROC>(
 		SetWindowLongPtrA(gameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&HookedWndProc)));
 
-	// Release our raw pointers — the ImGui backends already called AddRef
-	dev->Release();
-	ctx->Release();
+	// Release only fallback-path references — the ImGui backends hold their
+	// own AddRef'd copies, and captured objects keep their process-lifetime ref.
+	if (ownsRefs) {
+		dev->Release();
+		ctx->Release();
+	}
 
 	initialized.store(true);
 	logger::info("[OAR] ImGui initialized");

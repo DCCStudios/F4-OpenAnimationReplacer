@@ -4,7 +4,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "RE/Bethesda/TESForms.h"
 
 struct FormEntry
 {

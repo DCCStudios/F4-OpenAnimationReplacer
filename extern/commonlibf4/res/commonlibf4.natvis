@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?> 
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+	<Type Name="REL::Relocation&lt;*&gt;">
+		<DisplayString>{($T1)_impl}</DisplayString>
+		<Expand>
+			<Item Name="[object]">($T1)_impl</Item>
+		</Expand>
+	</Type>
+	
+	<Type Name="REX::TEnumSet&lt;*&gt;">
+		<DisplayString Optional="true">{static_cast&lt;$T1&gt;(_impl),en}</DisplayString>
+	</Type>
+
+	<Type Name="RE::RTTI::RVA&lt;*&gt;">
+		<Intrinsic Name="good" Expression="_rva != 0"/>
+		<DisplayString Condition="good()">{($T1*)(REL::Module::_natvis + _rva)}</DisplayString>
+		<DisplayString Condition="!good()">empty</DisplayString>
+		<Expand>
+			<Item Name="[object]" Condition="good()">($T1*)(REL::Module::_natvis + _rva)</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTArray&lt;*,RE::BSTArrayHeapAllocator&gt;">
+		<DisplayString>{{ size={_size} }}</DisplayString>
+		<Expand>
+			<Item Name="[capacity]">_allocator._capacity</Item>
+			<ArrayItems>
+				<Size>_size</Size>
+				<ValuePointer>($T1*)_allocator._data</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTArray&lt;*,RE::BSTSmallArrayHeapAllocator&lt;*&gt;&gt;">
+		<DisplayString>{{ size={_size} }}</DisplayString>
+		<Expand>
+			<Item Name="[capacity]">_allocator._capacity</Item>
+			<ArrayItems>
+				<Size>_size</Size>
+				<ValuePointer Condition="_allocator._local">($T1*)_allocator._stack</ValuePointer>
+				<ValuePointer Condition="!_allocator._local">($T1*)_allocator._heap</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSStaticArray&lt;*&gt;">
+		<DisplayString>{{ size={_size} }}</DisplayString>
+		<Expand>
+			<ArrayItems>
+				<Size>_size</Size>
+				<ValuePointer>($T1*)_data</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTSmallSharedArray&lt;*&gt;">
+		<DisplayString>{{ size={_size} }}</DisplayString>
+		<Expand>
+			<ArrayItems>
+				<Size>_size</Size>
+				<ValuePointer Condition="_size &gt; 0">($T1*)_data.heap</ValuePointer>
+				<ValuePointer Condition="_size &lt;= 0">($T1*)_data.local</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSSimpleList&lt;*&gt;">
+		<Intrinsic Name="empty" Expression="!_root.next &amp;&amp; !_root.value"/>
+		<DisplayString Condition="empty()">empty</DisplayString>
+		<DisplayString Condition="empty()">non-empty</DisplayString>
+		<Expand>
+			<LinkedListItems>
+				<HeadPointer>&amp;_root</HeadPointer>
+				<NextPointer>next</NextPointer>
+				<ValueNode>value</ValueNode>
+			</LinkedListItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTScatterTable&lt;*&gt;">
+		<DisplayString>{{ size={_capacity - _free} }}</DisplayString>
+		<Expand>
+			<Item Name="[capacity]">_capacity</Item>
+			<Item Name="[free]">_free</Item>
+			<Item Name="[allocator]">_allocator</Item>
+			<CustomListItems MaxItemsPerView="1000">
+				<Variable Name="iter" InitialValue="(RE::BSTScatterTable&lt;$T1,$T2,$T3,$T4&gt;::entry_type*)_allocator._entries"/>
+				<Variable Name="end" InitialValue="iter + _capacity"/>
+
+				<Size>_capacity - _free</Size>
+				<Loop Condition="iter != end">
+					<If Condition="iter-&gt;next != nullptr">
+						<Item>iter-&gt;value</Item>
+					</If>
+					<Exec>++iter</Exec>
+				</Loop>
+			</CustomListItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTScatterTable&lt;*&gt;::iterator_base&lt;*&gt;">
+		<DisplayString Condition="_first != _last">{_first->value}</DisplayString>
+		<DisplayString Condition="_first == _last">end</DisplayString>
+		<Expand>
+			<Item Condition="_first != _last" Name="[value]">_first->value</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSTTuple&lt;*&gt;">
+		<DisplayString>({first}, {second})</DisplayString>
+		<Expand>
+			<Item Name="first">first</Item>
+			<Item Name="second">second</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSStringPool::Entry">
+		<Intrinsic Name="shallow" Expression="_flags &amp; kShallow"/>
+		<DisplayString Condition="shallow()">{*this->_right}</DisplayString>
+		<DisplayString Condition="!shallow()">{*this,view(leaf)}</DisplayString>
+		<Expand>
+			<Item Name="[next]" Condition="shallow()">*this->_right</Item>
+			<Item Name="[leaf]" Condition="!shallow()">*this,view(leaf)</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSStringPool::Entry" IncludeView="leaf">
+		<DisplayString Condition="(_flags &amp; kWide) != 0">{(wchar_t*)(this + 1)}</DisplayString>
+		<DisplayString Condition="(_flags &amp; kWide) == 0">{(char*)(this + 1)}</DisplayString>
+		<Expand>
+			<Item Name="[size]">_length</Item>
+			<Item Name="[crc]">_crc,H</Item>
+			<Item Name="[wide]" Condition="(_flags &amp; kWide) == 0">false</Item>
+			<Item Name="[wide]" Condition="(_flags &amp; kWide) != 0">true</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::detail::BSFixedString&lt;*&gt;">
+		<DisplayString Condition="_data != nullptr">{*_data,na}</DisplayString>
+		<DisplayString Condition="_data == nullptr">&quot;&quot;</DisplayString>
+		<Expand>
+			<Item Name="[data]" Condition="_data != nullptr">_data</Item>
+			<Item Name="[data]" Condition="_data == nullptr">"empty"</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::BSStringT&lt;*&gt;">
+		<DisplayString>{_data,[_size]}</DisplayString>
+		<Expand>
+			<Item Name="[size]">_size</Item>
+			<Item Name="[capacity]">_capacity</Item>
+			<ArrayItems>
+				<Size>_size</Size>
+				<ValuePointer>_data</ValuePointer>
+			</ArrayItems>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::SCRIPT_FUNCTION">
+		<Intrinsic Name="HasShortName" Expression="shortName &amp;&amp; shortName[0] != '\0'"/>
+		<DisplayString Condition="HasShortName()">{functionName,na} ({shortName,na})</DisplayString>
+		<DisplayString Condition="!HasShortName()">{functionName,na}</DisplayString>
+		<Expand>
+			<Item Name="functionName">functionName</Item>
+			<Item Name="shortName">shortName</Item>
+			<Item Name="helpString">helpString</Item>
+			<Item Name="referenceFunction">referenceFunction</Item>
+			<Item Name="paramCount">paramCount</Item>
+			<ArrayItems>
+				<Size>paramCount</Size>
+				<ValuePointer>parameters</ValuePointer>
+			</ArrayItems>
+			<Item Name="executeFunction">executeFunction</Item>
+			<Item Name="compileFunction">compileFunction</Item>
+			<Item Name="conditionFunction">conditionFunction</Item>
+			<Item Name="editorFilter">editorFilter</Item>
+			<Item Name="invalidatesCellList">invalidatesCellList</Item>
+		</Expand>
+	</Type>
+
+	<Type Name="RE::TESForm">
+		<DisplayString>{formType} [{formID,H}]</DisplayString>
+	</Type>
+</AutoVisualizer>

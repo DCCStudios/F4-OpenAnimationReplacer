@@ -1,6 +1,5 @@
 #include "Functions.h"
 #include "Conditions.h"
-#include "RE/Bethesda/ActorValueInfo.h"
 #include <random>
 
 // ===== SendAnimEvent =====
@@ -90,25 +89,34 @@ void ModActorValueFunction::Initialize(const nlohmann::json& a_json)
 void PlaySoundFunction::Execute(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*)
 {
 	if (!a_refr || soundName.empty()) return;
-	// Use BSAudioManager to play the sound descriptor
-	using GetSoundHandle_t = bool(*)(void*, void*, uint32_t, const char*);
-	using FadeInPlay_t = bool(*)(void*, int);
 
-	static auto* audioMgr = []() -> void* {
-		REL::Relocation<void**> singleton{ REL::ID(1168512) };
-		return *singleton;
-	}();
-
+	// Play through BSAudioManager by EditorID name. Uses the same proven
+	// GetSoundHandleByName/FadeInPlay path as the annotation audio in
+	// Hooks.cpp (the old parallel IDs 1168512/57416/1492470 have no NG/AE
+	// Address Library entries). Multi-runtime: { OG, NG }; the AE databases
+	// carry the same NG ids, so the NG slot pads forward.
+	static REL::Relocation<void**> s_audioMgrPtr{ REL::ID({ 1321158, 2703058 }) };
+	void* audioMgr = *s_audioMgrPtr;
 	if (!audioMgr) return;
 
-	struct SoundHandle { uint32_t soundID{ 0xFFFFFFFF }; uint32_t unk04{ 0 }; };
+	struct SoundHandle
+	{
+		uint32_t soundID{ 0 };
+		bool assumeSuccess{ false };
+		int8_t state{ 0 };
+	};
+	static_assert(sizeof(SoundHandle) == 0x8);
+
+	using GetSoundByName_t = void(*)(void* mgr, SoundHandle* handle, const char* name,
+		float distance, uint32_t usageFlags, void* extraData);
+	static REL::Relocation<GetSoundByName_t> GetSoundByName{ REL::ID({ 196484, 2267104 }) };
+
+	using FadeInPlay_t = bool(*)(SoundHandle* handle, uint16_t ms);
+	static REL::Relocation<FadeInPlay_t> FadeInPlay{ REL::ID({ 353528, 2267075 }) };
+
 	SoundHandle handle{};
-
-	REL::Relocation<GetSoundHandle_t> GetSoundHandleByName{ REL::ID(57416) };
-	REL::Relocation<FadeInPlay_t> FadeInPlay{ REL::ID(1492470) };
-
-	if (!GetSoundHandleByName(audioMgr, &handle, 0, soundName.c_str())) return;
-	if (handle.soundID == 0xFFFFFFFF) return;
+	GetSoundByName(audioMgr, &handle, soundName.c_str(), 0.f, 0x1A, nullptr);
+	if (handle.soundID == 0 && !handle.assumeSuccess) return;
 	FadeInPlay(&handle, 0);
 }
 

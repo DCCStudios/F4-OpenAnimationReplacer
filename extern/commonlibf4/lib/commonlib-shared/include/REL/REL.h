@@ -1,0 +1,15 @@
+#pragma once
+
+#include "REL/ASM.h"
+#include "REL/FHook.h"
+#include "REL/FHookStore.h"
+#include "REL/IAT.h"
+#include "REL/IHook.h"
+#include "REL/VariantID.h"
+#include "REL/Offset2ID.h"
+#include "REL/Pattern.h"
+#include "REL/Relocation.h"
+#include "REL/THook.h"
+#include "REL/Trampoline.h"
+#include "REL/Utility.h"
+#include "REL/Version.h"

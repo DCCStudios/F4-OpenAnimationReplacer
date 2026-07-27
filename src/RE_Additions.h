@@ -23,7 +23,9 @@ namespace OAR_RE
 	public:
 		[[nodiscard]] static ProcessLists* GetSingleton()
 		{
-			REL::Relocation<ProcessLists**> singleton{ REL::ID(1569706) };
+			// Multi-runtime { OG, NG, AE } (matches the Dear-Modding fork's
+			// ID::ProcessLists::Singleton; verified against 984/221 bins).
+			static REL::Relocation<ProcessLists**> singleton{ REL::ID({ 1569706, 2688869, 4796160 }) };
 			return *singleton;
 		}
 
@@ -54,9 +56,19 @@ namespace OAR_RE
 		kCritical = 5
 	};
 
+	// OG-only: 943772 has no NG/AE Address Library entry. On NG/AE this
+	// returns 0 (undetected) and the IsDetectedBy condition logs one warning;
+	// resolving the ID there would abort the process.
 	inline int32_t RequestDetectionLevel(RE::Actor* a_detector, RE::Actor* a_target,
 		DETECTION_PRIORITY a_priority = DETECTION_PRIORITY::kNormal)
 	{
+		if (!REX::FModule::IsRuntimeOG()) {
+			static std::atomic_bool s_warned{ false };
+			if (!s_warned.exchange(true)) {
+				logger::warn("[OAR] RequestDetectionLevel unavailable on this runtime (OG-only engine function); IsDetectedBy conditions evaluate as undetected");
+			}
+			return 0;
+		}
 		using func_t = int32_t(*)(RE::Actor*, RE::Actor*, DETECTION_PRIORITY);
 		static REL::Relocation<func_t> func{ REL::ID(943772) };
 		return func(a_detector, a_target, a_priority);
@@ -71,7 +83,8 @@ namespace OAR_RE
 	public:
 		[[nodiscard]] static MenuTopicManager* GetSingleton()
 		{
-			static REL::Relocation<MenuTopicManager**> singleton{ REL::ID(520890) };
+			// Multi-runtime { OG, NG, AE } (verified against 984/221 bins).
+			static REL::Relocation<MenuTopicManager**> singleton{ REL::ID({ 520890, 2689089, 4796375 }) };
 			return *singleton;
 		}
 

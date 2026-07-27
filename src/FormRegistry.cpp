@@ -1,9 +1,5 @@
 #include "FormRegistry.h"
 
-#include "RE/Bethesda/TESDataHandler.h"
-#include "RE/Bethesda/TESFile.h"
-#include "RE/Bethesda/TESForms.h"
-#include "RE/Bethesda/FormComponents.h"
 
 const std::vector<FormEntry> FormRegistry::s_empty{};
 

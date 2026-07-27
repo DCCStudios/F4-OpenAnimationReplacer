@@ -1,0 +1,50 @@
+#pragma once
+
+namespace RE
+{
+	class BGSNumericIDIndex
+	{
+	public:
+		~BGSNumericIDIndex() noexcept {}  // intentional
+
+		enum class Flags : std::uint8_t
+		{
+			kDefault = 1u << 6,  // idx 0x00
+			kCreated = 1u << 7,  // idx 0xFF
+		};
+
+		[[nodiscard]] bool IsCreated() const noexcept { return flags.all(Flags::kCreated); }
+		[[nodiscard]] bool IsDefault() const noexcept { return flags.all(Flags::kDefault); }
+
+		[[nodiscard]] std::uint32_t GetNumericID() const
+		{
+			using func_t = decltype(&BGSNumericIDIndex::GetNumericID);
+			static REL::Relocation<func_t> func{ ID::BGSNumericIDIndex::GetNumericID };
+			return func(this);
+		}
+
+		void SetNumericID(std::uint32_t a_formID)
+		{
+			using func_t = decltype(&BGSNumericIDIndex::SetNumericID);
+			static REL::Relocation<func_t> func{ ID::BGSNumericIDIndex::SetNumericID };
+			return func(this, a_formID);
+		}
+
+		// members
+		union
+		{
+			struct
+			{
+				union
+				{
+					std::uint8_t                       data1;
+					REX::TEnumSet<Flags, std::uint8_t> flags;
+				};  // 0
+				std::uint8_t data2;  // 1
+				std::uint8_t data3;  // 2
+			};
+			std::uint8_t data[3]{ 0 };
+		};  // 0
+	};
+	static_assert(sizeof(BGSNumericIDIndex) == 0x3);
+}

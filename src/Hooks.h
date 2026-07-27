@@ -104,6 +104,15 @@ namespace Hooks
 {
 	void Install();
 
+	namespace AutoReloadSuppression
+	{
+		// Per-frame driver for the auto-reload replication feature (triggers
+		// OAR's own full-playback reload per the Auto-Reload mode setting while
+		// the engine's truncating auto-reloads are suppressed). GAME THREAD
+		// ONLY; called from the actor-update poll once the game is fully loaded.
+		void PerFrameUpdate();
+	}
+
 	namespace ClipGeneratorHooks
 	{
 		void Install();

@@ -10,11 +10,39 @@
 #include "Offsets.h"
 #include "FormRegistry.h"
 
+// Defined in LogSetup.cpp (separate TU: needs ShlObj_core.h, whose COM
+// ICondition interface collides with OAR's global ICondition class).
+void OAR_InitializeLogging(std::string_view a_pluginName);
+
 namespace Plugin
 {
 	static constexpr auto NAME    = "OpenAnimationReplacer"sv;
 	static constexpr auto VERSION = REL::Version{ 1, 0, 0 };
 }
+
+// Version data consumed by the NG/AE F4SE loaders (0.7.x reads the exported
+// F4SEPlugin_Version structure instead of calling F4SEPlugin_Query). The
+// address-independence bits declare that everything resolves through the
+// Address Library, so any 1.10.980+ runtime with a matching version-*.bin may
+// load us. OG F4SE (0.6.23) ignores this export and uses F4SEPlugin_Query.
+F4SE_PLUGIN_VERSION = []() noexcept {
+	F4SE::PluginVersionData v{};
+	v.PluginVersion({ 1, 0, 0, 0 });
+	v.PluginName("OpenAnimationReplacer");
+	v.AuthorName("");
+	v.UsesAddressLibraryNG(true);  // 1.10.980 / 1.10.984
+	v.UsesAddressLibraryAE(true);  // 1.11.137 and later
+	v.UsesSigScanning(false);
+	v.IsLayoutDependentNG(true);
+	v.IsLayoutDependentAE(true);
+	v.CompatibleVersions({
+		F4SE::RUNTIME_1_10_163,
+		F4SE::RUNTIME_1_10_980,
+		F4SE::RUNTIME_1_10_984,
+		F4SE::RUNTIME_LATEST,
+	});
+	return v;
+}();
 
 namespace StructProbe
 {
@@ -204,13 +232,12 @@ namespace StructProbe
 	{
 		Log("[OAR-Probe] === Scanning for loadClips call site ===");
 
-		auto moduleBase = REL::Module::get().base();
-		auto textSeg = REL::Module::get().segment(REL::Segment::Name::text);
-		auto moduleEnd = textSeg.address() + textSeg.size();
+		auto moduleBase = REX::FModule::GetExecutingModule().GetBaseAddress();
+		auto textSeg = REX::FModule::GetExecutingModule().GetSection(".text");
+		auto moduleEnd = textSeg.GetAddress() + textSeg.GetSize();
 		auto moduleSize = moduleEnd - moduleBase;
 		Log(fmt::format("[OAR-Probe] Module base={:X}, text end={:X}", moduleBase, moduleEnd));
 
-		auto bsAnimGraphVtbl = Offsets::ptr_VisitGraph.address();
 		auto bindingSetVtbl = REL::Relocation<uintptr_t>{ REL::ID(802975) }.address();
 		auto stringDataVtbl = Offsets::hkbCharacterStringData_vtbl.address();
 		Log(fmt::format("[OAR-Probe] hkbAnimationBindingSet vtable at {:X}", bindingSetVtbl));
@@ -303,22 +330,6 @@ namespace StructProbe
 
 namespace
 {
-	void InitializeLogging()
-	{
-		auto path = F4SE::log::log_directory();
-		if (!path) {
-			F4SE::stl::report_and_fail("Failed to find F4SE log directory"sv);
-		}
-		*path /= std::format("{}.log"sv, Plugin::NAME);
-
-		auto log = std::make_shared<spdlog::logger>(
-			"global"s,
-			std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true));
-		log->set_level(spdlog::level::trace);
-		log->flush_on(spdlog::level::info);
-		set_default_logger(std::move(log));
-	}
-
 	void MessageCallback(F4SE::MessagingInterface::Message* msg)
 	{
 		if (!msg) return;
@@ -426,13 +437,23 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* F
 
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4SE)
 {
-	InitializeLogging();
+	OAR_InitializeLogging(Plugin::NAME);
 	logger::info("{} v{}.{}.{} loading", Plugin::NAME,
 		Plugin::VERSION[0], Plugin::VERSION[1], Plugin::VERSION[2]);
 
-	F4SE::Init(F4SE);
+	// Which address-library slot this process resolves REL::IDs from.
+	{
+		const auto gameVer = REX::FModule::GetExecutingModule().GetFileVersion();
+		const char* slot =
+			REX::FModule::IsRuntimeOG() ? "OG" :
+			REX::FModule::IsRuntimeNG() ? "NG" : "AE";
+		logger::info("[OAR] Game runtime {} -> {} address slot", gameVer.string(), slot);
+	}
 
-	F4SE::AllocTrampoline(1024);
+	// log = false: InitializeLogging() already installed the spdlog default
+	// logger (CommonLib's REX layer logs through it too). trampoline = true
+	// replaces the old F4SE::AllocTrampoline(1024).
+	F4SE::Init(F4SE, { .log = false, .trampoline = true, .trampolineSize = 1024 });
 
 	// Load settings early so the toggle hotkey is correct from the start
 	Settings::GetSingleton()->Load();

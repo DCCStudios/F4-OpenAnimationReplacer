@@ -1646,6 +1646,45 @@ void UIMain::DrawSettingsPanel()
 			"path cannot be resolved. Disable to restore the legacy leaf-matching\n"
 			"behavior everywhere.");
 	}
+	{
+		// The engine's own auto-reloads are always suppressed (they are
+		// attack-initiated and get cut short at reloadComplete). This picks
+		// what OAR does instead; its reloads use the reload-key path and
+		// play the full animation.
+		static const char* kAutoReloadModes[] = {
+			"Auto-Reload On Last Round",
+			"Auto-Reload On Fire Press When Empty",
+			"Suppress Auto-Reload",
+		};
+		ImGui::SetNextItemWidth(280.0f);
+		dirty |= ImGui::Combo("Auto-Reload", &settings->iAutoReloadMode, kAutoReloadModes, 3);
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(
+				"The game's own auto-reloads are attack-initiated, so the engine cuts\n"
+				"them short the moment the magazine refills (at the reloadComplete\n"
+				"annotation). OAR always suppresses them and instead triggers reloads\n"
+				"through the reload-key path, which plays the full animation.\n"
+				"\n"
+				"On Last Round: reload as soon as the magazine hits 0 by firing.\n"
+				"On Fire Press When Empty: reload when you press fire on an empty\n"
+				"magazine (vanilla-style trigger); dry fire still plays first.\n"
+				"Suppress Auto-Reload: no automatic reloads; reload key only.\n"
+				"\n"
+				"Compatible with ManualReloadF4SE (whichever loads first applies the\n"
+				"engine patch, the other detects it and leaves it alone).");
+		}
+
+		dirty |= ImGui::Checkbox("Play Dry-Fire Sound", &settings->bPlayDryFireSound);
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(
+				"Plays a click when you press fire on an empty magazine (or with no\n"
+				"ammo of that type at all). With the engine's fire-empty auto-reload\n"
+				"suppressed, the press would otherwise be silent. Uses the weapon's\n"
+				"Attack Fail sound, or the vanilla 10mm dry-fire click if it has none.\n"
+				"Turn this off if your dry-fire replacement animations already play\n"
+				"their own click sounds.");
+		}
+	}
 	dirty |= ImGui::Checkbox("Verbose Logging", &settings->bVerboseLogging);
 
 	ImGui::Spacing();

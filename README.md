@@ -362,6 +362,8 @@ Players can override author settings without editing `config.json`. The in-game 
 | | `bDisablePreloading` | `0` | Skip upfront `.hkx` preload |
 | | `bFilterOutDuplicateAnimations` | `1` | Dedupe registration |
 | | `bDirectPathMatching` | `1` | Exact path matching (default). `0` = leaf matching everywhere. Also in Settings |
+| | `iAutoReloadMode` | `0` | `0` = auto-reload on last round (default), `1` = auto-reload on fire when empty, `2` = suppress auto-reload (reload key only). Engine auto-reloads are always suppressed so OAR can issue full-length reload-key reloads. Also in Settings |
+| | `bPlayDryFireSound` | `1` | Play a dry-fire click when firing on empty (weapon Attack Fail sound, or vanilla 10mm dry click). Also in Settings |
 | **UI** | `iToggleKey` | `60` (`0x3C`) | DIK scan code for UI toggle (default **F2**; rebind in Settings) |
 | | `bRequireShift` | `0` | Require Shift + toggle key |
 | **AnimationLog** | `bLogReplace` | `1` | Log replacements in overlay |
@@ -974,12 +976,14 @@ OpenAnimationReplacer/
 |-- CMakePresets.json       # msvc-release / msvc-debug
 |-- OpenAnimationReplacer.ini
 |-- README.md
+|-- extern/commonlibf4/     # Vendored multi-runtime CommonLibF4 (OG/NG/AE)
 |-- docs/
 |   |-- QuickStart.md       # Authoring + conditions (detailed)
 |   |-- HavokReference.md
 |   +-- HavokReference2.md
 |-- src/
 |   |-- main.cpp            # F4SE entry, messaging
+|   |-- LogSetup.cpp        # spdlog init (separate TU for ShlObj)
 |   |-- Hooks.cpp           # hkbClipGenerator hooks, track filter, variants
 |   |-- Parsing.cpp         # Disk scan, variant grouping, JSON
 |   |-- AnimationCache.cpp  # .hkx load, runtime clone, annotations
@@ -1013,7 +1017,7 @@ OpenAnimationReplacer/
 | **Visual Studio 2022** | x64, Desktop development with C++ |
 | **CMake** | >= 3.21 |
 | **vcpkg** | `VCPKG_ROOT` set; triplet `x64-windows-static-md` |
-| **CommonLibF4** | Expected at `../PluginTemplate/CommonLibF4` (adjust `CMakeLists.txt` if needed) |
+| **CommonLibF4** | Vendored multi-runtime fork at `extern/commonlibf4` (OG / NG / AE) |
 | **Fallout4Path** | Environment variable -- game root |
 
 ### Commands

@@ -89,7 +89,7 @@ private:
 	std::deque<std::unique_ptr<BlendingClip>> blendingClips;
 	bool transitioning{ false };
 
-	RE::hkRefPtr<RE::hkbClipTriggerArray> triggersBackup;
+	RE::hkRawRefPtr<RE::hkbClipTriggerArray> triggersBackup;
 	bool triggersBackedUp{ false };
 
 	float deactivationDelayRemaining{ 0.0f };

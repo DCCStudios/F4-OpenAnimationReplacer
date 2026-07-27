@@ -73,6 +73,16 @@ private:
 	using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
 	static inline PresentFn OriginalPresent{ nullptr };
 
+	// Device / context / window captured at D3D11CreateDeviceAndSwapChain time.
+	// Swap-chain proxy mods (Frame Generation / Upscaling, common on AE) hand
+	// the game a custom swap-chain object whose GetDevice() returns null, so
+	// InitImGui must prefer these authoritative objects over asking the swap
+	// chain (mirrors the F4SE Menu Framework 3 fix). Held with one AddRef for
+	// the life of the process.
+	static inline ID3D11Device* CapturedDevice{ nullptr };
+	static inline ID3D11DeviceContext* CapturedContext{ nullptr };
+	static inline HWND CapturedWindow{ nullptr };
+
 	// ── ClipCursor IAT hook ────────────────────────────────────────────
 	using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
 	static inline ClipCursorFn OriginalClipCursor{ nullptr };

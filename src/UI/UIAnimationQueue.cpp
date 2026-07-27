@@ -62,7 +62,13 @@ void UIAnimationQueue::DrawContents()
 	std::string overlayStr;
 
 	if (total > 0) {
+		// Prefer loaded during the cache phase; fall back to parsed during the
+		// filesystem scan. Clamp so a transient counter mismatch can't draw a
+		// bar past 100% or show "40/36".
 		int progress = loaded > 0 ? loaded : parsed;
+		if (progress > total) {
+			progress = total;
+		}
 		fraction = static_cast<float>(progress) / static_cast<float>(total);
 		overlayStr = std::format("{}/{}", progress, total);
 	}

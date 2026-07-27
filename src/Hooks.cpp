@@ -1430,20 +1430,25 @@ namespace
 	};
 	static_assert(sizeof(OARSoundHandle) == 0x8);
 
-	static void PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr)
+	// Returns true when a sound descriptor was found and playback started, so
+	// callers with a fallback sound (dry-fire click) know whether to try it.
+	static bool PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr)
 	{
-		if (!a_soundName || !a_soundName[0]) return;
+		if (!a_soundName || !a_soundName[0]) return false;
 
-		static REL::Relocation<void**> s_audioMgrPtr{ REL::ID(1321158) };
+		// Multi-runtime IDs: OG id first, NG id second (the AE databases carry
+		// the same NG function ids, so the NG slot pads forward to AE).
+		// Verified against version-1-10-984 and version-1-11-221 bins.
+		static REL::Relocation<void**> s_audioMgrPtr{ REL::ID({ 1321158, 2703058 }) };
 		void* audioMgr = *s_audioMgrPtr;
-		if (!audioMgr) return;
+		if (!audioMgr) return false;
 
 		using GetSoundByName_t = void(*)(void* mgr, OARSoundHandle* handle, const char* name,
 			float distance, uint32_t usageFlags, void* extraData);
-		static REL::Relocation<GetSoundByName_t> GetSoundByName{ REL::ID(196484) };
+		static REL::Relocation<GetSoundByName_t> GetSoundByName{ REL::ID({ 196484, 2267104 }) };
 
 		using FadeInPlay_t = bool(*)(OARSoundHandle* handle, uint16_t ms);
-		static REL::Relocation<FadeInPlay_t> FadeInPlay{ REL::ID(353528) };
+		static REL::Relocation<FadeInPlay_t> FadeInPlay{ REL::ID({ 353528, 2267075 }) };
 
 		OARSoundHandle handle{};
 		GetSoundByName(audioMgr, &handle, a_soundName, 0.f, 0x1A, nullptr);
@@ -1454,34 +1459,66 @@ namespace
 				logger::info("[OAR-Audio] GetSoundHandleByName('{}') failed — no sound descriptor found", a_soundName);
 				s_failLog++;
 			}
-			return;
+			return false;
 		}
 
 		FadeInPlay(&handle, 0);
 
+		// High cap on purpose: this line is the ground truth when diagnosing
+		// missing end-of-clip sounds. The old cap of 50 ran out mid-session and
+		// made annotation firing look broken when only the logging had stopped.
 		static int s_playLog = 0;
-		if (s_playLog < 50) {
+		if (s_playLog < 1000) {
 			logger::info("[OAR-Audio] Played sound '{}' (id={:X}) on {:X}",
 				a_soundName, handle.soundID,
 				a_refr ? a_refr->GetFormID() : 0u);
 			s_playLog++;
 		}
+		return true;
 	}
 
 	// Dual-path emission: fire directly to BSTEventSource sinks (audio system, etc.)
+	// so gameplay reactions to replacement annotations (reloadComplete refilling
+	// the magazine, etc.) still happen even though the original triggers are
+	// NULLed. Per-runtime strategy:
+	//  - OG: enumerate the graph's event sources (897074) and Notify each; this
+	//    reaches every registered sink (the refr, audio system, ...).
+	//  - NG/AE: 897074 has no Address Library entry. Deliver straight to the
+	//    actor's own BSTEventSink<BSAnimationGraphEvent> base instead
+	//    (TESObjectREFR + 0x38, ProcessEvent = vfunc 1 — same layout facts as
+	//    AnimGraphEventFeedHook). The refr's handler is the consumer that
+	//    drives gameplay reactions; sounds already play via BSAudioManager.
+	//    Verified symptom before this path existed: on AE, replaced reloads
+	//    played sounds but never fired reloadComplete, so reloads never
+	//    completed.
 	static void NotifyEventSinks(RE::TESObjectREFR* a_refr, const RE::BSFixedString& a_evt)
 	{
-		RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
-		if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(a_refr, sources)) return;
+		if (!a_refr) return;
 		static const RE::BSFixedString emptyArg{ "" };
-		for (auto* src : sources) {
-			if (!src) continue;
-			RE::BSAnimationGraphEvent ge{};
-			ge.refr = a_refr;
-			ge.animEvent = a_evt;
-			ge.argument = emptyArg;
-			src->Notify(ge);
+
+		if (REX::FModule::IsRuntimeOG()) {
+			RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
+			if (!RE::BGSAnimationSystemUtils::GetEventSourcePointersFromGraph(a_refr, sources)) return;
+			for (auto* src : sources) {
+				if (!src) continue;
+				// Fork's BSAnimationGraphEvent: holderID carries the holder ref
+				// bits (bit-identical to the old refr pointer member), tag is
+				// the event name, payload the argument. Members are const, so
+				// build via aggregate init.
+				RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), a_evt, emptyArg };
+				src->Notify(ge);
+			}
+			return;
 		}
+
+		// NG/AE: virtual dispatch through the refr's own sink base. This goes
+		// through the object's live vtable, so it also passes through our
+		// AnimGraphEventFeedHook (which logs the event and calls the engine
+		// original) — matching OG, where the registered log sink sees these too.
+		RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), a_evt, emptyArg };
+		auto* sink = reinterpret_cast<RE::BSTEventSink<RE::BSAnimationGraphEvent>*>(
+			reinterpret_cast<uintptr_t>(a_refr) + 0x38);
+		sink->ProcessEvent(ge, nullptr);
 	}
 
 	// Animation event observer — feeds events to the Animation Log for the UI.
@@ -1493,13 +1530,15 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override
 		{
-			const char* evtStr = a_event.animEvent.c_str();
+			const char* evtStr = a_event.tag.c_str();
 			if (!evtStr || !evtStr[0]) return RE::BSEventNotifyControl::kContinue;
 
+			// holderID carries the same bits the old refr pointer member did.
+			auto* refr = reinterpret_cast<RE::TESObjectREFR*>(a_event.holderID);
+
 			// Feed every animation event to the Animation Log for the UI
-			if (AnimationLog::GetSingleton()->IsEnabled() && a_event.refr) {
-				AnimationLog::GetSingleton()->AddAnimEvent(
-					const_cast<RE::TESObjectREFR*>(a_event.refr), std::string(evtStr));
+			if (AnimationLog::GetSingleton()->IsEnabled() && refr) {
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, std::string(evtStr));
 			}
 
 			return RE::BSEventNotifyControl::kContinue;
@@ -1513,6 +1552,20 @@ namespace
 	void RegisterSuppressionSink()
 	{
 		if (s_suppressionSink.registered) return;
+
+		// OG-only: GetEventSourcePointersFromGraph (897074) has no NG/AE ID.
+		// On NG/AE the equivalent feed comes from AnimGraphEventFeedHook (a
+		// BSTEventSink<BSAnimationGraphEvent> ProcessEvent vfunc hook on the
+		// Actor/PlayerCharacter vtables), installed at hook time.
+		if (!REX::FModule::IsRuntimeOG()) {
+			static bool s_logged = false;
+			if (!s_logged) {
+				s_logged = true;
+				logger::info("[OAR-Annot] Registered-sink path skipped on this runtime; event log fed by the BSTEventSink vfunc hook instead");
+			}
+			return;
+		}
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) return;
 
@@ -1920,6 +1973,18 @@ namespace
 	{
 		if (s_idleAnimReverseBuilt.load()) return;
 
+		// OG-only: the LoadedIdleAnimData array global (762973) has no NG/AE
+		// Address Library entry. On NG/AE the idle reverse map stays empty;
+		// idle path resolution falls back to the other capture sources
+		// (CreateFileW redirects, string-data scan, clip bindings).
+		if (!REX::FModule::IsRuntimeOG()) {
+			static std::atomic_bool s_warned{ false };
+			if (!s_warned.exchange(true)) {
+				logger::warn("[OAR-IdleAnim] Idle reverse map unavailable on this runtime (OG-only engine global); idle paths resolve via fallback sources");
+			}
+			return;
+		}
+
 		REL::Relocation<BSTArrayHeaderRaw*> arrReloc{ REL::ID(762973) };
 		auto* arrHeader = arrReloc.get();
 		if (!arrHeader) {
@@ -2145,6 +2210,24 @@ namespace
 		auto* cache = AnimationCache::GetSingleton();
 		const auto& pathMap = oar->GetPathToSubModsMap();
 
+		// Progress bar denominator must match what LoadAnimation increments
+		// (loadingLoadedAnims), not the ReplacementAnimation object count.
+		// Variant groups are ONE ReplacementAnimation but N cache files
+		// (base + __v1/__v2/...), and multiple SubMods can each contribute a
+		// file for the same original path — that used to show as "40/36".
+		int expectedLoads = 0;
+		for (auto& [mapKey, replacementInfos] : pathMap) {
+			if (ExtractAnimSuffix(mapKey).empty()) continue;
+			for (auto& info : replacementInfos) {
+				if (!info.absoluteDiskPath.empty()) {
+					expectedLoads++;
+				}
+			}
+		}
+		oar->loadingTotalAnims.store(expectedLoads);
+		oar->loadingLoadedAnims.store(0);
+		oar->loadingParsedAnims.store(expectedLoads);
+
 		int loaded = 0;
 		int failed = 0;
 
@@ -2257,15 +2340,16 @@ namespace
 		explicit SubgraphResourceProbe(const char* a_path)
 		{
 			// void BSResourceNiBinaryStream::ctor(this, fileName, writeable, location, fullReadHint)
+			// Multi-runtime: { OG, NG } (NG id also present in the AE bins).
 			using Ctor_t = void (*)(void*, const char*, bool, void*, bool);
-			static REL::Relocation<Ctor_t> ctor{ REL::ID(1198116) };
+			static REL::Relocation<Ctor_t> ctor{ REL::ID({ 1198116, 2269830 }) };
 			ctor(buffer, a_path, false, nullptr, false);
 		}
 
 		~SubgraphResourceProbe()
 		{
 			using Dtor_t = void (*)(void*);
-			static REL::Relocation<Dtor_t> dtor{ REL::ID(1516202) };
+			static REL::Relocation<Dtor_t> dtor{ REL::ID({ 1516202, 2269832 }) };
 			dtor(buffer);
 		}
 
@@ -3721,21 +3805,29 @@ namespace
 					}
 
 					if (hasRegistered) {
-						preSwapAttempted = true;
 						auto** animSlotPre = a_this->GetAnimationSlot();
 						if (animSlotPre && *animSlotPre) {
 							auto* cachePre = AnimationCache::GetSingleton();
 							RE::hkaAnimation* replacement = nullptr;
 
 							// Evaluate conditions NOW (same loop as the Update hook) so the
-							// animation control is built from the winning SubMod's file rather
-							// than a highest-priority guess that Update corrects later. When
-							// no winner can be determined here (actor unresolvable, or all
-							// conditions currently false), fall back to the highest-priority
-							// file — pre-swapping SOMETHING keeps the control built from a
-							// clone with nulled annotation tracks, which is the crash guard
-							// this pre-swap exists for, and covers conditions that flip true
-							// a few frames into the clip.
+							// animation control is built from the winning SubMod's file.
+							//
+							// CRITICAL: only pre-swap when a condition-passing winner exists.
+							// The old "fallback pre-swap any highest-priority file" path built
+							// the control from a clone with emptied annotationTracks, then
+							// restored the original into the slot when Update decided NOT to
+							// replace. Result: the clip played the original visuals, but its
+							// control had no annotation-derived triggers — end sounds and
+							// events (reloadEnd, final Foley, etc.) silently never fired.
+							// Field case (AE, SCAR Reload Variants): empty-mag reloads failed
+							// the submod's `NOT CurrentMagazineAmmo==0` condition, so OAR
+							// never managed annotations, yet Activate had already stripped
+							// the native ones. Skip the pre-swap entirely when there is no
+							// winner; _Activate then builds the control from the real
+							// original and native annotations work. If conditions flip true
+							// a few frames later, the Update hook installs the replacement
+							// (same path as a deferred direct-path resolve).
 							RE::TESObjectREFR* refrPre = GetRefrFromContext(a_context);
 							if (!refrPre) refrPre = RE::PlayerCharacter::GetSingleton();
 
@@ -3744,8 +3836,6 @@ namespace
 								std::shared_lock rlock(s_nameLookupMutex);
 								auto leafIt = s_leafToFullSuffixes.find(leafName);
 								if (leafIt != s_leafToFullSuffixes.end()) {
-									// Pass 1: first suffix (most specific first — the vector is
-									// pre-sorted) with a condition-passing winner.
 									for (const auto& fullSuffix : leafIt->second) {
 										auto candIt = s_suffixToInfos.find(fullSuffix);
 										if (candIt == s_suffixToInfos.end()) continue;
@@ -3758,14 +3848,6 @@ namespace
 											}
 										}
 									}
-									// Pass 2 (fallback): no winner anywhere — old behavior, first
-									// suffix with any cached file.
-									if (!replacement) {
-										for (const auto& fullSuffix : leafIt->second) {
-											replacement = cachePre->GetOrBuildRuntimeAnim(fullSuffix, *animSlotPre);
-											if (replacement) break;
-										}
-									}
 								}
 							} else {
 								ReplacementAnimFileInfo* winner = nullptr;
@@ -3776,14 +3858,18 @@ namespace
 										winner = EvaluateWinningInfo(candIt->second, refrPre, a_this);
 									}
 								}
-								// winner==nullptr falls back to the highest-priority file inside
-								// the cache (owner=nullptr selects entries[0]).
-								replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre,
-									winner ? winner->parentSubMod : nullptr);
-								if (replacement && winner) preSwapWinner = winner;
+								if (winner) {
+									replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre,
+										winner->parentSubMod);
+									if (replacement) preSwapWinner = winner;
+								}
 							}
 
+							// Mark attempted only when we had a winner to install. A
+							// no-winner skip must NOT put the clip in the bypass set —
+							// Update still needs to be able to swap if conditions flip.
 							if (replacement) {
+								preSwapAttempted = true;
 								auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
 								if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
 									preSwapOriginal = *animSlotPre;
@@ -3963,7 +4049,7 @@ namespace
 			static int s_failLogCount = 0;
 			if (s_failLogCount < 10) {
 				const char* rawName = a_this->animationName.data();
-				uintptr_t rawPtr = reinterpret_cast<uintptr_t>(a_this->animationName.stringAndFlag);
+				uintptr_t rawPtr = reinterpret_cast<uintptr_t>(RE::GetHkStringRawPtr(a_this->animationName));
 				logger::warn("[OAR-Activate] Failed to get suffix: rawPtr={:X}, bindIdx={}",
 					rawPtr, static_cast<int>(a_this->animationBindingIndex));
 				s_failLogCount++;
@@ -4200,6 +4286,116 @@ namespace
 					de.refr->GetFormID());
 				s_ceLog++;
 			}
+		}
+	}
+
+	// Fire any not-yet-fired annotations of an ending replacement play.
+	//
+	// Annotation firing is driven by Update crossing each annotation's time, but
+	// field logs (AE, SCAR reload replacements) show the behavior graph can stop
+	// advancing a clip's localTime ~0.5s before the animation's end (state exits /
+	// transition blends park the outgoing clip at a frozen time) while the clip
+	// stays alive for a while and is then torn down — either via Deactivate or via
+	// OAR's own condition-fail restore. Everything between the freeze point and
+	// the end (final foley sounds, initiateStart, reloadEnd) was silently lost.
+	//
+	// This helper fires the remaining annotations if tracking got within
+	// kEndFlushWindowSec of the end: sounds immediately (BSAudioManager is safe on
+	// this thread), graph/sink events via the deferred queue (never notify the
+	// graph from inside its own update/teardown; the queue also handles the
+	// reloadEnd IsReloading cleanup). A genuine early interrupt (reload cancelled
+	// halfway) leaves prevLocalTime outside the window and flushes nothing.
+	// The clip's annotation tracking state is erased afterwards so a later
+	// re-application re-initializes cleanly.
+	static void FlushPendingEndAnnotations(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr, const char* a_reason)
+	{
+		// Wide window on purpose: the observed freeze points sat 0.5-0.65s before
+		// the end (prevT 2.86 / duration 3.50, prevT 3.05 / duration 3.567). The
+		// cost of a too-wide window is firing tail foley on a late manual cancel,
+		// which is cosmetically harmless; the cost of a too-narrow one is losing
+		// the end sound/event on every graph-side early exit.
+		constexpr float kEndFlushWindowSec = 1.0f;
+
+		std::string flushSuffix;
+		const void* flushOwner = nullptr;
+		float flushPrevT = -1.f;
+		int32_t flushLastIdx = -1;
+		{
+			std::shared_lock alock(s_annotStateMutex);
+			auto ait = s_annotStateMap.find(a_clip);
+			if (ait == s_annotStateMap.end()) return;
+			flushSuffix = ait->second.activeSuffix;
+			flushOwner = ait->second.activeOwner;
+			flushPrevT = ait->second.prevLocalTime;
+			flushLastIdx = ait->second.lastFiredIndex;
+		}
+		if (flushSuffix.empty() || flushPrevT < 0.f) return;
+
+		// Duration of the animation actually in the slot (the replacement clone
+		// while a replacement is active) — same +0x14 read as the completion path.
+		float duration = 0.f;
+		if (auto** slot = a_clip->GetAnimationSlot()) {
+			auto* anim = *slot;
+			if (anim && !IsBadReadPtr(anim, 0x18)) {
+				duration = *reinterpret_cast<float*>(
+					reinterpret_cast<uint8_t*>(anim) + 0x14);
+			}
+		}
+
+		const auto* annotations = AnimationCache::GetSingleton()->GetAnnotations(flushSuffix, flushOwner);
+		const int32_t total = annotations ? static_cast<int32_t>(annotations->size()) : 0;
+
+		if (annotations && flushLastIdx + 1 < total && duration > 0.01f) {
+			if (flushPrevT >= duration - kEndFlushWindowSec) {
+				auto* flushRefr = a_refr;
+				if (!flushRefr) flushRefr = RE::PlayerCharacter::GetSingleton();
+				// Honor the winning submod's annotation suppression config.
+				SubMod* flushSubMod = nullptr;
+				{
+					std::shared_lock smLock(s_activeSubModMutex);
+					auto smIt = s_activeSubModMap.find(a_clip);
+					if (smIt != s_activeSubModMap.end()) flushSubMod = smIt->second;
+				}
+				std::vector<std::string> flushEvents;
+				for (int32_t i = flushLastIdx + 1; i < total; ++i) {
+					const auto& ann = (*annotations)[i];
+					if (flushSubMod && flushSubMod->IsAnnotationSuppressed(ann.text)) continue;
+
+					static constexpr const char* kSoundPlayPrefix = "SoundPlay.";
+					static constexpr size_t kSoundPlayLen = 10;
+					if (ann.text.size() > kSoundPlayLen &&
+						_strnicmp(ann.text.c_str(), kSoundPlayPrefix, kSoundPlayLen) == 0)
+					{
+						if (flushRefr) PlaySoundDirect(ann.text.c_str() + kSoundPlayLen, flushRefr);
+					} else {
+						flushEvents.push_back(ann.text);
+					}
+					static int s_endFlushLog = 0;
+					if (s_endFlushLog < 100) {
+						logger::info("[OAR-Annot] End-flush '{}' (clip '{}', {}, prevT={:.3f} duration={:.3f})",
+							ann.text, flushSuffix, a_reason, flushPrevT, duration);
+						s_endFlushLog++;
+					}
+				}
+				if (flushRefr && !flushEvents.empty()) {
+					QueueCustomEvents(flushRefr, flushEvents, "annot end-flush");
+				}
+			} else {
+				// Pending annotations exist but tracking stopped too far from the
+				// end — treated as a genuine interrupt. Logged so freeze points
+				// that outgrow the window are visible in the field.
+				static int s_endFlushSkipLog = 0;
+				if (s_endFlushSkipLog < 30) {
+					logger::info("[OAR-Annot] End-flush skipped for '{}' ({}, prevT={:.3f} duration={:.3f}, {} pending)",
+						flushSuffix, a_reason, flushPrevT, duration, total - (flushLastIdx + 1));
+					s_endFlushSkipLog++;
+				}
+			}
+		}
+
+		{
+			std::unique_lock alock(s_annotStateMutex);
+			s_annotStateMap.erase(a_clip);
 		}
 	}
 
@@ -4600,9 +4796,15 @@ namespace
 
 		auto** animSlot = a_this->GetAnimationSlot();
 		if (!animSlot || !*animSlot) {
+			// Normal during Activate / early Update: the control can exist before
+			// its binding (and therefore the animation slot) is attached, or the
+			// binding can be briefly cleared during a graph transition. Returning
+			// here is correct — there is nothing to swap yet. Was a warn that
+			// spammed the log on every weapon equip / reload (especially AE);
+			// keep a tiny breadcrumb at info for genuine stuck cases.
 			static int s_slotNullLog = 0;
-			if (s_slotNullLog < 20) {
-				logger::warn("[OAR-SlotNull] animSlot null for '{}' clipGen={:X} ctrl={:X}",
+			if (s_slotNullLog < 5) {
+				logger::info("[OAR-SlotNull] animSlot not ready for '{}' clipGen={:X} ctrl={:X} (transient; skipped)",
 					resolvedSuffix, reinterpret_cast<uintptr_t>(a_this),
 					reinterpret_cast<uintptr_t>(a_this->GetAnimationControlRaw()));
 				s_slotNullLog++;
@@ -5444,8 +5646,10 @@ namespace
 							}
 						}
 
+						// High cap on purpose (was 50, exhausted mid-session and made
+						// later plays look like they lost annotations in the log).
 						static int s_annotFireLog = 0;
-						if (s_annotFireLog < 50) {
+						if (s_annotFireLog < 1000) {
 							logger::info("[OAR-Annot] Fired '{}' (clip '{}')",
 								text, suffix);
 							s_annotFireLog++;
@@ -5588,6 +5792,15 @@ namespace
 				if (!IsBadReadPtr(originalAnim, sizeof(uintptr_t))) {
 					auto vtbl = *reinterpret_cast<uintptr_t*>(originalAnim);
 					if (IsPlausibleGameAnimVtable(vtbl)) {
+						// Flush end-of-clip annotations BEFORE restoring the slot:
+						// plays that end through this path (conditions flip false
+						// after the graph parked the clip near its end) never reach
+						// Deactivate promptly, and their tail annotations
+						// (reloadEnd, final foley) were lost. Must run while the
+						// clone is still in the slot (duration read) and while
+						// s_activeSubModMap still has the owner (suppression).
+						FlushPendingEndAnnotations(a_this, refr, "condition-fail restore");
+
 						// Fire custom "on end" events before restoring
 						{
 							std::shared_lock smLock(s_activeSubModMutex);
@@ -5694,6 +5907,15 @@ namespace
 						displayPath,
 						ClassifyClipPerspective(a_this, displayPath));
 				}
+			}
+
+			// End-of-clip annotation flush — see FlushPendingEndAnnotations. Runs
+			// before the state erasures below (needs the annot state and the
+			// active-submod entry) and before the engine frees the clip (needs
+			// the clone still in the animation slot for the duration read).
+			{
+				auto* deactRefr = GetRefrFromContext(a_context);
+				FlushPendingEndAnnotations(a_this, deactRefr, "deactivate");
 			}
 
 			// Do NOT restore the original animation or triggers during deactivation.
@@ -6468,7 +6690,12 @@ namespace
 		s_currentFrame.fetch_add(1, std::memory_order_relaxed);
 
 		// Process the original actor updates FIRST so game state is current.
-		Hooks::UpdateHooks::RunActorUpdatesOrig();
+		// Null on NG/AE: there the per-frame driver is F4SE's permanent task
+		// queue (see UpdateHooks::Install), which runs alongside the game's
+		// own actor updates rather than wrapping them.
+		if (Hooks::UpdateHooks::RunActorUpdatesOrig) {
+			Hooks::UpdateHooks::RunActorUpdatesOrig();
+		}
 
 		// The Settings "Enabled" box was just unticked on the UI thread:
 		// perform the vanilla restore here on the game thread, outside the
@@ -6506,6 +6733,13 @@ namespace
 				}
 				RegisterActorCharacter(RE::PlayerCharacter::GetSingleton());
 			}
+		}
+
+		// Auto-reload replication: last-round / fire-empty detection and the
+		// delayed DoAction(kActionReload) trigger. Needs current game state,
+		// so it runs after the actor updates above.
+		if (s_gameFullyLoaded.load()) {
+			Hooks::AutoReloadSuppression::PerFrameUpdate();
 		}
 
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
@@ -7031,37 +7265,506 @@ namespace Hooks
 		}
 	}
 
+	// === Animation event feed via BSTEventSink<BSAnimationGraphEvent> vfunc hook ===
+	// NG/AE replacement for the OG-only registered-sink path (RegisterSuppressionSink
+	// uses BGSAnimationSystemUtils::GetEventSourcePointersFromGraph, id 897074, which
+	// has no NG/AE Address Library entry). TESObjectREFR itself derives from
+	// BSTEventSink<BSAnimationGraphEvent> (base at +0x38), and the engine delivers
+	// every graph event to that sink — so hooking ProcessEvent (vfunc index 1) on
+	// the Actor / PlayerCharacter copies of that base vtable gives us the same feed
+	// with only RTTI-derived vtable IDs, which are identical across OG/NG/AE:
+	//   Actor vtable array index 3           = REL::ID(720550)
+	//   PlayerCharacter vtable array index 3 = REL::ID(1542933)
+	// (index 5 is the IAnimationGraphManagerHolder base hooked above; the graph-event
+	// sink sits two bases earlier: 030 BSActiveGraphIfInactiveEvent sink, 038 THIS,
+	// 040 BGSInventoryListEvent sink, 048 holder — verified in the fork's
+	// TESObjectREFR.h and against the 163/984/221 databases.)
+	// Installed only on NG/AE; OG keeps the proven registered-sink path.
+	namespace AnimGraphEventFeedHook
+	{
+		using ProcessEventFn = RE::BSEventNotifyControl(*)(
+			void*, const RE::BSAnimationGraphEvent&, RE::BSTEventSource<RE::BSAnimationGraphEvent>*);
+		static ProcessEventFn _OriginalActorProcess = nullptr;
+		static ProcessEventFn _OriginalPlayerProcess = nullptr;
+
+		static RE::BSEventNotifyControl HookedProcessEventImpl(
+			void* a_sinkThis, const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source,
+			ProcessEventFn a_original)
+		{
+			const char* evtStr = a_event.tag.c_str();
+			if (evtStr && evtStr[0] && AnimationLog::GetSingleton()->IsEnabled()) {
+				// The sink base lives at TESObjectREFR + 0x38 (fork header),
+				// so back-adjust the interface pointer to the refr base. More
+				// reliable than holderID, which the engine sometimes leaves 0.
+				auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
+					reinterpret_cast<uintptr_t>(a_sinkThis) - 0x38);
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, std::string(evtStr));
+			}
+			return a_original(a_sinkThis, a_event, a_source);
+		}
+
+		static RE::BSEventNotifyControl HookedActorProcessEvent(
+			void* a_this, const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+		{
+			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalActorProcess);
+		}
+
+		static RE::BSEventNotifyControl HookedPlayerProcessEvent(
+			void* a_this, const RE::BSAnimationGraphEvent& a_event,
+			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
+		{
+			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalPlayerProcess);
+		}
+
+		void Install()
+		{
+			// OG uses the registered-sink feed (RegisterSuppressionSink); do not
+			// double-feed the log there.
+			if (REX::FModule::IsRuntimeOG()) return;
+
+			REL::Relocation<uintptr_t> actorSinkVtbl{ REL::ID(720550) };
+			_OriginalActorProcess = reinterpret_cast<ProcessEventFn>(
+				actorSinkVtbl.write_vfunc(1, &HookedActorProcessEvent));
+
+			REL::Relocation<uintptr_t> playerSinkVtbl{ REL::ID(1542933) };
+			_OriginalPlayerProcess = reinterpret_cast<ProcessEventFn>(
+				playerSinkVtbl.write_vfunc(1, &HookedPlayerProcessEvent));
+
+			logger::info("[OAR] Animation event feed installed via BSTEventSink vfunc hooks (NG/AE path; Actor + PlayerCharacter)");
+		}
+	}
+
 	// Secondary detection: hook the PlayerControls "fire empty" code path directly.
-	// REL::ID(818081) is the function called when the player presses fire with an empty
-	// magazine. At offset 0x40A there's a call to DoAction that triggers the auto-reload.
-	// By hooking this call site, we reliably detect fire-empty input at the PlayerControls
-	// level — upstream of the animation graph, so it fires even if the anim event is
-	// swallowed or doesn't reach NotifyAnimationGraphImpl.
+	// REL::ID 818081 (OG) / 2234796 (NG; AE bins carry the same id) is
+	// PlayerControls::DoAction itself. When the player presses fire with an empty
+	// weapon, the attack-processing path inside DoAction recursively calls itself
+	// to start the auto-reload. AE 1.11.221 codegen duplicates that recursion
+	// across two branches (disassembly of the on-disk exe at the AL RVA):
+	//   +0x464: DoAction(this, kActionReload = 0x6C, 2)  -- empty mag, ammo type equipped
+	//   +0x477: DoAction(this, action = 0x75, 2)         -- no ammo type equipped at all
+	// while OG shares a single call site at +0x40A. Both AE branches indicate
+	// "player pressed fire with an empty weapon", so both are hooked for
+	// detection. Hooking here is upstream of the animation graph, so it fires
+	// even if the anim event is swallowed before NotifyAnimationGraphImpl.
+	//
+	// Because the displacement moves between runtimes, the sites are located by
+	// scanning the function body for CALL (E8) instructions whose argument setup
+	// stages the 0x6C / 0x75 action constant. The CALL target is accepted if it
+	// is the function start (pristine self-call) OR lies outside the game module
+	// (another mod, e.g. ManualReloadF4SE, already detoured the same site into
+	// its trampoline — GLXRM_ManualReload.dll loads before us alphabetically and
+	// swallows the auto-reload; chaining through it is intended). The OG-measured
+	// +0x40A site remains as a guarded fallback (the OG Steam exe is DRM-wrapped
+	// on disk, so that site can only be runtime-verified — and it is, on 1.10.163).
 	namespace PlayerFireEmptyHook
 	{
 		using DoActionFn = int64_t(*)(int64_t, int, unsigned int);
-		static DoActionFn _OriginalDoAction = nullptr;
 
-		static int64_t HookedDoAction(int64_t a_arg1, int a_arg2, unsigned int a_arg3)
+		// Per-site trampoline originals; AE has two distinct call sites and each
+		// chains to its own original (which may be another mod's detour).
+		static DoActionFn _OriginalDoAction[2] = { nullptr, nullptr };
+
+		static void RecordFireEmpty()
 		{
 			// The player just pressed fire with an empty weapon — record timestamp.
 			// We use formID 0x14 (player) since this only fires for the player character.
-			{
-				std::unique_lock lock{ s_fireEmptyMutex };
-				auto& entry = s_fireEmptyMap[0x14];
-				entry.timestamp = std::chrono::steady_clock::now();
-				entry.generation++;
-			}
-			// Call through so the game's normal logic (or other mod hooks) still runs
-			return _OriginalDoAction(a_arg1, a_arg2, a_arg3);
+			std::unique_lock lock{ s_fireEmptyMutex };
+			auto& entry = s_fireEmptyMap[0x14];
+			entry.timestamp = std::chrono::steady_clock::now();
+			entry.generation++;
 		}
 
-		void Install(F4SE::Trampoline& trampoline)
+		// One thin detour per call site. Behavior: record the fire-empty press
+		// (feeds IsFiringEmpty conditions and the auto-reload replication),
+		// then swallow the engine's auto-reload — it is attack-initiated and
+		// gets cut short at reloadComplete. OAR's replacement reload (see
+		// AutoReloadSuppression::PerFrameUpdate) goes through the reload-key
+		// path instead and plays in full. The originals are kept only so the
+		// call chain stays intact if a future mode needs to call through.
+		// Dry-fire click. With the engine's fire-empty auto-reload suppressed,
+		// pressing fire on an empty magazine would otherwise give no feedback at
+		// all: vanilla plays no sound of its own on this path (it auto-reloads
+		// instead), which is exactly why the original Manual Reload mod added
+		// one in its v1.2. Plays the equipped weapon's Attack Fail sound
+		// descriptor, falling back to the vanilla WPNPistol10mmFireDry click
+		// when the weapon has none (same default the original mod uses).
+		// Runs on the game thread (inside PlayerControls::DoAction).
+		static void PlayDryFireClick()
 		{
-			REL::Relocation<std::uintptr_t> callLocation{ REL::ID(818081), 0x40A };
-			_OriginalDoAction = reinterpret_cast<DoActionFn>(
-				trampoline.write_call<5>(callLocation.address(), &HookedDoAction));
-			logger::info("[OAR] PlayerFireEmpty hook installed (REL::ID 818081 + 0x40A)");
+			if (!Settings::GetSingleton()->bPlayDryFireSound) {
+				return;
+			}
+
+			// Debounce: automatic weapons re-attempt the fire action every frame
+			// while the trigger is held, which would buzz the click at frame
+			// rate. 150 ms still lets rapid deliberate presses each click.
+			static std::chrono::steady_clock::time_point s_lastClick{};
+			const auto now = std::chrono::steady_clock::now();
+			if (now - s_lastClick < std::chrono::milliseconds(150)) {
+				return;
+			}
+			s_lastClick = now;
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || !player->currentProcess || !player->currentProcess->middleHigh) {
+				return;
+			}
+
+			// Find the equipped weapon's attack-fail sound. The equipped item's
+			// live instance data (weapon mods applied) wins over the base form's
+			// default data.
+			RE::BGSSoundDescriptorForm* failSound = nullptr;
+			{
+				auto* mh = player->currentProcess->middleHigh;
+				RE::BSAutoLock lock{ mh->equippedItemsLock };
+				for (auto& eq : mh->equippedItems) {
+					auto* weap = eq.item.object ? eq.item.object->As<RE::TESObjectWEAP>() : nullptr;
+					if (!weap) {
+						continue;
+					}
+					if (auto* inst = static_cast<RE::TESObjectWEAP::InstanceData*>(eq.item.instanceData.get())) {
+						failSound = inst->attackFailSound;
+					}
+					if (!failSound) {
+						failSound = weap->weaponData.attackFailSound;
+					}
+					break;
+				}
+			}
+
+			// BSAudioManager resolves sounds by editor id (SNDR editor ids are
+			// kept at runtime for exactly this lookup). If the weapon-specific
+			// descriptor is missing or fails to resolve, use the vanilla click.
+			const char* name = failSound ? failSound->GetFormEditorID() : nullptr;
+			if (!name || !name[0] || !PlaySoundDirect(name, player)) {
+				PlaySoundDirect("WPNPistol10mmFireDry", player);
+			}
+		}
+
+		static int64_t HookedDoAction0(int64_t a_arg1, int a_arg2, unsigned int a_arg3)
+		{
+			(void)a_arg1; (void)a_arg2; (void)a_arg3;
+			RecordFireEmpty();
+			PlayDryFireClick();
+			return 0;
+		}
+
+		static int64_t HookedDoAction1(int64_t a_arg1, int a_arg2, unsigned int a_arg3)
+		{
+			(void)a_arg1; (void)a_arg2; (void)a_arg3;
+			RecordFireEmpty();
+			PlayDryFireClick();
+			return 0;
+		}
+
+		// Returns [start, end) of the game module for the "target outside module"
+		// test (a rel32 rewritten by another mod points into its trampoline, which
+		// lives outside the exe image).
+		static std::pair<std::uintptr_t, std::uintptr_t> GetGameModuleRange()
+		{
+			const auto modBase = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(modBase);
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(modBase + dos->e_lfanew);
+			return { modBase, modBase + nt->OptionalHeader.SizeOfImage };
+		}
+
+		// Scans the first a_scanLen bytes of the function at a_base for the
+		// recursive auto-reload CALL site(s), identified by the staged action
+		// constant (0x6C kActionReload / 0x75 no-ammo variant) in the ~16 bytes
+		// before the CALL. Fills a_sites (up to a_maxSites) and returns the count.
+		static std::size_t FindFireEmptyCallSites(std::uintptr_t a_base, std::size_t a_scanLen, std::uintptr_t* a_sites, std::size_t a_maxSites)
+		{
+			const auto [modStart, modEnd] = GetGameModuleRange();
+			const auto* code = reinterpret_cast<const std::uint8_t*>(a_base);
+			std::size_t count = 0;
+
+			for (std::size_t i = 0; i + 5 <= a_scanLen && count < a_maxSites; ++i) {
+				if (code[i] != 0xE8)
+					continue;
+				const auto rel = *reinterpret_cast<const std::int32_t*>(code + i + 1);
+				const auto target = a_base + i + 5 + static_cast<std::intptr_t>(rel);
+
+				// Accept a pristine self-call or a site already detoured out of
+				// the module by another mod; reject calls to other game functions.
+				const bool selfCall = (target == a_base);
+				const bool detoured = (target < modStart || target >= modEnd);
+				if (!selfCall && !detoured)
+					continue;
+
+				// Confirm the action-id constant is staged just before the call:
+				//   lea edx, [rax+6Ch]  -> 8D 50 6C      (AE +0x464 codegen)
+				//   mov edx, 75h        -> BA 75 00 00 00 (AE +0x477 codegen)
+				//   plus the mov/lea variants of each, in case codegen differs.
+				const std::size_t lookback = i >= 16 ? i - 16 : 0;
+				for (std::size_t j = lookback; j + 3 <= i; ++j) {
+					const bool leaReload = (code[j] == 0x8D && code[j + 1] == 0x50 && (code[j + 2] == 0x6C || code[j + 2] == 0x75));
+					const bool movReload = (code[j] == 0xBA && (code[j + 1] == 0x6C || code[j + 1] == 0x75) && code[j + 2] == 0x00);
+					if (leaReload || movReload) {
+						a_sites[count++] = a_base + i;
+						break;
+					}
+				}
+			}
+			return count;
+		}
+
+		void Install(REL::Trampoline& trampoline)
+		{
+			REL::Relocation<std::uintptr_t> funcBase{ REL::ID({ 818081, 2234796 }) };
+			const auto base = funcBase.address();
+
+			// Primary: locate the recursive DoAction call site(s) by signature.
+			std::uintptr_t sites[2] = { 0, 0 };
+			std::size_t count = FindFireEmptyCallSites(base, 0x800, sites, 2);
+
+			// Fallback: the OG-measured +0x40A displacement, guarded by opcode check.
+			if (count == 0) {
+				const auto* legacy = reinterpret_cast<const std::uint8_t*>(base + 0x40A);
+				if (*legacy == 0xE8) {
+					sites[count++] = base + 0x40A;
+				}
+			}
+
+			if (count == 0) {
+				logger::warn("[OAR] PlayerFireEmpty hook skipped: no auto-reload call site found in 818081/2234796 and no CALL at legacy +0x40A; fire-empty detection falls back to the anim-graph path");
+				return;
+			}
+
+			static constexpr DoActionFn kDetours[2] = { &HookedDoAction0, &HookedDoAction1 };
+			for (std::size_t i = 0; i < count; ++i) {
+				_OriginalDoAction[i] = reinterpret_cast<DoActionFn>(
+					trampoline.write_call<5>(sites[i], kDetours[i]));
+				logger::info("[OAR] PlayerFireEmpty hook installed (REL::ID 818081/2234796 + 0x{:X})", sites[i] - base);
+			}
+		}
+	}
+
+	// Last-round auto-reload suppression (the other half; the fire-on-empty
+	// half lives in PlayerFireEmptyHook's detours above). Always applied: the
+	// engine's auto-reloads are attack-initiated and get cut short, so OAR
+	// replaces them entirely (see the Auto-Reload mode / PerFrameUpdate below).
+	//
+	// PlayerCharacter::UseAmmo (REL::ID 902833 OG / 2233939 NG+AE, vtable slot
+	// 0xF0) auto-reloads when the last round is consumed. At +0x206 a near-JZ
+	// (0F 84) guards the auto-reload; rewriting it to NOP+JMP (90 E9) forces the
+	// "skip auto-reload" branch while keeping the original rel32 displacement.
+	// Same patch as ManualReloadF4SE. Coexistence: if that plugin already
+	// applied it, the bytes read 90 E9 and we leave them alone.
+	namespace AutoReloadSuppression
+	{
+		static constexpr std::uint8_t kOriginalBytes[2] = { 0x0F, 0x84 };  // jz near
+		static constexpr std::uint8_t kPatchedBytes[2] = { 0x90, 0xE9 };   // nop; jmp near
+
+		void Install()
+		{
+			// { OG, NG }; AE shares the NG id. The +0x206 displacement is
+			// OG-measured but holds on AE 1.11.221 (the opcode guard below
+			// verifies before writing).
+			REL::Relocation<std::uintptr_t> site{ REL::ID({ 902833, 2233939 }), 0x206 };
+			const auto address = site.address();
+
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+			if (bytes[0] == kPatchedBytes[0] && bytes[1] == kPatchedBytes[1]) {
+				// Another plugin (ManualReloadF4SE) already suppresses this path.
+				logger::info("[OAR] Last-round auto-reload already patched by another plugin; leaving as is");
+				return;
+			}
+			if (bytes[0] != kOriginalBytes[0] || bytes[1] != kOriginalBytes[1]) {
+				logger::warn("[OAR] Last-round auto-reload patch skipped: expected JZ near (0F 84) at 902833/2233939+0x206, found {:02X} {:02X}", bytes[0], bytes[1]);
+				return;
+			}
+			if (!REL::WriteSafe(address, kPatchedBytes, sizeof(kPatchedBytes))) {
+				logger::error("[OAR] Last-round auto-reload patch: WriteSafe failed at {:X}", address);
+				return;
+			}
+			logger::info("[OAR] Last-round auto-reload patch applied (REL::ID 902833/2233939 + 0x206)");
+		}
+
+		// ===== Auto-reload replication ==========================================
+		// Replaces the vanilla auto-reload convenience while the engine's own
+		// (attack-initiated, truncating) auto-reloads stay suppressed. OAR calls
+		// PlayerControls::DoAction(kActionReload, kTry) from the per-frame
+		// update — the same action id and priority the reload key uses (all of
+		// the game's own reload call sites stage kActionReload with kTry,
+		// verified by scanning the AE exe's 52 DoAction callers).
+		//
+		// The trigger is picked by Settings > General > Auto-Reload (dropdown):
+		//   0 = last round:  the equipped weapon's magazine count transitions
+		//                    >0 -> 0 on the same weapon (i.e. by firing, not by
+		//                    switching to an already-empty weapon)
+		//   1 = fire empty:  the PlayerFireEmptyHook generation counter advanced
+		//                    (player pressed fire with an empty magazine)
+		//   2 = suppress:    no automatic reloads at all; reload key only
+		//
+		// CRITICAL TIMING: the reload must NOT be issued while the firing /
+		// dry-firing attack action is still current (gunState kFire /
+		// kFireSighted). A reload started inside that window is owned by the
+		// attack context and the engine exits the reload state the moment
+		// reloadComplete refills the magazine — the exact truncation this
+		// feature exists to avoid (and DoAction can also outright reject the
+		// reload during the attack, losing it entirely). So triggers only ARM
+		// a pending reload here; it is ISSUED once the player's gun state
+		// leaves the attack states, and retried until DoAction accepts it.
+		// DoAction(kTry) validates the rest (reserve ammo, menus, weapon
+		// state) exactly like a reload-key press would.
+
+		static const void* s_prevWeaponData = nullptr;  // EquippedWeaponData identity
+		static std::uint32_t s_prevMagCount = 0;
+		static bool s_prevMagValid = false;
+		static std::uint32_t s_lastFireEmptyGen = 0;
+		static bool s_fireEmptyGenValid = false;
+
+		static bool s_reloadPending = false;
+		static std::uint32_t s_pendingFrames = 0;
+		// Give up if the reload could not be issued within ~5s worth of frames
+		// (weapon holstered mid-pending, scripted scenes, etc.).
+		static constexpr std::uint32_t kPendingFrameLimit = 600;
+
+		// Reads the player's equipped weapon's magazine count (same walk as
+		// CurrentMagazineAmmoCondition). Returns false when no gun with an ammo
+		// type is equipped.
+		static bool GetPlayerMagCount(std::uint32_t& a_outCount, const void*& a_outWeaponData)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || !player->currentProcess || !player->currentProcess->middleHigh) {
+				return false;
+			}
+			auto* mh = player->currentProcess->middleHigh;
+			RE::BSAutoLock lock{ mh->equippedItemsLock };
+			for (auto& eq : mh->equippedItems) {
+				if (!eq.data) {
+					continue;
+				}
+				auto* wd = static_cast<RE::EquippedWeaponData*>(eq.data.get());
+				if (!wd || !wd->ammo) {
+					continue;
+				}
+				a_outCount = static_cast<std::uint32_t>(wd->ammoCount);
+				a_outWeaponData = wd;
+				return true;
+			}
+			return false;
+		}
+
+		static void CancelPending()
+		{
+			s_reloadPending = false;
+			s_pendingFrames = 0;
+		}
+
+		static void ArmPending(const char* a_reason)
+		{
+			if (!s_reloadPending) {
+				s_reloadPending = true;
+				s_pendingFrames = 0;
+				static int s_armLog = 0;
+				if (s_armLog < 20) {
+					logger::info("[OAR] Auto-reload armed ({})", a_reason);
+					s_armLog++;
+				}
+			}
+		}
+
+		// Runs every frame on the game thread (called from HookedActorUpdate
+		// once the game is fully loaded).
+		void PerFrameUpdate()
+		{
+			const int mode = Settings::GetSingleton()->iAutoReloadMode;
+
+			// Mode 2 (suppress only): drop state so nothing stale triggers later.
+			if (mode == 2) {
+				s_prevMagValid = false;
+				s_fireEmptyGenValid = false;
+				CancelPending();
+				return;
+			}
+
+			std::uint32_t magCount = 0;
+			const void* weaponData = nullptr;
+			if (!GetPlayerMagCount(magCount, weaponData)) {
+				s_prevMagValid = false;
+				CancelPending();
+				return;
+			}
+
+			// Mode 0 — last round: mag transitioned >0 -> 0 on the SAME weapon.
+			// A weapon-data identity change means equip/switch, not firing.
+			if (s_prevMagValid && weaponData == s_prevWeaponData) {
+				if (mode == 0 && s_prevMagCount > 0 && magCount == 0) {
+					ArmPending("last round");
+				}
+			} else {
+				CancelPending();  // weapon changed: any pending reload is stale
+			}
+			s_prevWeaponData = weaponData;
+			s_prevMagCount = magCount;
+			s_prevMagValid = true;
+
+			// Mode 1 — fire press when empty: the PlayerFireEmptyHook detour
+			// advanced the generation counter (covers both the 0x6C and 0x75
+			// swallowed engine branches).
+			{
+				const std::uint32_t gen = GetFireEmptyGeneration(0x14);
+				if (!s_fireEmptyGenValid) {
+					s_lastFireEmptyGen = gen;  // first frame: sync, don't trigger
+					s_fireEmptyGenValid = true;
+				} else if (gen != s_lastFireEmptyGen) {
+					s_lastFireEmptyGen = gen;
+					if (mode == 1 && magCount == 0) {
+						ArmPending("fire press on empty");
+					}
+				}
+			}
+
+			if (!s_reloadPending) {
+				return;
+			}
+
+			// Pending reload: decide whether to cancel, wait, or issue.
+			if (magCount != 0) {
+				CancelPending();  // mag refilled: a reload already happened
+				return;
+			}
+			if (++s_pendingFrames > kPendingFrameLimit) {
+				CancelPending();
+				return;
+			}
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return;
+			}
+			const auto gunState = player->gunState;
+			if (gunState == RE::GUN_STATE::kReloading) {
+				CancelPending();  // a reload (ours or manual) is already running
+				return;
+			}
+			// Attack action still current (firing / dry-fire click / grenade):
+			// wait for it to finish so the reload is not owned by the attack
+			// context (truncation) or rejected outright.
+			if (gunState == RE::GUN_STATE::kFire ||
+				gunState == RE::GUN_STATE::kFireSighted ||
+				gunState == RE::GUN_STATE::kThrowing) {
+				return;
+			}
+
+			if (auto* controls = RE::PlayerControls::GetSingleton()) {
+				const bool ok = controls->DoAction(
+					RE::DEFAULT_OBJECT::kActionReload,
+					RE::ActionInput::ACTIONPRIORITY::kTry);
+				static int s_issueLog = 0;
+				if (s_issueLog < 20) {
+					logger::info("[OAR] Auto-reload issued: DoAction(kActionReload) -> {} (gunState={})",
+						ok, static_cast<int>(gunState));
+					s_issueLog++;
+				}
+				if (ok) {
+					CancelPending();
+				}
+				// Rejected: stay pending and retry next frame until the limit.
+			}
 		}
 	}
 
@@ -7074,7 +7777,9 @@ namespace Hooks
 		UpdateHooks::Install();
 		FileRedirectHooks::Install();
 		ActionFireEmptyHook::Install();
-		PlayerFireEmptyHook::Install(F4SE::GetTrampoline());
+		AnimGraphEventFeedHook::Install();
+		PlayerFireEmptyHook::Install(REL::GetTrampoline());
+		AutoReloadSuppression::Install();
 		logger::info("[OAR] All hooks installed");
 	}
 
@@ -7132,9 +7837,9 @@ namespace Hooks
 
 		void Install()
 		{
-			auto moduleBase = REL::Module::get().base();
-			auto textSeg = REL::Module::get().segment(REL::Segment::Name::text);
-			auto textEnd = textSeg.address() + textSeg.size();
+			auto moduleBase = REX::FModule::GetExecutingModule().GetBaseAddress();
+			auto textSeg = REX::FModule::GetExecutingModule().GetSection(".text");
+			auto textEnd = textSeg.GetAddress() + textSeg.GetSize();
 
 			auto* settings = Settings::GetSingleton();
 			auto bsGraphVtblBase = REL::Relocation<uintptr_t>{ REL::ID(742655) }.address();
@@ -7202,7 +7907,7 @@ namespace Hooks
 			});
 
 			std::set<uintptr_t> hookedTargets;
-			auto& trampoline = F4SE::GetTrampoline();
+			auto& trampoline = REL::GetTrampoline();
 			int hookCount = 0;
 
 			for (auto& c : candidates) {
@@ -7447,9 +8152,9 @@ namespace Hooks
 		{
 			logger::info("[OAR] Engine patches:");
 
-			auto moduleBase = REL::Module::get().base();
-			auto textSeg = REL::Module::get().segment(REL::Segment::Name::text);
-			auto textEnd = textSeg.address() + textSeg.size();
+			auto moduleBase = REX::FModule::GetExecutingModule().GetBaseAddress();
+			auto textSeg = REX::FModule::GetExecutingModule().GetSection(".text");
+			auto textEnd = textSeg.GetAddress() + textSeg.GetSize();
 
 			// movsx→movzx patch on the ORIGINAL Activate function (not our hook)
 			// Use the saved original function pointer, not the vtable (which now points to our hook)
@@ -7518,15 +8223,31 @@ namespace Hooks
 	{
 		void Install()
 		{
-			auto& trampoline = F4SE::GetTrampoline();
-			RunActorUpdatesOrig = reinterpret_cast<RunActorUpdatesFn>(
-				trampoline.write_call<5>(
-					Offsets::ptr_RunActorUpdates.address() + Offsets::RunActorUpdates_Offset,
-					reinterpret_cast<uintptr_t>(HookedActorUpdate)
-				)
-			);
+			if (REX::FModule::IsRuntimeOG()) {
+				// OG 1.10.163: trampoline the RunActorUpdates call site
+				// (556439 + 0x17, proven from FPInertia). OAR's per-frame work
+				// then runs immediately after the game's actor updates.
+				auto& trampoline = REL::GetTrampoline();
+				RunActorUpdatesOrig = reinterpret_cast<RunActorUpdatesFn>(
+					trampoline.write_call<5>(
+						Offsets::GetRunActorUpdatesAddr() + Offsets::RunActorUpdates_Offset,
+						reinterpret_cast<uintptr_t>(HookedActorUpdate)
+					)
+				);
+				logger::info("[OAR] Actor update hook installed (RunActorUpdates call site)");
+				return;
+			}
 
-			logger::info("[OAR] Actor update hook installed");
+			// NG/AE: 556439 has no Address Library entry in those databases.
+			// Drive the per-frame work from F4SE's permanent task queue
+			// instead: permanent tasks run on the game thread every frame.
+			// RunActorUpdatesOrig stays null; HookedActorUpdate handles that.
+			if (const auto* tasks = F4SE::GetTaskInterface()) {
+				tasks->AddTaskPermanent([]() { HookedActorUpdate(); });
+				logger::info("[OAR] Actor update driver installed (F4SE permanent task, NG/AE path)");
+			} else {
+				logger::error("[OAR] F4SE task interface unavailable - per-frame polling disabled on this runtime");
+			}
 		}
 	}
 

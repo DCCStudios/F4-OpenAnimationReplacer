@@ -120,21 +120,38 @@ namespace RE
 		};
 	};
 
-	struct hkStringPtr
-	{
-		const char* stringAndFlag;
+	// hkStringPtr comes from the multi-runtime CommonLibF4 fork (RE/H/hkStringPtr.h):
+	// same single-pointer layout with the low ownership-flag bit masked by data().
 
-		const char* data() const
-		{
-			return reinterpret_cast<const char*>(
-				reinterpret_cast<uintptr_t>(stringAndFlag) & ~static_cast<uintptr_t>(1));
-		}
-		void set(const char* a_str)
-		{
-			stringAndFlag = a_str;
-		}
-		operator const char*() const { return data(); }
+	// Raw accessors for hkStringPtr: the fork keeps the pointer protected and
+	// its const char* ctor allocates through the game's Havok string routine.
+	// OAR owns the clone tables it patches and stores plain C strings there,
+	// so it reads/writes the underlying pointer bits directly.
+	[[nodiscard]] inline const char* GetHkStringRawPtr(const hkStringPtr& a_str) noexcept
+	{
+		return *reinterpret_cast<const char* const*>(std::addressof(a_str));
+	}
+	inline void SetHkStringRawPtr(hkStringPtr& a_str, const char* a_value) noexcept
+	{
+		*reinterpret_cast<const char**>(std::addressof(a_str)) = a_value;
+	}
+
+	// Raw, non-refcounting mirror of Havok's hkRefPtr layout (one pointer).
+	// The fork's RE::hkRefPtr hides its pointer as a private member and
+	// adds/removes references on assignment; OAR's replacement machinery
+	// deliberately swaps animation/trigger pointers WITHOUT touching Havok
+	// refcounts (the engine still owns them), so OAR's own Havok struct
+	// definitions use this raw mirror and keep direct `._ptr` access.
+	template <class T>
+	struct hkRawRefPtr
+	{
+		T* _ptr{ nullptr };
+
+		[[nodiscard]] T* get() const noexcept { return _ptr; }
+		T* operator->() const noexcept { return _ptr; }
+		explicit operator bool() const noexcept { return _ptr != nullptr; }
 	};
+	static_assert(sizeof(hkRawRefPtr<void*>) == 0x8);
 
 	struct hkbVariableBindingSet : public hkReferencedObject
 	{
@@ -169,7 +186,7 @@ namespace RE
 
 	struct hkbBindable : public hkReferencedObject
 	{
-		hkRefPtr<hkbVariableBindingSet> variableBindingSet;
+		hkRawRefPtr<hkbVariableBindingSet> variableBindingSet;
 		hkArray<hkbBindable*, hkContainerHeapAllocator> cachedBindables;
 		hkBool areBindablesCached;
 		hkBool hasEnableChanged;
@@ -323,7 +340,7 @@ namespace RE
 	{
 		hkStringPtr animationBundleName;                   // from NAF
 		hkStringPtr animationName;                         // from NAF
-		hkRefPtr<hkbClipTriggerArray> triggers;            // from NAF
+		hkRawRefPtr<hkbClipTriggerArray> triggers;            // from NAF
 		uint32_t userPartitionMask;                        // from NAF
 		float cropStartAmountLocalTime;                    // from NAF
 		float cropEndAmountLocalTime;                      // from NAF
@@ -392,7 +409,7 @@ namespace RE
 	struct hkbProjectData : public hkReferencedObject
 	{
 		uint8_t worldUpWS[16];                         // +0x10 (hkVector4f)
-		hkRefPtr<hkbProjectStringData> stringData;     // +0x20
+		hkRawRefPtr<hkbProjectStringData> stringData;     // +0x20
 	};
 
 	struct __declspec(novtable) hkbCharacter : public hkReferencedObject
@@ -406,17 +423,17 @@ namespace RE
 		int16_t numTracksInLod;
 		hkbGeneratorOutput* generatorOutput;
 		hkStringPtr name;
-		hkRefPtr<hkbRagdollDriver> ragdollDriver;
-		hkRefPtr<hkbRagdollInterface> ragdollInterface;
-		hkRefPtr<hkbCharacterControllerDriver> characterControllerDriver;
-		hkRefPtr<hkbFootIkDriver> footIkDriver;
-		hkRefPtr<hkbHandIkDriver> handIkDriver;
-		hkRefPtr<hkbDockingDriver> dockingDriver;
-		hkRefPtr<hkReferencedObject> aiControlDriver;
-		hkRefPtr<hkbCharacterSetup> setup;
-		hkRefPtr<hkbBehaviorGraph> behaviorGraph;
-		hkRefPtr<hkbProjectData> projectData;
-		hkRefPtr<hkbAnimationBindingSet> animationBindingSet;
+		hkRawRefPtr<hkbRagdollDriver> ragdollDriver;
+		hkRawRefPtr<hkbRagdollInterface> ragdollInterface;
+		hkRawRefPtr<hkbCharacterControllerDriver> characterControllerDriver;
+		hkRawRefPtr<hkbFootIkDriver> footIkDriver;
+		hkRawRefPtr<hkbHandIkDriver> handIkDriver;
+		hkRawRefPtr<hkbDockingDriver> dockingDriver;
+		hkRawRefPtr<hkReferencedObject> aiControlDriver;
+		hkRawRefPtr<hkbCharacterSetup> setup;
+		hkRawRefPtr<hkbBehaviorGraph> behaviorGraph;
+		hkRawRefPtr<hkbProjectData> projectData;
+		hkRawRefPtr<hkbAnimationBindingSet> animationBindingSet;
 		hkbSpatialQueryInterface* spatialQueryInterface;
 		hkbWorld* world;
 		hkArray<hkaBoneAttachment*, hkContainerHeapAllocator> boneAttachments;
@@ -428,7 +445,9 @@ namespace RE
 	};
 	static_assert(offsetof(hkbCharacter, behaviorGraph) == 0x80);
 
-	struct hkPointerMap
+	// Renamed from hkPointerMap: the fork declares a template class of that
+	// name. OAR only holds these as opaque pointers inside hkbBehaviorGraph.
+	struct hkPointerMapOpaque
 	{
 		void* elements;
 		int32_t numElements;
@@ -443,22 +462,22 @@ namespace RE
 
 		hkEnum<VariableMode, int8_t> variableMode;
 		hkArray<uint16_t, hkContainerHeapAllocator> uniqueIdPool;
-		hkPointerMap* idToStateMachineTemplateMap;
+		hkPointerMapOpaque* idToStateMachineTemplateMap;
 		hkArray<int32_t, hkContainerHeapAllocator> mirroredExternalIdMap;
 		hkPseudoRandomGenerator* pseudoRandomGenerator;
-		hkRefPtr<hkbGenerator> rootGenerator;
-		hkRefPtr<hkbBehaviorGraphData> data;
-		hkRefPtr<hkbBehaviorGraph> _template;
+		hkRawRefPtr<hkbGenerator> rootGenerator;
+		hkRawRefPtr<hkbBehaviorGraphData> data;
+		hkRawRefPtr<hkbBehaviorGraph> _template;
 		hkbGenerator* rootGeneratorClone;
 		hkArray<hkbNodeInfo*, hkContainerHeapAllocator>* activeNodes;
-		hkRefPtr<hkbBehaviorGraph::GlobalTransitionData> globalTransitionData;
-		hkRefPtr<hkbSymbolIdMap> eventIdMap;
-		hkRefPtr<hkbSymbolIdMap> attributeIdMap;
-		hkRefPtr<hkbSymbolIdMap> variableIdMap;
-		hkRefPtr<hkbSymbolIdMap> characterPropertyIdMap;
+		hkRawRefPtr<hkbBehaviorGraph::GlobalTransitionData> globalTransitionData;
+		hkRawRefPtr<hkbSymbolIdMap> eventIdMap;
+		hkRawRefPtr<hkbSymbolIdMap> attributeIdMap;
+		hkRawRefPtr<hkbSymbolIdMap> variableIdMap;
+		hkRawRefPtr<hkbSymbolIdMap> characterPropertyIdMap;
 		hkbVariableValueSet* variableValueSet;
-		hkPointerMap* nodeTemplateToCloneMap;
-		hkPointerMap* stateListenerTemplateToCloneMap;
+		hkPointerMapOpaque* nodeTemplateToCloneMap;
+		hkPointerMapOpaque* stateListenerTemplateToCloneMap;
 		hkArray<hkbNode*, hkContainerHeapAllocator> recentlyCreatedClones;
 		hkbNodePartitionInfo* nodePartitionInfo;
 		int32_t numIntermediateOutputs;
@@ -476,6 +495,8 @@ namespace RE
 		hkBool checkNodeValidity;
 		hkBool stateOrTransitionChanged;
 
+		// OG-only IDs (992878 / 326555 missing from NG/AE databases). No live
+		// callers in OAR; gate on REX::FModule::IsRuntimeOG() before calling.
 		void setActiveGeneratorLocalTime(const hkbContext* a_context, hkbGenerator* a_gen, float a_time)
 		{
 			using func_t = decltype(&hkbBehaviorGraph::setActiveGeneratorLocalTime);
@@ -521,68 +542,28 @@ namespace RE
 		hkStringPtr behaviorFilename;
 	};
 
-	class AnimVariableCacheInfo;
-	class BSAnimationGraphChannel;
-	class BShkbAnimationGraph;
-	class hkbVariableValue;
-
-	struct BSAnimationGraphVariableCache
-	{
-		BSTArray<AnimVariableCacheInfo> variableCache;
-		BSTArray<hkbVariableValue*> variableQuickLookup;
-		BSSpinLock* lock;
-		BSTSmartPointer<BShkbAnimationGraph> graphToCacheFor;
-	};
-	static_assert(sizeof(BSAnimationGraphVariableCache) == 0x40);
-
-	struct BSAnimationGraphEvent
-	{
-		TESObjectREFR* refr;
-		BSFixedString animEvent;
-		BSFixedString argument;
-	};
+	// BSAnimationGraphVariableCache, BSAnimationGraphEvent, and
+	// BSAnimationGraphManager now come from the multi-runtime CommonLibF4 fork
+	// (RE/B/*.h). Note the fork's BSAnimationGraphEvent member names:
+	//   holderID (uint64, the holder ref bits) / tag / payload
+	// where OAR's old local definition had refr / animEvent / argument.
+	// The layout is bit-identical; call sites reinterpret holderID as
+	// TESObjectREFR* where the pointer is needed.
 
 	namespace BGSAnimationSystemUtils
 	{
+		// OG-only Address Library ID (897074 does not exist in the NG/AE
+		// databases). Callers must gate on REX::FModule::IsRuntimeOG();
+		// resolving this on NG/AE aborts the process with a missing-ID error.
 		inline bool GetEventSourcePointersFromGraph(
 			const TESObjectREFR* a_refr,
 			BSScrapArray<BSTEventSource<BSAnimationGraphEvent>*>& a_sourcesOut)
 		{
 			using func_t = decltype(&GetEventSourcePointersFromGraph);
-			REL::Relocation<func_t> func{ REL::ID(897074) };
+			static REL::Relocation<func_t> func{ REL::ID(897074) };
 			return func(a_refr, a_sourcesOut);
 		}
 	}
-
-	class BSAnimationGraphManager :
-		public BSTEventSink<BSAnimationGraphEvent>,
-		public BSIntrusiveRefCounted
-	{
-	public:
-		struct DependentManagerSmartPtr
-		{
-			std::uint64_t ptrAndFlagsStorage;
-		};
-		static_assert(sizeof(DependentManagerSmartPtr) == 0x08);
-
-		BSTArray<BSTSmartPointer<BSAnimationGraphChannel>> boundChannel;
-		BSTArray<BSTSmartPointer<BSAnimationGraphChannel>> bumpedChannel;
-		BSTSmallArray<BSTSmartPointer<BShkbAnimationGraph>, 1> graph;
-		BSTArray<DependentManagerSmartPtr> subManagers;
-		BSTArray<BSTTuple<BSFixedString, BSFixedString>> eventQueuea;
-		BSAnimationGraphVariableCache variableCache;
-		BSSpinLock updateLock;
-		BSSpinLock dependentManagerLock;
-		std::uint32_t activeGraph;
-		std::uint32_t generateDepth;
-	};
-	static_assert(sizeof(BSAnimationGraphManager) == 0xE0);
-
-	enum BSVisitControl : uint32_t
-	{
-		kContinue = 0,
-		kStop = 1
-	};
 
 	class BShkbAnimationGraph
 	{
@@ -590,6 +571,8 @@ namespace RE
 		uint8_t pad00[0x1C8];
 		hkbCharacter character;
 
+		// OG-only ID (194777 missing from NG/AE databases). No live callers;
+		// kept for diagnostics on OG. Gate on IsRuntimeOG() before calling.
 		void VisitGraph(class BShkbVisitor& a_visitor)
 		{
 			using func_t = decltype(&BShkbAnimationGraph::VisitGraph);
@@ -602,19 +585,19 @@ namespace RE
 	struct hkbCharacterData : public hkReferencedObject
 	{
 		uint8_t unk10[0xA0];  // probe: stringData found at data+0xB0 (0x10 base + 0xA0 pad)
-		hkRefPtr<hkbCharacterStringData> stringData;  // +0xB0
+		hkRawRefPtr<hkbCharacterStringData> stringData;  // +0xB0
 	};
 
 	struct hkbCharacterSetup : public hkReferencedObject
 	{
 		hkArray<void*, hkContainerHeapAllocator> retargetingSkeletonMappers;  // +0x10
-		hkRefPtr<hkReferencedObject> animationSkeleton;                      // +0x20
-		hkRefPtr<hkReferencedObject> ragdollToAnimationSkeletonMapper;       // +0x28
-		hkRefPtr<hkReferencedObject> animationToRagdollSkeletonMapper;       // +0x30
+		hkRawRefPtr<hkReferencedObject> animationSkeleton;                      // +0x20
+		hkRawRefPtr<hkReferencedObject> ragdollToAnimationSkeletonMapper;       // +0x28
+		hkRawRefPtr<hkReferencedObject> animationToRagdollSkeletonMapper;       // +0x30
 		uint8_t pad38[8];                                                     // +0x38 (probe: data at +0x40)
-		hkRefPtr<hkbCharacterData> data;                                     // +0x40
-		hkRefPtr<hkReferencedObject> unscaledAnimationSkeleton;
-		hkRefPtr<hkbMirroredSkeletonInfo> mirroredSkeletonInfo;
+		hkRawRefPtr<hkbCharacterData> data;                                     // +0x40
+		hkRawRefPtr<hkReferencedObject> unscaledAnimationSkeleton;
+		hkRawRefPtr<hkbMirroredSkeletonInfo> mirroredSkeletonInfo;
 	};
 
 	struct hkbAnimationBindingWithTriggers
@@ -622,6 +605,9 @@ namespace RE
 		float unk00[10];
 	};
 
+	// OG-only ctor/dtor IDs (1381136 / 144578 missing from NG/AE databases).
+	// OAR never constructs one (graph hooks receive engine-provided contexts);
+	// gate on REX::FModule::IsRuntimeOG() if construction is ever needed.
 	struct hkbContext
 	{
 		hkbContext(hkbCharacter* a_char, void* a_physIntfc = nullptr, void* a_attchMngr = nullptr)
@@ -702,8 +688,8 @@ namespace RE
 
 	// hkaAnimationBinding layout (verified from CommonLibSSE NG / Havok 2014):
 	//   +0x00 vtable, +0x08 refCount/memSize
-	//   +0x10 hkRefPtr<hkaSkeletonInfo> originalSkeletonName (deprecated, sometimes absent)
-	//   +0x18 hkRefPtr<hkaAnimation> animation
+	//   +0x10 hkRawRefPtr<hkaSkeletonInfo> originalSkeletonName (deprecated, sometimes absent)
+	//   +0x18 hkRawRefPtr<hkaAnimation> animation
 	//   +0x20 hkArray<int16_t>     transformTrackToBoneIndices  ← what we need
 	//   +0x30 hkArray<int16_t>     floatTrackToFloatSlotIndices
 	//   +0x40 hkArray<int16_t>     partitionIndices

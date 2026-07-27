@@ -24,6 +24,8 @@ void Settings::Load()
 	bFilterOutDuplicateAnimations = getB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	bShowWelcomeBanner            = getB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	bDirectPathMatching           = getB("General", "bDirectPathMatching", bDirectPathMatching);
+	iAutoReloadMode               = std::clamp(getI("General", "iAutoReloadMode", iAutoReloadMode), 0, 2);
+	bPlayDryFireSound             = getB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
 	iToggleKey   = static_cast<std::uint32_t>(ini.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
@@ -77,6 +79,8 @@ void Settings::Save()
 	setB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	setB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	setB("General", "bDirectPathMatching", bDirectPathMatching);
+	setI("General", "iAutoReloadMode", iAutoReloadMode);
+	setB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
 	setI("UI", "iToggleKey", static_cast<int>(iToggleKey));
 	setB("UI", "bRequireShift", bRequireShift);

@@ -254,6 +254,18 @@ bEnableUI = true
 ; Match replacements against the clip's resolved on-disk animation path
 ; (default). Set to false to restore legacy leaf-name matching everywhere.
 bDirectPathMatching = true
+; Auto-reload mode (dropdown in the Settings menu). The engine's own
+; auto-reloads are always suppressed; they are attack-initiated and get cut
+; short the moment the magazine refills. OAR's replacement reloads use the
+; reload-key path and play the full animation.
+;   0 = Auto-Reload On Last Round (default)
+;   1 = Auto-Reload On Fire Press When Empty
+;   2 = Suppress Auto-Reload (reload key only)
+iAutoReloadMode = 0
+; Click sound when firing on an empty magazine (weapon's Attack Fail sound,
+; or the vanilla 10mm dry-fire click if the weapon has none). Turn off if
+; your dry-fire replacement animations already carry their own click.
+bPlayDryFireSound = true
 
 [UI]
 iToggleKey = 0x3C    ; F2 (DIK scan code). Rebind in-game via Settings.

@@ -185,8 +185,8 @@ bool OpenAnimationReplacer::CreateReplacementAnimations(
 
 			int16_t newIndex = static_cast<int16_t>(bundleArr.size);
 			auto& newEntry = bundleArr.data[bundleArr.size];
-			newEntry.fileName.stringAndFlag = _strdup(info.replacementPath.c_str());
-			newEntry.meshName.stringAndFlag = "*";
+			RE::SetHkStringRawPtr(newEntry.fileName, _strdup(info.replacementPath.c_str()));
+			RE::SetHkStringRawPtr(newEntry.meshName, "*");
 			bundleArr.size++;
 
 			auto replacement = std::make_unique<ReplacementAnimation>(
