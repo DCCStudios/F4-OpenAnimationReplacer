@@ -518,6 +518,17 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		}
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Custom blend duration in seconds when interrupting. Default: 0.20s. Set negative to use default.");
 
+		float blendOut = a_subMod->GetCustomBlendOutTime();
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputFloat("Blend out time (?)", &blendOut, 0, 0, "%.2f")) {
+			a_subMod->customBlendOutTime = blendOut;
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Full-body blend duration in seconds when this replacement ends\n"
+			"(conditions become false). Set negative to use the blend-in time\n"
+			"above (default behavior). 0 = instant snap back to the original.");
+
 		float deactivDelay = a_subMod->GetDeactivationDelay();
 		ImGui::SetNextItemWidth(80);
 		if (ImGui::InputFloat("Deactivation Delay (?)", &deactivDelay, 0, 0, "%.2f")) {
@@ -764,6 +775,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["suppressAnnotations"] = a_subMod->suppressedAnnotations;
 			if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
 				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
+			if (a_subMod->GetCustomBlendOutTime() >= 0.f)
+				json["customBlendOutTime"] = a_subMod->GetCustomBlendOutTime();
 			if (a_subMod->GetDeactivationDelay() > 0.0f)
 				json["deactivationDelay"] = a_subMod->GetDeactivationDelay();
 			if (a_subMod->GetPlayOnceFullBody())
@@ -781,6 +794,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["weight"] = tf.weight;
 				tfJson["blendInTime"] = tf.blendInTime;
 				tfJson["blendOutTime"] = tf.blendOutTime;
+				tfJson["sampleFrame"] = tf.sampleFrame;
 				tfJson["includeChildren"] = tf.includeChildren;
 				tfJson["bones"] = tf.boneNames;
 				tfJson["excludeChildren"] = tf.excludeChildren;
@@ -1266,6 +1280,33 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			}
 			if (ImGui::IsItemHovered()) {
 				ImGui::SetTooltip("Time in seconds to ramp from full weight to 0 when conditions become false.\n0 = instant snap.");
+			}
+
+			bool useFixedFrame = tf.sampleFrame >= 0.0f;
+			if (ImGui::Checkbox("Sample Fixed Frame (?)##trackFilter", &useFixedFrame)) {
+				tf.sampleFrame = useFixedFrame ? 0.0f : -1.0f;
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Take the filtered bones' pose from ONE fixed frame of the replacement\n"
+					"animation instead of following the clip's playback time — a held\n"
+					"static pose (e.g. a slide locked back from frame 24 of the animation).\n"
+					"When off, the replacement is sampled at the clip's current time.");
+			}
+			if (useFixedFrame) {
+				ImGui::SameLine();
+				int frame = static_cast<int>(tf.sampleFrame);
+				ImGui::SetNextItemWidth(100);
+				if (ImGui::InputInt("Frame##trackFilterFrame", &frame)) {
+					tf.sampleFrame = static_cast<float>(std::max(0, frame));
+					a_subMod->SetDirty(true);
+				}
+				if (ImGui::IsItemHovered()) {
+					ImGui::SetTooltip(
+						"Frame number in the replacement animation to sample (30 frames per\n"
+						"second; clamped to the animation's length).");
+				}
 			}
 
 			if (ImGui::Checkbox("Include Children##trackFilter", &tf.includeChildren)) {

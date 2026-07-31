@@ -50,6 +50,7 @@ public:
 	float GetCustomBlendTimeOnInterrupt() const { return customBlendTimeOnInterrupt; }
 	float GetCustomBlendTimeOnLoop() const { return customBlendTimeOnLoop; }
 	float GetCustomBlendTimeOnEcho() const { return customBlendTimeOnEcho; }
+	float GetCustomBlendOutTime() const { return customBlendOutTime; }
 	float GetDeactivationDelay() const { return deactivationDelay; }
 	void SetDeactivationDelay(float a_val) { deactivationDelay = a_val; }
 	bool GetPlayOnceFullBody() const { return playOnceFullBody; }
@@ -97,6 +98,9 @@ public:
 	float customBlendTimeOnInterrupt{ -1.0f };
 	float customBlendTimeOnLoop{ -1.0f };
 	float customBlendTimeOnEcho{ -1.0f };
+	// Full-body blend-out duration when the replacement ends (conditions fail).
+	// Negative = mirror the blend-in duration (existing behavior); 0 = instant.
+	float customBlendOutTime{ -1.0f };
 	float deactivationDelay{ 0.0f };
 	bool playOnceFullBody{ false };
 	std::string requiredProjectName;
@@ -126,6 +130,11 @@ public:
 		float weight = 1.0f;
 		float blendInTime = 0.0f;
 		float blendOutTime = 0.0f;
+		// Fixed-frame sampling: when >= 0, the replacement's pose for the
+		// filtered bones is taken from this authored frame (30 fps) instead
+		// of following the clip's playback time — a held static pose.
+		// Negative = disabled (sample at the clip's current time).
+		float sampleFrame = -1.0f;
 		bool includeChildren = true;
 		std::vector<std::string> boneNames;
 		// Exclude list: bones matching here are removed from the final resolved set

@@ -17,7 +17,7 @@ void OAR_InitializeLogging(std::string_view a_pluginName);
 namespace Plugin
 {
 	static constexpr auto NAME    = "OpenAnimationReplacer"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 0, 0 };
+	static constexpr auto VERSION = REL::Version{ 1, 1, 0 };
 }
 
 // Version data consumed by the NG/AE F4SE loaders (0.7.x reads the exported

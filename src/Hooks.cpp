@@ -205,6 +205,9 @@ struct FullBodyBlendState {
 	float blendAlpha = 0.0f;       // 0 = fully original, 1 = fully replacement
 	float blendElapsed = 0.0f;
 	float blendDuration = 0.0f;
+	// SubMod's configured blend-out duration, captured at registration.
+	// Negative = mirror the blend-in duration (default behavior).
+	float blendOutDuration = -1.0f;
 	bool blendingIn = false;       // ramping 0→1
 	bool blendingOut = false;      // ramping 1→0
 	bool poseSnapshotValid = false;
@@ -5435,42 +5438,81 @@ namespace
 						}
 					}
 
-					// Start full-body blend-in if SubMod has a blend time configured
+					// Start full-body blend-in if SubMod has a blend time configured.
+					// Also register when only a blend-OUT time is set (blend-in 0):
+					// the driver snaps alpha to 1 instantly for a zero blend-in, but
+					// the map entry must exist for the blend-out to run later.
 					float blendTime = (winningInfo && winningInfo->parentSubMod)
 						? winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt() : -1.0f;
 					if (blendTime < 0.0f) blendTime = 0.0f;
-					if (blendTime > 0.0f && originalAnim) {
+					float blendOutCfg = (winningInfo && winningInfo->parentSubMod)
+						? winningInfo->parentSubMod->GetCustomBlendOutTime() : -1.0f;
+					if (originalAnim) {
 						RE::TESObjectREFR* blendActor = refr ? refr : RE::PlayerCharacter::GetSingleton();
 						if (blendActor) {
 							ActorClipKey key{ blendActor, suffix };
 							std::unique_lock fbLock(s_fullBodyBlendMutex);
-							bool isNew = (s_fullBodyBlendMap.find(key) == s_fullBodyBlendMap.end());
-							auto& bs = s_fullBodyBlendMap[key];
+							auto exIt = s_fullBodyBlendMap.find(key);
+							bool isNew = (exIt == s_fullBodyBlendMap.end());
+							// Create an entry only when this submod configures a blend —
+							// but if one already EXISTS, process it even when the new
+							// submod has no blend times: a replacement→replacement
+							// switch must still honor the OUTGOING submod's blend-out.
+							if (blendTime > 0.0f || blendOutCfg > 0.0f || !isNew) {
+							auto& bs = isNew ? s_fullBodyBlendMap[key] : exIt->second;
 							if (isNew || bs.replacement != replacement) {
+								// Default: blend from the vanilla original (fresh
+								// replacement start). On a replacement→replacement
+								// switch (another submod won mid-clip), blend from the
+								// OUTGOING replacement's pose instead, over at least
+								// the outgoing submod's effective blend-out time — the
+								// game never returns to the original in between, so
+								// this is where its blend-out applies.
+								RE::hkaAnimation* blendFrom = originalAnim;
+								bool isSwitch = (!isNew && bs.replacement && bs.replacement != replacement);
+								if (isSwitch) {
+									blendFrom = bs.replacement;
+									// Outgoing effective blend-out: its configured out
+									// time, or (mirror default) its current blendDuration
+									// (the in time while blending in / steady, or the out
+									// time if it was already blending out).
+									float outgoingOut = (bs.blendOutDuration >= 0.0f)
+										? bs.blendOutDuration : bs.blendDuration;
+									if (outgoingOut > blendTime) blendTime = outgoingOut;
+								}
 								bs.replacement = replacement;
-								bs.original = originalAnim;
+								bs.original = blendFrom;
 								bs.ownerClip = a_this;
 								bs.blendElapsed = 0.0f;
-								bs.blendAlpha = 0.0f;
-								bs.blendingIn = true;
+								// Zero blend-in (entry exists only for its blend-out):
+								// start settled at alpha 1 so Generate never outputs a
+								// frame of the original pose while "blending in".
+								bs.blendAlpha = (blendTime > 0.0f) ? 0.0f : 1.0f;
+								bs.blendingIn = (blendTime > 0.0f);
 								bs.blendingOut = false;
 								bs.blendDuration = blendTime;
+								bs.blendOutDuration = blendOutCfg;
 								bs.poseSnapshotValid = false;
 								bs.poseSnapshot.clear();
 								if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
 								static int s_fbRegLog = 0;
 								if (s_fbRegLog < 10) {
-									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s",
-										suffix, blendTime);
+									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s switch={}",
+										suffix, blendTime, isSwitch);
 									s_fbRegLog++;
 								}
 							} else if (bs.blendingOut) {
-								// Re-activation during blend-out: cancel, resume blend-in
+								// Re-activation during blend-out: cancel, resume blend-in.
+								// blendDuration currently holds the blend-OUT time (set
+								// when the blend-out started) — restore the in time.
 								bs.blendingOut = false;
-								bs.blendingIn = true;
+								bs.blendingIn = (blendTime > 0.0f);
+								if (!bs.blendingIn) bs.blendAlpha = 1.0f;
 								bs.blendElapsed = 0.0f;
+								bs.blendDuration = blendTime;
 								bs.poseSnapshotValid = false;
 								bs.ownerClip = a_this;
+							}
 							}
 						}
 					}
@@ -5881,8 +5923,12 @@ namespace
 						// Steady state — start blend-out.
 						// Swap slot to original NOW so Generate outputs original.
 						// The snapshot (captured on first Generate frame) will be replacement.
+						// A configured blend-out time (>= 0) wins; negative means
+						// mirror the blend-in duration (the original behavior).
 						float blendOutTime = 0.0f;
-						if (it->second.blendDuration > 0.0f) {
+						if (it->second.blendOutDuration >= 0.0f) {
+							blendOutTime = it->second.blendOutDuration;
+						} else if (it->second.blendDuration > 0.0f) {
 							blendOutTime = it->second.blendDuration;
 						}
 						if (blendOutTime > 0.0f) {
@@ -5902,6 +5948,12 @@ namespace
 									suffix, blendOutTime);
 								s_fbBoLog++;
 							}
+						} else {
+							// Explicit blend-out of 0 (instant): take the immediate
+							// restore path below, and erase the blend entry now so
+							// it doesn't linger with stale clip/animation pointers.
+							s_fullBodyBlendMap.erase(it);
+							s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
 						}
 					}
 				}
@@ -6565,15 +6617,25 @@ namespace
 				if (numTracksToSample <= 0) return;
 
 				float localTime = a_this->GetLocalTime();
-
-				// The clip generator's localTime is driven by the ORIGINAL animation's
-				// duration (since *animSlot isn't swapped for track filtering). Wrap it
-				// to the replacement's duration so different-length replacements sample
-				// correctly — preventing both out-of-bounds reads (replacement shorter)
-				// and ensuring the full replacement plays through (replacement longer,
-				// cycling independently of the base animation's loop).
 				float repDuration = repAnim->duration;
-				if (repDuration > 0.001f) {
+
+				if (filterPtr->sampleFrame >= 0.0f) {
+					// Fixed-frame sampling: hold the override pose at one authored
+					// frame of the replacement instead of following playback time.
+					// FO4 animations are authored at 30 fps. Clamp (don't wrap) so a
+					// frame past the end holds the final pose.
+					constexpr float kAnimFps = 30.0f;
+					localTime = filterPtr->sampleFrame / kAnimFps;
+					if (repDuration > 0.001f && localTime > repDuration) {
+						localTime = repDuration;
+					}
+				} else if (repDuration > 0.001f) {
+					// The clip generator's localTime is driven by the ORIGINAL animation's
+					// duration (since *animSlot isn't swapped for track filtering). Wrap it
+					// to the replacement's duration so different-length replacements sample
+					// correctly — preventing both out-of-bounds reads (replacement shorter)
+					// and ensuring the full replacement plays through (replacement longer,
+					// cycling independently of the base animation's loop).
 					localTime = std::fmod(localTime, repDuration);
 					if (localTime < 0.f) localTime += repDuration;
 				}
@@ -6663,6 +6725,17 @@ namespace
 			// Swap the binding's animation pointer to our replacement, call
 			// _Generate to let the engine sample it through its normal code path
 			// (which handles null offsets in the clone), then read the result.
+			// NOTE: this path samples at the clip's own playback time, so the
+			// fixed-frame option cannot be honored here. Warn once so the user
+			// knows why the pose follows playback instead of holding a frame.
+			if (filterPtr->sampleFrame >= 0.0f) {
+				static std::atomic<bool> s_fixedFrameFallbackWarned{ false };
+				if (!s_fixedFrameFallbackWarned.exchange(true)) {
+					logger::warn("[OAR-TrackFilter] SubMod '{}' requests fixed-frame sampling (frame {:.0f}) "
+						"but this clip has no readable track binding — falling back to playback-time sampling.",
+						state.parentSubMod ? state.parentSubMod->GetName() : "?", filterPtr->sampleFrame);
+				}
+			}
 			if (!animSlot || !*animSlot) return;
 
 			RE::hkaAnimation* originalInSlot = *animSlot;
