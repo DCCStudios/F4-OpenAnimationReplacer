@@ -1236,6 +1236,10 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 	if (a_editable) {
 		if (ImGui::Checkbox("Enabled##trackFilter", &tf.enabled)) {
 			a_subMod->SetDirty(true);
+			// The file redirect map excludes track-filtered submods (their
+			// files are pose donors, not file replacements). Rebuild it now
+			// so toggling the filter takes effect without a config reload.
+			Hooks::FileRedirectHooks::BuildFileRedirectMap();
 		}
 		if (ImGui::IsItemHovered()) {
 			ImGui::SetTooltip(

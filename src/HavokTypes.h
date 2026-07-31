@@ -315,22 +315,33 @@ namespace RE
 		// +0x20: extractedMotion (hkRefPtr)
 		// +0x28: annotationTracks (hkArray<hkaAnnotationTrack>)
 
-		// Vtable [4] in F4 (Havok 2014, confirmed via SKSE/CommonLibSSE NG): SamplePartialTracks
-		// Samples this animation at a_time and fills a_outTracks (track-indexed) with the
-		// per-track hkQsTransform. a_outFloats is filled with float track values.
-		void SamplePartialTracks(float a_time,
-			uint32_t a_maxNumTransformTracks,
-			hkQsTransformRaw* a_outTracks,
-			uint32_t a_maxNumFloatTracks,
-			float* a_outFloats,
-			void* a_chunkCache /* hkaChunkCache* */) const
+		// Vtable [4] in FO4's Havok 2014: sampleTracks(float, hkQsTransformf*, float*).
+		//
+		// VERIFIED from crash-2026-07-31-07-09-01 (OG 1.10.163): Buffout's
+		// symbolication names slot 4's target
+		//   hkaSplineCompressedAnimation::sampleTracks(float,hkQsTransformf*,float*)
+		// which internally forwards to
+		//   samplePartialTracks(float,uint,hkQsTransformf*,uint,float*).
+		// The previous wrapper here used Skyrim's Havok-2010 samplePartialTracks
+		// signature (with track-count params and a trailing hkaChunkCache*) on
+		// slot 4 — the same Skyrim-layout carryover class of bug as GitHub issue
+		// #1. Calling slot 4 with that argument list put the track count (0x5E)
+		// in the register sampleTracks reads its output pointer from; the crash
+		// faulted writing to address 0x5E. It never fired before because the
+		// direct-sampling path was never reached until identity bindings were
+		// accepted (all prior track-filter sessions used the swap fallback).
+		//
+		// The 2014 sampleTracks takes NO counts: the callee reads
+		// m_numberOfTransformTracks / m_numberOfFloatTracks from the animation
+		// itself. Callers MUST size a_outTracks to numberOfTransformTracks and
+		// a_outFloats to numberOfFloatTracks (both 16-byte aligned; the engine
+		// writes transforms with movaps).
+		void SampleTracks(float a_time, hkQsTransformRaw* a_outTracks, float* a_outFloats) const
 		{
-			using SampleFn = void(*)(const hkaAnimation*, float, uint32_t,
-				hkQsTransformRaw*, uint32_t, float*, void*);
+			using SampleFn = void(*)(const hkaAnimation*, float, hkQsTransformRaw*, float*);
 			auto* vtbl = *reinterpret_cast<void* const* const*>(this);
 			auto fn = reinterpret_cast<SampleFn>(vtbl[4]);
-			fn(this, a_time, a_maxNumTransformTracks, a_outTracks,
-				a_maxNumFloatTracks, a_outFloats, a_chunkCache);
+			fn(this, a_time, a_outTracks, a_outFloats);
 		}
 	};
 	static_assert(offsetof(hkaAnimation, type) == 0x10);
@@ -663,7 +674,9 @@ namespace RE
 	// Track indices within hkbGeneratorOutput::Tracks
 	static constexpr int kTrackIndex_Pose = 2;
 
-	struct hkQsTransformRaw {
+	// alignas(16): the engine's sampleTracks writes these with movaps (16-byte
+	// aligned SSE stores), so buffers we hand it must be explicitly aligned.
+	struct alignas(16) hkQsTransformRaw {
 		float translation[4];  // xyz + w(usually 0)
 		float rotation[4];     // quaternion xyzw
 		float scale[4];        // xyz + w(usually 0)

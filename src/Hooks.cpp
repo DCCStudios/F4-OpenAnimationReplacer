@@ -5317,12 +5317,16 @@ namespace
 		bool useTrackFilter = winningInfo && winningInfo->parentSubMod &&
 			winningInfo->parentSubMod->trackFilter.enabled && replacement;
 
-			// Track-filtered clips ALWAYS fire replacement annotations. The original
-			// animation stays in the slot and its triggers fire normally for base events.
-			// The replacement's annotations (sounds, bone culls) must be fired manually
-			// regardless of the replaceAnnotations setting, since the replacement anim
-			// isn't in the slot and its triggers can't be read by the engine.
-			if (useTrackFilter) bReplaceAnnot = true;
+			// Track-filtered clips honor the submod's Replace Annotations setting,
+			// same as full-body replacements. The original stays in the slot with
+			// intact triggers, so its own annotations always fire natively; when
+			// Replace Annotations is ON the donor file's annotations are ALSO
+			// fired manually (the donor isn't in the slot, so the engine can't).
+			// This used to be forced ON for all track filters — wrong for
+			// pose-donor workflows: a filter sampling a frame from a reload
+			// animation manually replayed the reload's SoundPlay.* annotations
+			// AND reloadComplete, which the game answered by refilling the mag
+			// ('Sig Idle Empty', 2026-07-31 session log).
 		if (useTrackFilter) {
 			{
 				std::unique_lock tfLock(s_trackFilterMutex);
@@ -5604,7 +5608,8 @@ namespace
 		// for what triggers can't do: PlaySoundDirect fallback, suppressAnnotations
 		// filtering (apply at build time instead), and ReloadEnd side-effects.
 		// Kept as-is for now because this battle-tested path also feeds dry-fire,
-		// suppression, and track-filter forced annotations — migrate deliberately.
+		// suppression, and track-filter annotations (when ReplaceAnnotations is
+		// enabled on the submod) — migrate deliberately.
 		// ==============================================================================
 		if (bReplaceAnnot) {
 			const auto& annotSuffix = cacheSuffix;
@@ -6652,17 +6657,29 @@ namespace
 					if (localTime < 0.f) localTime += repDuration;
 				}
 
+				// Sanity: numberOfTransformTracks read at +0x18 — the same field
+				// the cache logs as "tracks=N" at load, so a wild value here
+				// means a corrupted/stale animation pointer. Bail rather than
+				// hand the engine an undersized output buffer.
+				if (animNumTracks > 4096) {
+					static int s_trackCountWarn = 0;
+					if (s_trackCountWarn < 5) {
+						logger::warn("[OAR-TrackFilter] Implausible track count {} on replacement — skipping sample", animNumTracks);
+						s_trackCountWarn++;
+					}
+					return;
+				}
+
+				// sampleTracks fills ALL of the animation's tracks (it reads the
+				// counts from the animation itself — see SampleTracks in
+				// HavokTypes.h), so the buffers are sized by the animation's own
+				// track counts, independent of how many tracks we then map.
 				thread_local std::vector<RE::hkQsTransformRaw> tl_sampledTracks;
 				thread_local std::vector<float> tl_sampledFloats;
-				tl_sampledTracks.assign(numTracksToSample, RE::hkQsTransformRaw{});
+				tl_sampledTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
 				tl_sampledFloats.assign(std::max(1, repAnim->numberOfFloatTracks), 0.0f);
 
-				repAnim->SamplePartialTracks(localTime,
-					static_cast<uint32_t>(numTracksToSample),
-					tl_sampledTracks.data(),
-					static_cast<uint32_t>(repAnim->numberOfFloatTracks),
-					tl_sampledFloats.data(),
-					nullptr);
+				repAnim->SampleTracks(localTime, tl_sampledTracks.data(), tl_sampledFloats.data());
 
 				static int s_bindingDiagLog = 0;
 				bool wantBindingDiag = (s_bindingDiagLog < 3);
@@ -8641,6 +8658,20 @@ namespace Hooks
 				const ReplacementAnimFileInfo* best = nullptr;
 				int bestPriority = INT32_MIN;
 				for (auto& info : replacementInfos) {
+					// Track-filtered submods must NOT redirect files. Their
+					// animation files are pose DONORS sampled by the track
+					// filter; the game must load the true original untouched.
+					// Redirecting them made the engine play the donor content
+					// outright, annotations included — a donor holding reload
+					// data fired reload sounds AND reload-completion events
+					// (ammo refill) the moment the "original" idle played.
+					if (info.parentSubMod && info.parentSubMod->trackFilter.enabled) {
+						continue;
+					}
+					// A disabled submod's file must not win the redirect either.
+					if (info.parentSubMod && info.parentSubMod->IsDisabled()) {
+						continue;
+					}
 					const int prio = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
 					if (!best || prio > bestPriority) {
 						best = &info;
