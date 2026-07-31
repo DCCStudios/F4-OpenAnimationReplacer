@@ -32,7 +32,10 @@ void UIMain::DrawContents()
 		}
 		if (ImGui::BeginMenu("Actions")) {
 			if (ImGui::MenuItem("Reload All Configs")) {
-				JobQueue::GetSingleton()->Enqueue(std::make_unique<ReloadConfigJob>());
+				// Queued to the GAME thread — the reload frees objects that
+				// live graph updates (and this UI) hold pointers to, so it
+				// must never run here on the render thread.
+				RequestConfigReload();
 			}
 			ImGui::EndMenu();
 		}
@@ -108,6 +111,25 @@ void UIMain::DrawTabBar()
 
 void UIMain::DrawReplacerModsTab()
 {
+	auto* oar = OpenAnimationReplacer::GetSingleton();
+
+	// Hold the mods read-lock for the WHOLE tab (tree, details panel, and the
+	// rename/description popups all dereference ReplacerMod/SubMod pointers).
+	// The game-thread config reload takes the write lock in ClearAllMods, so
+	// it cannot free those objects mid-draw. DrawModTree relies on this lock
+	// being held by us.
+	ReadLocker modsLock(oar->GetModsMutex());
+
+	// A config reload destroyed and re-created every mod object: drop the raw
+	// pointers we cached across frames before anything dereferences them.
+	const auto gen = oar->GetModsGeneration();
+	if (gen != lastModsGeneration) {
+		lastModsGeneration = gen;
+		selectedSubMod = nullptr;
+		renamingSubMod = nullptr;
+		editingDescSubMod = nullptr;
+	}
+
 	float availWidth = ImGui::GetContentRegionAvail().x;
 	float firstColW = availWidth * firstColumnPercent;
 	float secondColW = availWidth - firstColW - ImGui::GetStyle().ItemSpacing.x;
@@ -160,6 +182,46 @@ void UIMain::DrawReplacerModsTab()
 		}
 		ImGui::EndPopup();
 	}
+
+	// Edit Description modal popup (opened from the right-panel description
+	// text via double-click or the right-click context menu).
+	if (editingDescSubMod) {
+		ImGui::OpenPopup("Edit Description");
+	}
+	if (ImGui::BeginPopupModal("Edit Description", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::Text("Description for '%s':",
+			editingDescSubMod ? editingDescSubMod->GetName().c_str() : "");
+		ImGui::SetNextItemWidth(420);
+		if (ImGui::IsWindowAppearing()) {
+			ImGui::SetKeyboardFocusHere();
+		}
+		ImGui::InputTextMultiline("##DescEditInput", descEditBuffer, sizeof(descEditBuffer),
+			ImVec2(420, 120));
+
+		ImGui::Spacing();
+		if (ImGui::Button("OK", ImVec2(120, 0))) {
+			if (editingDescSubMod) {
+				editingDescSubMod->SetDescription(descEditBuffer);
+				editingDescSubMod->SetDirty(true);
+				logger::info("[OAR-UI] SubMod '{}' description updated", editingDescSubMod->GetName());
+			}
+			editingDescSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			editingDescSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
+}
+
+void UIMain::BeginEditDescription(SubMod* a_subMod)
+{
+	if (!a_subMod) return;
+	editingDescSubMod = a_subMod;
+	strncpy_s(descEditBuffer, a_subMod->GetDescription().c_str(), sizeof(descEditBuffer) - 1);
 }
 
 void UIMain::DrawReplacementAnimsTab()
@@ -214,9 +276,10 @@ void UIMain::DrawReplacementAnimsTab()
 
 void UIMain::DrawModTree()
 {
+	// NOTE: the caller (DrawReplacerModsTab) holds the mods read-lock for the
+	// whole tab — do not re-acquire it here (shared_mutex is not recursive;
+	// a writer waiting between the two acquisitions would deadlock us).
 	auto* oar = OpenAnimationReplacer::GetSingleton();
-	ReadLocker modsLock(oar->GetModsMutex());
-
 	auto& mods = oar->GetReplacerMods();
 
 	ImGui::Text("%zu mods, %zu replacements", mods.size(), oar->GetTotalReplacementCount());
@@ -322,9 +385,34 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 	bool editable = currentMode != UICommon::EditorMode::kInspect;
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "%s", a_subMod->GetName().c_str());
+
+	// Description: clickable in Author/Condition modes so a double-click or
+	// right-click opens the edit popup. Empty descriptions still render a
+	// placeholder so there's always something to interact with.
+	ImGui::PushID("SubModDesc");
 	if (!a_subMod->GetDescription().empty()) {
 		ImGui::TextWrapped("%s", a_subMod->GetDescription().c_str());
+	} else if (editable) {
+		ImGui::TextDisabled("(no description; double-click or right-click to edit)");
+	} else {
+		ImGui::TextDisabled("(no description)");
 	}
+	if (editable) {
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("Double-click or right-click to edit description");
+			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+				BeginEditDescription(a_subMod);
+			}
+		}
+		if (ImGui::BeginPopupContextItem("DescContext")) {
+			if (ImGui::MenuItem("Edit Description...")) {
+				BeginEditDescription(a_subMod);
+			}
+			ImGui::EndPopup();
+		}
+	}
+	ImGui::PopID();
+
 	ImGui::Separator();
 
 	if (editable) {
@@ -341,6 +429,10 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		if (ImGui::InputInt("Priority", &priority)) {
 			a_subMod->SetPriority(priority);
 			a_subMod->SetDirty(true);
+			// The winner-selection lists are pre-sorted by priority; re-sort
+			// them (on the game thread) so the change applies immediately
+			// instead of only after a config reload.
+			RequestLookupResort();
 		}
 
 		bool interruptible = a_subMod->IsInterruptible();
@@ -742,7 +834,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 
 		ImGui::SameLine();
 		if (ImGui::Button("Reload config")) {
-			JobQueue::GetSingleton()->Enqueue(std::make_unique<ReloadConfigJob>());
+			RequestConfigReload();
 		}
 
 		if (a_subMod->hasUserConfig) {
@@ -753,7 +845,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			{
 				auto userPath = a_subMod->GetPath() / "user.json";
 				try { std::filesystem::remove(userPath); } catch (...) {}
-				JobQueue::GetSingleton()->Enqueue(std::make_unique<ReloadConfigJob>());
+				RequestConfigReload();
 			}
 		}
 	}

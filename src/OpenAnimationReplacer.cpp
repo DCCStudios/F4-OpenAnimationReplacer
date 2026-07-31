@@ -27,6 +27,9 @@ void OpenAnimationReplacer::ClearAllMods()
 		WriteLocker lock(pathMapMutex);
 		animPathToReplacementsMap.clear();
 	}
+	// Signal the UI that every ReplacerMod/SubMod pointer it may be caching
+	// (selection, rename/description popups) just became invalid.
+	modsGeneration.fetch_add(1, std::memory_order_release);
 }
 
 ReplacementAnimation* OpenAnimationReplacer::GetReplacementAnimation(

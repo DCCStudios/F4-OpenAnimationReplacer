@@ -60,4 +60,16 @@ private:
 	// Rename popup state
 	SubMod* renamingSubMod{ nullptr };
 	char renameBuffer[256]{};
+
+	// Description edit popup state (opened from the right-panel description
+	// via double-click or right-click "Edit Description...")
+	SubMod* editingDescSubMod{ nullptr };
+	char descEditBuffer[2048]{};
+
+	// Last OpenAnimationReplacer::GetModsGeneration() seen; when it changes
+	// (config reload rebuilt all mods) the cached SubMod pointers above are
+	// dropped before drawing (see DrawReplacerModsTab).
+	std::uint64_t lastModsGeneration{ 0 };
+
+	void BeginEditDescription(SubMod* a_subMod);
 };

@@ -68,30 +68,53 @@ namespace
 bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
 	const void* a_owner, int32_t a_priority)
 {
-	if (!std::filesystem::exists(a_absolutePath)) {
+	std::error_code ec;
+	const auto diskSize = std::filesystem::file_size(a_absolutePath, ec);
+	if (ec) {
 		logger::warn("[OAR-Cache] File not found: '{}'", a_absolutePath.string());
 		return false;
 	}
+	const auto diskMTime = std::filesystem::last_write_time(a_absolutePath, ec);
 
-	// Already cached? One suffix can hold several files (one per SubMod that
-	// replaces the same original path) — dedupe on (owner, path).
+	// Fast path: this exact file is already cached. The cache's real identity
+	// is the on-disk file, not the owner tag — a config reload recreates every
+	// SubMod, so matching on owner would miss ALL entries and re-read every
+	// animation file from disk (seconds of hitching with thousands of anims).
+	// Match by path instead and, when size+mtime are unchanged, just re-bind
+	// the entry to the new owner/priority: the parsed data, annotations, and
+	// runtime clone all stay valid because the bytes they were built from are
+	// the same. A changed file (author replaced the .hkx and hit reload) falls
+	// through to a full re-read that replaces the entry below.
+	const std::string pathStr = a_absolutePath.string();
 	{
-		std::shared_lock lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		auto it = m_cache.find(a_suffix);
 		if (it != m_cache.end()) {
 			for (auto& existing : it->second) {
-				if (existing && existing->owner == a_owner &&
-					existing->filePath == a_absolutePath.string()) {
+				if (!existing || existing->filePath != pathStr) continue;
+				if (existing->fileSize == diskSize && existing->fileMTime == diskMTime) {
+					existing->owner = a_owner;
+					existing->priority = a_priority;
+					existing->pendingRebind = false;
+					// Priority may have changed; keep index 0 = highest.
+					std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
+						return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
+					});
+					// Count toward the loading progress bar like a real load.
+					OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
 					return true;
 				}
+				break;
 			}
 		}
 	}
 
 	auto entry = std::make_unique<CachedAnimation>();
-	entry->filePath = a_absolutePath.string();
+	entry->filePath = pathStr;
 	entry->owner = a_owner;
 	entry->priority = a_priority;
+	entry->fileSize = diskSize;
+	entry->fileMTime = diskMTime;
 
 	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
 	if (!file.is_open()) {
@@ -135,10 +158,19 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 
 	std::unique_lock lock(m_mutex);
 	auto& files = m_cache[a_suffix];
-	// Re-check for a duplicate under the exclusive lock (the early check above
-	// ran under a shared lock).
+	// Path identity: a same-path entry here means the file CHANGED on disk
+	// (the unchanged case re-bound and returned above). Replace it in place —
+	// but retire its clone AND its fileData first: live clips may still hold
+	// pointers into both (the clone's spline data targets fileData, and clones
+	// retired on earlier invalidations point into it too).
 	for (auto& existing : files) {
-		if (existing && existing->owner == a_owner && existing->filePath == entry->filePath) {
+		if (existing && existing->filePath == entry->filePath) {
+			RetireCloneLocked(*existing, /*a_retireBackingData=*/true);
+			existing = std::move(entry);
+			std::ranges::stable_sort(files, [](const auto& a, const auto& b) {
+				return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
+			});
+			logger::info("[OAR-Cache] Replaced changed file for '{}' (old entry retired)", a_suffix);
 			return true;
 		}
 	}
@@ -440,23 +472,64 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 	return nullptr;
 }
 
-void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry)
+void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData)
 {
 	// See header comment: the buffer must survive intact because active clips
 	// may still hold a pointer into it. Move it to the keep-alive list instead
-	// of clearing it in place.
-	if (!a_entry.runtimeStruct.empty()) {
+	// of clearing it in place. When the entry itself is going away
+	// (a_retireBackingData), its fileData must be kept alive too — even if the
+	// entry has no CURRENT clone, clones retired on earlier invalidations
+	// still point into that buffer.
+	const bool retireData = a_retireBackingData && !a_entry.fileData.empty();
+	if (!a_entry.runtimeStruct.empty() || retireData) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
-		m_retiredClones.push_back({ std::move(a_entry.runtimeStruct), a_entry.runtimeAnimation });
+		RetiredClone rec;
+		rec.buffer = std::move(a_entry.runtimeStruct);
+		rec.clonePtr = a_entry.runtimeAnimation;
+		if (retireData) {
+			rec.backingFileData = std::move(a_entry.fileData);
+			a_entry.fileData = std::vector<uint8_t>{};
+		}
+		m_retiredClones.push_back(std::move(rec));
 	}
 	// Guarantee the entry gets a FRESH allocation on next build (moved-from
 	// vector state is unspecified; assign a new empty one explicitly).
 	a_entry.runtimeStruct = std::vector<uint8_t>{};
 	a_entry.runtimeAnimation = nullptr;
 	a_entry.gameOriginal = nullptr;
+}
+
+void AnimationCache::MarkAllForRebind()
+{
+	std::unique_lock lock(m_mutex);
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (entry) entry->pendingRebind = true;
+		}
+	}
+}
+
+size_t AnimationCache::PruneUnrebound()
+{
+	std::unique_lock lock(m_mutex);
+	size_t pruned = 0;
+	for (auto it = m_cache.begin(); it != m_cache.end();) {
+		auto& files = it->second;
+		std::erase_if(files, [&](std::unique_ptr<CachedAnimation>& entry) {
+			if (!entry || !entry->pendingRebind) return false;
+			// The submod that owned this file no longer exists after the
+			// reload. Retire the clone and the backing file bytes (live clips
+			// may still reference them), then drop the entry.
+			RetireCloneLocked(*entry, /*a_retireBackingData=*/true);
+			pruned++;
+			return true;
+		});
+		it = files.empty() ? m_cache.erase(it) : std::next(it);
+	}
+	return pruned;
 }
 
 void AnimationCache::InvalidateRuntimeClones()

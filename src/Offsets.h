@@ -27,11 +27,33 @@ namespace Offsets
 	// hkbCharacterStringData vtable — REL::ID(931110)
 	inline REL::Relocation<uintptr_t> hkbCharacterStringData_vtbl{ REL::ID(931110) };
 
-	// ===== hkbClipGenerator vtable function indices (Havok SDK) =====
-	// Verified via OAR-main FO4 port (Hooks.h) — same as Skyrim SE Havok SDK
-	constexpr std::size_t ClipGen_Activate  = 0x4;
-	constexpr std::size_t ClipGen_Update    = 0x5;
-	constexpr std::size_t ClipGen_Deactivate = 0x7;
+	// ===== hkbClipGenerator vtable function indices (Havok 2014, FO4) =====
+	// FO4 ships Havok 2014 — NOT Skyrim's 2010 layout. The lifecycle slots
+	// shifted +3 relative to Skyrim while generate/startEcho stayed put.
+	// (The old values 0x4/0x5/0x7, carried over from the Skyrim OAR port,
+	// attached Activate/Update to inherited base virtuals and Deactivate to
+	// the REAL activate — see GitHub issue #1 and the 2026-07-31 fix.)
+	//
+	// Measured directly from the AE 1.11.221 exe on disk
+	// (tools/Verify-ClipGenVtbl.ps1 + Dump-VtblSlotBodies.ps1):
+	//   slot 4/5 = pointer-identical to hkbBehaviorGraph's vtable slots 4/5
+	//              (inherited hkbBindable/hkbNode defaults — not per-class)
+	//   slot 7   = activate   — body has a RIP-relative LEA to the
+	//              "Invalid clip generator detected" hkError string
+	//   slot 8   = update     — per-class override, 3rd arg float in XMM2
+	//              (matches update(const hkbContext&, hkReal timestep))
+	//   slot 10  = deactivate — per-class override, no float, clears members
+	//   slot 23  = generate   — 0x17, same as Skyrim (unchanged)
+	//   slot 27  = startEcho  — 0x1B, the ONLY per-class override with a
+	//              two-arg (this, float-in-XMM1) signature (unchanged)
+	// Same layout on NG 1.10.984 and OG 1.10.163 (issue #1 measured the OG
+	// vtable bytes at REL::ID(1360555) = 0x142dce288 and NG's slot bodies).
+	// ClipGeneratorHooks::Install() re-verifies the activate slot against
+	// the LOADED image at startup (string-anchor guard) and logs loudly if
+	// a future runtime shuffles the table.
+	constexpr std::size_t ClipGen_Activate  = 0x7;
+	constexpr std::size_t ClipGen_Update    = 0x8;
+	constexpr std::size_t ClipGen_Deactivate = 0xA;
 	constexpr std::size_t ClipGen_Generate  = 0x17;
 	constexpr std::size_t ClipGen_StartEcho = 0x1B;
 

@@ -17,6 +17,16 @@ void RestoreAllActiveReplacements();
 // game thread on the next frame; enabling lets replacement resume on the next
 // clip update. Safe to call from the UI (render) thread.
 void OnGlobalEnabledChanged(bool a_enabled);
+// "Reload All Configs": queues the full teardown + re-parse + lookup rebuild
+// to run on the GAME thread, outside the Havok update cycle. NEVER run the
+// reload directly on the UI (render) thread — the game thread can be mid
+// graph-update holding pointers into the lookup tables the reload destroys
+// (crash-2026-07-31-04-28-26: use-after-free in the clip Update hook).
+void RequestConfigReload();
+// Queues a re-sort of the per-suffix candidate vectors by current SubMod
+// priority (game thread). Call after a priority edit so the change takes
+// effect immediately instead of waiting for a full config reload.
+void RequestLookupResort();
 void SetGameFullyLoaded(bool a_loaded);
 void SetHasActiveReplacements(bool a_has);
 bool HasActiveReplacements();

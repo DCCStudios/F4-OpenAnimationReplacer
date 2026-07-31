@@ -51,6 +51,11 @@ public:
 	const auto& GetPathToSubModsMap() const { return animPathToReplacementsMap; }
 	bool HasReplacementsForPath(const std::string& a_normalizedPath) const;
 
+	// Incremented by ClearAllMods. The UI compares this against the value it
+	// last saw and drops its raw SubMod* selection/popup pointers when it
+	// changed — after a config reload those objects have been destroyed.
+	std::uint64_t GetModsGeneration() const { return modsGeneration.load(std::memory_order_acquire); }
+
 	std::atomic<int> loadingTotalAnims{ 0 };
 	std::atomic<int> loadingParsedAnims{ 0 };
 	std::atomic<int> loadingLoadedAnims{ 0 };
@@ -72,4 +77,6 @@ private:
 
 	mutable std::shared_mutex pathMapMutex;
 	std::unordered_map<std::string, std::vector<ReplacementAnimFileInfo>> animPathToReplacementsMap;
+
+	std::atomic<std::uint64_t> modsGeneration{ 0 };
 };

@@ -1,4 +1,5 @@
 #include "Jobs.h"
+#include "Hooks.h"
 #include "Parsing.h"
 #include "OpenAnimationReplacer.h"
 
@@ -40,7 +41,8 @@ void SaveConfigJob::Run()
 
 void ReloadConfigJob::Run()
 {
-	logger::info("[OAR] Reloading all mod configurations...");
-	OpenAnimationReplacer::GetSingleton()->ClearAllMods();
-	Parsing::ParseAllMods();
+	// The job queue drains on the UI (render) thread, but the reload frees
+	// objects that live graph updates hold pointers to — it must run on the
+	// game thread. Defer to Hooks' game-thread drain (HookedActorUpdate).
+	RequestConfigReload();
 }

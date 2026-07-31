@@ -48,6 +48,18 @@ public:
 		// condition-winning SubMod's actual file is the one that plays.
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
+
+		// Disk identity at load time. A config reload recreates every SubMod,
+		// so `owner` always misses — LoadAnimation matches by filePath instead
+		// and RE-BINDS the entry to the new owner when size+mtime still match,
+		// skipping the disk read/parse/clone rebuild entirely.
+		uint64_t fileSize{ 0 };
+		std::filesystem::file_time_type fileMTime{};
+		// Set by MarkAllForRebind (config reload); cleared when LoadAnimation
+		// re-binds or replaces the entry. Entries still flagged after the
+		// re-parse belong to SubMods that no longer exist — PruneUnrebound
+		// removes them so a deleted submod's file can never play again.
+		bool pendingRebind{ false };
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
@@ -72,6 +84,15 @@ public:
 	void InvalidateRuntimeClones();
 	void Clear();
 
+	// Config-reload support (see CachedAnimation::pendingRebind):
+	// MarkAllForRebind flags every entry BEFORE the re-parse; the preload then
+	// re-binds surviving files in place; PruneUnrebound removes whatever was
+	// not re-bound (its submod was deleted/renamed), retiring clone AND file
+	// buffers because live clips may still reference them. Returns the number
+	// of entries pruned.
+	void MarkAllForRebind();
+	size_t PruneUnrebound();
+
 private:
 	AnimationCache() = default;
 
@@ -85,6 +106,10 @@ private:
 
 	// Move a clone buffer into the keep-alive retirement list and reset the
 	// entry's runtime fields. Caller must hold m_mutex (unique).
+	// a_retireBackingData: also move the entry's fileData into the retirement
+	// record. REQUIRED whenever the entry itself is about to be destroyed or
+	// replaced — the clone's spline data pointers target fileData, and clones
+	// retired on EARLIER invalidations still point into it too.
 	//
 	// WHY: active hkbClipGenerators hold a raw pointer into runtimeStruct.
 	// Clearing/reusing that buffer while the game's render-job thread is still
@@ -94,7 +119,7 @@ private:
 	// vtable is the game's and its data pointers target fileData, which the
 	// cache never frees — so a stale-referencing clip keeps playing it safely
 	// until it deactivates.
-	void RetireCloneLocked(CachedAnimation& a_entry);
+	void RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData = false);
 
 	mutable std::shared_mutex m_mutex;
 	// Retired clone buffers, kept alive because clips may still reference them
@@ -113,6 +138,10 @@ private:
 	{
 		std::vector<uint8_t> buffer;
 		RE::hkaAnimation* clonePtr{ nullptr };
+		// Backing .hkx file buffer of a destroyed/replaced entry (see
+		// RetireCloneLocked's a_retireBackingData). Empty for plain clone
+		// invalidations, where fileData stays in the live entry.
+		std::vector<uint8_t> backingFileData;
 	};
 	std::vector<RetiredClone> m_retiredClones;
 	// One suffix -> all files registered for it (one per SubMod replacing the
