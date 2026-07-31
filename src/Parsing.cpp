@@ -497,6 +497,8 @@ namespace Parsing
 
 		if (json.contains("customBlendTimeOnInterrupt"))
 			a_subMod->customBlendTimeOnInterrupt = json["customBlendTimeOnInterrupt"].get<float>();
+		if (json.contains("customBlendOutTime"))
+			a_subMod->customBlendOutTime = json["customBlendOutTime"].get<float>();
 		if (json.contains("customBlendTimeOnLoop"))
 			a_subMod->customBlendTimeOnLoop = json["customBlendTimeOnLoop"].get<float>();
 		if (json.contains("customBlendTimeOnEcho"))

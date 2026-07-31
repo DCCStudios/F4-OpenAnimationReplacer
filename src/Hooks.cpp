@@ -205,6 +205,9 @@ struct FullBodyBlendState {
 	float blendAlpha = 0.0f;       // 0 = fully original, 1 = fully replacement
 	float blendElapsed = 0.0f;
 	float blendDuration = 0.0f;
+	// SubMod's configured blend-out duration, captured at registration.
+	// Negative = mirror the blend-in duration (default behavior).
+	float blendOutDuration = -1.0f;
 	bool blendingIn = false;       // ramping 0→1
 	bool blendingOut = false;      // ramping 1→0
 	bool poseSnapshotValid = false;
@@ -781,6 +784,23 @@ namespace
 	// Forward-declared — defined below, cleared from ClearClipRuntimeState
 	static std::shared_mutex s_originalAnimMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, RE::hkaAnimation*> s_originalAnimMap;
+
+	// Binding-identity memory for direct path matching: original GAME
+	// hkaAnimation pointer -> the authoritatively resolved REAL path of the
+	// file the engine actually loaded for that binding. Pooled/recycled
+	// hkbClipGenerator instances all play the SAME underlying binding, but the
+	// subgraph walk may succeed for one instance and fail for the next — and
+	// the leaf-match fallback then GUESSES among all same-leaf candidates
+	// (most-specific first). With a weapon that ships every attachment variant
+	// on disk, that guess installed 'p890\fasthands\xmaglrg\wpnreload' for a
+	// clip whose real file was 'p890\wpnreload' (2026-07-31 session log).
+	// A known binding path is PROMOTED to a full authoritative resolution for
+	// new clip instances (see the direct-path defer gate), so path matching —
+	// not leaf guessing — stays in charge across clip pool recycling.
+	// Learned only at Update/poll time (slot is current); never at Activate,
+	// where a recycled clip's slot can still hold the previous clip's anim.
+	static std::shared_mutex s_bindingSuffixMutex;
+	static std::unordered_map<const RE::hkaAnimation*, std::string> s_bindingRealPath;
 
 	// Track the active SubMod per clip for firing custom "on end" events at deactivation.
 	static std::shared_mutex s_activeSubModMutex;
@@ -1495,7 +1515,25 @@ namespace
 	static void NotifyEventSinks(RE::TESObjectREFR* a_refr, const RE::BSFixedString& a_evt)
 	{
 		if (!a_refr) return;
-		static const RE::BSFixedString emptyArg{ "" };
+
+		// The engine delivers annotation events SPLIT at the first '.': the tag
+		// is the handler selector, the payload the argument. Verified against
+		// the game exe's string table, which stores the bare selector
+		// "CullBone" (next to "ReloadComplete") — the bone cull handler matches
+		// the TAG against that and reads the bone name from the PAYLOAD.
+		// Sending the full dotted annotation text as the tag (payload empty)
+		// meant the engine's CullBone/UncullBone handler ignored every
+		// manually-fired cull, so magazine meshes stayed in whatever state the
+		// last NATIVE trigger left them (2026-07-31: P890/SCAR reload mags).
+		// Splitting applies to all dotted events, matching native dispatch.
+		RE::BSFixedString tag = a_evt;
+		RE::BSFixedString payload{ "" };
+		if (const char* full = a_evt.c_str()) {
+			if (const char* dot = std::strchr(full, '.'); dot && dot != full && dot[1] != '\0') {
+				tag = RE::BSFixedString(std::string(full, dot - full).c_str());
+				payload = RE::BSFixedString(dot + 1);
+			}
+		}
 
 		if (REX::FModule::IsRuntimeOG()) {
 			RE::BSScrapArray<RE::BSTEventSource<RE::BSAnimationGraphEvent>*> sources;
@@ -1506,7 +1544,7 @@ namespace
 				// bits (bit-identical to the old refr pointer member), tag is
 				// the event name, payload the argument. Members are const, so
 				// build via aggregate init.
-				RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), a_evt, emptyArg };
+				RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), tag, payload };
 				src->Notify(ge);
 			}
 			return;
@@ -1516,7 +1554,7 @@ namespace
 		// through the object's live vtable, so it also passes through our
 		// AnimGraphEventFeedHook (which logs the event and calls the engine
 		// original) — matching OG, where the registered log sink sees these too.
-		RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), a_evt, emptyArg };
+		RE::BSAnimationGraphEvent ge{ reinterpret_cast<std::uint64_t>(a_refr), tag, payload };
 		auto* sink = reinterpret_cast<RE::BSTEventSink<RE::BSAnimationGraphEvent>*>(
 			reinterpret_cast<uintptr_t>(a_refr) + 0x38);
 		sink->ProcessEvent(ge, nullptr);
@@ -1537,9 +1575,17 @@ namespace
 			// holderID carries the same bits the old refr pointer member did.
 			auto* refr = reinterpret_cast<RE::TESObjectREFR*>(a_event.holderID);
 
-			// Feed every animation event to the Animation Log for the UI
+			// Feed every animation event to the Animation Log for the UI.
+			// Events with a payload (CullBone.X, SoundPlay.X, ...) display as
+			// tag.payload — the engine splits dotted annotations on dispatch,
+			// so tag alone would read as just "CullBone".
 			if (AnimationLog::GetSingleton()->IsEnabled() && refr) {
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, std::string(evtStr));
+				std::string display(evtStr);
+				if (const char* pay = a_event.payload.c_str(); pay && pay[0]) {
+					display += '.';
+					display += pay;
+				}
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display);
 			}
 
 			return RE::BSEventNotifyControl::kContinue;
@@ -1730,6 +1776,12 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		s_originalAnimMap.clear();
+	}
+	{
+		// Binding identities are keyed by GAME animation pointers, which a
+		// save load frees — never let a recycled address inherit a path.
+		std::unique_lock lock(s_bindingSuffixMutex);
+		s_bindingRealPath.clear();
 	}
 	{
 		std::unique_lock lock(s_clipSuffixMutex);
@@ -2909,12 +2961,74 @@ namespace
 	// restore/tracking state is keyed by the old suffix and re-keying
 	// mid-replacement would desync it (the re-key happens on a later poll pass
 	// once the replacement is uninstalled, or on the clip's next activation).
+	// The clip's underlying ORIGINAL game animation (its binding identity),
+	// regardless of whether one of our replacements is currently installed in
+	// the animation slot. Null when the slot is empty (e.g. before the first
+	// activate populates the control) or the original can't be recovered.
+	static RE::hkaAnimation* GetBindingOriginalForClip(RE::hkbClipGenerator* a_clip)
+	{
+		if (!a_clip) return nullptr;
+		{
+			std::shared_lock lock(s_originalAnimMutex);
+			auto it = s_originalAnimMap.find(a_clip);
+			if (it != s_originalAnimMap.end() && it->second) return it->second;
+		}
+		auto** slot = a_clip->GetAnimationSlot();
+		if (!slot || !*slot) return nullptr;
+		auto* cache = AnimationCache::GetSingleton();
+		if (cache->IsOurReplacement(*slot)) {
+			return cache->GetOriginalFromReplacement(*slot);
+		}
+		return *slot;
+	}
+
+	// Record an authoritatively resolved REAL path against the clip's binding
+	// identity (see s_bindingRealPath). Cheap no-op when already recorded.
+	static void LearnBindingPathForClip(RE::hkbClipGenerator* a_clip, const std::string& a_realPath)
+	{
+		if (a_realPath.empty()) return;
+		auto* bindingAnim = GetBindingOriginalForClip(a_clip);
+		if (!bindingAnim) return;
+		{
+			std::shared_lock lock(s_bindingSuffixMutex);
+			auto it = s_bindingRealPath.find(bindingAnim);
+			if (it != s_bindingRealPath.end() && it->second == a_realPath) return;
+		}
+		std::unique_lock lock(s_bindingSuffixMutex);
+		s_bindingRealPath[bindingAnim] = a_realPath;
+	}
+
+	// The real path learned for this clip's binding identity, or empty when
+	// unknown. Leaf-validated: a recycled hkaAnimation address serving a
+	// different animation must not inherit (the caller passes the leaf it
+	// expects for this clip, e.g. from the authored suffix guess).
+	static std::string InheritedBindingPathForClip(RE::hkbClipGenerator* a_clip, const std::string& a_expectedLeaf)
+	{
+		if (a_expectedLeaf.empty()) return {};
+		auto* bindingAnim = GetBindingOriginalForClip(a_clip);
+		if (!bindingAnim) return {};
+		std::string path;
+		{
+			std::shared_lock lock(s_bindingSuffixMutex);
+			auto it = s_bindingRealPath.find(bindingAnim);
+			if (it != s_bindingRealPath.end()) path = it->second;
+		}
+		if (path.empty() || SubgraphGetLeaf(path.c_str()) != a_expectedLeaf) return {};
+		return path;
+	}
+
 	static void EnsureDirectSuffixForClip(RE::hkbClipGenerator* a_clip, const std::string& a_realPath)
 	{
 		if (!Settings::GetSingleton()->bDirectPathMatching || a_realPath.empty()) return;
 
 		const auto exactSuffix = ExtractAnimSuffix(a_realPath);
 		if (exactSuffix.empty()) return;
+
+		// Learn the binding identity BEFORE any early return below: the re-key
+		// itself is deferred while our replacement occupies the slot, but the
+		// resolution is authoritative NOW, and other clip instances of the
+		// same binding need it to resolve without re-walking.
+		LearnBindingPathForClip(a_clip, a_realPath);
 
 		{
 			std::shared_lock lock(s_clipSuffixMutex);
@@ -3391,6 +3505,10 @@ namespace
 				}
 				auto suffix = ExtractAnimSuffix(realPath);
 				if (!suffix.empty()) {
+					// NOTE: deliberately NOT learning the binding identity here.
+					// This runs at Activate time, where a recycled clip's slot
+					// can still hold the PREVIOUS clip's animation — the learn
+					// happens at Update/poll time via EnsureDirectSuffixForClip.
 					bool registered;
 					{
 						std::shared_lock rlock(s_nameLookupMutex);
@@ -4714,7 +4832,23 @@ namespace
 					if (isPlayerClip) {
 						// Resolve the real path NOW — the decision below must be
 						// made against the engine's ground truth, not the guess.
+						// The walk failing does NOT mean the truth is unknown:
+						// another (pooled) clip instance of the same underlying
+						// binding may already have resolved it — inherit that and
+						// promote it to a full authoritative resolution, identical
+						// to a walk success. This keeps PATH matching in charge
+						// across clip pool recycling instead of burning defer
+						// frames and dropping to the leaf-match guess (which
+						// installed 'p890\fasthands\xmaglrg\wpnreload' for a
+						// clip whose real file was 'p890\wpnreload').
 						auto realPath = ResolveClipPathFromSubgraph(a_this, a_context);
+						bool inherited = false;
+						if (realPath.empty()) {
+							std::string leafGuess = suffix;
+							if (leafGuess.rfind("multi:", 0) == 0) leafGuess = leafGuess.substr(6);
+							realPath = InheritedBindingPathForClip(a_this, SubgraphGetLeaf(leafGuess.c_str()));
+							inherited = !realPath.empty();
+						}
 						if (!realPath.empty()) {
 							{
 								std::unique_lock plock(s_clipRealPathMutex);
@@ -4728,6 +4862,13 @@ namespace
 							EnsureDirectSuffixForClip(a_this, realPath);
 							if (auto exact = ExtractAnimSuffix(realPath); !exact.empty()) {
 								suffix = exact;  // match against the REAL path from this frame on
+							}
+							if (inherited) {
+								static std::atomic<int> s_inheritPromoteLog{ 0 };
+								if (s_inheritPromoteLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+									logger::info("[OAR-DirectPath] Clip {:X} inherited binding path '{}' (subgraph walk unavailable)",
+										reinterpret_cast<uintptr_t>(a_this), realPath);
+								}
 							}
 						} else {
 							std::unique_lock slock(s_clipRealPathStateMutex);
@@ -4784,7 +4925,45 @@ namespace
 			RE::TESObjectREFR* multiRefr = GetRefrFromContext(a_context);
 			if (!multiRefr) multiRefr = RE::PlayerCharacter::GetSingleton();
 
+			// Binding-identity safety net. The defer gate normally promotes an
+			// inherited binding path BEFORE the suffix ever reaches here as
+			// "multi:", but some clips arrive in multi mode anyway (gate
+			// skipped while our replacement occupies the slot, non-player
+			// attribution, stale multi suffix cached from a previous frame).
+			// If the real path for this clip's underlying binding is known,
+			// that is ground truth — the condition probe below cannot
+			// discriminate variants whose submods share the same conditions
+			// (all gated on IsEquipped), and its most-specific-first order
+			// then installs the WRONG variant's file. Leaf-validated inside
+			// the helper: a recycled animation address for a different clip
+			// falls through to the normal probe.
+			bool bindingKnown = false;
+			{
+				const auto inheritedPath = InheritedBindingPathForClip(a_this, leafName);
+				if (!inheritedPath.empty()) {
+					const auto inherited = ExtractAnimSuffix(inheritedPath);
+					if (!inherited.empty()) {
+						bindingKnown = true;
+						auto candIt = s_suffixToInfos.find(inherited);
+						if (candIt != s_suffixToInfos.end()) {
+							resolvedSuffix = inherited;
+							candidatesPtr = &candIt->second;
+						}
+						// Registered or not, the identity is settled: when no
+						// replacement exists under the real suffix, fall through
+						// to the no-candidate restore below rather than letting
+						// the probe pick a different variant's file.
+						static std::atomic<int> s_bindInheritLog{ 0 };
+						if (s_bindInheritLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+							logger::info("[OAR-MultiMatch] leaf='{}' inherited binding suffix='{}' (registered={})",
+								leafName, inherited, candidatesPtr != nullptr);
+						}
+					}
+				}
+			}
+
 			// Evaluate each candidate suffix's conditions, most-specific (longest) first
+			if (!bindingKnown)
 			for (auto& candidateSuffix : leafIt->second) {
 				auto candIt = s_suffixToInfos.find(candidateSuffix);
 				if (candIt == s_suffixToInfos.end()) continue;
@@ -5423,42 +5602,81 @@ namespace
 						}
 					}
 
-					// Start full-body blend-in if SubMod has a blend time configured
+					// Start full-body blend-in if SubMod has a blend time configured.
+					// Also register when only a blend-OUT time is set (blend-in 0):
+					// the driver snaps alpha to 1 instantly for a zero blend-in, but
+					// the map entry must exist for the blend-out to run later.
 					float blendTime = (winningInfo && winningInfo->parentSubMod)
 						? winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt() : -1.0f;
 					if (blendTime < 0.0f) blendTime = 0.0f;
-					if (blendTime > 0.0f && originalAnim) {
+					float blendOutCfg = (winningInfo && winningInfo->parentSubMod)
+						? winningInfo->parentSubMod->GetCustomBlendOutTime() : -1.0f;
+					if (originalAnim) {
 						RE::TESObjectREFR* blendActor = refr ? refr : RE::PlayerCharacter::GetSingleton();
 						if (blendActor) {
 							ActorClipKey key{ blendActor, suffix };
 							std::unique_lock fbLock(s_fullBodyBlendMutex);
-							bool isNew = (s_fullBodyBlendMap.find(key) == s_fullBodyBlendMap.end());
-							auto& bs = s_fullBodyBlendMap[key];
+							auto exIt = s_fullBodyBlendMap.find(key);
+							bool isNew = (exIt == s_fullBodyBlendMap.end());
+							// Create an entry only when this submod configures a blend —
+							// but if one already EXISTS, process it even when the new
+							// submod has no blend times: a replacement→replacement
+							// switch must still honor the OUTGOING submod's blend-out.
+							if (blendTime > 0.0f || blendOutCfg > 0.0f || !isNew) {
+							auto& bs = isNew ? s_fullBodyBlendMap[key] : exIt->second;
 							if (isNew || bs.replacement != replacement) {
+								// Default: blend from the vanilla original (fresh
+								// replacement start). On a replacement→replacement
+								// switch (another submod won mid-clip), blend from the
+								// OUTGOING replacement's pose instead, over at least
+								// the outgoing submod's effective blend-out time — the
+								// game never returns to the original in between, so
+								// this is where its blend-out applies.
+								RE::hkaAnimation* blendFrom = originalAnim;
+								bool isSwitch = (!isNew && bs.replacement && bs.replacement != replacement);
+								if (isSwitch) {
+									blendFrom = bs.replacement;
+									// Outgoing effective blend-out: its configured out
+									// time, or (mirror default) its current blendDuration
+									// (the in time while blending in / steady, or the out
+									// time if it was already blending out).
+									float outgoingOut = (bs.blendOutDuration >= 0.0f)
+										? bs.blendOutDuration : bs.blendDuration;
+									if (outgoingOut > blendTime) blendTime = outgoingOut;
+								}
 								bs.replacement = replacement;
-								bs.original = originalAnim;
+								bs.original = blendFrom;
 								bs.ownerClip = a_this;
 								bs.blendElapsed = 0.0f;
-								bs.blendAlpha = 0.0f;
-								bs.blendingIn = true;
+								// Zero blend-in (entry exists only for its blend-out):
+								// start settled at alpha 1 so Generate never outputs a
+								// frame of the original pose while "blending in".
+								bs.blendAlpha = (blendTime > 0.0f) ? 0.0f : 1.0f;
+								bs.blendingIn = (blendTime > 0.0f);
 								bs.blendingOut = false;
 								bs.blendDuration = blendTime;
+								bs.blendOutDuration = blendOutCfg;
 								bs.poseSnapshotValid = false;
 								bs.poseSnapshot.clear();
 								if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
 								static int s_fbRegLog = 0;
 								if (s_fbRegLog < 10) {
-									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s",
-										suffix, blendTime);
+									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s switch={}",
+										suffix, blendTime, isSwitch);
 									s_fbRegLog++;
 								}
 							} else if (bs.blendingOut) {
-								// Re-activation during blend-out: cancel, resume blend-in
+								// Re-activation during blend-out: cancel, resume blend-in.
+								// blendDuration currently holds the blend-OUT time (set
+								// when the blend-out started) — restore the in time.
 								bs.blendingOut = false;
-								bs.blendingIn = true;
+								bs.blendingIn = (blendTime > 0.0f);
+								if (!bs.blendingIn) bs.blendAlpha = 1.0f;
 								bs.blendElapsed = 0.0f;
+								bs.blendDuration = blendTime;
 								bs.poseSnapshotValid = false;
 								bs.ownerClip = a_this;
+							}
 							}
 						}
 					}
@@ -5566,13 +5784,23 @@ namespace
 				// state machine briefly Updates clips that aren't really playing
 				// (e.g. wpnequipfast while melee resolves). Their localTime often
 				// jumps 0 → end in one frame; catch-up then dumps every SoundPlay.
-				// Skip ALL emission (including SoundPlay) while nested, and seek
-				// the tracker forward so the next real Update doesn't catch-up-dump.
+				// Nested updates are fully PASSIVE here: no firing (synchronous
+				// dispatch mid-graph-update is unsafe/dropped) and no seeking.
+				// Seeking forward while nested marked annotations between two real
+				// Updates as already fired — the graph is busiest with notifies
+				// right at animation start (equip/reload events, our own annotation
+				// dispatch), which is why early CullBone/UncullBone annotations
+				// were being swallowed. The next REAL Update fires the whole
+				// [prev, cur] window through the normal path instead.
 				const bool nestedNotify = (s_notifyAnimGraphDepth > 0);
-				// Max gap we'll still treat as continuous playback (~3 frames at 30fps).
-				// Larger jumps = seek without firing (time teleport / ghost complete).
-				constexpr float kMaxAnnotCatchUpSec = 0.12f;
-				constexpr float kInitSeekThresholdSec = 0.05f;
+				// Max gap we'll still treat as continuous playback. Generous on
+				// purpose: equip/reload starts routinely hitch 100-300ms while
+				// assets load, and a smaller cap (was 0.12) turned every hitch
+				// into a silent seek that dropped early annotations. Jumps larger
+				// than this = seek without firing sounds (time teleport / ghost
+				// complete), but bone-visibility annotations are still replayed —
+				// see replayBoneVisAnnots below.
+				constexpr float kMaxAnnotCatchUpSec = 0.30f;
 
 				auto seekIndexToTime = [&](float t) -> int32_t {
 					int32_t idx = -1;
@@ -5581,6 +5809,31 @@ namespace
 						else break;
 					}
 					return idx;
+				};
+
+				// CullBone./UncullBone. annotations are STATE, not one-shot events:
+				// dropping one desyncs bone visibility for the rest of the session
+				// (a culled magazine stays invisible until something unculls it).
+				auto isBoneVisAnnot = [](const std::string& t) -> bool {
+					return _strnicmp(t.c_str(), "CullBone.", 9) == 0 ||
+					       _strnicmp(t.c_str(), "UncullBone.", 11) == 0;
+				};
+
+				// When a seek skips annotations without firing them, the skipped
+				// bone-visibility annotations are still replayed in order so the
+				// authored cull state at the destination time is reached. They are
+				// idempotent per bone, so replaying is always safe; sounds and
+				// graph events stay dropped (firing a 2-second-old SoundPlay dump
+				// is exactly what the seek exists to prevent).
+				auto replayBoneVisAnnots = [&](int32_t fromIdx, int32_t toIdx,
+					std::vector<std::string>& out) {
+					for (int32_t i = fromIdx; i <= toIdx &&
+						i < static_cast<int32_t>(annotations->size()); ++i) {
+						if (i < 0) continue;
+						if (isBoneVisAnnot((*annotations)[i].text)) {
+							out.push_back((*annotations)[i].text);
+						}
+					}
 				};
 
 				{
@@ -5596,15 +5849,20 @@ namespace
 								annotSuffix, annotations->size(), localTime, nestedNotify);
 							s_annotInitLog++;
 						}
-						// Late join / ghost activate already past the start: seek
-						// silently so we don't dump every annotation up to localTime.
-						if (nestedNotify || localTime > kInitSeekThresholdSec) {
-							astate.prevLocalTime = localTime;
-							astate.lastFiredIndex = seekIndexToTime(localTime);
-						} else {
-							astate.prevLocalTime = 0.f;
-							astate.lastFiredIndex = -1;
-						}
+						// Always start the window pinned at 0 — even when nested, and
+						// even when localTime is already past the start. Replacement
+						// swaps install during the activation frame's NESTED graph
+						// update; seeking here marked the t=0 annotations as already
+						// fired, and bone-visibility STATE SETUP lives at t=0 (P890
+						// reload: UncullBone.WeaponExtra3 / CullBone.
+						// Weaponmagazinechild3) — swallowing it left the spare
+						// magazine mesh permanently hidden. The first REAL Update
+						// decides what happens: a small gap fires everything in
+						// [0, curT] normally; a genuine late join / ghost jump hits
+						// the dt guard below, which seeks but still replays the
+						// skipped bone-visibility annotations.
+						astate.prevLocalTime = 0.f;
+						astate.lastFiredIndex = -1;
 					}
 
 					if (localTime >= 0.f && !nestedNotify) {
@@ -5626,7 +5884,9 @@ namespace
 									loopPath, ClassifyClipPerspective(a_this, loopPath));
 							}
 							// Loop wrap: only fire the remaining tail if the gap is
-							// small; a huge wrap after a teleport is a seek, not a play.
+							// small; a huge wrap after a teleport is a seek, not a
+							// play — but bone-visibility state in the tail must still
+							// land (see replayBoneVisAnnots).
 							if ((astate.prevLocalTime - curT) <= kMaxAnnotCatchUpSec) {
 								for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
 									auto& ann = (*annotations)[i];
@@ -5634,6 +5894,9 @@ namespace
 										toFire.push_back(ann.text);
 									}
 								}
+							} else {
+								replayBoneVisAnnots(astate.lastFiredIndex + 1,
+									static_cast<int32_t>(annotations->size()) - 1, toFire);
 							}
 							astate.lastFiredIndex = -1;
 							prevT = 0.f;
@@ -5660,14 +5923,18 @@ namespace
 
 						const float dt = curT - prevT;
 						if (dt > kMaxAnnotCatchUpSec) {
-							// Time jumped (ghost complete / scrub) — seek, don't dump.
+							// Time jumped (ghost complete / scrub / late join) — seek
+							// without dumping sounds, but replay the skipped
+							// bone-visibility annotations so cull state stays correct.
+							const int32_t seekIdx = seekIndexToTime(curT);
+							replayBoneVisAnnots(astate.lastFiredIndex + 1, seekIdx, toFire);
 							static int s_seekLog = 0;
 							if (s_seekLog < 30) {
-								logger::info("[OAR-Annot] Seek (no fire) '{}' prev={:.3f} cur={:.3f} (dt={:.3f})",
-									annotSuffix, prevT, curT, dt);
+								logger::info("[OAR-Annot] Seek '{}' prev={:.3f} cur={:.3f} (dt={:.3f}, replaying {} bone-vis annots)",
+									annotSuffix, prevT, curT, dt, toFire.size());
 								s_seekLog++;
 							}
-							astate.lastFiredIndex = seekIndexToTime(curT);
+							astate.lastFiredIndex = seekIdx;
 						} else {
 							for (int32_t i = astate.lastFiredIndex + 1; i < static_cast<int32_t>(annotations->size()); ++i) {
 								auto& ann = (*annotations)[i];
@@ -5679,18 +5946,25 @@ namespace
 							}
 						}
 					} else if (nestedNotify) {
-						// Keep tracker aligned with the ghost clip's time so a later
-						// real Update doesn't treat the whole anim as a catch-up gap.
-						astate.prevLocalTime = localTime;
-						astate.lastFiredIndex = seekIndexToTime(localTime);
+						// Nested update: fully passive. No firing (unsafe mid-graph-
+						// update) and no seeking — advancing lastFiredIndex here
+						// swallowed annotations that a real Update between notifies
+						// had not fired yet. The tracker keeps its last real-Update
+						// position; the next real Update fires (small gap) or seeks
+						// with bone-vis replay (big gap). Ghosts that only ever see
+						// nested updates therefore fire nothing, same as before.
 						static int s_nestSkipLog = 0;
 						if (s_nestSkipLog < 30) {
-							logger::info("[OAR-Annot] Nested Update — suppressed all annots for '{}' at t={:.3f}",
-								annotSuffix, localTime);
+							logger::info("[OAR-Annot] Nested Update — passive for '{}' at t={:.3f} (tracker at {:.3f})",
+								annotSuffix, localTime, astate.prevLocalTime);
 							s_nestSkipLog++;
 						}
 					}
-					astate.prevLocalTime = localTime;
+					// Only real Updates advance the window; nested updates must not
+					// move prevLocalTime past annotations they didn't fire.
+					if (!nestedNotify && localTime >= 0.f) {
+						astate.prevLocalTime = localTime;
+					}
 				}
 				// Lock released — drop suppressed annotations before firing.
 				// "suppressAnnotations" in the winning SubMod's config mutes
@@ -5870,8 +6144,12 @@ namespace
 						// Steady state — start blend-out.
 						// Swap slot to original NOW so Generate outputs original.
 						// The snapshot (captured on first Generate frame) will be replacement.
+						// A configured blend-out time (>= 0) wins; negative means
+						// mirror the blend-in duration (the original behavior).
 						float blendOutTime = 0.0f;
-						if (it->second.blendDuration > 0.0f) {
+						if (it->second.blendOutDuration >= 0.0f) {
+							blendOutTime = it->second.blendOutDuration;
+						} else if (it->second.blendDuration > 0.0f) {
 							blendOutTime = it->second.blendDuration;
 						}
 						if (blendOutTime > 0.0f) {
@@ -5891,6 +6169,12 @@ namespace
 									suffix, blendOutTime);
 								s_fbBoLog++;
 							}
+						} else {
+							// Explicit blend-out of 0 (instant): take the immediate
+							// restore path below, and erase the blend entry now so
+							// it doesn't linger with stale clip/animation pointers.
+							s_fullBodyBlendMap.erase(it);
+							s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
 						}
 					}
 				}
@@ -6172,7 +6456,24 @@ namespace
 						}
 					}
 
-					if ((fbBlendingIn || fbBlendingOut) && fbAlpha > 0.001f && fbAlpha < 0.999f && fbOrigAnim && fbRepAnim) {
+					// Boundary alphas are INCLUDED on purpose — they are not no-ops.
+					// Blend-in frame 1 has alpha=0.0 with the replacement already in
+					// the slot: the apply (lerp weight 1.0 toward the original-pose
+					// snapshot) is what makes that frame render as the original.
+					// Blend-out frame 1 has alpha=1.0 with the original already back
+					// in the slot: the apply is what keeps that frame rendering the
+					// replacement. Excluding them (the old > 0.001 && < 0.999 gate)
+					// produced a one-frame flash of the wrong pose at the start of
+					// every blend, in both directions (verified from the 2026-07-30
+					// session log: first blend-in apply was a=0.003 one frame AFTER
+					// the swap, so the swap frame rendered the raw replacement).
+					// The far boundary of each direction stays excluded: there the
+					// lerp genuinely converges to the live pose, and blend-out
+					// entries at alpha<=0.001 are erased by the driver anyway.
+					const bool fbApplicable =
+						(fbBlendingIn && fbAlpha < 0.999f) ||
+						(fbBlendingOut && fbAlpha > 0.001f);
+					if (fbApplicable && fbOrigAnim && fbRepAnim) {
 						auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
 						if (tracksPtr) {
 							auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
@@ -7473,7 +7774,14 @@ namespace Hooks
 				// reliable than holderID, which the engine sometimes leaves 0.
 				auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
 					reinterpret_cast<uintptr_t>(a_sinkThis) - 0x38);
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, std::string(evtStr));
+				// Display tag.payload for dotted annotation events (see the
+				// registered-sink feed for rationale).
+				std::string display(evtStr);
+				if (const char* pay = a_event.payload.c_str(); pay && pay[0]) {
+					display += '.';
+					display += pay;
+				}
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display);
 			}
 			return a_original(a_sinkThis, a_event, a_source);
 		}

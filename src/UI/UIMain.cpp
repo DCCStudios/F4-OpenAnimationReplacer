@@ -518,6 +518,17 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		}
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Custom blend duration in seconds when interrupting. Default: 0.20s. Set negative to use default.");
 
+		float blendOut = a_subMod->GetCustomBlendOutTime();
+		ImGui::SetNextItemWidth(80);
+		if (ImGui::InputFloat("Blend out time (?)", &blendOut, 0, 0, "%.2f")) {
+			a_subMod->customBlendOutTime = blendOut;
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Full-body blend duration in seconds when this replacement ends\n"
+			"(conditions become false). Set negative to use the blend-in time\n"
+			"above (default behavior). 0 = instant snap back to the original.");
+
 		float deactivDelay = a_subMod->GetDeactivationDelay();
 		ImGui::SetNextItemWidth(80);
 		if (ImGui::InputFloat("Deactivation Delay (?)", &deactivDelay, 0, 0, "%.2f")) {
@@ -764,6 +775,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["suppressAnnotations"] = a_subMod->suppressedAnnotations;
 			if (a_subMod->GetCustomBlendTimeOnInterrupt() >= 0.f)
 				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
+			if (a_subMod->GetCustomBlendOutTime() >= 0.f)
+				json["customBlendOutTime"] = a_subMod->GetCustomBlendOutTime();
 			if (a_subMod->GetDeactivationDelay() > 0.0f)
 				json["deactivationDelay"] = a_subMod->GetDeactivationDelay();
 			if (a_subMod->GetPlayOnceFullBody())
