@@ -205,9 +205,6 @@ struct FullBodyBlendState {
 	float blendAlpha = 0.0f;       // 0 = fully original, 1 = fully replacement
 	float blendElapsed = 0.0f;
 	float blendDuration = 0.0f;
-	// SubMod's configured blend-out duration, captured at registration.
-	// Negative = mirror the blend-in duration (default behavior).
-	float blendOutDuration = -1.0f;
 	bool blendingIn = false;       // ramping 0→1
 	bool blendingOut = false;      // ramping 1→0
 	bool poseSnapshotValid = false;
@@ -3850,24 +3847,8 @@ namespace
 		return nullptr;
 	}
 
-	// Drops every per-clip state entry keyed on this clip pointer (defined
-	// above hkbClipGenerator_Deactivate; shared by Deactivate and the
-	// recycled-address guard at the top of Activate).
-	static void EraseClipState(RE::hkbClipGenerator* a_this);
-
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
-		// Fresh-start guard. With the vfunc indices corrected (Offsets.h,
-		// 2026-07-31) this handler runs at the REAL activate. Per-clip state
-		// is normally erased at real deactivate, but a graph torn down
-		// wholesale can skip per-clip deactivation — erase defensively so a
-		// recycled clip address can never inherit the previous clip's state
-		// (stale refr/animation pointers reachable through leftover state
-		// were implicated in the crash-2026-07-31-02-22-09 execute-AV).
-		// This also matches the pre-fix behavior, where the misplaced
-		// "Deactivate" handler performed exactly this cleanup at activation.
-		EraseClipState(a_this);
-
 		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
 		// the original _Activate runs. This ensures the hkaDefaultAnimationControl
 		// is built from our clone (which has NULLed annotationTracks), preventing
@@ -5442,81 +5423,42 @@ namespace
 						}
 					}
 
-					// Start full-body blend-in if SubMod has a blend time configured.
-					// Also register when only a blend-OUT time is set (blend-in 0):
-					// the driver snaps alpha to 1 instantly for a zero blend-in, but
-					// the map entry must exist for the blend-out to run later.
+					// Start full-body blend-in if SubMod has a blend time configured
 					float blendTime = (winningInfo && winningInfo->parentSubMod)
 						? winningInfo->parentSubMod->GetCustomBlendTimeOnInterrupt() : -1.0f;
 					if (blendTime < 0.0f) blendTime = 0.0f;
-					float blendOutCfg = (winningInfo && winningInfo->parentSubMod)
-						? winningInfo->parentSubMod->GetCustomBlendOutTime() : -1.0f;
-					if (originalAnim) {
+					if (blendTime > 0.0f && originalAnim) {
 						RE::TESObjectREFR* blendActor = refr ? refr : RE::PlayerCharacter::GetSingleton();
 						if (blendActor) {
 							ActorClipKey key{ blendActor, suffix };
 							std::unique_lock fbLock(s_fullBodyBlendMutex);
-							auto exIt = s_fullBodyBlendMap.find(key);
-							bool isNew = (exIt == s_fullBodyBlendMap.end());
-							// Create an entry only when this submod configures a blend —
-							// but if one already EXISTS, process it even when the new
-							// submod has no blend times: a replacement→replacement
-							// switch must still honor the OUTGOING submod's blend-out.
-							if (blendTime > 0.0f || blendOutCfg > 0.0f || !isNew) {
-							auto& bs = isNew ? s_fullBodyBlendMap[key] : exIt->second;
+							bool isNew = (s_fullBodyBlendMap.find(key) == s_fullBodyBlendMap.end());
+							auto& bs = s_fullBodyBlendMap[key];
 							if (isNew || bs.replacement != replacement) {
-								// Default: blend from the vanilla original (fresh
-								// replacement start). On a replacement→replacement
-								// switch (another submod won mid-clip), blend from the
-								// OUTGOING replacement's pose instead, over at least
-								// the outgoing submod's effective blend-out time — the
-								// game never returns to the original in between, so
-								// this is where its blend-out applies.
-								RE::hkaAnimation* blendFrom = originalAnim;
-								bool isSwitch = (!isNew && bs.replacement && bs.replacement != replacement);
-								if (isSwitch) {
-									blendFrom = bs.replacement;
-									// Outgoing effective blend-out: its configured out
-									// time, or (mirror default) its current blendDuration
-									// (the in time while blending in / steady, or the out
-									// time if it was already blending out).
-									float outgoingOut = (bs.blendOutDuration >= 0.0f)
-										? bs.blendOutDuration : bs.blendDuration;
-									if (outgoingOut > blendTime) blendTime = outgoingOut;
-								}
 								bs.replacement = replacement;
-								bs.original = blendFrom;
+								bs.original = originalAnim;
 								bs.ownerClip = a_this;
 								bs.blendElapsed = 0.0f;
-								// Zero blend-in (entry exists only for its blend-out):
-								// start settled at alpha 1 so Generate never outputs a
-								// frame of the original pose while "blending in".
-								bs.blendAlpha = (blendTime > 0.0f) ? 0.0f : 1.0f;
-								bs.blendingIn = (blendTime > 0.0f);
+								bs.blendAlpha = 0.0f;
+								bs.blendingIn = true;
 								bs.blendingOut = false;
 								bs.blendDuration = blendTime;
-								bs.blendOutDuration = blendOutCfg;
 								bs.poseSnapshotValid = false;
 								bs.poseSnapshot.clear();
 								if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
 								static int s_fbRegLog = 0;
 								if (s_fbRegLog < 10) {
-									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s switch={}",
-										suffix, blendTime, isSwitch);
+									logger::info("[OAR-FullBodyBlend] Registered blend-in: suffix='{}' dur={:.2f}s",
+										suffix, blendTime);
 									s_fbRegLog++;
 								}
 							} else if (bs.blendingOut) {
-								// Re-activation during blend-out: cancel, resume blend-in.
-								// blendDuration currently holds the blend-OUT time (set
-								// when the blend-out started) — restore the in time.
+								// Re-activation during blend-out: cancel, resume blend-in
 								bs.blendingOut = false;
-								bs.blendingIn = (blendTime > 0.0f);
-								if (!bs.blendingIn) bs.blendAlpha = 1.0f;
+								bs.blendingIn = true;
 								bs.blendElapsed = 0.0f;
-								bs.blendDuration = blendTime;
 								bs.poseSnapshotValid = false;
 								bs.ownerClip = a_this;
-							}
 							}
 						}
 					}
@@ -5928,12 +5870,8 @@ namespace
 						// Steady state — start blend-out.
 						// Swap slot to original NOW so Generate outputs original.
 						// The snapshot (captured on first Generate frame) will be replacement.
-						// A configured blend-out time (>= 0) wins; negative means
-						// mirror the blend-in duration (the original behavior).
 						float blendOutTime = 0.0f;
-						if (it->second.blendOutDuration >= 0.0f) {
-							blendOutTime = it->second.blendOutDuration;
-						} else if (it->second.blendDuration > 0.0f) {
+						if (it->second.blendDuration > 0.0f) {
 							blendOutTime = it->second.blendDuration;
 						}
 						if (blendOutTime > 0.0f) {
@@ -5953,12 +5891,6 @@ namespace
 									suffix, blendOutTime);
 								s_fbBoLog++;
 							}
-						} else {
-							// Explicit blend-out of 0 (instant): take the immediate
-							// restore path below, and erase the blend entry now so
-							// it doesn't linger with stale clip/animation pointers.
-							s_fullBodyBlendMap.erase(it);
-							s_fullBodyBlendActiveCount.fetch_sub(1, std::memory_order_relaxed);
 						}
 					}
 				}
@@ -6055,100 +5987,8 @@ namespace
 	}
 	}
 
-	// All per-clip state erasures for one clip pointer, with no side effects
-	// (no event firing, no annotation flushing, no pointer writes into the
-	// clip). Called from hkbClipGenerator_Deactivate after its flush/restore
-	// work, and from the top of hkbClipGenerator_Activate as a guard against
-	// recycled clip addresses whose deactivation was skipped (wholesale graph
-	// teardown does not deactivate clips one by one).
-	static void EraseClipState(RE::hkbClipGenerator* a_this)
-	{
-		if (!a_this) return;
-		{
-			std::unique_lock lock(s_triggersBackupMutex);
-			s_triggersBackup.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_originalAnimMutex);
-			s_originalAnimMap.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_clipSuffixMutex);
-			s_clipSuffixCache.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_clipRealPathMutex);
-			s_clipRealPathCache.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_clipRealPathStateMutex);
-			s_clipRealPathAuthoritative.erase(a_this);
-			s_clipRealPathAttempts.erase(a_this);
-			s_pendingActivateLog.erase(a_this);
-		}
-		{
-			// The per-frame poll rebuilds this map, but erase eagerly so a
-			// recycled clip address can't inherit stale player membership.
-			std::unique_lock lock(s_playerClipMutex);
-			s_playerClipGraph.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_clipVariantMutex);
-			s_clipVariantCache.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_annotStateMutex);
-			s_annotStateMap.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_bypassMutex);
-			s_bypassSet.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_playOnceDecisionMutex);
-			s_playOnceDecision.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_loopEchoFlagMutex);
-			s_clipLoopPending.erase(a_this);
-			s_clipEchoPending.erase(a_this);
-		}
-		{
-			std::unique_lock lock(s_deactDelayMutex);
-			s_deactivationDelay.erase(a_this);
-		}
-		{
-			std::unique_lock smLock(s_activeSubModMutex);
-			s_activeSubModMap.erase(a_this);
-		}
-		{
-			std::lock_guard rg(s_triggersRestoredMutex);
-			s_triggersRestoredSet.erase(a_this);
-		}
-		// Remove this clip from any track filter source sets to prevent stale
-		// pointers from being used if a new clip is allocated at the same address.
-		// Do NOT erase the entry when sourceClips becomes empty — keep the cached
-		// override alive so non-source clips continue receiving the correct values
-		// during animation transitions (e.g., idle→fire→idle). The staleness
-		// mechanism (kTrackFilterStaleFrames) will clean up entries that never get
-		// a new source clip registered.
-		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
-			std::unique_lock tfLock(s_trackFilterMutex);
-			for (auto& [actor, states] : s_charTrackFilterMap) {
-				for (auto& state : states) {
-					state.sourceClips.erase(a_this);
-					if (state.sourceClip == a_this) state.sourceClip = nullptr;
-				}
-			}
-		}
-	}
-
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
-		// NOTE (2026-07-31, corrected vfunc slots): this handler now runs at
-		// the REAL deactivate. Before the fix it was attached to slot 7 (the
-		// real ACTIVATE), so all of this cleanup ran at the start of the next
-		// activation at the same address and nothing ever ran at clip end.
 		if (a_this) {
 			// Flush a still-pending kActivate log entry BEFORE dropping the
 			// per-clip state below. Short-lived clips (fire animations,
@@ -6179,28 +6019,71 @@ namespace
 
 			// End-of-clip annotation flush — see FlushPendingEndAnnotations. Runs
 			// before the state erasures below (needs the annot state and the
-			// active-submod entry) and before the engine releases the clip's
-			// control (needs the clone still in the animation slot for the
-			// duration read).
+			// active-submod entry) and before the engine frees the clip (needs
+			// the clone still in the animation slot for the duration read).
 			{
 				auto* deactRefr = GetRefrFromContext(a_context);
 				FlushPendingEndAnnotations(a_this, deactRefr, "deactivate");
 			}
 
-			// Hand the engine back its native trigger arrays BEFORE the original
-			// deactivate runs, so it releases them exactly as vanilla would.
-			// The clip object itself stays alive across deactivate (deactivate
-			// is not destruction), so the backed-up pointers are still valid
-			// here. Without this, a clip left dormant with our filtered array
-			// installed loses its native triggers permanently: the backup is
-			// erased below, and the next activation snapshots the filtered
-			// array as "original" — a no-winner re-activation then plays with
-			// no native annotations (missing end sounds). No-op when no
-			// backup exists.
-			RestoreClipTriggers(a_this);
-
-			// Fire custom "on end" events (needs s_activeSubModMap, so this
-			// runs before the erasure below).
+			// Do NOT restore the original animation or triggers during deactivation.
+			// The clip is being freed and ALL backed-up pointers (animation, triggers)
+			// will become stale. If the address is recycled by a new clip, stale entries
+			// would cause crashes. Erase everything for this clip.
+			{
+				std::unique_lock lock(s_triggersBackupMutex);
+				s_triggersBackup.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_originalAnimMutex);
+				s_originalAnimMap.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipSuffixMutex);
+				s_clipSuffixCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipRealPathMutex);
+				s_clipRealPathCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipRealPathStateMutex);
+				s_clipRealPathAuthoritative.erase(a_this);
+				s_clipRealPathAttempts.erase(a_this);
+				s_pendingActivateLog.erase(a_this);
+			}
+			{
+				// The per-frame poll rebuilds this map, but erase eagerly so a
+				// recycled clip address can't inherit stale player membership.
+				std::unique_lock lock(s_playerClipMutex);
+				s_playerClipGraph.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_clipVariantMutex);
+				s_clipVariantCache.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_annotStateMutex);
+				s_annotStateMap.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_bypassMutex);
+				s_bypassSet.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_playOnceDecisionMutex);
+				s_playOnceDecision.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_loopEchoFlagMutex);
+				s_clipLoopPending.erase(a_this);
+				s_clipEchoPending.erase(a_this);
+			}
+			{
+				std::unique_lock lock(s_deactDelayMutex);
+				s_deactivationDelay.erase(a_this);
+			}
+			// Fire custom "on end" events at deactivation + reset variant state if kOnEachPlay
 			{
 				std::shared_lock smLock(s_activeSubModMutex);
 				auto smIt = s_activeSubModMap.find(a_this);
@@ -6210,18 +6093,35 @@ namespace
 					if (deactRefr) {
 						QueueCustomEvents(deactRefr, smIt->second->eventsOnEnd, "onEnd/deactivate");
 
-						// kOnEachPlay uses per-clip cache (s_clipVariantCache),
-						// erased in EraseClipState — no actor-keyed reset needed.
+						// kOnEachPlay uses per-clip cache (s_clipVariantCache) which is
+						// erased above — no actor-keyed reset needed.
 					}
 				}
 			}
-
-			// Do NOT restore the original ANIMATION pointer here — the cached
-			// clone is engine-visible in the slot and stays valid (owned by
-			// the AnimationCache); re-activation rebuilds the control from
-			// whatever is in the slot, and the Update hook re-evaluates. Drop
-			// all per-clip bookkeeping so a recycled address starts clean.
-			EraseClipState(a_this);
+			{
+				std::unique_lock smLock(s_activeSubModMutex);
+				s_activeSubModMap.erase(a_this);
+			}
+			{
+				std::lock_guard rg(s_triggersRestoredMutex);
+				s_triggersRestoredSet.erase(a_this);
+			}
+			// Remove this clip from any track filter source sets to prevent stale
+			// pointers from being used if a new clip is allocated at the same address.
+			// Do NOT erase the entry when sourceClips becomes empty — keep the cached
+			// override alive so non-source clips continue receiving the correct values
+			// during animation transitions (e.g., idle→fire→idle). The staleness
+			// mechanism (kTrackFilterStaleFrames) will clean up entries that never get
+			// a new source clip registered.
+			if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
+				std::unique_lock tfLock(s_trackFilterMutex);
+				for (auto& [actor, states] : s_charTrackFilterMap) {
+					for (auto& state : states) {
+						state.sourceClips.erase(a_this);
+						if (state.sourceClip == a_this) state.sourceClip = nullptr;
+					}
+				}
+			}
 		}
 
 		Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
@@ -6272,24 +6172,7 @@ namespace
 						}
 					}
 
-					// Boundary alphas are INCLUDED on purpose — they are not no-ops.
-					// Blend-in frame 1 has alpha=0.0 with the replacement already in
-					// the slot: the apply (lerp weight 1.0 toward the original-pose
-					// snapshot) is what makes that frame render as the original.
-					// Blend-out frame 1 has alpha=1.0 with the original already back
-					// in the slot: the apply is what keeps that frame rendering the
-					// replacement. Excluding them (the old > 0.001 && < 0.999 gate)
-					// produced a one-frame flash of the wrong pose at the start of
-					// every blend, in both directions (verified from the 2026-07-30
-					// session log: first blend-in apply was a=0.003 one frame AFTER
-					// the swap, so the swap frame rendered the raw replacement).
-					// The far boundary of each direction stays excluded: there the
-					// lerp genuinely converges to the live pose, and blend-out
-					// entries at alpha<=0.001 are erased by the driver anyway.
-					const bool fbApplicable =
-						(fbBlendingIn && fbAlpha < 0.999f) ||
-						(fbBlendingOut && fbAlpha > 0.001f);
-					if (fbApplicable && fbOrigAnim && fbRepAnim) {
+					if ((fbBlendingIn || fbBlendingOut) && fbAlpha > 0.001f && fbAlpha < 0.999f && fbOrigAnim && fbRepAnim) {
 						auto* tracksPtr = *reinterpret_cast<uint8_t**>(&a_output);
 						if (tracksPtr) {
 							auto* headers = reinterpret_cast<RE::TrackHeaderRaw*>(tracksPtr + sizeof(RE::TrackMasterHeaderRaw));
@@ -8076,54 +7959,9 @@ namespace Hooks
 
 	namespace ClipGeneratorHooks
 	{
-		// Layout guard: hkbClipGenerator::activate is the one slot with an
-		// unambiguous fingerprint — its body raises hkError with the
-		// "Invalid clip generator detected ..." string. Scan the slot target
-		// for a RIP-relative LEA resolving to that string in the LOADED image
-		// (works on OG too, where the on-disk exe is DRM-packed). Catches any
-		// future runtime shuffling the vtable in a way address-library IDs
-		// can't express (the Skyrim-layout bug this guards against shipped
-		// for weeks without a crash at install time).
-		static bool ActivateSlotHasFingerprint(uintptr_t a_target)
-		{
-			static constexpr char kNeedle[] = "Invalid clip generator";
-			constexpr int kScanLen = 0x600;
-			if (!a_target) return false;
-			auto* body = reinterpret_cast<uint8_t*>(a_target);
-			for (int i = 0; i < kScanLen - 7; i++) {
-				if (IsBadReadPtr(body + i, 8)) break;
-				const uint8_t rex = body[i];
-				if (rex != 0x48 && rex != 0x4C) continue;
-				if (body[i + 1] != 0x8D) continue;               // LEA r64, [rip+disp32]
-				if ((body[i + 2] & 0xC7) != 0x05) continue;      // ModRM: RIP-relative
-				const auto disp = *reinterpret_cast<const int32_t*>(body + i + 3);
-				const auto resolved = a_target + i + 7 + static_cast<intptr_t>(disp);
-				if (IsBadReadPtr(reinterpret_cast<void*>(resolved), sizeof(kNeedle) - 1)) continue;
-				if (std::memcmp(reinterpret_cast<const void*>(resolved), kNeedle, sizeof(kNeedle) - 1) == 0) {
-					return true;
-				}
-			}
-			return false;
-		}
-
 		void Install()
 		{
 			auto& vtbl = Offsets::hkbClipGenerator_vtbl;
-
-			const auto activateTarget =
-				*reinterpret_cast<uintptr_t*>(vtbl.address() + Offsets::ClipGen_Activate * 8);
-			if (ActivateSlotHasFingerprint(activateTarget)) {
-				logger::info("[OAR] ClipGen vtable layout verified: slot {:#x} ({:X}) is activate "
-					"(references the 'Invalid clip generator' hkError string)",
-					Offsets::ClipGen_Activate, activateTarget);
-			} else {
-				// Install anyway (a scanner false negative must not brick the
-				// mod), but make the failure impossible to miss in the log.
-				logger::error("[OAR] ClipGen vtable layout check FAILED: slot {:#x} target {:X} does not "
-					"reference the 'Invalid clip generator' string. Lifecycle hooks may be attached to "
-					"the wrong virtuals on this runtime — please report this along with your game version.",
-					Offsets::ClipGen_Activate, activateTarget);
-			}
 
 			_Activate   = reinterpret_cast<ActivateFn>(vtbl.write_vfunc(Offsets::ClipGen_Activate, hkbClipGenerator_Activate));
 			_Update     = reinterpret_cast<UpdateFn>(vtbl.write_vfunc(Offsets::ClipGen_Update, hkbClipGenerator_Update));
@@ -8131,10 +7969,7 @@ namespace Hooks
 			_Generate   = reinterpret_cast<GenerateFn>(vtbl.write_vfunc(Offsets::ClipGen_Generate, hkbClipGenerator_Generate));
 			_StartEcho  = reinterpret_cast<StartEchoFn>(vtbl.write_vfunc(Offsets::ClipGen_StartEcho, hkbClipGenerator_StartEcho));
 
-			logger::info("[OAR] hkbClipGenerator vtable hooks installed (activate={:#x} update={:#x} "
-				"deactivate={:#x} generate={:#x} startEcho={:#x})",
-				Offsets::ClipGen_Activate, Offsets::ClipGen_Update, Offsets::ClipGen_Deactivate,
-				Offsets::ClipGen_Generate, Offsets::ClipGen_StartEcho);
+			logger::info("[OAR] hkbClipGenerator vtable hooks installed (active mode)");
 		}
 	}
 
@@ -8651,12 +8486,6 @@ namespace Hooks
 				std::ranges::transform(lowerKey, lowerKey.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 				std::ranges::replace(lowerKey, '/', '\\');
 
-				// Several SubMods can replace the same original path; the file
-				// redirect can only serve ONE file, so pick the highest-priority
-				// SubMod's deterministically (this used to take whichever info
-				// happened to be first in parse order).
-				const ReplacementAnimFileInfo* best = nullptr;
-				int bestPriority = INT32_MIN;
 				for (auto& info : replacementInfos) {
 					// Track-filtered submods must NOT redirect files. Their
 					// animation files are pose DONORS sampled by the track
@@ -8672,15 +8501,9 @@ namespace Hooks
 					if (info.parentSubMod && info.parentSubMod->IsDisabled()) {
 						continue;
 					}
-					const int prio = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
-					if (!best || prio > bestPriority) {
-						best = &info;
-						bestPriority = prio;
-					}
-				}
-				if (best) {
-					s_fileRedirectMap[lowerKey] = best->replacementPath;
-					logger::info("[OAR] FileRedirect: '{}' -> '{}'", lowerKey, best->replacementPath);
+					s_fileRedirectMap[lowerKey] = info.replacementPath;
+					logger::info("[OAR] FileRedirect: '{}' -> '{}'", lowerKey, info.replacementPath);
+					break;
 				}
 			}
 
@@ -8737,36 +8560,18 @@ namespace Hooks
 						// File redirect (existing behavior). Honors the global
 						// "Enabled" toggle: while disabled the engine must load
 						// the VANILLA file, not the replacement.
-						//
-						// Matching is PATH-SUFFIX based, longest key first. The
-						// old `find() != npos` containment test could hijack an
-						// unrelated file whose full path merely embedded a
-						// registered original path, and the unordered_map
-						// iteration order made multi-hit resolution
-						// nondeterministic across sessions.
 						if (s_fileMapBuilt && Settings::GetSingleton()->bEnabled) {
 							std::shared_lock lock(s_fileMapMutex);
 
-							const std::string* bestReplace = nullptr;
-							size_t bestKeyLen = 0;
 							for (auto& [origSuffix, replacePath] : s_fileRedirectMap) {
-								if (origSuffix.size() > lower.size() || origSuffix.size() <= bestKeyLen) continue;
-								if (!lower.ends_with(origSuffix)) continue;
-								// Require a path boundary before the match so
-								// "...\idle.hkx" cannot claim "...\combatidle.hkx".
-								if (origSuffix.size() < lower.size()) {
-									const char before = lower[lower.size() - origSuffix.size() - 1];
-									if (before != '\\' && before != '/') continue;
+								if (lower.find(origSuffix) != std::string::npos) {
+									logger::info("[OAR] FILE REDIRECT: '{}' -> '{}'", narrow, replacePath);
+
+									std::wstring wideReplace(replacePath.begin(), replacePath.end());
+									lock.unlock();
+									return s_origCreateFileW(wideReplace.c_str(), dwDesiredAccess, dwShareMode,
+										lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 								}
-								bestReplace = &replacePath;
-								bestKeyLen = origSuffix.size();
-							}
-							if (bestReplace) {
-								logger::info("[OAR] FILE REDIRECT: '{}' -> '{}'", narrow, *bestReplace);
-								std::wstring wideReplace(bestReplace->begin(), bestReplace->end());
-								lock.unlock();
-								return s_origCreateFileW(wideReplace.c_str(), dwDesiredAccess, dwShareMode,
-									lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 							}
 						}
 

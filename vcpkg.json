@@ -1,6 +1,6 @@
 {
   "name": "openanimationreplacer",
-  "version-string": "1.0.0",
+  "version-string": "1.1.1",
   "description": "Runtime animation replacement framework for Fallout 4",
   "license": "GPL-3.0-or-later",
   "dependencies": [
