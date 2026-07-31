@@ -6597,23 +6597,35 @@ namespace
 			if (!repAnim) return;
 
 			const auto* trackToBoneArr = GetTrackToBoneIndices(a_this);
-			const bool haveBinding =
+			const bool haveMapping =
 				trackToBoneArr && trackToBoneArr->data && trackToBoneArr->size > 0;
 
+			// An EMPTY transformTrackToBoneIndices array is not "no binding":
+			// Havok's convention is that an empty array means IDENTITY mapping
+			// (track i drives bone i). The clip's animation slot lives on this
+			// same binding object (binding+0x18), so if the slot is readable the
+			// binding exists and direct sampling with identity mapping is valid.
+			// Previously an empty array sent these clips to the swap-and-generate
+			// fallback, which follows playback time and therefore cannot honor
+			// fixed-frame sampling (seen on 'Sig Idle Empty' / p226 wpnidleready).
+			const bool haveIdentityBinding = !haveMapping && animSlot && *animSlot;
+
 			static int s_pathLog = 0;
-			if (s_pathLog < 3) {
-				logger::info("[OAR-TrackFilter] Source path: clip={:X} haveBinding={} bindingTracks={}",
-					reinterpret_cast<uintptr_t>(a_this), haveBinding,
-					haveBinding ? trackToBoneArr->size : 0);
+			if (s_pathLog < 6) {
+				logger::info("[OAR-TrackFilter] Source path: clip={:X} mapping={} identity={} bindingTracks={}",
+					reinterpret_cast<uintptr_t>(a_this), haveMapping, haveIdentityBinding,
+					haveMapping ? trackToBoneArr->size : 0);
 				s_pathLog++;
 			}
 
-			if (haveBinding) {
+			if (haveMapping || haveIdentityBinding) {
 				// ============== Direct sampling path ==============
-				const auto* trackToBoneData = reinterpret_cast<const int16_t*>(trackToBoneArr->data);
-				const int32_t bindingNumTracks = trackToBoneArr->size;
+				const auto* trackToBoneData = haveMapping
+					? reinterpret_cast<const int16_t*>(trackToBoneArr->data) : nullptr;
+				const int32_t bindingNumTracks = haveMapping ? trackToBoneArr->size : 0;
 				const int32_t animNumTracks = repAnim->numberOfTransformTracks;
-				const int32_t numTracksToSample = std::min(animNumTracks, bindingNumTracks);
+				const int32_t numTracksToSample = haveMapping
+					? std::min(animNumTracks, bindingNumTracks) : animNumTracks;
 				if (numTracksToSample <= 0) return;
 
 				float localTime = a_this->GetLocalTime();
@@ -6664,8 +6676,13 @@ namespace
 					if (idx < 0 || idx >= numOutputBones) continue;
 
 					int32_t trackIdx = -1;
-					for (int32_t t = 0; t < numTracksToSample; ++t) {
-						if (trackToBoneData[t] == idx) { trackIdx = t; break; }
+					if (haveMapping) {
+						for (int32_t t = 0; t < numTracksToSample; ++t) {
+							if (trackToBoneData[t] == idx) { trackIdx = t; break; }
+						}
+					} else if (idx < numTracksToSample) {
+						// Identity binding: track index == bone index.
+						trackIdx = idx;
 					}
 
 					if (wantBindingDiag) {
