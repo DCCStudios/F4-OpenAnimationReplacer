@@ -27,7 +27,7 @@ namespace Plugin
 // load us. OG F4SE (0.6.23) ignores this export and uses F4SEPlugin_Query.
 F4SE_PLUGIN_VERSION = []() noexcept {
 	F4SE::PluginVersionData v{};
-	v.PluginVersion({ 1, 1, 1, 0 });
+	v.PluginVersion({ 1, 1, 2, 0 });
 	v.PluginName("OpenAnimationReplacer");
 	v.AuthorName("");
 	v.UsesAddressLibraryNG(true);  // 1.10.980 / 1.10.984
