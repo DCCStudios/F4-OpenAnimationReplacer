@@ -165,7 +165,7 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	// retired on earlier invalidations point into it too).
 	for (auto& existing : files) {
 		if (existing && existing->filePath == entry->filePath) {
-			RetireCloneLocked(*existing, /*a_retireBackingData=*/true);
+			RetireCloneLocked(*existing, /*a_retireBackingData=*/true, a_suffix);
 			existing = std::move(entry);
 			std::ranges::stable_sort(files, [](const auto& a, const auto& b) {
 				return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
@@ -256,7 +256,7 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 			reinterpret_cast<uintptr_t>(a_gameAnim));
 		// Retire (don't clear) — another still-active clip may reference the
 		// old clone; rebuilding in place would zero its vtable mid-generate.
-		RetireCloneLocked(entry);
+		RetireCloneLocked(entry, /*a_retireBackingData=*/false, a_suffix);
 	}
 
 	if (entry.runtimeAnimation) return entry.runtimeAnimation;
@@ -447,6 +447,34 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 	return false;
 }
 
+bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::string& a_outSuffix,
+	const void*& a_outOwner) const
+{
+	if (!a_anim) return false;
+	std::shared_lock lock(m_mutex);
+	// Live entries first: the clip is still playing a current clone.
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (entry && entry->runtimeAnimation == a_anim) {
+				a_outSuffix = key;
+				a_outOwner = entry->owner;
+				return true;
+			}
+		}
+	}
+	// Retired clones: the clip carried a kept-alive buffer across an
+	// invalidation (mid-session save load, weapon switch). The identity was
+	// stamped onto the record at retire time.
+	for (auto& retired : m_retiredClones) {
+		if (retired.clonePtr == a_anim && !retired.suffix.empty()) {
+			a_outSuffix = retired.suffix;
+			a_outOwner = retired.owner;
+			return true;
+		}
+	}
+	return false;
+}
+
 RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_suffix) const
 {
 	std::shared_lock lock(m_mutex);
@@ -472,7 +500,8 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 	return nullptr;
 }
 
-void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData)
+void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData,
+	const std::string& a_suffix)
 {
 	// See header comment: the buffer must survive intact because active clips
 	// may still hold a pointer into it. Move it to the keep-alive list instead
@@ -489,6 +518,8 @@ void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBa
 		RetiredClone rec;
 		rec.buffer = std::move(a_entry.runtimeStruct);
 		rec.clonePtr = a_entry.runtimeAnimation;
+		rec.suffix = a_suffix;
+		rec.owner = a_entry.owner;
 		if (retireData) {
 			rec.backingFileData = std::move(a_entry.fileData);
 			a_entry.fileData = std::vector<uint8_t>{};
@@ -523,7 +554,7 @@ size_t AnimationCache::PruneUnrebound()
 			// The submod that owned this file no longer exists after the
 			// reload. Retire the clone and the backing file bytes (live clips
 			// may still reference them), then drop the entry.
-			RetireCloneLocked(*entry, /*a_retireBackingData=*/true);
+			RetireCloneLocked(*entry, /*a_retireBackingData=*/true, it->first);
 			pruned++;
 			return true;
 		});
@@ -539,7 +570,7 @@ void AnimationCache::InvalidateRuntimeClones()
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
 			if (entry && entry->runtimeAnimation) {
-				RetireCloneLocked(*entry);
+				RetireCloneLocked(*entry, /*a_retireBackingData=*/false, key);
 				count++;
 			}
 		}

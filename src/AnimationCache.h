@@ -77,6 +77,15 @@ public:
 	size_t GetCacheSize() const;
 	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
 	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
+	// Reverse-lookup the suffix + owning SubMod for a clone still installed in a
+	// clip's animation slot. Checks live cache entries first, then RETIRED
+	// clones (kept-alive buffers whose owning clip survived an invalidation,
+	// e.g. a mid-session save load). Returns false when the pointer is not one
+	// of ours. outOwner is an opaque tag (a SubMod*): compare it against the
+	// live registry before using — a config reload can retire clones whose
+	// owner pointer no longer refers to a live SubMod.
+	bool GetReplacementIdentity(RE::hkaAnimation* a_anim, std::string& a_outSuffix,
+		const void*& a_outOwner) const;
 	// The freshest game original recorded for this suffix (set whenever any
 	// clip rebuilds a clone). Used to opportunistically re-arm orphaned clips
 	// whose own original was lost to an invalidation. May be null.
@@ -119,7 +128,8 @@ private:
 	// vtable is the game's and its data pointers target fileData, which the
 	// cache never frees — so a stale-referencing clip keeps playing it safely
 	// until it deactivates.
-	void RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData = false);
+	void RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData = false,
+		const std::string& a_suffix = {});
 
 	mutable std::shared_mutex m_mutex;
 	// Retired clone buffers, kept alive because clips may still reference them
@@ -142,6 +152,14 @@ private:
 		// RetireCloneLocked's a_retireBackingData). Empty for plain clone
 		// invalidations, where fileData stays in the live entry.
 		std::vector<uint8_t> backingFileData;
+		// Identity carried from the entry this clone came from, so a clip still
+		// holding the retired clone in its animation slot after a save-load
+		// invalidation can be re-identified (suffix it plays + owning SubMod).
+		// owner is an opaque tag (a SubMod*), only ever compared against the
+		// LIVE registry before use — never dereferenced blind. See
+		// GetReplacementIdentity.
+		std::string suffix;
+		const void* owner{ nullptr };
 	};
 	std::vector<RetiredClone> m_retiredClones;
 	// One suffix -> all files registered for it (one per SubMod replacing the

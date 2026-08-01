@@ -802,6 +802,32 @@ namespace
 	static std::shared_mutex s_bindingSuffixMutex;
 	static std::unordered_map<const RE::hkaAnimation*, std::string> s_bindingRealPath;
 
+	// Save-load restore keyed by the BINDING SLOT rather than the clip.
+	//
+	// WHY: the hkbClipGenerator instances die on a mid-session save load
+	// (kPreLoadGame's clip-keyed restore skipped ALL of them — "Skipped 61/175
+	// dead/freed clip entries", 2026-08-01 log), but the animation BINDING the
+	// clone was written into lives in the engine's animation DB cache and
+	// SURVIVES the load. That is exactly how a retired clone leaked into the
+	// NEW session's clips with no game original anywhere ([OAR-RecoveryFail]
+	// spam + original-mod annotations playing after every reload-over-session).
+	// Recording {slot -> clone written, game original} at swap time lets
+	// RestoreAllActiveReplacements un-replace the surviving binding no matter
+	// what happened to the clips: after the load the fresh clips see the real
+	// game original, resolve normally, and rebuild fresh clones from it.
+	//
+	// Safety: a slot write happens ONLY when *slot still equals the exact clone
+	// we recorded (an 8-byte match on freed/recycled binding memory is
+	// negligible) AND the recorded original still carries a plausible game
+	// animation vtable — the same guard level as the clip-keyed restore.
+	struct BindingSlotBackup
+	{
+		RE::hkaAnimation* clone{ nullptr };
+		RE::hkaAnimation* original{ nullptr };
+	};
+	static std::shared_mutex s_bindingSlotBackupMutex;
+	static std::unordered_map<RE::hkaAnimation**, BindingSlotBackup> s_bindingSlotBackup;
+
 	// Track the active SubMod per clip for firing custom "on end" events at deactivation.
 	static std::shared_mutex s_activeSubModMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, SubMod*> s_activeSubModMap;
@@ -1744,6 +1770,35 @@ void RestoreAllActiveReplacements()
 		}
 	}
 
+	// Second pass, keyed by BINDING SLOT (see BindingSlotBackup). This is the
+	// pass that actually works on a mid-session save load: the clip-keyed pass
+	// above skips everything because the clips are already dead, but the
+	// bindings those slots live in are cached by the engine and survive the
+	// load. Restoring the game original here is what prevents a retired clone
+	// from leaking into the NEW session's clips as an unrecoverable orphan
+	// (wrong/original annotations, [OAR-RecoveryFail] spam — 2026-08-01 log).
+	size_t restoredSlots = 0;
+	{
+		std::unique_lock bsLock(s_bindingSlotBackupMutex);
+		for (auto& [slot, backup] : s_bindingSlotBackup) {
+			if (!slot || !backup.clone || !backup.original) continue;
+			if (IsBadReadPtr(slot, sizeof(void*))) continue;
+			// Only touch slots that STILL hold the exact clone we recorded.
+			// Anything else means the binding was freed/recycled or the slot
+			// was already restored — leave it alone.
+			if (*slot != backup.clone) continue;
+			if (IsBadReadPtr(backup.original, sizeof(uintptr_t))) continue;
+			auto vtbl = *reinterpret_cast<uintptr_t*>(backup.original);
+			if (!IsPlausibleGameAnimVtable(vtbl)) continue;
+			*slot = backup.original;
+			restoredSlots++;
+		}
+		s_bindingSlotBackup.clear();
+	}
+	if (restoredSlots > 0) {
+		logger::info("[OAR-PreLoad] Restored {} surviving binding slots to game originals", restoredSlots);
+	}
+
 	// Restore all NULL'd triggers so native annotations work after the load.
 	size_t restoredTriggers = 0;
 	{
@@ -1782,6 +1837,13 @@ void ClearClipRuntimeState()
 		// save load frees — never let a recycled address inherit a path.
 		std::unique_lock lock(s_bindingSuffixMutex);
 		s_bindingRealPath.clear();
+	}
+	{
+		// Slot backups are consumed by RestoreAllActiveReplacements on a save
+		// load; clear here too for the weapon-switch invalidation path, where
+		// the old bindings (and thus these slot addresses) are being freed.
+		std::unique_lock lock(s_bindingSlotBackupMutex);
+		s_bindingSlotBackup.clear();
 	}
 	{
 		std::unique_lock lock(s_clipSuffixMutex);
@@ -4913,6 +4975,17 @@ namespace
 		std::string resolvedSuffix = suffix;
 		std::vector<ReplacementAnimFileInfo*> const* candidatesPtr = nullptr;
 
+		// Orphan recovery (mid-session save load): when a clip still holds our
+		// clone in its slot but the condition probe resolves no candidate — the
+		// save load wiped the binding-identity map, and the probe alone can't
+		// re-identify the variant — we re-identify the clip from the clone the
+		// engine is actually playing (ground truth) and fire THAT submod's
+		// annotations instead of returning early and letting the original mod's
+		// annotations leak. orphanAnnotOnly means "clone already installed;
+		// don't rebuild/swap, just correct the annotations + triggers".
+		SubMod* orphanRecoverOwner = nullptr;
+		bool orphanAnnotOnly = false;
+
 		std::shared_lock lock(s_nameLookupMutex);
 
 		if (isMultiMatch) {
@@ -4987,6 +5060,46 @@ namespace
 					}
 				}
 				if (candidatesPtr) break;
+			}
+
+			// Orphan recovery, tried BEFORE the restore/leave fallback below.
+			// If the slot still holds one of our clones and the cache can name
+			// the suffix + owning SubMod it belongs to, that identity is ground
+			// truth for what is visibly playing. Validate the owner against the
+			// LIVE candidate infos for this leaf (never dereference a possibly
+			// stale SubMod*), then resolve to it so the correct annotations fire.
+			if (!candidatesPtr) {
+				auto** oSlot = a_this->GetAnimationSlot();
+				auto* oCache = AnimationCache::GetSingleton();
+				if (oSlot && *oSlot && oCache->IsOurReplacement(*oSlot)) {
+					std::string recSuffix;
+					const void* recOwner = nullptr;
+					if (oCache->GetReplacementIdentity(*oSlot, recSuffix, recOwner) && recOwner) {
+						for (auto& candSfx : leafIt->second) {
+							auto ci = s_suffixToInfos.find(candSfx);
+							if (ci == s_suffixToInfos.end()) continue;
+							for (auto* info : ci->second) {
+								if (!info || !info->parentSubMod) continue;
+								if (static_cast<const void*>(info->parentSubMod) != recOwner) continue;
+								if (info->parentSubMod->IsDisabled()) continue;
+								resolvedSuffix = candSfx;
+								candidatesPtr = &ci->second;
+								orphanRecoverOwner = info->parentSubMod;
+								orphanAnnotOnly = true;
+								break;
+							}
+							if (candidatesPtr) break;
+						}
+						if (orphanAnnotOnly) {
+							static int s_orphanRecLog = 0;
+							if (s_orphanRecLog < 20) {
+								logger::info("[OAR-OrphanRecover] leaf='{}' re-identified stuck clone as suffix='{}' owner={:X} — firing correct annotations",
+									leafName, resolvedSuffix, reinterpret_cast<uintptr_t>(orphanRecoverOwner));
+								s_orphanRecLog++;
+							}
+						}
+					}
+				}
 			}
 
 			if (!candidatesPtr) {
@@ -5167,7 +5280,7 @@ namespace
 						}
 					}
 				}
-				if (!originalAnim) {
+				if (!originalAnim && !orphanAnnotOnly) {
 					static int s_recoveryFailLog = 0;
 					if (s_recoveryFailLog < 20) {
 						logger::warn("[OAR-RecoveryFail] Can't recover valid original for '{}' clipGen={:X} current={:X}",
@@ -5177,13 +5290,19 @@ namespace
 					}
 					return;
 				}
+				// orphanAnnotOnly: no valid original is expected (the game
+				// original was freed by the save load). We won't rebuild or swap
+				// — the clone is already in the slot — so continue to fire the
+				// correct annotations for it.
 			}
 		}
 
 		// Still no template to clone from — cannot swap / register track filter.
 		// Log loudly; previously this fell through and silently no-op'd after
 		// conditions passed (looked like "conditions met but idle empty never applied").
-		if (!originalAnim) {
+		// Exception: orphanAnnotOnly deliberately has no template (the clone is
+		// already installed) and only needs the annotation-firing path.
+		if (!originalAnim && !orphanAnnotOnly) {
 			static int s_noOrigLog = 0;
 			if (s_noOrigLog < 30) {
 				logger::warn("[OAR-NoOriginal] No game-anim template for '{}' clipGen={:X} — skip replace this frame",
@@ -5272,6 +5391,15 @@ namespace
 					}
 				}
 			}
+		}
+
+		// Orphan recovery forces the replacement decision: the clip is already
+		// playing our clone, we identified its owner from the cache, and the
+		// condition probe can't help (state wiped by the save load). Reuse the
+		// skip-condition-eval machinery so downstream picks winningInfo by owner.
+		if (!skipConditionEval && orphanAnnotOnly && orphanRecoverOwner) {
+			skipConditionEval = true;
+			lockedSubMod = orphanRecoverOwner;
 		}
 
 		bool shouldReplace = false;
@@ -5458,8 +5586,12 @@ namespace
 			// SubMods can register the same suffix (and variant suffixes can
 			// collide across SubMods too), each with a different .hkx.
 			const void* winningOwner = winningInfo ? winningInfo->parentSubMod : nullptr;
-			auto* replacement = cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim, winningOwner);
-			if (!replacement) {
+			// Orphan recovery never rebuilds/swaps (no valid original template,
+			// and the clone is already installed) — leave replacement null so
+			// the swap block below is skipped; only the annotation/trigger fix runs.
+			auto* replacement = orphanAnnotOnly ? nullptr
+				: cache->GetOrBuildRuntimeAnim(cacheSuffix, originalAnim, winningOwner);
+			if (!replacement && !orphanAnnotOnly) {
 				static int s_buildFailLog = 0;
 				if (s_buildFailLog < 30) {
 					logger::warn("[OAR-BuildFail] GetOrBuildRuntimeAnim('{}') returned null (original={:X} owner={:X})",
@@ -5476,6 +5608,29 @@ namespace
 			// slot. Instead register the replacement so Generate can sample it per-bone.
 		bool useTrackFilter = winningInfo && winningInfo->parentSubMod &&
 			winningInfo->parentSubMod->trackFilter.enabled && replacement;
+
+		if (orphanAnnotOnly) {
+			// Clone already in the slot from before the save load. Do NOT rebuild
+			// or touch the animation slot. Just make annotation delivery correct:
+			// NULL the native triggers (so the original mod file's own annotations
+			// stop firing) when we're going to fire ours, and record the active
+			// submod so the interruptible/annotation logic downstream works. The
+			// manual annotation-firing block further below does the rest.
+			if (bReplaceAnnot) {
+				bool alreadyRestored = false;
+				{
+					std::lock_guard rg(s_triggersRestoredMutex);
+					alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+				}
+				if (!alreadyRestored) {
+					InstallReplacementTriggers(a_this, cacheSuffix);
+				}
+			}
+			if (winningInfo && winningInfo->parentSubMod) {
+				std::unique_lock smLock(s_activeSubModMutex);
+				s_activeSubModMap[a_this] = winningInfo->parentSubMod;
+			}
+		} else {
 
 			// Track-filtered clips honor the submod's Replace Annotations setting,
 			// same as full-body replacements. The original stays in the slot with
@@ -5567,6 +5722,19 @@ namespace
 							s_swapLog++;
 						}
 						*animSlot = replacement;
+
+						// Record the un-replace recipe against the SLOT ADDRESS:
+						// the binding this slot lives in survives save loads even
+						// when every clip dies, and this backup is what lets
+						// kPreLoadGame restore the game original into it (see
+						// BindingSlotBackup). originalAnim is guaranteed here: the
+						// clone was just built from it.
+						{
+							std::unique_lock bsLock(s_bindingSlotBackupMutex);
+							auto& bs = s_bindingSlotBackup[animSlot];
+							bs.clone = replacement;
+							bs.original = originalAnim;
+						}
 
 						// When playOnceFullBody is active, keep original triggers intact so the
 						// Havok state machine can still transition out of the current state
@@ -5694,6 +5862,7 @@ namespace
 				}
 				}
 			}
+		}
 
 		ActiveReplacementEntry entry;
 		entry.clipSuffix = resolvedSuffix;
