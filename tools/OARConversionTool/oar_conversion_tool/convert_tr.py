@@ -47,7 +47,7 @@ def plan_tactical_reload(
     submod_name: str,
     description: str = "",
     priority: int = 3000,
-    equipped: dict[str, str] | None = None,
+    equipped: dict[str, str] | list[dict[str, str]] | None = None,
     author: str = "",
     overwrite: bool = False,
 ) -> ConversionPlan:

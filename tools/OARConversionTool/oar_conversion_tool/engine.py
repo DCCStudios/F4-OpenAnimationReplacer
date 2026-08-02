@@ -15,6 +15,7 @@ from .convert_tr import ConversionPlan, execute_plan, plan_tactical_reload
 from .esp_io import EspInfo, parse_esp, patch_esp_remove_tr
 from .paths import TACTICAL_RESERVE_NAMES, AnimRoot, scan_anim_roots
 from .subgraph import SubgraphData, find_subgraph_files_near, load_subgraph_file
+from .weapon_match import RootWeaponGroup, match_roots_to_weapons
 
 
 LogFn = Callable[[str], None]
@@ -220,9 +221,9 @@ def build_preview(opts: JobOptions) -> PreviewResult:
             f"Subgraph: {sg.path.name if sg.path else '?'}: {len(sg.entries)} rows"
         )
 
-    equipped = None
+    manual_equipped = None
     if opts.equipped_form_id and opts.equipped_plugin:
-        equipped = {"formID": opts.equipped_form_id, "pluginName": opts.equipped_plugin}
+        manual_equipped = {"formID": opts.equipped_form_id, "pluginName": opts.equipped_plugin}
 
     roots = opts.selected_roots or []
     if not roots and (opts.do_tactical_reload or opts.do_idle_empty):
@@ -231,37 +232,86 @@ def build_preview(opts: JobOptions) -> PreviewResult:
 
     assert opts.destination is not None
 
-    if opts.do_tactical_reload:
-        tr_roots = [r for r in roots]
-        plan = plan_tactical_reload(
-            tr_roots,
-            opts.destination,
-            pack_name=opts.pack_name,
-            submod_name=opts.tr_submod_name,
-            description=opts.description,
-            priority=opts.priority,
-            equipped=equipped,
-            author=opts.author,
-            overwrite=opts.overwrite,
+    # Match each selected root to the WEAP form(s) that actually use it (subgraph walk +
+    # keyword-suffix heuristic - see weapon_match.py), so a multi-weapon ESP gets one
+    # SubMod per weapon instead of one shared SubMod whose single IsEquipped condition
+    # would silently disable every weapon but the first the moment a different one is
+    # drawn. Computed once and reused for both TR and Idle Empty below.
+    groups: list[RootWeaponGroup] = []
+    if roots and (opts.do_tactical_reload or opts.do_idle_empty):
+        groups = match_roots_to_weapons(
+            roots,
+            result.esp_info,
+            result.subgraphs,
+            include_1st=opts.include_1st,
+            include_3rd=opts.include_3rd,
         )
-        result.plans.append(plan)
-        result.messages.append(f"TR plan: {len(plan.files)} file(s) -> {plan.submod_dir}")
+        matched_groups = [g for g in groups if g.weapons]
+        if len(matched_groups) > 1:
+            for g in matched_groups:
+                names = ", ".join(f"{w.edid} ({w.form_id_hex})" for w in g.weapons)
+                result.messages.append(f"Weapon match: {g.label} -> {names}")
+            unmatched_roots = next((g.roots for g in groups if not g.weapons), [])
+            if unmatched_roots:
+                result.messages.append(
+                    "Weapon match: no ESP/subgraph coverage for "
+                    f"{', '.join(r.name for r in unmatched_roots)}; grouped into a shared SubMod."
+                )
+            if manual_equipped:
+                result.messages.append(
+                    "Multiple weapon forms detected; using auto-derived per-weapon "
+                    "IsEquipped conditions instead of the manually entered Equipped FormID."
+                )
+
+    def _equipped_for(group: RootWeaponGroup) -> dict[str, str] | list[dict[str, str]] | None:
+        if len(groups) <= 1:
+            # Single (or no) group: identical to the tool's pre-matching behavior. The
+            # manually entered FormID/plugin, if any, always wins here.
+            if manual_equipped:
+                return manual_equipped
+        if group.weapons and opts.esp_path is not None:
+            plugin = opts.esp_path.name
+            forms = [{"formID": w.form_id_hex, "pluginName": plugin} for w in group.weapons]
+            return forms[0] if len(forms) == 1 else forms
+        return None
+
+    def _submod_name(base_name: str, group: RootWeaponGroup) -> str:
+        if len(groups) <= 1:
+            return base_name
+        return f"{base_name} - {group.label}"
+
+    if opts.do_tactical_reload:
+        for group in groups:
+            plan = plan_tactical_reload(
+                group.roots,
+                opts.destination,
+                pack_name=opts.pack_name,
+                submod_name=_submod_name(opts.tr_submod_name, group),
+                description=opts.description,
+                priority=opts.priority,
+                equipped=_equipped_for(group),
+                author=opts.author,
+                overwrite=opts.overwrite,
+            )
+            result.plans.append(plan)
+            result.messages.append(f"TR plan: {len(plan.files)} file(s) -> {plan.submod_dir}")
 
     if opts.do_idle_empty:
-        plan = plan_idle_empty(
-            roots,
-            opts.destination,
-            pack_name=opts.pack_name,
-            submod_name=opts.idle_submod_name,
-            description=opts.description,
-            priority=opts.priority,
-            bones=opts.idle_bones,
-            equipped=equipped,
-            author=opts.author,
-            deactivation_delay=opts.deactivation_delay,
-        )
-        result.plans.append(plan)
-        result.messages.append(f"Idle plan: {len(plan.files)} file(s) -> {plan.submod_dir}")
+        for group in groups:
+            plan = plan_idle_empty(
+                group.roots,
+                opts.destination,
+                pack_name=opts.pack_name,
+                submod_name=_submod_name(opts.idle_submod_name, group),
+                description=opts.description,
+                priority=opts.priority,
+                bones=opts.idle_bones,
+                equipped=_equipped_for(group),
+                author=opts.author,
+                deactivation_delay=opts.deactivation_delay,
+            )
+            result.plans.append(plan)
+            result.messages.append(f"Idle plan: {len(plan.files)} file(s) -> {plan.submod_dir}")
 
     return result
 
@@ -274,6 +324,8 @@ def run_job(opts: JobOptions, log: LogFn | None = None) -> PreviewResult:
 
     preview = build_preview(opts)
     try:
+        for m in preview.messages:
+            _log(m)
         if preview.errors:
             for e in preview.errors:
                 _log(f"ERROR: {e}")

@@ -3,6 +3,9 @@ build/
 dist/
 *.spec
 
+# Local release zip copies produced next to the tool before uploading to GitHub
+F4OARConversionTool-*.zip
+
 # Runtime logs written next to the exe/script (local file paths, not source)
 logs/
 

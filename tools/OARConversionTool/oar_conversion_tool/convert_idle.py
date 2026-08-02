@@ -78,7 +78,7 @@ def plan_idle_empty(
     description: str = "",
     priority: int = 3000,
     bones: list[str] | None = None,
-    equipped: dict[str, str] | None = None,
+    equipped: dict[str, str] | list[dict[str, str]] | None = None,
     author: str = "",
     deactivation_delay: float = 0.1,
 ) -> ConversionPlan:

@@ -23,11 +23,13 @@ from oar_conversion_tool.engine import (
     JobOptions,
     build_preview,
     discover_roots,
+    discover_subgraphs,
     extract_ba2_source,
     run_job,
 )
 from oar_conversion_tool.esp_io import parse_esp
 from oar_conversion_tool.paths import AnimRoot
+from oar_conversion_tool.weapon_match import RootWeaponGroup, match_roots_to_weapons
 
 # Fallout-inspired dark theme
 BG = "#1a1d1a"
@@ -141,8 +143,8 @@ class OARConversionApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("F4 OAR Conversion Tool")
-        self.geometry("1100x760")
-        self.minsize(960, 640)
+        self.geometry("1100x700")
+        self.minsize(960, 600)
         self.configure(fg_color=BG)
 
         # Current form state (one job being edited)
@@ -151,6 +153,10 @@ class OARConversionApp(ctk.CTk):
         self.esp_path: Path | None = None
         self.scanned_roots: list[AnimRoot] = []
         self.root_vars: dict[str, ctk.BooleanVar] = {}
+        # root_key -> " -> WeaponEdid (0xForm)" suffix, only populated when a Scan finds
+        # 2+ distinct weapon forms (see _match_groups/_build_root_labels), so a single-
+        # weapon job's checkboxes stay exactly as plain as before.
+        self._root_weapon_labels: dict[str, str] = {}
 
         # BA2 archive used in lieu of a source folder (None when using a plain folder).
         self.ba2_path: Path | None = None
@@ -185,33 +191,35 @@ class OARConversionApp(ctk.CTk):
         return path
 
     def _build(self) -> None:
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 8, "pady": 3}
 
-        header = ctk.CTkLabel(
-            self,
+        titlerow = ctk.CTkFrame(self, fg_color="transparent")
+        titlerow.pack(fill="x", padx=12, pady=(8, 0))
+        ctk.CTkLabel(
+            titlerow,
             text="F4 OAR Conversion Tool",
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=ctk.CTkFont(size=18, weight="bold"),
             text_color=ACCENT,
-        )
-        header.pack(anchor="w", padx=12, pady=(10, 2))
-        sub = ctk.CTkLabel(
-            self,
-            text="Configure one folder → Add to Queue → repeat → Confirm & Run Queue. Preview writes to the log panel and logs/.",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            titlerow,
+            text="  |  Configure one folder \u2192 Add to Queue \u2192 repeat \u2192 Confirm & Run Queue.",
             text_color=MUTED,
-            font=ctk.CTkFont(size=12),
-        )
-        sub.pack(anchor="w", padx=12, pady=(0, 4))
-        credits = ctk.CTkLabel(
+            font=ctk.CTkFont(size=11),
+        ).pack(side="left")
+        ctk.CTkLabel(
             self,
-            text="BA2 archive support: format re-derived from BSA Browser by AlexxEG (github.com/AlexxEG/BSA_Browser).",
+            text=(
+                "Preview/log also saved to logs/. BA2 support format re-derived from "
+                "BSA Browser by AlexxEG (github.com/AlexxEG/BSA_Browser)."
+            ),
             text_color=MUTED,
             font=ctk.CTkFont(size=10),
-        )
-        credits.pack(anchor="w", padx=12, pady=(0, 4))
+        ).pack(anchor="w", padx=12, pady=(0, 3))
 
         # Scrollable form area; log stays pinned at the bottom of the window
         body = ctk.CTkScrollableFrame(self, fg_color=BG)
-        body.pack(fill="both", expand=True, padx=6, pady=2)
+        body.pack(fill="both", expand=True, padx=6, pady=1)
 
         # --- Current job inputs ---
         inputs = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8)
@@ -219,11 +227,11 @@ class OARConversionApp(ctk.CTk):
         ctk.CTkLabel(
             inputs,
             text="Current job: inputs",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).pack(anchor="w", padx=10, pady=(8, 2))
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(6, 1))
 
         row = ctk.CTkFrame(inputs, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=2)
+        row.pack(fill="x", padx=10, pady=1)
         ctk.CTkButton(
             row, text="Source Folder…", command=self._set_source,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
@@ -244,16 +252,13 @@ class OARConversionApp(ctk.CTk):
             row, text="Clear Form", command=self._clear_form,
             fg_color="#3a3f3a", hover_color="#4a504a",
         ).pack(side="left", padx=6)
-
-        ba2row = ctk.CTkFrame(inputs, fg_color="transparent")
-        ba2row.pack(fill="x", padx=10, pady=(0, 2))
         self.keep_ba2 = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            ba2row,
-            text="Keep extracted BA2 files after running (instead of auto-deleting)",
+            row,
+            text="Keep extracted BA2 files",
             variable=self.keep_ba2,
             fg_color=ACCENT,
-        ).pack(side="left")
+        ).pack(side="left", padx=(10, 0))
 
         self.inputs_label = ctk.CTkLabel(
             inputs,
@@ -265,7 +270,7 @@ class OARConversionApp(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.inputs_label.pack(fill="x", padx=10, pady=(2, 8))
+        self.inputs_label.pack(fill="x", padx=10, pady=(1, 6))
 
         # --- Destination / names ---
         destf = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8)
@@ -273,30 +278,27 @@ class OARConversionApp(ctk.CTk):
         ctk.CTkLabel(
             destf,
             text="Current job: output",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).pack(anchor="w", padx=10, pady=(8, 2))
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(6, 1))
 
         drow = ctk.CTkFrame(destf, fg_color="transparent")
-        drow.pack(fill="x", padx=10, pady=2)
+        drow.pack(fill="x", padx=10, pady=1)
         self.dest_var = ctk.StringVar(value="")
         ctk.CTkEntry(drow, textvariable=self.dest_var).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(
             drow, text="Browse…", width=90, command=self._browse_dest,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
         ).pack(side="left", padx=6)
-
-        keeprow = ctk.CTkFrame(destf, fg_color="transparent")
-        keeprow.pack(fill="x", padx=10, pady=(0, 2))
         self.keep_dest = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            keeprow,
-            text="Keep Output Location (don't clear this path when starting the next job)",
+            drow,
+            text="Keep this path between jobs",
             variable=self.keep_dest,
             fg_color=ACCENT,
         ).pack(side="left")
 
         nrow = ctk.CTkFrame(destf, fg_color="transparent")
-        nrow.pack(fill="x", padx=10, pady=(2, 8))
+        nrow.pack(fill="x", padx=10, pady=(1, 6))
         ctk.CTkLabel(nrow, text="Pack").pack(side="left")
         self.pack_var = ctk.StringVar(value="OAR Conversion")
         ctk.CTkEntry(nrow, textvariable=self.pack_var, width=160).pack(side="left", padx=6)
@@ -313,8 +315,8 @@ class OARConversionApp(ctk.CTk):
         ctk.CTkLabel(
             ops,
             text="Current job: operations",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).pack(anchor="w", padx=10, pady=(8, 2))
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(6, 1))
 
         self.do_tr = ctk.BooleanVar(value=True)
         self.do_idle = ctk.BooleanVar(value=False)
@@ -325,13 +327,13 @@ class OARConversionApp(ctk.CTk):
         self.overwrite = ctk.BooleanVar(value=False)
 
         orow = ctk.CTkFrame(ops, fg_color="transparent")
-        orow.pack(fill="x", padx=10, pady=2)
+        orow.pack(fill="x", padx=10, pady=1)
         ctk.CTkCheckBox(orow, text="Tactical Reload → OAR", variable=self.do_tr, fg_color=ACCENT).pack(side="left")
         ctk.CTkCheckBox(orow, text="Idle Empty", variable=self.do_idle, fg_color=ACCENT).pack(side="left", padx=12)
         ctk.CTkCheckBox(orow, text="Include 3rd person", variable=self.do_3rd, fg_color=ACCENT).pack(side="left")
 
         self.esp_frame = ctk.CTkFrame(ops, fg_color="transparent")
-        self.esp_frame.pack(fill="x", padx=10, pady=2)
+        self.esp_frame.pack(fill="x", padx=10, pady=1)
         self.esp_check = ctk.CTkCheckBox(
             self.esp_frame,
             text="Patch ESP (strip AnimsReloadReserve / drop TR master if unused)",
@@ -350,26 +352,26 @@ class OARConversionApp(ctk.CTk):
         self.master_check.pack(side="left")
 
         erow = ctk.CTkFrame(ops, fg_color="transparent")
-        erow.pack(fill="x", padx=10, pady=(2, 8))
+        erow.pack(fill="x", padx=10, pady=(1, 6))
         ctk.CTkLabel(erow, text="Idle bones").pack(side="left")
         self.bones_var = ctk.StringVar(value="WeaponBolt")
-        ctk.CTkEntry(erow, textvariable=self.bones_var, width=160).pack(side="left", padx=6)
-        ctk.CTkLabel(erow, text="IsEquipped FormID").pack(side="left")
+        ctk.CTkEntry(erow, textvariable=self.bones_var, width=140).pack(side="left", padx=6)
+        ctk.CTkLabel(erow, text="Manual IsEquipped FormID (single-weapon jobs only)").pack(side="left")
         self.equip_fid_var = ctk.StringVar(value="")
-        ctk.CTkEntry(erow, textvariable=self.equip_fid_var, width=90).pack(side="left", padx=4)
+        ctk.CTkEntry(erow, textvariable=self.equip_fid_var, width=80).pack(side="left", padx=4)
         ctk.CTkLabel(erow, text="plugin").pack(side="left")
         self.equip_plugin_var = ctk.StringVar(value="")
-        ctk.CTkEntry(erow, textvariable=self.equip_plugin_var, width=130).pack(side="left", padx=4)
+        ctk.CTkEntry(erow, textvariable=self.equip_plugin_var, width=120).pack(side="left", padx=4)
 
         # --- Weapon folders (formerly "anim roots") ---
         rootsf = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8)
         rootsf.pack(fill="x", **pad)
         rhead = ctk.CTkFrame(rootsf, fg_color="transparent")
-        rhead.pack(fill="x", padx=10, pady=(8, 2))
+        rhead.pack(fill="x", padx=10, pady=(6, 0))
         ctk.CTkLabel(
             rhead,
             text="Weapon folders to convert",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(side="left")
         ctk.CTkButton(
             rhead, text="Rescan", width=80, command=self._scan,
@@ -387,25 +389,24 @@ class OARConversionApp(ctk.CTk):
         ctk.CTkLabel(
             rootsf,
             text=(
-                "These are the weapon animation folders under Meshes/.../Animations that contain "
-                "reload files (from the Source Folder or the extracted BA2). Checked folders are "
-                "copied into the OAR SubMod. Leave all checked unless you want to skip a weapon "
-                "in a multi-weapon pack."
+                "Checked = copied into the SubMod. A folder gets its own weapon match "
+                "(-> shown inline) and IsEquipped SubMod whenever the ESP has 2+ weapons."
             ),
             text_color=MUTED,
+            font=ctk.CTkFont(size=11),
             justify="left",
             anchor="w",
             wraplength=1000,
-        ).pack(fill="x", padx=10, pady=(0, 2))
+        ).pack(fill="x", padx=10, pady=(0, 1))
 
-        self.roots_frame = ctk.CTkScrollableFrame(rootsf, height=88, fg_color="#1e221e")
-        self.roots_frame.pack(fill="x", padx=10, pady=(2, 8))
+        self.roots_frame = ctk.CTkScrollableFrame(rootsf, height=90, fg_color="#1e221e")
+        self.roots_frame.pack(fill="x", padx=10, pady=(1, 6))
 
         # --- Queue actions ---
         qact = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8)
         qact.pack(fill="x", **pad)
         brow = ctk.CTkFrame(qact, fg_color="transparent")
-        brow.pack(fill="x", padx=10, pady=8)
+        brow.pack(fill="x", padx=10, pady=6)
         ctk.CTkButton(
             brow, text="Preview Current", command=self._preview_current,
             fg_color="#3a3f3a", hover_color="#4a504a", width=130,
@@ -422,8 +423,8 @@ class OARConversionApp(ctk.CTk):
         queuef = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8)
         queuef.pack(fill="x", **pad)
         qhead = ctk.CTkFrame(queuef, fg_color="transparent")
-        qhead.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(qhead, text="Job queue", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        qhead.pack(fill="x", padx=10, pady=(6, 1))
+        ctk.CTkLabel(qhead, text="Job queue", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
         self.queue_count_label = ctk.CTkLabel(qhead, text="(0)", text_color=MUTED)
         self.queue_count_label.pack(side="left", padx=6)
         ctk.CTkButton(
@@ -435,12 +436,12 @@ class OARConversionApp(ctk.CTk):
             fg_color="#3a3f3a",
         ).pack(side="right", padx=4)
 
-        self.queue_frame = ctk.CTkScrollableFrame(queuef, height=90, fg_color="#1e221e")
-        self.queue_frame.pack(fill="x", padx=10, pady=(2, 4))
+        self.queue_frame = ctk.CTkScrollableFrame(queuef, height=80, fg_color="#1e221e")
+        self.queue_frame.pack(fill="x", padx=10, pady=(1, 3))
         self.queue_select_vars: list[ctk.BooleanVar] = []
 
         qrun = ctk.CTkFrame(queuef, fg_color="transparent")
-        qrun.pack(fill="x", padx=10, pady=(0, 8))
+        qrun.pack(fill="x", padx=10, pady=(0, 6))
         ctk.CTkButton(
             qrun, text="Preview Queue", command=self._preview_queue,
             fg_color="#3a3f3a", hover_color="#4a504a", width=120,
@@ -458,17 +459,17 @@ class OARConversionApp(ctk.CTk):
         log_bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0)
         log_bar.pack(fill="x", side="bottom")
         log_head = ctk.CTkFrame(log_bar, fg_color="transparent")
-        log_head.pack(fill="x", padx=10, pady=(6, 0))
-        ctk.CTkLabel(log_head, text="Log", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
-        self.log_path_label = ctk.CTkLabel(log_head, text="", text_color=MUTED)
+        log_head.pack(fill="x", padx=10, pady=(4, 0))
+        ctk.CTkLabel(log_head, text="Log", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+        self.log_path_label = ctk.CTkLabel(log_head, text="", text_color=MUTED, font=ctk.CTkFont(size=10))
         self.log_path_label.pack(side="left", padx=8)
         ctk.CTkButton(
             log_head, text="Open Log Folder", width=120, command=self._open_log_folder,
             fg_color="#3a3f3a",
         ).pack(side="right")
 
-        self.log = ctk.CTkTextbox(log_bar, height=140, fg_color="#121512", text_color=TEXT)
-        self.log.pack(fill="x", padx=10, pady=(4, 10))
+        self.log = ctk.CTkTextbox(log_bar, height=110, fg_color="#121512", text_color=TEXT)
+        self.log.pack(fill="x", padx=10, pady=(3, 6))
         self.log_path_label.configure(text=str(self.log_path))
         self._log(
             "Ready. Pick Source Folder (ESP auto-detects), set destination, Rescan if needed, "
@@ -684,6 +685,7 @@ class OARConversionApp(ctk.CTk):
         self.esp_path = None
         self.scanned_roots.clear()
         self.root_vars.clear()
+        self._root_weapon_labels.clear()
         if not self.keep_dest.get():
             self.dest_var.set("")
         self.pack_var.set("OAR Conversion")
@@ -758,6 +760,55 @@ class OARConversionApp(ctk.CTk):
     def _root_key(root: AnimRoot) -> str:
         return f"{root.source_mod}::{root.perspective}::{root.name}"
 
+    def _match_groups(self, opts: JobOptions, roots: list[AnimRoot]) -> list[RootWeaponGroup]:
+        """Weapon-match roots for display only (Scan/queue summaries); never raises.
+
+        Mirrors engine.build_preview's own matching so the checkbox list and queue
+        summary agree with what a Run will actually produce, without needing to run a
+        full preview just to find out.
+        """
+        if not roots:
+            return []
+        esp_info = None
+        if opts.esp_path and opts.esp_path.is_file():
+            try:
+                esp_info = parse_esp(opts.esp_path)
+            except Exception:  # noqa: BLE001
+                esp_info = None
+        try:
+            subgraphs = discover_subgraphs(opts) if (esp_info or opts.subgraph_paths) else []
+        except Exception:  # noqa: BLE001
+            subgraphs = []
+        try:
+            return match_roots_to_weapons(
+                roots, esp_info, subgraphs,
+                include_1st=opts.include_1st, include_3rd=opts.include_3rd,
+            )
+        except Exception:  # noqa: BLE001
+            return []
+
+    @staticmethod
+    def _build_root_labels(groups: list[RootWeaponGroup]) -> dict[str, str]:
+        """root_key -> ' -> Weapon(s)' suffix, only for a real multi-weapon split.
+
+        A single matched weapon (or none at all) is the common case already implied by
+        the plain root checkbox, so it stays unlabeled to keep that case exactly as
+        compact as before Scan ever ran.
+        """
+        matched = [g for g in groups if g.weapons]
+        if len(matched) < 2:
+            return {}
+        labels: dict[str, str] = {}
+        for g in matched:
+            if len(g.weapons) == 1:
+                w = g.weapons[0]
+                suffix = f"  \u2192  {w.edid} ({w.form_id_hex})"
+            else:
+                suffix = "  \u2192  " + "+".join(w.edid for w in g.weapons)
+            for r in g.roots:
+                labels[OARConversionApp._root_key(r)] = suffix
+        return labels
+
     def _scan(self) -> None:
         opts = self._job_options()
         if not opts.source_dirs and opts.esp_path:
@@ -768,8 +819,12 @@ class OARConversionApp(ctk.CTk):
             self._log("Scan skipped: no source folder.")
             return
         self.scanned_roots = discover_roots(opts)
+        groups = self._match_groups(opts, self.scanned_roots)
+        self._root_weapon_labels = self._build_root_labels(groups)
         self._render_roots()
-        self._log(f"Scan found {len(self.scanned_roots)} weapon folder(s) for current job.")
+        n_matched = len([g for g in groups if g.weapons])
+        extra = f"; {n_matched} distinct weapon(s) matched -> will split into {n_matched} SubMod(s) per operation" if n_matched > 1 else ""
+        self._log(f"Scan found {len(self.scanned_roots)} weapon folder(s) for current job{extra}.")
 
     def _render_roots(self) -> None:
         for w in self.roots_frame.winfo_children():
@@ -786,7 +841,7 @@ class OARConversionApp(ctk.CTk):
             key = self._root_key(root)
             var = ctk.BooleanVar(value=True)
             self.root_vars[key] = var
-            label = f"[{root.perspective}] {root.name}"
+            label = f"[{root.perspective}] {root.name}" + self._root_weapon_labels.get(key, "")
             ctk.CTkCheckBox(
                 self.roots_frame, text=label, variable=var, fg_color=ACCENT
             ).pack(anchor="w", pady=1)
@@ -800,11 +855,13 @@ class OARConversionApp(ctk.CTk):
     def _job_summary(self, opts: JobOptions, index: int | None = None) -> str:
         src = opts.source_dirs[0].name if opts.source_dirs else "(no source)"
         dest = str(opts.destination) if opts.destination else "(no dest)"
+        n_matched = len([g for g in self._match_groups(opts, opts.selected_roots) if g.weapons])
+        submod_tag = f" ({n_matched}x SubMods)" if n_matched > 1 else ""
         ops = []
         if opts.do_tactical_reload:
-            ops.append(f"TR:{opts.tr_submod_name}")
+            ops.append(f"TR:{opts.tr_submod_name}{submod_tag}")
         if opts.do_idle_empty:
-            ops.append(f"Idle:{opts.idle_submod_name}")
+            ops.append(f"Idle:{opts.idle_submod_name}{submod_tag}")
         if opts.patch_esp:
             ops.append("ESP")
         roots = ", ".join(r.name for r in opts.selected_roots) or "(no folders)"

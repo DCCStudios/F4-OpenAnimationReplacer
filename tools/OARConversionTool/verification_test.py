@@ -626,6 +626,133 @@ def test_engine_anims_plus_esp(f: Failures) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# 15. Multi-weapon ESP: one root per weapon must not share one IsEquipped
+# ---------------------------------------------------------------------------
+
+def _write_multi_weapon_esp(path: Path, weapons: list[tuple[str, str]]) -> None:
+    """Minimal 1-master ESP: one KYWD 'Anims<Suffix>' + one WEAP per (edid, suffix)."""
+    subs = [
+        (b"HEDR", struct.pack("<fiI", 0.95, 1, 0)),
+        (b"CNAM", b"MultiWeapon\x00"),
+    ]
+    subs.append((b"MAST", b"Fallout4.esm\x00"))
+    subs.append((b"DATA", struct.pack("<2I", 0, 0)))
+    tes4_body = b"".join(st + struct.pack("<H", len(sd)) + sd for st, sd in subs)
+    tes4 = (
+        b"TES4"
+        + struct.pack("<I", len(tes4_body))
+        + struct.pack("<I", 0)
+        + struct.pack("<I", 0)
+        + b"\x00\x00\x00\x00\x83\x00\x00\x00"
+        + tes4_body
+    )
+
+    self_index = 1  # one master (Fallout4.esm) -> this plugin's own records start at index 1
+    kywd_records = b""
+    weap_records = b""
+    next_low = 0x000800
+    for i, (edid, suffix) in enumerate(weapons):
+        kw_fid = (self_index << 24) | (next_low + i * 2)
+        weap_fid = (self_index << 24) | (next_low + i * 2 + 1)
+
+        kw_subs = [(b"EDID", f"Anims{suffix}\x00".encode("latin-1"))]
+        kw_body = b"".join(st + struct.pack("<H", len(sd)) + sd for st, sd in kw_subs)
+        kywd_records += (
+            b"KYWD" + struct.pack("<I", len(kw_body)) + struct.pack("<I", 0)
+            + struct.pack("<I", kw_fid) + b"\x00\x00\x00\x00\x83\x00\x00\x00" + kw_body
+        )
+
+        weap_subs = [
+            (b"EDID", f"{edid}\x00".encode("latin-1")),
+            (b"KSIZ", struct.pack("<I", 1)),
+            (b"KWDA", struct.pack("<I", kw_fid)),
+        ]
+        weap_body = b"".join(st + struct.pack("<H", len(sd)) + sd for st, sd in weap_subs)
+        weap_records += (
+            b"WEAP" + struct.pack("<I", len(weap_body)) + struct.pack("<I", 0)
+            + struct.pack("<I", weap_fid) + b"\x00\x00\x00\x00\x83\x00\x00\x00" + weap_body
+        )
+
+    kywd_grup = (
+        b"GRUP" + struct.pack("<I", 24 + len(kywd_records)) + b"KYWD"
+        + struct.pack("<I", 0) + b"\x00\x00\x00\x00\x00\x00\x00\x00" + kywd_records
+    )
+    weap_grup = (
+        b"GRUP" + struct.pack("<I", 24 + len(weap_records)) + b"WEAP"
+        + struct.pack("<I", 0) + b"\x00\x00\x00\x00\x00\x00\x00\x00" + weap_records
+    )
+    path.write_bytes(tes4 + kywd_grup + weap_grup)
+
+
+def test_multi_weapon_esp_grouping(f: Failures) -> None:
+    """A 2-weapon ESP (SCAR root has a subgraph dump, P226 root has none) must produce
+    two separate SubMods, each gated by its own weapon's IsEquipped - never one shared
+    SubMod whose single condition would silently disable the other weapon's reload."""
+    print("\n[15] multi-weapon ESP: per-weapon SubMod split")
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "out"
+        esp_path = Path(td) / "MultiWeapon.esp"
+        # "SCAR" is matched via the real shipped subgraph dump (Target Keyword AnimsSCAR).
+        # "P226" has no subgraph at all in TestAssets/Sig Sauer Pack - matched purely via
+        # the Anims<RootName> keyword-suffix heuristic. Covers both matching paths at once.
+        _write_multi_weapon_esp(esp_path, [("SCARWeapon", "SCAR"), ("P226Weapon", "P226")])
+
+        scar = _scar_root()
+        p226 = _p226_root()
+        opts = JobOptions(
+            source_dirs=[TEST_SCAR, TEST_SIG],
+            subgraph_paths=[SCAR_SUBGRAPH],
+            esp_path=esp_path,
+            destination=dest,
+            do_tactical_reload=True,
+            selected_roots=[scar, p226],
+            pack_name="Multi Pack",
+            tr_submod_name="Tactical Reload",
+            overwrite=True,
+        )
+        result = run_job(opts)
+        f.check(not result.errors, f"multi-weapon run errors: {result.errors}")
+        f.check(len(result.plans) == 2, f"one SubMod per weapon: {len(result.plans)} plan(s)")
+
+        by_root: dict[str, Path] = {}
+        for plan in result.plans:
+            for root_name in ("SCAR", "P226"):
+                if (plan.submod_dir / root_name).is_dir():
+                    by_root[root_name] = plan.submod_dir
+        f.check(set(by_root) == {"SCAR", "P226"}, f"both weapons got their own SubMod: {sorted(by_root)}")
+
+        scar_dir = by_root.get("SCAR")
+        p226_dir = by_root.get("P226")
+        f.check(scar_dir != p226_dir, "SCAR and P226 SubMods are different folders")
+        if scar_dir and p226_dir:
+            f.check(not (scar_dir / "P226").exists(), "SCAR SubMod does not also contain P226's tree")
+            f.check(not (p226_dir / "SCAR").exists(), "P226 SubMod does not also contain SCAR's tree")
+
+            scar_cfg = json.loads((scar_dir / "config.json").read_text(encoding="utf-8"))
+            p226_cfg = json.loads((p226_dir / "config.json").read_text(encoding="utf-8"))
+            scar_eq = next((c for c in scar_cfg["conditions"] if c["condition"] == "IsEquipped"), None)
+            p226_eq = next((c for c in p226_cfg["conditions"] if c["condition"] == "IsEquipped"), None)
+            f.check(scar_eq is not None, "SCAR SubMod has its own IsEquipped")
+            f.check(p226_eq is not None, "P226 SubMod has its own IsEquipped")
+            if scar_eq and p226_eq:
+                f.check(scar_eq["Form"]["pluginName"] == "MultiWeapon.esp", "SCAR IsEquipped plugin")
+                f.check(p226_eq["Form"]["pluginName"] == "MultiWeapon.esp", "P226 IsEquipped plugin")
+                f.check(
+                    scar_eq["Form"]["formID"] != p226_eq["Form"]["formID"],
+                    f"SCAR and P226 IsEquipped reference different forms: "
+                    f"{scar_eq['Form']['formID']} vs {p226_eq['Form']['formID']}",
+                )
+
+            info = parse_esp(esp_path)
+            scar_weap = next(w for w in info.weapons if w["edid"] == "SCARWeapon")
+            p226_weap = next(w for w in info.weapons if w["edid"] == "P226Weapon")
+            f.check(scar_eq is not None and scar_eq["Form"]["formID"] == scar_weap["form_id_hex"],
+                    "SCAR SubMod IsEquipped matches SCARWeapon's own FormID")
+            f.check(p226_eq is not None and p226_eq["Form"]["formID"] == p226_weap["form_id_hex"],
+                    "P226 SubMod IsEquipped matches P226Weapon's own FormID")
+
+
 def main() -> int:
     f = Failures()
     tests = [
@@ -643,6 +770,7 @@ def main() -> int:
         test_preview_is_dry,
         test_job_queue_different_options,
         test_engine_anims_plus_esp,
+        test_multi_weapon_esp_grouping,
     ]
     for t in tests:
         try:
