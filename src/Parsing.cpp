@@ -568,6 +568,7 @@ namespace Parsing
 			a_subMod->trackFilter.blendInTime = tf.value("blendInTime", 0.0f);
 			a_subMod->trackFilter.blendOutTime = tf.value("blendOutTime", 0.0f);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
+			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", true);
 			a_subMod->trackFilter.includeChildren = tf.value("includeChildren", true);
 			if (tf.contains("bones") && tf["bones"].is_array()) {
 				for (const auto& b : tf["bones"]) {

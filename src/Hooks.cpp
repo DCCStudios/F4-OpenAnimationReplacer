@@ -10,6 +10,14 @@
 #include "AnimationLog.h"
 #include "ActiveReplacementTracker.h"
 #include "RE_Additions.h"
+#include "UI/BoneDebugViz.h"
+
+// Full declaration lives in Conditions.h; forward-declared here to avoid
+// pulling the entire conditions header into this TU.
+namespace ConditionTracking
+{
+	void TickPlayerAimState();
+}
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -146,6 +154,38 @@ struct CharTrackFilterState {
 	// window is identical at any framerate.
 	float lastSourceTimeSec = 0.0f;
 
+	// --- One-shot playback tracking ---
+	// Only meaningful for playback-following filters (sampleFrame < 0). Fixed-frame
+	// pose donors keep the original persistent-overlay semantics untouched.
+	//
+	// Wall-clock time of the last actual donor SAMPLE. Unlike lastSourceTimeSec
+	// this is never refreshed by mere re-registration (the Update hook re-registers
+	// every frame while the clip generator stays alive, which is exactly what kept
+	// a finished grenade-throw overlay pinned forever, 2026-08-04 session).
+	float lastSampleSec = 0.0f;
+	// Source-clip localTime at the last sample. A backward jump means the engine
+	// restarted the clip for a new play — the overlay re-arms and blends back in.
+	float lastSampledLocalTime = -1.0f;
+	// Wall-clock time localTime last ADVANCED. The graph can park a finished
+	// clip at a fixed localTime while keeping it active and sampling — the
+	// stall detector ends the one-shot instead of freezing on that pose.
+	float lastAdvanceSec = 0.0f;
+	// Donor playback reached its end for the current activation (non-looping
+	// source): the tick updater blends the overlay out even though conditions
+	// may still be true, and re-registration must not cancel that blend-out.
+	bool oneShotDone = false;
+	// One-shot finished and fully blended out. The state is kept (alpha 0, applies
+	// nothing) so a restart of the same clip generator can blend back in without
+	// the erase-then-recreate cycle re-sampling the held end pose.
+	bool dormant = false;
+	// The source stopped producing samples (clip zero-weight / ended before the
+	// donor). Unlike oneShotDone this clears the moment samples resume — a
+	// looping source (sprint overlay) that pauses must come back on its own.
+	bool sampleStarved = false;
+	// Guards duplicate onEnd custom-event delivery: fired once at dormant entry
+	// OR at erase, never both.
+	bool onEndFired = false;
+
 	// Temporal blend state: ramps effectiveAlpha toward 1.0 (active) or 0.0 (deactivating)
 	float blendAlpha = 0.0f;        // current interpolated alpha [0, 1]
 	bool blendingOut = false;        // true = ramping down, erase when alpha reaches 0
@@ -180,8 +220,19 @@ static CharTrackFilterState* FindTrackFilterState(RE::TESObjectREFR* a_actor, co
 // Play Once (Full Body): tracks the initial replacement decision per clip generator.
 // When a clip has a playOnceFullBody candidate, the first evaluation result is locked
 // so that mid-animation condition flips in either direction are ignored.
+//
+// The decision records WHICH SubMod won, not just whether to replace: locked
+// replays used to re-derive the winner as "first playOnceFullBody candidate",
+// which silently overrode a higher-priority non-play-once winner (SCAR ADS
+// Reload prio 3002 lost every reload to SCAR Reload Variants prio 3000+
+// playOnce, 2026-08-03 session).
+struct PlayOnceDecision
+{
+	bool replace{ false };
+	SubMod* winner{ nullptr };  // valid while replace is true; cleared with the map on config reload
+};
 static std::shared_mutex s_playOnceDecisionMutex;
-static std::unordered_map<RE::hkbClipGenerator*, bool> s_playOnceDecision;
+static std::unordered_map<RE::hkbClipGenerator*, PlayOnceDecision> s_playOnceDecision;
 
 // Per-frame counter, incremented in HookedActorUpdate. Used for staleness detection.
 static std::atomic<uint64_t> s_currentFrame{ 0 };
@@ -194,6 +245,14 @@ static std::atomic<float> s_tfNowSec{ 0.0f };
 // Threshold: if no source clip has fired Generate for this long, the entry
 // is considered stale and erased (so non-source clips stop applying old cached pose).
 static constexpr float kTrackFilterStaleSeconds = 5.0f;
+// Playback-following filters only: if the source hasn't produced an actual donor
+// SAMPLE for this long (clip went zero-weight or ended before the donor did),
+// the overlay blends out. Long enough to ride out brief graph transitions,
+// short enough that a finished one-shot doesn't visibly linger.
+static constexpr float kOneShotSampleGraceSeconds = 0.5f;
+// One-shot sources only: localTime not advancing for this long while samples
+// keep flowing means the graph parked the finished clip — end the play.
+static constexpr float kOneShotStallSeconds = 0.25f;
 
 // --- Full-body replacement blend state ---
 // Uses a cached pose snapshot so we NEVER call _Generate twice per frame.
@@ -348,6 +407,88 @@ static void LerpTransform(RE::hkQsTransformRaw& base, const RE::hkQsTransformRaw
 	SlerpQuat(base.rotation, rep.rotation, w, base.rotation);
 	for (int i = 0; i < 4; ++i)
 		base.scale[i] = base.scale[i] * iw + rep.scale[i] * w;
+}
+
+// --- hkQsTransform algebra for model-space anchoring ---
+// Havok quaternions are (x, y, z, w) with w at [3]. The inverse assumes
+// uniform scale (FO4 character animations do not animate scale), and
+// normalized quaternions (Havok pose data is normalized).
+
+static RE::hkQsTransformRaw MakeIdentityQs()
+{
+	RE::hkQsTransformRaw t{};
+	t.rotation[3] = 1.0f;
+	t.scale[0] = t.scale[1] = t.scale[2] = 1.0f;
+	return t;
+}
+
+static void QuatMul(const float a[4], const float b[4], float out[4])
+{
+	// out = a * b (b's rotation applied first, then a's)
+	const float x = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+	const float y = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+	const float z = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+	const float w = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+	out[0] = x; out[1] = y; out[2] = z; out[3] = w;
+}
+
+static void QuatRotateVec(const float q[4], const float v[3], float out[3])
+{
+	// v' = v + w*t + q.xyz × t, where t = 2*(q.xyz × v)
+	const float tx = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+	const float ty = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+	const float tz = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+	const float rx = v[0] + q[3] * tx + (q[1] * tz - q[2] * ty);
+	const float ry = v[1] + q[3] * ty + (q[2] * tx - q[0] * tz);
+	const float rz = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
+	out[0] = rx; out[1] = ry; out[2] = rz;
+}
+
+// out = p ∘ c (parent transform applied to child): x -> p.t + p.R*(p.s * c(x)).
+// Alias-safe: out may be p or c.
+static void ComposeQs(const RE::hkQsTransformRaw& p, const RE::hkQsTransformRaw& c, RE::hkQsTransformRaw& out)
+{
+	RE::hkQsTransformRaw r{};
+	const float scaled[3] = {
+		c.translation[0] * p.scale[0],
+		c.translation[1] * p.scale[1],
+		c.translation[2] * p.scale[2]
+	};
+	float rotated[3];
+	QuatRotateVec(p.rotation, scaled, rotated);
+	r.translation[0] = p.translation[0] + rotated[0];
+	r.translation[1] = p.translation[1] + rotated[1];
+	r.translation[2] = p.translation[2] + rotated[2];
+	r.translation[3] = 0.0f;
+	QuatMul(p.rotation, c.rotation, r.rotation);
+	r.scale[0] = p.scale[0] * c.scale[0];
+	r.scale[1] = p.scale[1] * c.scale[1];
+	r.scale[2] = p.scale[2] * c.scale[2];
+	r.scale[3] = 0.0f;
+	out = r;
+}
+
+// out = t⁻¹ under the same application form (uniform-scale assumption).
+// Alias-safe: out may be t.
+static void InverseQs(const RE::hkQsTransformRaw& t, RE::hkQsTransformRaw& out)
+{
+	RE::hkQsTransformRaw r{};
+	r.rotation[0] = -t.rotation[0];
+	r.rotation[1] = -t.rotation[1];
+	r.rotation[2] = -t.rotation[2];
+	r.rotation[3] = t.rotation[3];
+	float rt[3];
+	const float tr[3] = { t.translation[0], t.translation[1], t.translation[2] };
+	QuatRotateVec(r.rotation, tr, rt);
+	for (int i = 0; i < 3; ++i) {
+		const float s = t.scale[i];
+		const float si = (std::fabs(s) > 1e-6f) ? 1.0f / s : 1.0f;
+		r.scale[i] = si;
+		r.translation[i] = -rt[i] * si;
+	}
+	r.translation[3] = 0.0f;
+	r.scale[3] = 0.0f;
+	out = r;
 }
 
 // Set the "modified bones" bitmask bit for a bone in the pose track's output.
@@ -5345,12 +5486,14 @@ namespace
 
 		bool playOnceLocked = false;
 		bool playOnceLockedResult = false;
+		SubMod* playOnceLockedWinner = nullptr;
 		if (hasPlayOnceCandidate) {
 			std::shared_lock poLock(s_playOnceDecisionMutex);
 			auto it = s_playOnceDecision.find(a_this);
 			if (it != s_playOnceDecision.end()) {
 				playOnceLocked = true;
-				playOnceLockedResult = it->second;
+				playOnceLockedResult = it->second.replace;
+				playOnceLockedWinner = it->second.winner;
 			}
 		}
 
@@ -5420,11 +5563,27 @@ namespace
 		} else if (playOnceLocked) {
 			shouldReplace = playOnceLockedResult;
 			if (shouldReplace) {
+				// Replay the RECORDED winner. Re-deriving it here (the old code
+				// took the first playOnceFullBody candidate) handed the play to
+				// a lower-priority play-once submod even when a higher-priority
+				// submod had won the initial evaluation.
 				for (auto* info : candidates) {
-					if (info && info->parentSubMod && info->parentSubMod->GetPlayOnceFullBody() &&
+					if (info && info->parentSubMod && info->parentSubMod == playOnceLockedWinner &&
 						!info->parentSubMod->IsDisabled()) {
 						winningInfo = info;
 						break;
+					}
+				}
+				// Recorded winner gone (disabled mid-play): fall back to the
+				// old first-play-once-candidate pick rather than yanking the
+				// replacement mid-animation.
+				if (!winningInfo) {
+					for (auto* info : candidates) {
+						if (info && info->parentSubMod && info->parentSubMod->GetPlayOnceFullBody() &&
+							!info->parentSubMod->IsDisabled()) {
+							winningInfo = info;
+							break;
+						}
 					}
 				}
 			}
@@ -5442,10 +5601,23 @@ namespace
 				} catch (...) { continue; }
 			}
 
-			// Record the initial decision for playOnceFullBody candidates
+			// Record the initial decision for playOnceFullBody candidates —
+			// but only when the outcome actually involves play-once semantics:
+			//   - a play-once submod WON: freeze that winner for the play.
+			//   - NOTHING won: freeze "no replacement" so a play-once candidate
+			//     cannot kick in mid-animation when conditions flip true.
+			// A non-play-once winner is deliberately NOT locked: its own
+			// interruptible setting governs re-evaluation, and locking it used
+			// to hand later updates to the wrong submod (see PlayOnceDecision).
 			if (hasPlayOnceCandidate) {
-				std::unique_lock poLock(s_playOnceDecisionMutex);
-				s_playOnceDecision[a_this] = shouldReplace;
+				if (shouldReplace && winningInfo && winningInfo->parentSubMod &&
+					winningInfo->parentSubMod->GetPlayOnceFullBody()) {
+					std::unique_lock poLock(s_playOnceDecisionMutex);
+					s_playOnceDecision[a_this] = { true, winningInfo->parentSubMod };
+				} else if (!shouldReplace) {
+					std::unique_lock poLock(s_playOnceDecisionMutex);
+					s_playOnceDecision[a_this] = { false, nullptr };
+				}
 			}
 		}
 
@@ -5687,17 +5859,73 @@ namespace
 						state.blendElapsed = 0.0f;
 						state.blendDuration = blendIn;
 						state.blendingOut = false;
+						state.lastSampleSec = state.lastSourceTimeSec;
+						state.lastSampledLocalTime = -1.0f;
+						state.lastAdvanceSec = state.lastSourceTimeSec;
+						// Custom "on start" events fire for track-filtered submods
+						// too. The swap path queues these at slot-swap time, but a
+						// track filter never swaps the slot, so without this the
+						// events were silently skipped (found 2026-08-03: a
+						// CullBone.X start event on a track-filtered submod never
+						// appeared in the log). Fired only on NEW registration —
+						// re-registration of a live filter (including one that is
+						// blending out) is a continuation, not a new start.
+						QueueCustomEvents(tfActor, winningInfo->parentSubMod->eventsOnStart, "onStart/trackFilter");
 					}
-					// If re-registered while blending out, cancel blend-out
-					if (state.blendingOut) {
-						state.blendingOut = false;
-						state.blendElapsed = 0.0f;
-						state.blendDuration = winningInfo->parentSubMod->trackFilter.blendInTime;
+					// Re-registration only cancels an in-progress blend-out (or wakes
+					// a dormant one-shot) when this clip is at the START of a play.
+					// The Update hook re-registers EVERY frame while the generator
+					// stays alive, and the old unconditional cancel here fought the
+					// tick updater's condition-driven blend-out — the log showed
+					// "Blend-out started" restarting 9 times in 150ms mid-throw
+					// (2026-08-04 grenade session). A mid-clip re-registration is a
+					// continuation and must leave blend state alone.
+					if (state.blendingOut || state.dormant) {
+						const bool freshPlay = a_this->GetLocalTime() <= 0.15f;
+						if (freshPlay) {
+							const bool wasEnded = state.dormant || state.oneShotDone;
+							state.blendingOut = false;
+							state.dormant = false;
+							state.oneShotDone = false;
+							state.sampleStarved = false;
+							state.lastSampledLocalTime = -1.0f;
+							state.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
+							state.lastAdvanceSec = state.lastSampleSec;
+							// Blend in from the CURRENT alpha (0 if dormant) rather than
+							// snapping, so cancelling a half-done blend-out doesn't pop.
+							float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
+							state.blendDuration = blendIn;
+							state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+							if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
+							if (wasEnded) {
+								// The previous play already delivered onEnd; this is a
+								// genuinely new play, so onStart fires again.
+								state.onEndFired = false;
+								QueueCustomEvents(tfActor, winningInfo->parentSubMod->eventsOnStart, "onStart/trackFilter-restart");
+							}
+						}
 					}
 				}
 			}
 			if (*animSlot != originalAnim && originalAnim) {
 				*animSlot = originalAnim;
+			}
+			// Replace Annotations for track filters: the original stays in the
+			// slot, so its native triggers fire the ORIGINAL's annotations while
+			// the manual pipeline fires the DONOR's — both firing doubled the
+			// gameplay events (two grenades thrown per throw, 2026-08-04 session).
+			// NULL the source clip's triggers exactly like the swap path does;
+			// BuildBehaviorOnlyTriggers keeps graph-critical transition events
+			// alive. This runs every Update, doubling as the per-frame re-assert.
+			if (bReplaceAnnot) {
+				bool alreadyRestored = false;
+				{
+					std::lock_guard rg(s_triggersRestoredMutex);
+					alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+				}
+				if (!alreadyRestored) {
+					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
+				}
 			}
 			// Record in activeSubModMap so the interruptible check works for track-filtered submods too
 			if (winningInfo->parentSubMod) {
@@ -6918,10 +7146,14 @@ namespace
 		if (cr.nameAndIndex.empty()) return;
 
 		float weight = filterPtr->weight * state.blendAlpha;
-		if (weight <= 0.001f) return;
 		auto mode = filterPtr->mode;
 		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+		// Source clips must proceed even at zero weight: dormant one-shot states
+		// watch the source's localTime here to detect a restart, and a blend-in's
+		// first frame still primes the sample cache. Non-source clips only apply
+		// cached values, so zero weight means nothing to do.
+		if (weight <= 0.001f && !isSourceClip) return;
 		auto** animSlot = a_this->GetAnimationSlot();
 
 		static int s_genEntryLog = 0;
@@ -6988,6 +7220,7 @@ namespace
 
 				float localTime = a_this->GetLocalTime();
 				float repDuration = repAnim->duration;
+				const bool loopingSource = (a_this->mode == RE::MODE_LOOPING);
 
 				if (filterPtr->sampleFrame >= 0.0f) {
 					// Fixed-frame sampling: hold the override pose at one authored
@@ -7000,14 +7233,101 @@ namespace
 						localTime = repDuration;
 					}
 				} else if (repDuration > 0.001f) {
-					// The clip generator's localTime is driven by the ORIGINAL animation's
-					// duration (since *animSlot isn't swapped for track filtering). Wrap it
-					// to the replacement's duration so different-length replacements sample
-					// correctly — preventing both out-of-bounds reads (replacement shorter)
-					// and ensuring the full replacement plays through (replacement longer,
-					// cycling independently of the base animation's loop).
-					localTime = std::fmod(localTime, repDuration);
-					if (localTime < 0.f) localTime += repDuration;
+					if (loopingSource) {
+						// Looping source (sprint, walk overlays): wrap the clip's
+						// localTime to the replacement's duration so different-length
+						// replacements cycle correctly.
+						localTime = std::fmod(localTime, repDuration);
+						if (localTime < 0.f) localTime += repDuration;
+					} else {
+						// ---- One-shot source (SINGLE_PLAY clip) ----
+						// Restart detection first: localTime moving backward means the
+						// engine restarted this generator for a new play. Re-arm a
+						// finished/dormant overlay and blend back in.
+						if (state.lastSampledLocalTime >= 0.0f &&
+							localTime + 0.05f < state.lastSampledLocalTime) {
+							const bool wasEnded = state.dormant || state.oneShotDone;
+							state.oneShotDone = false;
+							state.sampleStarved = false;
+							state.lastAdvanceSec = nowSec;
+							if (state.dormant || state.blendingOut) {
+								state.dormant = false;
+								state.blendingOut = false;
+								float blendIn = filterPtr->blendInTime;
+								state.blendDuration = blendIn;
+								state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+								if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
+							}
+							if (wasEnded) {
+								state.onEndFired = false;
+								if (state.parentSubMod) {
+									QueueCustomEvents(actor, state.parentSubMod->eventsOnStart, "onStart/trackFilter-restart");
+								}
+							}
+						}
+						if (std::fabs(localTime - state.lastSampledLocalTime) > 1e-5f) {
+							state.lastAdvanceSec = nowSec;
+						}
+						state.lastSampledLocalTime = localTime;
+
+						// The one-shot ends when ANY of these happen; the tick
+						// updater then starts the blend-out even though conditions
+						// may still be true:
+						//  - donor played through (clamp, never wrap: a donor
+						//    shorter than the original must hold its final frame
+						//    while blending out, not snap back to frame 0 mid-play);
+						//  - the SOURCE clip's own play finished (a source shorter
+						//    than the donor parks localTime at its end while the
+						//    graph holds the clip active — the overlay froze on the
+						//    last sampled frame for seconds, 2026-08-04 session);
+						//  - localTime stalled while samples keep flowing (same
+						//    parking behavior at an arbitrary point).
+						const float srcDuration = (animSlot && *animSlot) ? (*animSlot)->duration : 0.0f;
+						const bool donorDone = localTime >= repDuration;
+						const bool sourceDone = srcDuration > 0.02f && localTime >= srcDuration - 0.02f;
+						const bool stalled = state.lastAdvanceSec > 0.0f &&
+							nowSec - state.lastAdvanceSec > kOneShotStallSeconds;
+						if (donorDone) localTime = repDuration;
+						if (donorDone || sourceDone || stalled) {
+							state.oneShotDone = true;
+						}
+					}
+				}
+
+				// Dormant handling: starvation-induced dormancy (source stopped
+				// sampling) wakes as soon as samples resume; a completed one-shot
+				// (oneShotDone) stays dormant until the restart detection above
+				// sees the clip's localTime jump backward.
+				if (state.dormant) {
+					if (state.sampleStarved && !state.oneShotDone) {
+						state.dormant = false;
+						state.sampleStarved = false;
+						state.blendingOut = false;
+						float blendIn = filterPtr->blendInTime;
+						state.blendDuration = blendIn;
+						state.blendElapsed = 0.0f;
+						state.blendAlpha = (blendIn <= 0.0f) ? 1.0f : 0.0f;
+						if (state.onEndFired && state.parentSubMod) {
+							state.onEndFired = false;
+							QueueCustomEvents(actor, state.parentSubMod->eventsOnStart, "onStart/trackFilter-restart");
+						}
+					} else {
+						// Nothing to sample or apply, but stamp source liveness so
+						// staleness doesn't erase a state whose clip is still alive.
+						state.lastSourceTimeSec = nowSec;
+						return;
+					}
+				} else if (state.sampleStarved) {
+					// Samples resumed during a starvation blend-out: cancel it and
+					// blend back in from the current alpha (no pop).
+					state.sampleStarved = false;
+					if (state.blendingOut) {
+						state.blendingOut = false;
+						float blendIn = filterPtr->blendInTime;
+						state.blendDuration = blendIn;
+						state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+						if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
+					}
 				}
 
 				// Sanity: numberOfTransformTracks read at +0x18 — the same field
@@ -7042,6 +7362,71 @@ namespace
 						bindingNumTracks, animNumTracks, localTime);
 				}
 
+				// ---- Model-space anchoring setup (Override + playback-following) ----
+				// Donor LOCALS under the base animation's (different) parent chain do
+				// not reproduce the donor's motion: the arm inherits the base anim's
+				// torso. For each chain ROOT (filtered bone whose skeleton parent is
+				// outside the filter set), replace the donor local with
+				//   inv(currentParentModel) * donorModel(bone)
+				// so the whole chain lands exactly where the donor puts it relative
+				// to the character root. Children keep raw donor locals — composed
+				// under the anchored root they reproduce the donor in model space.
+				bool doAnchor = filterPtr->modelSpaceAnchor &&
+					mode == SubMod::TrackFilter::Mode::Override &&
+					filterPtr->sampleFrame < 0.0f;
+				const int16_t* skelParents = nullptr;
+				int32_t skelBoneCount = 0;
+				if (doAnchor) {
+					if (auto* setup = character->setup._ptr) {
+						if (auto* skel = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr)) {
+							auto* parentArr = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_parentIndices);
+							if (parentArr->data && parentArr->size > 0) {
+								skelParents = reinterpret_cast<int16_t*>(parentArr->data);
+								skelBoneCount = parentArr->size;
+							}
+						}
+					}
+					if (!skelParents) doAnchor = false;
+				}
+
+				thread_local std::unordered_set<int16_t> tl_filteredSet;
+				tl_filteredSet.clear();
+				if (doAnchor) {
+					for (auto& [n2, i2] : cr.nameAndIndex) tl_filteredSet.insert(i2);
+				}
+
+				auto donorTrackFor = [&](int16_t boneIdx) -> int32_t {
+					if (haveMapping) {
+						for (int32_t t = 0; t < numTracksToSample; ++t)
+							if (trackToBoneData[t] == boneIdx) return t;
+						return -1;
+					}
+					return (boneIdx < numTracksToSample) ? static_cast<int32_t>(boneIdx) : -1;
+				};
+
+				// Model transform = compose locals root→bone. Donor version uses the
+				// sampled donor tracks (falling back to the current pose for bones
+				// the donor doesn't track — arm chains are fully covered in practice);
+				// current version uses this generator's output pose.
+				auto modelTransform = [&](int16_t boneIdx, bool a_useDonor, RE::hkQsTransformRaw& outXf) {
+					int16_t chain[64];
+					int n = 0;
+					for (int16_t b = boneIdx; b >= 0 && b < skelBoneCount && n < 64; b = skelParents[b])
+						chain[n++] = b;
+					RE::hkQsTransformRaw acc = MakeIdentityQs();
+					for (int i = n - 1; i >= 0; --i) {
+						const int16_t b = chain[i];
+						const RE::hkQsTransformRaw* l = nullptr;
+						if (a_useDonor) {
+							const int32_t trk = donorTrackFor(b);
+							if (trk >= 0) l = &tl_sampledTracks[trk];
+						}
+						if (!l && b < numOutputBones) l = &outputPose[b];
+						if (l) ComposeQs(acc, *l, acc);
+					}
+					outXf = acc;
+				};
+
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
 
@@ -7062,20 +7447,42 @@ namespace
 
 					if (trackIdx < 0) continue;
 
-					const RE::hkQsTransformRaw& repVal = tl_sampledTracks[trackIdx];
+					RE::hkQsTransformRaw repVal = tl_sampledTracks[trackIdx];
 					RE::hkQsTransformRaw baseVal = outputPose[idx];
+
+					// Chain roots get the anchored local (see setup above). The
+					// walk only touches ancestors OUTSIDE the filter set, which the
+					// loop never overwrites, so iteration order doesn't matter.
+					if (doAnchor && idx < skelBoneCount) {
+						const int16_t par = skelParents[idx];
+						if (par < 0 || !tl_filteredSet.count(par)) {
+							RE::hkQsTransformRaw donorM, parentM;
+							modelTransform(idx, /*useDonor=*/true, donorM);
+							if (par >= 0) {
+								modelTransform(par, /*useDonor=*/false, parentM);
+								InverseQs(parentM, parentM);
+								ComposeQs(parentM, donorM, repVal);
+							} else {
+								repVal = donorM;
+							}
+						}
+					}
 
 					state.cachedRepByName[name] = repVal;
 					state.cachedBaseByName[name] = baseVal;
 
-					if (mode == SubMod::TrackFilter::Mode::Override) {
-						LerpTransform(outputPose[idx], repVal, weight);
-					} else {
-						BlendAdditiveTransform(outputPose[idx], baseVal, repVal, weight);
+					// At ~zero weight this pass only primes the cache (blend-in's
+					// first frame): don't touch the pose or set mask bits.
+					if (weight > 0.001f) {
+						if (mode == SubMod::TrackFilter::Mode::Override) {
+							LerpTransform(outputPose[idx], repVal, weight);
+						} else {
+							BlendAdditiveTransform(outputPose[idx], baseVal, repVal, weight);
+						}
+						// Mark this bone as MODIFIED in the pose's bone mask, so the
+						// engine's downstream pose composition honors our write.
+						SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 					}
-					// Mark this bone as MODIFIED in the pose's bone mask, so the
-					// engine's downstream pose composition honors our write.
-					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
 				if (wantBindingDiag) s_bindingDiagLog++;
 
@@ -7083,6 +7490,7 @@ namespace
 
 				state.cacheValid = true;
 				state.lastSourceTimeSec = nowSec;
+				state.lastSampleSec = nowSec;
 
 				static int s_finalLog = 0;
 				if (s_finalLog < 5) {
@@ -7124,6 +7532,9 @@ namespace
 				}
 			}
 			if (!animSlot || !*animSlot) return;
+			// This path swaps and recursively generates — there is no cache-only
+			// priming mode, so at ~zero weight just skip it entirely.
+			if (weight <= 0.001f) return;
 
 			RE::hkaAnimation* originalInSlot = *animSlot;
 
@@ -7156,6 +7567,7 @@ namespace
 			}
 			state2.cacheValid = true;
 			state2.lastSourceTimeSec = nowSec;
+			state2.lastSampleSec = nowSec;
 
 			memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
 
@@ -7325,6 +7737,16 @@ namespace
 			Hooks::UpdateHooks::RunActorUpdatesOrig();
 		}
 
+	// Track-filter bone debug aids (green mesh highlight + 3D name labels).
+	// Runs here because this is the game thread with the scene graph in a
+	// stable state; no-ops in a single check while the feature is unused.
+	BoneDebugViz::OnGameTick();
+
+	// Per-frame aim-state stamp for the IsADS condition's grace window
+	// (reloads drop sighted state on the same frame the reload clip starts,
+	// so conditions need last-sighted history rather than a live probe).
+	ConditionTracking::TickPlayerAimState();
+
 		// The Settings "Enabled" box was just unticked on the UI thread:
 		// perform the vanilla restore here on the game thread, outside the
 		// Havok update cycle (see OnGlobalEnabledChanged).
@@ -7424,11 +7846,19 @@ namespace
 			std::set<std::pair<RE::TESObjectREFR*, const SubMod::TrackFilter*>> conditionsFalse;
 			for (auto& pe : toEval) {
 				if (pe.subMod->GetPlayOnceFullBody()) continue;
-				// Track-filtered submods always re-evaluate conditions. Unlike full-body
-				// replacements (where IsInterruptible prevents mid-animation interruption),
-				// track filters overlay bones and must deactivate via blend-out when
-				// conditions become false. The configured blendOutTime provides the smooth
-				// transition — not the interruptible flag.
+				// Non-interruptible PLAYBACK-FOLLOWING overlays honor the same
+				// contract as non-interruptible full-body replacements: conditions
+				// gate activation, then the play rides through to the donor's end.
+				// Their termination comes from the one-shot path (donor completed /
+				// source stopped sampling), which is why re-evaluating conditions
+				// here cut a grenade throw at the release frame — IsAttacking drops
+				// a few tenths before the animation actually finishes (2026-08-04).
+				//
+				// FIXED-FRAME pose holders (sampleFrame >= 0) always re-evaluate:
+				// a condition flip is their ONLY end signal, and blendOutTime (not
+				// the interruptible flag) provides the smooth exit.
+				if (!pe.subMod->IsInterruptible() && pe.filter && pe.filter->sampleFrame < 0.0f)
+					continue;
 				if (!pe.subMod->EvaluateConditions(pe.actor, pe.sourceClip))
 					conditionsFalse.insert({ pe.actor, pe.filter });
 			}
@@ -7443,6 +7873,48 @@ namespace
 						auto* filterPtr = state.filter;
 						bool condFalse = conditionsFalse.count({ mapIt->first, filterPtr }) > 0;
 
+						// Dormant: applies nothing (alpha 0), kept while its source clip
+						// is alive so revival never goes through erase-and-recreate
+						// (a fresh state per frame was the register/erase churn,
+						// 2026-08-04 01:53 session). Erased ONLY by staleness — the
+						// clip generator actually going away. NOT erased on condFalse:
+						// for non-interruptible submods the Update hook re-registers
+						// the winner every frame regardless of conditions, so a
+						// condFalse erase just recreates the state next frame.
+						if (state.dormant) {
+							// Wake rules by dormancy reason:
+							//  - one-shot completed: only a fresh play (restart
+							//    detection / registration) wakes it, handled elsewhere.
+							//  - sample-starved: samples resuming wake it, handled in
+							//    the sampling path.
+							//  - condition-ended: conditions turning true again wake
+							//    it here (persistent-overlay semantics).
+							if (!condFalse && !state.oneShotDone && !state.sampleStarved) {
+								state.dormant = false;
+								state.blendingOut = false;
+								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
+								state.blendDuration = blendIn;
+								state.blendElapsed = 0.0f;
+								state.blendAlpha = (blendIn <= 0.0f) ? 1.0f : 0.0f;
+								if (state.onEndFired && state.parentSubMod) {
+									state.onEndFired = false;
+									QueueCustomEvents(mapIt->first, state.parentSubMod->eventsOnStart, "onStart/trackFilter-restart");
+								}
+								++stIt;
+								continue;
+							}
+							if (nowSec - state.lastSourceTimeSec > kTrackFilterStaleSeconds) {
+								if (!state.onEndFired && state.parentSubMod) {
+									QueueCustomEvents(mapIt->first, state.parentSubMod->eventsOnEnd, "onEnd/trackFilter");
+								}
+								stIt = states.erase(stIt);
+								s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+								continue;
+							}
+							++stIt;
+							continue;
+						}
+
 						// Staleness cleanup: if all source clips are gone and no source
 						// has generated for kTrackFilterStaleSeconds (wall-clock — frame
 						// counts would shrink the window at high framerates), treat as
@@ -7454,7 +7926,43 @@ namespace
 							condFalse = true;
 						}
 
-						if (condFalse && !state.blendingOut) {
+						// One-shot end for playback-following filters (sampleFrame < 0):
+						// the overlay ends itself when the donor has played through
+						// (oneShotDone, set by the sampling path) or when the source
+						// stops producing samples (clip went zero-weight / ended before
+						// the donor). Conditions staying true must NOT keep the overlay
+						// pinned — that froze a grenade-throw arm at its final frame
+						// indefinitely (2026-08-04 session). Fixed-frame pose donors
+						// keep the persistent-overlay semantics and are untouched.
+						bool oneShotEnd = false;
+						if (filterPtr && filterPtr->sampleFrame < 0.0f &&
+							!state.blendingOut && !condFalse) {
+							if (state.oneShotDone) {
+								oneShotEnd = true;
+							} else if (state.lastSampleSec > 0.0f &&
+								nowSec - state.lastSampleSec > kOneShotSampleGraceSeconds) {
+								state.sampleStarved = true;
+								oneShotEnd = true;
+							}
+						}
+
+						if (oneShotEnd) {
+							// No deactivation delay here — that setting is for
+							// condition-driven ends; a finished one-shot goes now.
+							state.deactivationDelayActive = false;
+							state.blendingOut = true;
+							state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
+							// Continue from the current alpha (alpha maps to elapsed
+							// via the inverse of the ease, approximated linearly).
+							state.blendElapsed = (1.0f - state.blendAlpha) * state.blendDuration;
+							static int s_osLog = 0;
+							if (s_osLog < 10) {
+								logger::info("[OAR-TrackFilter] One-shot end for '{}' ({}) — blending out ({:.2f}s)",
+									state.suffix, state.oneShotDone ? "donor completed" : "source stopped sampling",
+									state.blendDuration);
+								s_osLog++;
+							}
+						} else if (condFalse && !state.blendingOut) {
 							float deactivDelay = state.parentSubMod ? state.parentSubMod->GetDeactivationDelay() : 0.0f;
 							if (deactivDelay > 0.0f && !state.deactivationDelayActive) {
 								state.deactivationDelayActive = true;
@@ -7464,8 +7972,11 @@ namespace
 							if (!state.deactivationDelayActive || state.deactivationDelayRemaining <= 0.0f) {
 								state.deactivationDelayActive = false;
 								state.blendingOut = true;
-								state.blendElapsed = 0.0f;
 								state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
+								// Start from the current alpha, not from 1: restarting
+								// a blend-out that was already in progress used to snap
+								// alpha back to full (part of the 9-restart flap).
+								state.blendElapsed = (1.0f - state.blendAlpha) * state.blendDuration;
 								static int s_boLog = 0;
 								if (s_boLog < 10) {
 									logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
@@ -7476,6 +7987,18 @@ namespace
 						} else if (!condFalse) {
 							state.deactivationDelayActive = false;
 							state.deactivationDelayRemaining = 0.0f;
+							// Conditions true again during a CONDITION-driven blend-out:
+							// blend back in from the current alpha. One-shot/starvation
+							// blend-outs ignore conditions entirely. This (not the old
+							// unconditional cancel at re-registration) is now the single
+							// authority for condition-driven reactivation.
+							if (state.blendingOut && !state.oneShotDone && !state.sampleStarved) {
+								state.blendingOut = false;
+								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
+								state.blendDuration = blendIn;
+								state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+								if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
+							}
 						}
 
 						if (state.deactivationDelayActive) {
@@ -7483,9 +8006,26 @@ namespace
 						}
 
 						if (state.blendingOut) {
+							// A finished blend-out ALWAYS parks the state dormant.
+							// Erasing here while the source clip is still alive made
+							// the Update hook re-register a fresh state the very next
+							// frame (per-frame churn); the dormant branch above owns
+							// the actual erase via staleness. Custom "on end" events
+							// fire here — the visible end of the overlay — guarded so
+							// a later erase doesn't fire them again.
+							auto goDormant = [&]() {
+								state.dormant = true;
+								state.blendingOut = false;
+								state.blendAlpha = 0.0f;
+								if (!state.onEndFired && state.parentSubMod) {
+									QueueCustomEvents(mapIt->first, state.parentSubMod->eventsOnEnd, "onEnd/trackFilter");
+									state.onEndFired = true;
+								}
+							};
+
 							if (state.blendDuration <= 0.0f) {
-								stIt = states.erase(stIt);
-								s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+								goDormant();
+								++stIt;
 								continue;
 							}
 							state.blendElapsed += dt;
@@ -7501,10 +8041,14 @@ namespace
 							}
 
 							if (state.blendAlpha <= 0.001f) {
-								logger::info("[OAR-TrackFilter] Blend-out COMPLETE — erasing entry for '{}'", state.suffix);
 								s_lastBlendLog = 0.0f;
-								stIt = states.erase(stIt);
-								s_trackFilterActiveCount.fetch_sub(1, std::memory_order_relaxed);
+								static int s_dormLog = 0;
+								if (s_dormLog < 10) {
+									logger::info("[OAR-TrackFilter] Blend-out COMPLETE — '{}' dormant (awaiting reactivation)", state.suffix);
+									s_dormLog++;
+								}
+								goDormant();
+								++stIt;
 								continue;
 							}
 						} else {

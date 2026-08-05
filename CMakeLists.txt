@@ -82,6 +82,7 @@ set(SOURCES
 	src/UI/UIAnimationQueue.cpp
 	src/UI/UIDebugOverlay.cpp
 	src/UI/UIFormPicker.cpp
+	src/UI/BoneDebugViz.cpp
 	src/FormRegistry.cpp
 	src/API/OpenAnimationReplacerAPI.cpp
 )
@@ -117,6 +118,7 @@ set(HEADERS
 	src/UI/UIAnimationQueue.h
 	src/UI/UIDebugOverlay.h
 	src/UI/UIFormPicker.h
+	src/UI/BoneDebugViz.h
 	src/FormRegistry.h
 	src/ActiveReplacementTracker.h
 	src/RE_Additions.h

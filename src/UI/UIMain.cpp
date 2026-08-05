@@ -1,5 +1,6 @@
 #include "UI/UIMain.h"
 #include "UI/UIManager.h"
+#include "UI/BoneDebugViz.h"
 #include "OpenAnimationReplacer.h"
 #include "ReplacerMods.h"
 #include "ReplacementAnimation.h"
@@ -14,6 +15,60 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <mutex>
+
+// Havok skeleton bones — matches the actual animation skeleton definition.
+// File scope because both the track filter section and the custom events
+// bone picker (CullBone/UncullBone) present this list.
+static const char* kKnownBones[] = {
+	// Core body
+	"Root", "COM", "Pelvis", "Spine1", "Spine2", "Chest", "Neck", "Head",
+	// Left arm
+	"LArm_Collarbone", "LArm_UpperArm", "LArm_UpperTwist1", "LArm_UpperTwist2",
+	"LArm_ForeArm1", "LArm_ForeArm2", "LArm_ForeArm3", "LArm_Hand",
+	"LArm_Finger11", "LArm_Finger12", "LArm_Finger13",
+	"LArm_Finger21", "LArm_Finger22", "LArm_Finger23",
+	"LArm_Finger31", "LArm_Finger32", "LArm_Finger33",
+	"LArm_Finger41", "LArm_Finger42", "LArm_Finger43",
+	"LArm_Finger51", "LArm_Finger52", "LArm_Finger53",
+	// Right arm
+	"RArm_Collarbone", "RArm_UpperArm", "RArm_UpperTwist1", "RArm_UpperTwist2",
+	"RArm_ForeArm1", "RArm_ForeArm2", "RArm_ForeArm3", "PipboyBone", "RArm_Hand",
+	"RArm_Finger11", "RArm_Finger12", "RArm_Finger13",
+	"RArm_Finger21", "RArm_Finger22", "RArm_Finger23",
+	"RArm_Finger31", "RArm_Finger32", "RArm_Finger33",
+	"RArm_Finger41", "RArm_Finger42", "RArm_Finger43",
+	"RArm_Finger51", "RArm_Finger52", "RArm_Finger53",
+	// Legs
+	"LLeg_Thigh", "LLeg_Calf", "LLeg_Foot", "LLeg_Toe1",
+	"RLeg_Thigh", "RLeg_Calf", "RLeg_Foot", "RLeg_Toe1",
+	// Weapon (right hand)
+	"Weapon", "WeaponBolt", "WeaponTrigger", "WeaponMagazine",
+	"WeaponMagazineChild1", "WeaponMagazineChild2", "WeaponMagazineChild3",
+	"WeaponMagazineChild4", "WeaponMagazineChild5",
+	"WeaponMagazineChild6", "WeaponMagazineChild7", "WeaponMagazineChild8",
+	"WeaponMagazineChild9", "WeaponMagazineChild10", "WeaponMagazineChild11",
+	"WeaponMagazineChild12", "WeaponMagazineChild13", "WeaponMagazineChild14",
+	"WeaponMagazineChild15",
+	"WeaponOptics1", "WeaponOptics2",
+	"WeaponExtra1", "WeaponExtra2", "WeaponExtra3",
+	"WeaponExtra4", "WeaponExtra5", "WeaponExtra6", "WeaponExtra7",
+	"WeaponExtra8", "WeaponExtra9", "WeaponExtra10", "WeaponExtra11",
+	"WeaponExtra12", "WeaponExtra13", "WeaponExtra14", "WeaponExtra15",
+	"WeaponExtra16", "WeaponExtra17", "WeaponExtra18", "WeaponExtra19", "WeaponExtra20",
+	"WeaponBipod", "WeaponBipodL", "WeaponBipodR",
+	// Weapon (left hand)
+	"WeaponLeft",
+	// IK / Camera / Anim objects
+	"WeaponIKTargetL", "WeaponIKTargetR",
+	"WeaponIKTargetLMirror", "WeaponIKTargetRMirror",
+	"Camera", "Camera Control", "CamTarget",
+	"AnimObjectA", "AnimObjectB",
+	"AnimObjectL1", "AnimObjectL2", "AnimObjectL3",
+	"AnimObjectR1", "AnimObjectR2", "AnimObjectR3",
+	// Helpers
+	"L_RibHelper", "R_RibHelper",
+};
+static constexpr int kNumKnownBones = static_cast<int>(sizeof(kKnownBones) / sizeof(kKnownBones[0]));
 
 ImGuiWindowFlags UIMain::GetWindowFlags() const
 {
@@ -559,6 +614,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"sneakStart", "sneakStop",
 			"GunDown", "GunUp",
 			"EjectShellCasing", "Recoil",
+		"CullBone", "UncullBone",
 			"idleLoopingStart", "idleLoopingExit", "IdleStop",
 			"blockStart", "blockStop", "blockEnd",
 			"staggerExit", "staggerStop",
@@ -606,10 +662,49 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			static int selectedCommon = 0;
 			ImGui::SetNextItemWidth(200);
 			ImGui::Combo("##common", &selectedCommon, s_commonEvents, s_numCommonEvents);
-			ImGui::SameLine();
-			if (ImGui::Button("Add from List")) {
-				events.push_back(s_commonEvents[selectedCommon]);
-				a_subMod->SetDirty(true);
+
+			// CullBone / UncullBone are bone-targeted: the engine dispatches
+			// annotation events split at the first '.' into tag + payload, so
+			// these need a bone argument ("CullBone.WeaponMagazine"). OAR's
+			// event emission performs the same split (see NotifyEventSinks in
+			// Hooks.cpp), so the composed dotted name reaches the engine's
+			// cull handler exactly like a native annotation. Show a bone
+			// picker instead of adding the bare selector.
+			const char* selEvtName = s_commonEvents[selectedCommon];
+			const bool wantsBone = std::strcmp(selEvtName, "CullBone") == 0 ||
+			                       std::strcmp(selEvtName, "UncullBone") == 0;
+			if (!wantsBone) {
+				ImGui::SameLine();
+				if (ImGui::Button("Add from List")) {
+					events.push_back(selEvtName);
+					a_subMod->SetDirty(true);
+				}
+			} else {
+				ImGui::Indent(16.f);
+				ImGui::TextDisabled("%s which bone?", std::strcmp(selEvtName, "CullBone") == 0 ? "Hide (cull)" : "Show (uncull)");
+				static int selectedCullBone = 0;
+				ImGui::SetNextItemWidth(180);
+				ImGui::Combo("##cullBoneList", &selectedCullBone, kKnownBones, kNumKnownBones);
+				ImGui::SameLine();
+				static char cullBoneBuf[128] = "";
+				ImGui::SetNextItemWidth(160);
+				ImGui::InputTextWithHint("##cullBoneTyped", "...or type a bone name", cullBoneBuf, sizeof(cullBoneBuf));
+				ImGui::SameLine();
+				if (ImGui::Button("Add##cullBoneAdd")) {
+					// Typed name wins over the list selection when present.
+					const char* bone = cullBoneBuf[0] != '\0' ? cullBoneBuf : kKnownBones[selectedCullBone];
+					events.push_back(std::string(selEvtName) + "." + bone);
+					a_subMod->SetDirty(true);
+					cullBoneBuf[0] = '\0';
+				}
+				if (ImGui::IsItemHovered()) {
+					ImGui::SetTooltip(
+						"Adds '%s.<bone>' — hides/shows every mesh attached to that\n"
+						"bone, same as the CullBone/UncullBone annotations weapon\n"
+						"reload animations use for magazines. A typed name overrides\n"
+						"the list selection.", selEvtName);
+				}
+				ImGui::Unindent(16.f);
 			}
 
 			// Manual text entry
@@ -795,6 +890,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["blendInTime"] = tf.blendInTime;
 				tfJson["blendOutTime"] = tf.blendOutTime;
 				tfJson["sampleFrame"] = tf.sampleFrame;
+				tfJson["modelSpaceAnchor"] = tf.modelSpaceAnchor;
 				tfJson["includeChildren"] = tf.includeChildren;
 				tfJson["bones"] = tf.boneNames;
 				tfJson["excludeChildren"] = tf.excludeChildren;
@@ -1174,62 +1270,61 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 	ImGui::PopID();
 }
 
+// Session-only debug buttons drawn next to each bone in the track filter
+// lists: a green-mesh highlight toggle and a 3-state 3D name label
+// (off -> joint position -> attached mesh position). See BoneDebugViz.
+static void DrawBoneDebugButtons(const std::string& a_boneName)
+{
+	const bool highlighted = BoneDebugViz::IsHighlighted(a_boneName);
+	if (highlighted) {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.55f, 0.10f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.70f, 0.15f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.85f, 0.20f, 1.0f));
+	}
+	if (ImGui::SmallButton("HL##boneHighlight")) {
+		BoneDebugViz::ToggleHighlight(a_boneName);
+	}
+	if (highlighted) {
+		ImGui::PopStyleColor(3);
+	}
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Highlight every mesh attached under this node in bright green\n"
+			"(emissive tint). Click again to restore the original appearance.\n"
+			"Not saved — resets when the game closes.");
+	}
+
+	ImGui::SameLine();
+	const int labelMode = BoneDebugViz::GetLabelMode(a_boneName);
+	if (labelMode != 0) {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.40f, 0.60f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.50f, 0.75f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.60f, 0.90f, 1.0f));
+	}
+	const char* labelText = labelMode == 0 ? "Tag##boneLabel" :
+	                        labelMode == 1 ? "Tag:J##boneLabel" :
+	                                         "Tag:M##boneLabel";
+	if (ImGui::SmallButton(labelText)) {
+		BoneDebugViz::CycleLabel(a_boneName);
+	}
+	if (labelMode != 0) {
+		ImGui::PopStyleColor(3);
+	}
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Show this bone's name as floating 3D text in the world.\n"
+			"Click cycles: off -> at the joint (J) -> at the attached mesh (M) -> off.\n"
+			"Not saved — resets when the game closes.");
+	}
+}
+
 void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 {
 	if (!a_subMod) return;
 
 	auto& tf = a_subMod->trackFilter;
 
-	// Havok skeleton bones — matches the actual animation skeleton definition
-	static const char* kKnownBones[] = {
-		// Core body
-		"Root", "COM", "Pelvis", "Spine1", "Spine2", "Chest", "Neck", "Head",
-		// Left arm
-		"LArm_Collarbone", "LArm_UpperArm", "LArm_UpperTwist1", "LArm_UpperTwist2",
-		"LArm_ForeArm1", "LArm_ForeArm2", "LArm_ForeArm3", "LArm_Hand",
-		"LArm_Finger11", "LArm_Finger12", "LArm_Finger13",
-		"LArm_Finger21", "LArm_Finger22", "LArm_Finger23",
-		"LArm_Finger31", "LArm_Finger32", "LArm_Finger33",
-		"LArm_Finger41", "LArm_Finger42", "LArm_Finger43",
-		"LArm_Finger51", "LArm_Finger52", "LArm_Finger53",
-		// Right arm
-		"RArm_Collarbone", "RArm_UpperArm", "RArm_UpperTwist1", "RArm_UpperTwist2",
-		"RArm_ForeArm1", "RArm_ForeArm2", "RArm_ForeArm3", "PipboyBone", "RArm_Hand",
-		"RArm_Finger11", "RArm_Finger12", "RArm_Finger13",
-		"RArm_Finger21", "RArm_Finger22", "RArm_Finger23",
-		"RArm_Finger31", "RArm_Finger32", "RArm_Finger33",
-		"RArm_Finger41", "RArm_Finger42", "RArm_Finger43",
-		"RArm_Finger51", "RArm_Finger52", "RArm_Finger53",
-		// Legs
-		"LLeg_Thigh", "LLeg_Calf", "LLeg_Foot", "LLeg_Toe1",
-		"RLeg_Thigh", "RLeg_Calf", "RLeg_Foot", "RLeg_Toe1",
-		// Weapon (right hand)
-		"Weapon", "WeaponBolt", "WeaponTrigger", "WeaponMagazine",
-		"WeaponMagazineChild1", "WeaponMagazineChild2", "WeaponMagazineChild3",
-		"WeaponMagazineChild4", "WeaponMagazineChild5",
-		"WeaponMagazineChild6", "WeaponMagazineChild7", "WeaponMagazineChild8",
-		"WeaponMagazineChild9", "WeaponMagazineChild10", "WeaponMagazineChild11",
-		"WeaponMagazineChild12", "WeaponMagazineChild13", "WeaponMagazineChild14",
-		"WeaponMagazineChild15",
-		"WeaponOptics1", "WeaponOptics2",
-		"WeaponExtra1", "WeaponExtra2", "WeaponExtra3",
-		"WeaponExtra4", "WeaponExtra5", "WeaponExtra6", "WeaponExtra7",
-		"WeaponExtra8", "WeaponExtra9", "WeaponExtra10", "WeaponExtra11",
-		"WeaponExtra12", "WeaponExtra13", "WeaponExtra14", "WeaponExtra15",
-		"WeaponExtra16", "WeaponExtra17", "WeaponExtra18", "WeaponExtra19", "WeaponExtra20",
-		"WeaponBipod", "WeaponBipodL", "WeaponBipodR",
-		// Weapon (left hand)
-		"WeaponLeft",
-		// IK / Camera / Anim objects
-		"WeaponIKTargetL", "WeaponIKTargetR",
-		"WeaponIKTargetLMirror", "WeaponIKTargetRMirror",
-		"Camera", "Camera Control", "CamTarget",
-		"AnimObjectA", "AnimObjectB",
-		"AnimObjectL1", "AnimObjectL2", "AnimObjectL3",
-		"AnimObjectR1", "AnimObjectR2", "AnimObjectR3",
-		// Helpers
-		"L_RibHelper", "R_RibHelper",
-	};
+	// Bone list: file-scope kKnownBones (shared with the custom events UI).
 
 	ImGui::Indent(8.f);
 
@@ -1311,6 +1406,18 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 						"Frame number in the replacement animation to sample (30 frames per\n"
 						"second; clamped to the animation's length).");
 				}
+			} else {
+				if (ImGui::Checkbox("Anchor In Model Space (?)##trackFilter", &tf.modelSpaceAnchor)) {
+					a_subMod->SetDirty(true);
+				}
+				if (ImGui::IsItemHovered()) {
+					ImGui::SetTooltip(
+						"Re-express the filtered chain's root bones so the chain lands exactly\n"
+						"where the replacement animation puts it relative to the character root.\n"
+						"Without this, the replacement's bone rotations play under the BASE\n"
+						"animation's (different) torso pose and the motion looks off.\n"
+						"Override mode only. Recommended ON for partial-body action overlays.");
+				}
 			}
 
 			if (ImGui::Checkbox("Include Children##trackFilter", &tf.includeChildren)) {
@@ -1343,6 +1450,8 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				if (ImGui::SmallButton("X##removeBone")) {
 					removeIdx = i;
 				}
+				ImGui::SameLine();
+				DrawBoneDebugButtons(boneSnapshot[i]);
 				ImGui::PopID();
 			}
 			if (removeIdx >= 0) {
@@ -1384,8 +1493,32 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 
 			if (ImGui::BeginPopup("AddBonePopup")) {
 				static char boneFilter[64]{};
-				ImGui::InputTextWithHint("##boneSearch", "Search bones...", boneFilter, sizeof(boneFilter));
+				ImGui::InputTextWithHint("##boneSearch", "Search or type a bone name...", boneFilter, sizeof(boneFilter));
 				ImGui::Separator();
+
+				// The search text doubles as manual entry: offer to add it
+				// verbatim unless it exactly names a known bone (that entry is
+				// already listed below).
+				if (boneFilter[0] != '\0') {
+					bool exactKnown = false;
+					for (const char* bone : kKnownBones) {
+						if (_stricmp(bone, boneFilter) == 0) { exactKnown = true; break; }
+					}
+					bool alreadyAdded = false;
+					for (const auto& name : boneSnapshot) {
+						if (name == boneFilter) { alreadyAdded = true; break; }
+					}
+					if (!exactKnown && !alreadyAdded) {
+						std::string typedLabel = std::string("Add typed name: \"") + boneFilter + "\"";
+						if (ImGui::MenuItem(typedLabel.c_str())) {
+							std::lock_guard lock(tf.boneMutex);
+							tf.boneNames.emplace_back(boneFilter);
+							tf.version.fetch_add(1, std::memory_order_relaxed);
+							a_subMod->SetDirty(true);
+							boneFilter[0] = '\0';
+						}
+					}
+				}
 
 				for (const char* bone : kKnownBones) {
 					if (boneFilter[0] != '\0' && !UICommon::FuzzyMatch(boneFilter, bone)) continue;
@@ -1449,6 +1582,8 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				if (ImGui::SmallButton("X##removeExclBone")) {
 					exclRemoveIdx = i;
 				}
+				ImGui::SameLine();
+				DrawBoneDebugButtons(excludeSnapshot[i]);
 				ImGui::PopID();
 			}
 			if (exclRemoveIdx >= 0) {
@@ -1490,8 +1625,30 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 
 			if (ImGui::BeginPopup("AddExclBonePopup")) {
 				static char exclBoneFilter[64]{};
-				ImGui::InputTextWithHint("##exclBoneSearch", "Search bones...", exclBoneFilter, sizeof(exclBoneFilter));
+				ImGui::InputTextWithHint("##exclBoneSearch", "Search or type a bone name...", exclBoneFilter, sizeof(exclBoneFilter));
 				ImGui::Separator();
+
+				// Same search-as-manual-entry behavior as the include popup.
+				if (exclBoneFilter[0] != '\0') {
+					bool exactKnown = false;
+					for (const char* bone : kKnownBones) {
+						if (_stricmp(bone, exclBoneFilter) == 0) { exactKnown = true; break; }
+					}
+					bool alreadyAdded = false;
+					for (const auto& name : excludeSnapshot) {
+						if (name == exclBoneFilter) { alreadyAdded = true; break; }
+					}
+					if (!exactKnown && !alreadyAdded) {
+						std::string typedLabel = std::string("Add typed name: \"") + exclBoneFilter + "\"";
+						if (ImGui::MenuItem(typedLabel.c_str())) {
+							std::lock_guard lock(tf.boneMutex);
+							tf.excludeBoneNames.emplace_back(exclBoneFilter);
+							tf.version.fetch_add(1, std::memory_order_relaxed);
+							a_subMod->SetDirty(true);
+							exclBoneFilter[0] = '\0';
+						}
+					}
+				}
 
 				for (const char* bone : kKnownBones) {
 					if (exclBoneFilter[0] != '\0' && !UICommon::FuzzyMatch(exclBoneFilter, bone)) continue;

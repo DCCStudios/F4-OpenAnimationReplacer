@@ -135,6 +135,13 @@ public:
 		// of following the clip's playback time — a held static pose.
 		// Negative = disabled (sample at the clip's current time).
 		float sampleFrame = -1.0f;
+		// Model-space anchoring (Override + playback-following only): the
+		// filtered chain's ROOT bones are re-expressed so the chain lands
+		// exactly where the donor animation puts it relative to the character
+		// root, instead of playing donor locals under the base animation's
+		// (different) torso pose. This is what makes "the left arm looks
+		// exactly like the donor" true when only part of the body is filtered.
+		bool modelSpaceAnchor = true;
 		bool includeChildren = true;
 		std::vector<std::string> boneNames;
 		// Exclude list: bones matching here are removed from the final resolved set

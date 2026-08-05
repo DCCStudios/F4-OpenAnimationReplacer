@@ -277,15 +277,27 @@ private:
 	FormComponent form;
 };
 
+// Per-frame game-thread tracking used by conditions that need history rather
+// than an instantaneous state probe (IsADS's grace window). Called from
+// Hooks::HookedActorUpdate.
+namespace ConditionTracking
+{
+	void TickPlayerAimState();
+}
+
 class IsADSCondition : public ConditionBase
 {
 public:
 	std::string GetName() const override { return "IsADS"; }
-	std::string GetDescription() const override { return "True when the actor is aiming down sights (or using a scope). Reads the 'IsAiming' graph variable."; }
+	std::string GetDescription() const override { return "True while the actor is aiming down sights (gun state Sighted/FireSighted). Grace window keeps it true for that many milliseconds after leaving sights (player only) — needed for reload animations, which drop sighted state right as the reload clip starts. For one-shot animations combine with Play Once or non-interruptible so only the at-activation evaluation matters."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
-	void InitializeImpl(const nlohmann::json&) override {}
-	void SerializeImpl(nlohmann::json&) const override {}
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	int32_t graceMs = 0;  // extra time the condition stays true after leaving sights
 };
 
 class CompareActorValueCondition : public ConditionBase
@@ -1349,6 +1361,28 @@ protected:
 	void SerializeImpl(nlohmann::json& a_json) const override;
 private:
 	FormComponent form;
+};
+
+class IsPlayingAnyIdleAnimationCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsPlayingAnyIdleAnimation"; }
+	std::string GetDescription() const override { return "True while the actor is playing ANY explicitly triggered idle animation form (TESIdleForm) via the AI process — PlayIdle and special/scripted idles. Ambient flavor fidgets (idles from Flavor idle trees) and graph-internal states like WPNIdleReady do not count. Use Negate for 'no idle playing'."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
+class IsSeamlessInspectPlayingCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsSeamlessInspectPlaying"; }
+	std::string GetDescription() const override { return "True while a weapon inspect idle handled by the SeamlessInspect F4SE plugin is playing on the actor. Reads the same config SeamlessInspect uses (Data/F4SE/Plugins/SeamlessInspectMods.txt, default Inspectweapons.esl): true when the actor's current idle comes from one of those plugins, or (player only) while SeamlessInspect's inspect quest is at stage 1."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
 };
 
 // =============================================================================

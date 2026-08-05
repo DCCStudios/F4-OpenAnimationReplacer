@@ -139,6 +139,143 @@ class EspPickerDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class ConfirmDialog(ctk.CTkToplevel):
+    """Themed yes/no dialog used for run confirmation and overwrite prompts.
+
+    Looks like the rest of the tool (dark panel, green accent) instead of a stock
+    Windows message box. ``sections`` is optional structured content rendered as
+    compact cards; ``body`` is plain muted text above them.
+    """
+
+    def __init__(
+        self,
+        master,
+        *,
+        title: str,
+        heading: str,
+        body: str = "",
+        sections: list[tuple[str, list[str]]] | None = None,
+        confirm_text: str = "Confirm",
+        cancel_text: str = "Cancel",
+        danger: bool = False,
+        width: int = 680,
+        height: int = 440,
+    ):
+        super().__init__(master)
+        self.title(title)
+        self.geometry(f"{width}x{height}")
+        self.minsize(480, 260)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+        self.result = False
+
+        # Accent bar at the top so the dialog reads as part of the tool, not OS chrome.
+        accent_bar = ctk.CTkFrame(
+            self, fg_color=DANGER if danger else ACCENT, height=3, corner_radius=0
+        )
+        accent_bar.pack(fill="x")
+        accent_bar.pack_propagate(False)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=18, pady=(14, 4))
+        ctk.CTkLabel(
+            head,
+            text=heading,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=DANGER if danger else ACCENT,
+            anchor="w",
+        ).pack(fill="x")
+        if body:
+            ctk.CTkLabel(
+                head,
+                text=body,
+                text_color=MUTED,
+                font=ctk.CTkFont(size=12),
+                anchor="w",
+                justify="left",
+                wraplength=width - 48,
+            ).pack(fill="x", pady=(4, 0))
+
+        if sections:
+            scroll = ctk.CTkScrollableFrame(self, fg_color=BG)
+            scroll.pack(fill="both", expand=True, padx=14, pady=(6, 4))
+            for section_title, lines in sections:
+                card = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=8)
+                card.pack(fill="x", pady=(0, 8))
+                ctk.CTkLabel(
+                    card,
+                    text=section_title,
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=TEXT,
+                    anchor="w",
+                ).pack(fill="x", padx=12, pady=(10, 2))
+                for line in lines:
+                    ctk.CTkLabel(
+                        card,
+                        text=line,
+                        text_color=MUTED,
+                        font=ctk.CTkFont(size=12),
+                        anchor="w",
+                        justify="left",
+                        wraplength=width - 72,
+                    ).pack(fill="x", padx=12, pady=1)
+                # Bottom pad inside the card so the last line isn't flush with the edge.
+                ctk.CTkFrame(card, fg_color="transparent", height=8).pack(fill="x")
+
+        brow = ctk.CTkFrame(self, fg_color="transparent")
+        brow.pack(fill="x", padx=18, pady=(8, 16))
+        ctk.CTkButton(
+            brow,
+            text=cancel_text,
+            command=self._cancel,
+            fg_color="#3a3f3a",
+            hover_color="#4a504a",
+            width=110,
+        ).pack(side="left")
+        confirm_fg = DANGER if danger else ACCENT
+        confirm_hover = "#e07038" if danger else ACCENT_HOVER
+        ctk.CTkButton(
+            brow,
+            text=confirm_text,
+            command=self._ok,
+            fg_color=confirm_fg,
+            hover_color=confirm_hover,
+            width=140,
+        ).pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.bind("<Return>", lambda _e: self._ok())
+        self.after(10, self._center_on_master)
+        self.wait_window(self)
+
+    def _center_on_master(self) -> None:
+        """Place the dialog over the parent window rather than at screen (0,0)."""
+        try:
+            self.update_idletasks()
+            master = self.master
+            mw = master.winfo_width()
+            mh = master.winfo_height()
+            mx = master.winfo_rootx()
+            my = master.winfo_rooty()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = mx + max(0, (mw - w) // 2)
+            y = my + max(0, (mh - h) // 2)
+            self.geometry(f"+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ok(self) -> None:
+        self.result = True
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = False
+        self.destroy()
+
+
 class OARConversionApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -454,6 +591,15 @@ class OARConversionApp(ctk.CTk):
             qrun, text="Run Current Only", command=self._run_current,
             fg_color="#3a3f3a", hover_color="#4a504a", width=130,
         ).pack(side="left")
+        # Session preference (not per-job): wipe BA2_Extracted/ after the run finishes.
+        # Default off so kept/failed extractions stay available for inspection.
+        self.clear_cache_after = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            qrun,
+            text="Clear BA2 cache after jobs",
+            variable=self.clear_cache_after,
+            fg_color=ACCENT,
+        ).pack(side="left", padx=(12, 0))
 
         # Pinned log (outside scrollable body so it always fits)
         log_bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0)
@@ -554,6 +700,44 @@ class OARConversionApp(ctk.CTk):
                 self._log(f"Warning: could not remove {old_dir}: {exc}")
         self.ba2_path = None
         self.ba2_extract_dir = None
+
+    def _clear_ba2_cache(self) -> None:
+        """Delete the whole BA2_Extracted/ tree after a run (session 'clear cache' option).
+
+        Removes every leftover extraction folder, including ones kept by per-job
+        'Keep extracted BA2 files' or left behind after a failed job. Also drops any
+        form-side reference that pointed into that tree so the UI does not keep a
+        path that no longer exists.
+        """
+        cache_root = _tool_dir() / "BA2_Extracted"
+        if not cache_root.exists():
+            self._log("BA2 cache already empty (nothing under BA2_Extracted/).")
+            return
+        try:
+            entries = list(cache_root.iterdir())
+        except OSError as exc:
+            self._log(f"Warning: could not list BA2 cache {cache_root}: {exc}")
+            return
+        removed = 0
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=False)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                self._log(f"Warning: could not remove BA2 cache entry {entry}: {exc}")
+        # Drop the empty root too so the next extraction recreates it cleanly.
+        try:
+            cache_root.rmdir()
+        except OSError:
+            pass
+        if self.ba2_extract_dir is not None:
+            self.ba2_path = None
+            self.ba2_extract_dir = None
+            self._refresh_inputs_label()
+        self._log(f"Cleared BA2 cache: removed {removed} entr{'y' if removed == 1 else 'ies'} under {cache_root}")
 
     def _set_source(self) -> None:
         """One primary source folder per job (replaces previous)."""
@@ -985,13 +1169,43 @@ class OARConversionApp(ctk.CTk):
         for i, opts in enumerate(self.queue):
             self._preview_job(opts, f"Preview queue #{i + 1}: {self._job_summary(opts)}")
 
+    def _ask_confirm(
+        self,
+        *,
+        title: str,
+        heading: str,
+        body: str = "",
+        sections: list[tuple[str, list[str]]] | None = None,
+        confirm_text: str = "Confirm",
+        cancel_text: str = "Cancel",
+        danger: bool = False,
+        width: int = 680,
+        height: int = 440,
+    ) -> bool:
+        """Show a themed ConfirmDialog and return True if the user confirmed."""
+        dlg = ConfirmDialog(
+            self,
+            title=title,
+            heading=heading,
+            body=body,
+            sections=sections,
+            confirm_text=confirm_text,
+            cancel_text=cancel_text,
+            danger=danger,
+            width=width,
+            height=height,
+        )
+        return bool(dlg.result)
+
     def _confirm_and_run_jobs(self, jobs: list[JobOptions], title: str) -> None:
         if not jobs:
             mb.showerror("Nothing to run", "No jobs to run.")
             return
 
-        lines: list[str] = []
+        sections: list[tuple[str, list[str]]] = []
         any_esp = False
+        total_files = 0
+        total_plans = 0
         for i, opts in enumerate(jobs):
             preview = build_preview(opts)
             if preview.errors:
@@ -1001,19 +1215,66 @@ class OARConversionApp(ctk.CTk):
                     f"Job #{i + 1} has errors:\n" + "\n".join(preview.errors),
                 )
                 return
-            lines.append(self._job_summary(opts, i))
-            for plan in preview.plans:
-                lines.append(f"  {plan.label}: {len(plan.files)} file(s) -> {plan.submod_dir}")
-            if opts.patch_esp:
-                any_esp = True
-                lines.append(f"  Patch ESP: {opts.esp_path}")
 
-        if not mb.askokcancel(title, "Run the following?\n\n" + "\n".join(lines)):
+            src = opts.source_dirs[0].name if opts.source_dirs else "(no source)"
+            if opts.ba2_path:
+                src = opts.ba2_path.name
+            card_title = f"Job #{i + 1}  ·  {src}"
+            card_lines: list[str] = [
+                f"Pack  {opts.pack_name}",
+            ]
+            if opts.destination:
+                card_lines.append(f"Dest  {opts.destination}")
+            for plan in preview.plans:
+                total_plans += 1
+                total_files += len(plan.files)
+                card_lines.append(
+                    f"{plan.label}  ·  {len(plan.files)} file(s)"
+                )
+                card_lines.append(f"    →  {plan.submod_dir}")
+            if opts.patch_esp and opts.esp_path:
+                any_esp = True
+                out = opts.esp_output or opts.esp_path.with_name(
+                    opts.esp_path.stem + "_OAR" + opts.esp_path.suffix
+                )
+                card_lines.append(f"ESP patch  {opts.esp_path.name}  →  {out.name}")
+            if not preview.plans and not opts.patch_esp:
+                card_lines.append("(no file plans)")
+            sections.append((card_title, card_lines))
+
+        n_jobs = len(jobs)
+        summary_bits = [f"{n_jobs} job{'s' if n_jobs != 1 else ''}"]
+        if total_plans:
+            summary_bits.append(f"{total_plans} SubMod{'s' if total_plans != 1 else ''}")
+            summary_bits.append(f"{total_files} file{'s' if total_files != 1 else ''}")
+        if any_esp:
+            summary_bits.append("ESP patch")
+        if self.clear_cache_after.get():
+            summary_bits.append("clear BA2 cache after")
+        run_ok = self._ask_confirm(
+            title=title,
+            heading=title,
+            body=" · ".join(summary_bits) + ". Review below, then run.",
+            sections=sections,
+            confirm_text="Run",
+            cancel_text="Cancel",
+            width=720,
+            height=min(560, 220 + 110 * max(1, n_jobs)),
+        )
+        if not run_ok:
             return
 
-        if any_esp and not mb.askyesno(
-            "Write patched ESP?",
-            "One or more jobs will write a new ESP (original not overwritten in-place).\nContinue?",
+        if any_esp and not self._ask_confirm(
+            title="Write patched ESP?",
+            heading="Write patched ESP?",
+            body=(
+                "One or more jobs will write a new ESP next to the original "
+                "(the source plugin is not overwritten in-place)."
+            ),
+            confirm_text="Continue",
+            cancel_text="Cancel",
+            width=520,
+            height=220,
         ):
             return
 
@@ -1021,9 +1282,24 @@ class OARConversionApp(ctk.CTk):
             preview = build_preview(opts)
             for plan in preview.plans:
                 if plan.submod_dir.exists() and any(plan.submod_dir.iterdir()) and not opts.overwrite:
-                    if not mb.askyesno(
-                        "Overwrite?",
-                        f"Job #{i + 1}: SubMod folder already exists:\n{plan.submod_dir}\n\nOverwrite?",
+                    if not self._ask_confirm(
+                        title="Overwrite existing SubMod?",
+                        heading="Overwrite existing SubMod?",
+                        body=f"Job #{i + 1} already has output at this path.",
+                        sections=[
+                            (
+                                plan.label,
+                                [
+                                    str(plan.submod_dir),
+                                    f"{len(plan.files)} file(s) will replace existing content.",
+                                ],
+                            )
+                        ],
+                        confirm_text="Overwrite",
+                        cancel_text="Cancel",
+                        danger=True,
+                        width=620,
+                        height=280,
                     ):
                         return
                     opts.overwrite = True
@@ -1038,6 +1314,10 @@ class OARConversionApp(ctk.CTk):
                 self._log(f"Job #{i + 1} finished with errors.")
             else:
                 self._log(f"Job #{i + 1} completed.")
+
+        # Session option: wipe BA2_Extracted/ only after every job in this run has finished.
+        if self.clear_cache_after.get():
+            self._clear_ba2_cache()
 
         if failures:
             mb.showerror("Finished with errors", f"{failures} of {len(jobs)} job(s) failed. See log.")

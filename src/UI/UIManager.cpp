@@ -6,6 +6,7 @@
 #include "UI/UIAnimationQueue.h"
 #include "UI/UIDebugOverlay.h"
 #include "UI/UICommon.h"
+#include "UI/BoneDebugViz.h"
 #include "Jobs.h"
 #include "Offsets.h"
 #include "Settings.h"
@@ -864,6 +865,11 @@ void UIManager::RenderFrame()
 			break;
 		}
 	}
+	// Active 3D bone labels need the ImGui frame even with every window
+	// closed (they draw into the foreground draw list).
+	if (BoneDebugViz::HasActiveLabels()) {
+		anyIndependentOpen = true;
+	}
 
 	// Determine and apply lock state each frame (matches framework GameLock pattern)
 	if (mainOpen) {
@@ -903,6 +909,10 @@ void UIManager::RenderFrame()
 	for (auto& win : windows) {
 		if (win) win->TryDraw();
 	}
+
+	// Floating 3D bone-name labels (track filter debug aid). Positions were
+	// computed on the game thread; this only draws text.
+	BoneDebugViz::DrawLabels();
 
 	ImGui::EndFrame();
 	ImGui::Render();

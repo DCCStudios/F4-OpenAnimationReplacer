@@ -490,14 +490,83 @@ void CurrentWeatherCondition::SerializeImpl(nlohmann::json& a_json) const
 	form.Serialize(a_json);
 }
 
+namespace
+{
+	// kSighted covers holding aim, kFireSighted covers firing while aimed —
+	// the same pair MagnaScopes and FPInertia key their aim logic on.
+	bool IsSightedGunState(RE::GUN_STATE a_state)
+	{
+		return a_state == RE::GUN_STATE::kSighted || a_state == RE::GUN_STATE::kFireSighted;
+	}
+
+	int64_t SteadyNowMs()
+	{
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	// Last moment the PLAYER was in a sighted gun state, stamped every frame
+	// by ConditionTracking::TickPlayerAimState. -1 until first sighted frame.
+	std::atomic<int64_t> s_lastPlayerSightedMs{ -1 };
+}
+
+namespace ConditionTracking
+{
+	void TickPlayerAimState()
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player && IsSightedGunState(player->gunState)) {
+			s_lastPlayerSightedMs.store(SteadyNowMs(), std::memory_order_relaxed);
+		}
+	}
+}
+
 bool IsADSCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr) return false;
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return false;
-	// gunState 6 = sighted/ADS, 8 = firing while in ADS (pattern from FPInertia)
-	auto gs = static_cast<std::uint32_t>(actor->gunState);
-	return gs == 6 || gs == 8;
+
+	if (IsSightedGunState(actor->gunState)) return true;
+
+	// Grace window: reload clips activate on the same frame the engine drops
+	// sighted state (kSighted -> kReloading), so an instantaneous probe at
+	// clip evaluation misses aim-initiated reloads. The per-frame stamp from
+	// TickPlayerAimState is only maintained for the player.
+	if (graceMs > 0 && actor == RE::PlayerCharacter::GetSingleton()) {
+		const int64_t last = s_lastPlayerSightedMs.load(std::memory_order_relaxed);
+		if (last >= 0 && SteadyNowMs() - last <= graceMs) return true;
+	}
+	return false;
+}
+
+std::string IsADSCondition::GetParameterString() const
+{
+	return graceMs > 0 ? std::format("grace {}ms", graceMs) : "";
+}
+
+void IsADSCondition::DrawEditWidgets(bool& a_dirty)
+{
+	int grace = graceMs;
+	if (ImGui::SliderInt("Grace window (ms)", &grace, 0, 2000)) {
+		graceMs = grace;
+		a_dirty = true;
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip(
+			"Keeps the condition true this long after leaving sights (player only).\n"
+			"Reloads drop sighted state the moment they start, so use ~300-500ms\n"
+			"to catch aim-initiated reloads. 0 = current aim state only.");
+}
+
+void IsADSCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	if (a_json.contains("graceMs")) graceMs = a_json["graceMs"].get<int32_t>();
+}
+
+void IsADSCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	a_json["graceMs"] = graceMs;
 }
 
 static const char* ComparisonOpToString(ComparisonOperator op)
@@ -2560,6 +2629,161 @@ void IsPlayingIdleAnimationCondition::SerializeImpl(nlohmann::json& a_json) cons
 	form.Serialize(a_json);
 }
 
+// ===== IsPlayingAnyIdleAnimation =====
+
+namespace
+{
+	// True if the idle (or any ancestor in its parent chain) belongs to a
+	// flavor idle tree. The engine routes ambient flavor fidgets through the
+	// dedicated ActionIdleFlavor default object, but neither the action nor a
+	// flavor flag is reachable from the idle form at evaluate time — so this
+	// keys off the data convention instead: every vanilla flavor idle tree
+	// carries "Flavor" in its editor IDs including the roots (AnimFlavor*,
+	// DogIdleFlavorRoot, FurnitureIdleFlavorRoot, ...; verified by scanning
+	// Fallout4.esm EDIDs), and mod-added flavor idles parent into those
+	// roots to be picked up by the flavor system at all.
+	bool IsFlavorIdle(const RE::TESIdleForm* a_idle)
+	{
+		int guard = 0;  // parent chains are short; cap in case of a data cycle
+		for (auto* idle = a_idle; idle && guard < 16; idle = idle->parentIdle, ++guard) {
+			if (const char* edid = idle->formEditorID.c_str(); edid && *edid) {
+				std::string lower(edid);
+				std::ranges::transform(lower, lower.begin(),
+					[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				if (lower.find("flavor") != std::string::npos) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+}
+
+bool IsPlayingAnyIdleAnimationCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+
+	auto* process = actor->currentProcess;
+	if (!process || !process->middleHigh) return false;
+
+	// currentIdle is only populated while a real TESIdleForm is being driven
+	// through the AI process (PlayIdle / SetupSpecialIdle). Graph-internal
+	// states (WPNIdleReady etc.) never set it, which is exactly the
+	// distinction this condition exists to make.
+	auto* currentIdle = process->middleHigh->currentIdle;
+	if (!currentIdle) return false;
+
+	// Ambient flavor fidgets also land in currentIdle; the user-facing
+	// contract of this condition is "explicitly played idles only".
+	return !IsFlavorIdle(currentIdle);
+}
+
+// ===== IsSeamlessInspectPlaying =====
+
+namespace
+{
+	// SeamlessInspect's configuration: the list of plugin files whose idles
+	// are treated as weapon inspects. Same file, same path resolution, and
+	// same default as the SeamlessInspect DLL itself (see PluginTemplate/
+	// SeamlessInspect-main/src/main.cpp): <gameexe>/Data/F4SE/Plugins/
+	// SeamlessInspectMods.txt, one plugin filename per line, falling back to
+	// Inspectweapons.esl when the file is missing or empty. Loaded once —
+	// SeamlessInspect also only reads it at startup, so live edits are not a
+	// scenario to track.
+	const std::vector<std::string>& GetInspectPluginNames()
+	{
+		static const std::vector<std::string> s_names = [] {
+			std::vector<std::string> result;
+			wchar_t runtimePath[MAX_PATH];
+			if (const auto len = ::GetModuleFileNameW(nullptr, runtimePath, MAX_PATH); len > 0 && len < MAX_PATH) {
+				std::filesystem::path path(runtimePath);
+				path = path.parent_path() / "Data" / "F4SE" / "Plugins" / "SeamlessInspectMods.txt";
+				std::ifstream stream(path);
+				std::string line;
+				while (std::getline(stream, line)) {
+					const auto first = line.find_first_not_of(" \t\r\n");
+					if (first == std::string::npos) {
+						continue;
+					}
+					const auto last = line.find_last_not_of(" \t\r\n");
+					result.emplace_back(line.substr(first, last - first + 1));
+				}
+			}
+			if (result.empty()) {
+				result.emplace_back("Inspectweapons.esl");
+			}
+			logger::info("[OAR] IsSeamlessInspectPlaying: {} inspect plugin name(s) configured, first='{}'",
+				result.size(), result.front());
+			return result;
+		}();
+		return s_names;
+	}
+
+	// SeamlessInspect's inspect quest: FormID 0x805 in the inspect plugin.
+	// The DLL sets it to stage 1 in its SetupSpecialIdle hook when an inspect
+	// idle starts and back to 0 on IdleStop — stage 1 IS its own definition
+	// of "seamless inspect active". Resolved once on first evaluation (game
+	// data is loaded by then); a null result (plugin absent) is cached too.
+	RE::TESQuest* GetInspectQuest()
+	{
+		static RE::TESQuest* s_quest = []() -> RE::TESQuest* {
+			auto* dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!dataHandler) {
+				return nullptr;
+			}
+			for (const auto& name : GetInspectPluginNames()) {
+				if (auto* form = dataHandler->LookupForm(0x805, name)) {
+					return form->As<RE::TESQuest>();
+				}
+			}
+			return nullptr;
+		}();
+		return s_quest;
+	}
+}
+
+bool IsSeamlessInspectPlayingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr) return false;
+
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor) return false;
+
+	// Primary, per-actor check: the idle currently driven through the AI
+	// process originates from one of the configured inspect plugins. This is
+	// the same source-file test SeamlessInspect's SetupSpecialIdle hook uses
+	// to decide an idle is an inspect.
+	if (auto* process = actor->currentProcess; process && process->middleHigh) {
+		if (auto* idle = process->middleHigh->currentIdle) {
+			if (const auto* files = idle->sourceFiles.array) {
+				for (auto* file : *files) {
+					if (!file) continue;
+					for (const auto& name : GetInspectPluginNames()) {
+						if (_stricmp(name.c_str(), file->filename) == 0) {
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Boundary coverage: SeamlessInspect's own state flag. currentIdle can
+	// clear a beat before the graph's IdleStop lands, while the quest stays
+	// at stage 1 across that whole window. Quest state is global, so it is
+	// only honored for the player — the only actor inspects run on.
+	if (actor == RE::PlayerCharacter::GetSingleton()) {
+		if (auto* quest = GetInspectQuest(); quest && quest->currentStage == 1) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // =============================================================================
 // Detection Conditions
 // =============================================================================
@@ -3373,6 +3597,8 @@ void RegisterAllConditions()
 	factory->Register("AnimTimeElapsed", [] { return std::make_unique<AnimTimeElapsedCondition>(); });
 	factory->Register("AnimProgress", [] { return std::make_unique<AnimProgressCondition>(); });
 	factory->Register("IsPlayingIdleAnimation", [] { return std::make_unique<IsPlayingIdleAnimationCondition>(); });
+	factory->Register("IsPlayingAnyIdleAnimation", [] { return std::make_unique<IsPlayingAnyIdleAnimationCondition>(); });
+	factory->Register("IsSeamlessInspectPlaying", [] { return std::make_unique<IsSeamlessInspectPlayingCondition>(); });
 
 	// Detection conditions (ported from Skyrim OAR Detection Conditions plugin)
 	factory->Register("DetectedBy", [] { return std::make_unique<DetectedByCondition>(); });

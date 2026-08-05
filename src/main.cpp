@@ -7,6 +7,7 @@
 #include "Functions.h"
 #include "Parsing.h"
 #include "UI/UIManager.h"
+#include "UI/BoneDebugViz.h"
 #include "Offsets.h"
 #include "FormRegistry.h"
 
@@ -371,6 +372,10 @@ namespace
 			ClearCharacterCache();
 			ClearClipRuntimeState();
 			AnimationCache::GetSingleton()->InvalidateRuntimeClones();
+			// Bone highlight/label debug aids: drop per-geometry snapshots
+			// (their meshes are about to be freed); toggles stay active and
+			// re-apply to the new scene graph after the load.
+			BoneDebugViz::OnSceneInvalidated();
 			break;
 
 		case F4SE::MessagingInterface::kPostLoadGame:
