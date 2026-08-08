@@ -1,5 +1,15 @@
 #include "AnimationCache.h"
 #include "OpenAnimationReplacer.h"
+#include "Settings.h"
+
+// Per-file load logging is gated behind bVerboseLogging: at tens of thousands
+// of animations the ~15 info lines each file emits during preload dominate
+// the entire menu-load time (they used to be flushed line-by-line on top).
+// Warnings/errors always log.
+static bool VerboseCacheLog()
+{
+	return Settings::GetSingleton()->bVerboseLogging;
+}
 
 namespace
 {
@@ -150,9 +160,11 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		return false;
 	}
 
-	logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
-		a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
-		a_absolutePath.string());
+	if (VerboseCacheLog()) {
+		logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
+			a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
+			a_absolutePath.string());
+	}
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
 
@@ -603,9 +615,12 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 	bool isV11 = (header->fileVersion >= kVersion11);
 
-	logger::info("[OAR-Cache] Packfile: ver=0x{:X}, ptrSize={}, numSec={}, contIdx={}, contOff={}, v11={}",
-		header->fileVersion, header->pointerSize,
-		header->numSections, header->contentsSectionIndex, header->contentsSectionOffset, isV11);
+	const bool verbose = VerboseCacheLog();
+	if (verbose) {
+		logger::info("[OAR-Cache] Packfile: ver=0x{:X}, ptrSize={}, numSec={}, contIdx={}, contOff={}, v11={}",
+			header->fileVersion, header->pointerSize,
+			header->numSections, header->contentsSectionIndex, header->contentsSectionOffset, isV11);
+	}
 
 	uint32_t numSections = header->numSections;
 	if (numSections < 1 || numSections > 10) {
@@ -658,10 +673,12 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			sections[i].importsOffset = s->importsOffset;
 			sections[i].endOffset = s->endOffset;
 		}
-		logger::info("[OAR-Cache]   Section[{}] '{}': absStart=0x{:X}, localFix=0x{:X}, globalFix=0x{:X}, virtFix=0x{:X}, end=0x{:X}",
-			i, sections[i].tag, sections[i].absoluteDataStart,
-			sections[i].localFixupsOffset, sections[i].globalFixupsOffset,
-			sections[i].virtualFixupsOffset, sections[i].endOffset);
+		if (verbose) {
+			logger::info("[OAR-Cache]   Section[{}] '{}': absStart=0x{:X}, localFix=0x{:X}, globalFix=0x{:X}, virtFix=0x{:X}, end=0x{:X}",
+				i, sections[i].tag, sections[i].absoluteDataStart,
+				sections[i].localFixupsOffset, sections[i].globalFixupsOffset,
+				sections[i].virtualFixupsOffset, sections[i].endOffset);
+		}
 	}
 
 	// Find the __data__ section (contents section)
@@ -699,7 +716,9 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 	size_t sectionSize = payloadSize;
 	a_entry.sectionFileOffset = sectionFileOffset;
 
-	logger::info("[OAR-Cache] Data section payload: fileOffset=0x{:X}, size={} bytes", sectionFileOffset, sectionSize);
+	if (verbose) {
+		logger::info("[OAR-Cache] Data section payload: fileOffset=0x{:X}, size={} bytes", sectionFileOffset, sectionSize);
+	}
 
 	// === Apply local fixups ===
 	// Local fixups are 8-byte records (src_u32, dst_u32) stored at section offset localFixupsOffset
@@ -732,7 +751,9 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			}
 		}
 	}
-	logger::info("[OAR-Cache] Applied {} local fixups", localFixCount);
+	if (verbose) {
+		logger::info("[OAR-Cache] Applied {} local fixups", localFixCount);
+	}
 
 	// === Apply global fixups ===
 	// Global fixups are 12-byte records (src_u32, section_u32, dst_u32)
@@ -769,7 +790,9 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			}
 		}
 	}
-	logger::info("[OAR-Cache] Applied {} global fixups", globalFixCount);
+	if (verbose) {
+		logger::info("[OAR-Cache] Applied {} global fixups", globalFixCount);
+	}
 
 	// === Apply virtual fixups (vtable patching) ===
 	// Virtual fixups are 12-byte records (src_u32, section_u32, nameOffset_u32)
@@ -805,8 +828,10 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			}
 		}
 	}
-	logger::info("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
-		vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
+	if (verbose) {
+		logger::info("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
+			vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
+	}
 
 	// Now find the animation object - should be at contentsSectionOffset within the payload
 	uint32_t rootOffset = header->contentsSectionOffset;
@@ -821,18 +846,22 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			a_entry.numFloatTracks = candidate->numberOfFloatTracks;
 
 			auto* bytes = reinterpret_cast<uint8_t*>(candidate);
-			logger::info("[OAR-Cache]   Animation at root offset 0x{:X}: type={}, dur={:.3f}, tracks={}",
-				rootOffset, candidate->type, candidate->duration, candidate->numberOfTransformTracks);
+			if (verbose) {
+				logger::info("[OAR-Cache]   Animation at root offset 0x{:X}: type={}, dur={:.3f}, tracks={}",
+					rootOffset, candidate->type, candidate->duration, candidate->numberOfTransformTracks);
+			}
 
 			// Compute missing m_transformOffsets if the HKX didn't serialize them
 			ComputeSplineOffsets(bytes, a_entry);
 
-			logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
-				*reinterpret_cast<uintptr_t*>(bytes + 0x58),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x68),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x78),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x88),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x98));
+			if (verbose) {
+				logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
+					*reinterpret_cast<uintptr_t*>(bytes + 0x58),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x68),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x78),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x88),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x98));
+			}
 			return true;
 		}
 	}
@@ -869,18 +898,22 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			a_entry.numFloatTracks = floats;
 
 			auto* bytes = sectionData + off;
-			logger::info("[OAR-Cache]   Found animation (heuristic) at 0x{:X}: type={}, dur={:.3f}, tracks={}",
-				off, type, dur, tracks);
+			if (verbose) {
+				logger::info("[OAR-Cache]   Found animation (heuristic) at 0x{:X}: type={}, dur={:.3f}, tracks={}",
+					off, type, dur, tracks);
+			}
 
 			// Compute missing m_transformOffsets if the HKX didn't serialize them
 			ComputeSplineOffsets(bytes, a_entry);
 
-			logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
-				*reinterpret_cast<uintptr_t*>(bytes + 0x58),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x68),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x78),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x88),
-				*reinterpret_cast<uintptr_t*>(bytes + 0x98));
+			if (verbose) {
+				logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
+					*reinterpret_cast<uintptr_t*>(bytes + 0x58),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x68),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x78),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x88),
+					*reinterpret_cast<uintptr_t*>(bytes + 0x98));
+			}
 			return true;
 		}
 	}
@@ -947,8 +980,11 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 	int32_t dataSizeField = *reinterpret_cast<int32_t*>(a_animBytes + 0xA0);
 	size_t dataSize = (dataSizeField > 0) ? static_cast<size_t>(dataSizeField) : 0x100000;
 
-	logger::info("[OAR-Cache] ComputeSplineOffsets: maskAndQuantSz={}, dataSize={}, numBlocks={}, numTracks={}",
-		maskAndQuantSz, dataSize, numBlocks, numTracks);
+	const bool verbose = VerboseCacheLog();
+	if (verbose) {
+		logger::info("[OAR-Cache] ComputeSplineOffsets: maskAndQuantSz={}, dataSize={}, numBlocks={}, numTracks={}",
+			maskAndQuantSz, dataSize, numBlocks, numTracks);
+	}
 
 	// Per-component sub-track type helper using HavokLib's TransformMask layout
 	// For position/scale mask byte: bit i = static for axis i, bit (i+4) = spline for axis i (i=0..2)
@@ -1098,7 +1134,7 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 			if (!success) break;
 		}
 
-		if (success) {
+		if (success && verbose) {
 			logger::info("[OAR-Cache] Block {} walk complete: final cursor={} (max={})", block, cursor, maxCursor);
 		}
 	}
@@ -1114,8 +1150,10 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 	*reinterpret_cast<int32_t*>(a_animBytes + 0x80) = static_cast<int32_t>(numEntries);
 	*reinterpret_cast<uint32_t*>(a_animBytes + 0x84) = static_cast<uint32_t>(numEntries) | 0x80000000u;
 
-	logger::info("[OAR-Cache] Computed m_transformOffsets: {} entries ({} blocks x {} tracks)",
-		numEntries, numBlocks, numTracks);
+	if (verbose) {
+		logger::info("[OAR-Cache] Computed m_transformOffsets: {} entries ({} blocks x {} tracks)",
+			numEntries, numBlocks, numTracks);
+	}
 }
 
 RE::hkaAnimation* AnimationCache::FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable)

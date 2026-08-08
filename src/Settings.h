@@ -58,6 +58,10 @@ public:
 	bool  bRequireShift{ false };
 	bool  bPauseOnMenuOpen{ true };
 	int   iEditorMode{ 0 };
+	// Text is intentionally larger than Dear ImGui's base size by default.
+	// UIWindow applies the same ratio to window dimensions so increasing the
+	// text size does not reduce the amount of editor content that remains visible.
+	int   iTextSizePercent{ 125 };
 
 	bool  bLogActivate{ true };
 	bool  bLogReplace{ true };

@@ -56,15 +56,39 @@ public:
 	// changed — after a config reload those objects have been destroyed.
 	std::uint64_t GetModsGeneration() const { return modsGeneration.load(std::memory_order_acquire); }
 
+	// Startup load (parse + preload) runs on a background thread so the main
+	// menu stays responsive. Anything that must observe the fully-built state
+	// (save load, new game, config reload) calls WaitForBackgroundLoad first;
+	// after the first join it is a cheap no-op.
+	void StartBackgroundLoad(std::function<void()> a_work);
+	void WaitForBackgroundLoad();
+
+	// Loading-phase label for the progress bar. An atomic enum instead of a
+	// string: the background load thread writes it while the render thread
+	// reads it every frame.
+	enum class LoadingPhase : int
+	{
+		kIdle,
+		kParsing,
+		kLoading,
+	};
+	const char* GetLoadingPhaseText() const;
+
 	std::atomic<int> loadingTotalAnims{ 0 };
 	std::atomic<int> loadingParsedAnims{ 0 };
 	std::atomic<int> loadingLoadedAnims{ 0 };
 	std::atomic<bool> isLoading{ false };
 	std::atomic<bool> loadingComplete{ false };
-	std::string loadingPhase{ "Idle" };
+	std::atomic<LoadingPhase> loadingPhase{ LoadingPhase::kIdle };
 
 private:
 	OpenAnimationReplacer() = default;
+	// A joinable std::thread reaching its destructor calls std::terminate —
+	// join the background load if the process exits while it is still running.
+	~OpenAnimationReplacer();
+
+	std::mutex loadThreadMutex;
+	std::thread loadThread;
 
 	mutable std::shared_mutex modsMutex;
 	std::vector<std::unique_ptr<ReplacerMod>> replacerMods;

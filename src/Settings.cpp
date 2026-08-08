@@ -31,6 +31,7 @@ void Settings::Load()
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
+	iTextSizePercent = std::clamp(getI("UI", "iTextSizePercent", iTextSizePercent), 80, 200);
 
 	bLogActivate   = getB("AnimationLog", "bLogActivate", bLogActivate);
 	bLogReplace    = getB("AnimationLog", "bLogReplace", bLogReplace);
@@ -86,6 +87,7 @@ void Settings::Save()
 	setB("UI", "bRequireShift", bRequireShift);
 	setB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	setI("UI", "iEditorMode", iEditorMode);
+	setI("UI", "iTextSizePercent", iTextSizePercent);
 	setB("UI", "bEnableAnimationQueueProgressBar", bEnableAnimationQueueProgressBar);
 	ini.SetDoubleValue("UI", "fAnimationQueueLingerTime", static_cast<double>(fAnimationQueueLingerTime));
 

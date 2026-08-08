@@ -52,7 +52,7 @@ void UIAnimationQueue::DrawContents()
 	ImGui::SetNextWindowBgAlpha(0.25f);
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
 
-	const char* phaseText = oar->loadingPhase.c_str();
+	const char* phaseText = oar->GetLoadingPhaseText();
 	float windowWidth = ImGui::GetWindowSize().x;
 	float textWidth = ImGui::CalcTextSize(phaseText).x;
 	ImGui::SetCursorPosX((windowWidth - textWidth) * 0.5f);

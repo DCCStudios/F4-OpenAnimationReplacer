@@ -3,6 +3,49 @@
 #include "ReplacementAnimation.h"
 #include "Settings.h"
 
+OpenAnimationReplacer::~OpenAnimationReplacer()
+{
+	if (loadThread.joinable()) {
+		loadThread.join();
+	}
+}
+
+void OpenAnimationReplacer::StartBackgroundLoad(std::function<void()> a_work)
+{
+	std::lock_guard lock(loadThreadMutex);
+	// Only one background load ever runs (started once from kGameDataReady);
+	// join any previous thread defensively before reusing the member.
+	if (loadThread.joinable()) {
+		loadThread.join();
+	}
+	loadThread = std::thread(std::move(a_work));
+}
+
+void OpenAnimationReplacer::WaitForBackgroundLoad()
+{
+	std::lock_guard lock(loadThreadMutex);
+	if (loadThread.joinable()) {
+		const auto start = std::chrono::steady_clock::now();
+		loadThread.join();
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - start)
+		                    .count();
+		logger::info("[OAR] Joined background load thread (waited {}ms)", ms);
+	}
+}
+
+const char* OpenAnimationReplacer::GetLoadingPhaseText() const
+{
+	switch (loadingPhase.load(std::memory_order_relaxed)) {
+	case LoadingPhase::kParsing:
+		return "Parsing mods...";
+	case LoadingPhase::kLoading:
+		return "Loading animations...";
+	default:
+		return "Idle";
+	}
+}
+
 void OpenAnimationReplacer::AddReplacerMod(std::unique_ptr<ReplacerMod> a_mod)
 {
 	WriteLocker lock(modsMutex);
@@ -207,8 +250,10 @@ bool OpenAnimationReplacer::CreateReplacementAnimations(
 			AddOwnedAnimation(std::move(replacement));
 			injectedCount++;
 
-			logger::info("[OAR]   Injected '{}' at index {} (original: '{}')",
-				info.replacementPath, newIndex, info.originalPath);
+			if (Settings::GetSingleton()->bVerboseLogging) {
+				logger::info("[OAR]   Injected '{}' at index {} (original: '{}')",
+					info.replacementPath, newIndex, info.originalPath);
+			}
 		}
 	}
 

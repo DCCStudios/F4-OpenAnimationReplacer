@@ -2433,7 +2433,7 @@ namespace
 				return pa > pb;
 			});
 
-			if (!infoVec.empty()) {
+			if (!infoVec.empty() && Settings::GetSingleton()->bVerboseLogging) {
 				logger::info("[OAR] NameLookup: suffix='{}' -> '{}' ({} candidates)",
 					suffix, infoVec[0]->replacementPath, infoVec.size());
 			}
@@ -2504,54 +2504,94 @@ namespace
 		auto* cache = AnimationCache::GetSingleton();
 		const auto& pathMap = oar->GetPathToSubModsMap();
 
-		// Progress bar denominator must match what LoadAnimation increments
-		// (loadingLoadedAnims), not the ReplacementAnimation object count.
-		// Variant groups are ONE ReplacementAnimation but N cache files
-		// (base + __v1/__v2/...), and multiple SubMods can each contribute a
-		// file for the same original path — that used to show as "40/36".
-		int expectedLoads = 0;
-		for (auto& [mapKey, replacementInfos] : pathMap) {
-			if (ExtractAnimSuffix(mapKey).empty()) continue;
-			for (auto& info : replacementInfos) {
-				if (!info.absoluteDiskPath.empty()) {
-					expectedLoads++;
-				}
-			}
-		}
-		oar->loadingTotalAnims.store(expectedLoads);
-		oar->loadingLoadedAnims.store(0);
-		oar->loadingParsedAnims.store(expectedLoads);
-
-		int loaded = 0;
-		int failed = 0;
+		// Flatten the work list up front. The path map is stable for the whole
+		// preload (parsing finished before this runs; LoadAnimation never adds
+		// map entries), so raw info pointers are safe to hand to workers.
+		//
+		// Load EVERY SubMod's file for each original path. The cache keys
+		// entries per (suffix, owning SubMod), so the Update hook can play
+		// the condition-winning SubMod's actual file — previously only one
+		// file per suffix was cached and a lower-priority mod's file could
+		// play under a higher-priority mod's name (or vice versa).
+		struct PreloadItem
+		{
+			std::string suffix;
+			const ReplacementAnimFileInfo* info;
+		};
+		std::vector<PreloadItem> work;
+		std::atomic<int> failed{ 0 };
 
 		for (auto& [mapKey, replacementInfos] : pathMap) {
 			auto suffix = ExtractAnimSuffix(mapKey);
 			if (suffix.empty()) continue;
 
-			// Load EVERY SubMod's file for this original path. The cache keys
-			// entries per (suffix, owning SubMod), so the Update hook can play
-			// the condition-winning SubMod's actual file — previously only one
-			// file per suffix was cached and a lower-priority mod's file could
-			// play under a higher-priority mod's name (or vice versa).
 			for (auto& info : replacementInfos) {
 				if (info.absoluteDiskPath.empty()) {
 					logger::warn("[OAR-Preload] No absolute path for suffix '{}'", suffix);
-					failed++;
+					failed.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
-
-				if (cache->LoadAnimation(suffix, info.absoluteDiskPath, info.parentSubMod,
-						info.parentSubMod ? info.parentSubMod->GetPriority() : 0)) {
-					loaded++;
-				} else {
-					failed++;
-				}
+				work.push_back({ suffix, &info });
 			}
 		}
 
-		logger::info("[OAR-Preload] Pre-loaded {} animations ({} failed), cache size: {}",
-			loaded, failed, cache->GetCacheSize());
+		// Progress bar denominator must match what LoadAnimation increments
+		// (loadingLoadedAnims), not the ReplacementAnimation object count.
+		// Variant groups are ONE ReplacementAnimation but N cache files
+		// (base + __v1/__v2/...), and multiple SubMods can each contribute a
+		// file for the same original path — that used to show as "40/36".
+		oar->loadingTotalAnims.store(static_cast<int>(work.size()));
+		oar->loadingLoadedAnims.store(0);
+		oar->loadingParsedAnims.store(static_cast<int>(work.size()));
+
+		std::atomic<int> loaded{ 0 };
+		std::atomic<size_t> nextItem{ 0 };
+
+		auto runWorker = [&]() {
+			for (;;) {
+				const size_t i = nextItem.fetch_add(1, std::memory_order_relaxed);
+				if (i >= work.size()) break;
+				const auto& item = work[i];
+				if (cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod,
+						item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0)) {
+					loaded.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					failed.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		};
+
+		// Parallel load (same bAsyncParsing toggle upstream OAR uses for its
+		// std::async parsing). Safe because LoadAnimation only touches
+		// entry-local data outside the cache mutex, and every shared sink —
+		// cache map, progress counters, log sink — is thread-safe. File opens
+		// dominate the cost on Windows (the AV scans each loose file on open),
+		// so overlapping them scales nearly linearly with thread count.
+		unsigned threadCount = 1;
+		if (Settings::GetSingleton()->bAsyncParsing && work.size() > 1) {
+			threadCount = std::clamp(std::thread::hardware_concurrency(), 2u, 16u);
+			threadCount = std::min(threadCount, static_cast<unsigned>(work.size()));
+		}
+
+		const auto start = std::chrono::high_resolution_clock::now();
+		if (threadCount <= 1) {
+			runWorker();
+		} else {
+			std::vector<std::thread> workers;
+			workers.reserve(threadCount);
+			for (unsigned t = 0; t < threadCount; t++) {
+				workers.emplace_back(runWorker);
+			}
+			for (auto& w : workers) {
+				w.join();
+			}
+		}
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::high_resolution_clock::now() - start)
+		                    .count();
+
+		logger::info("[OAR-Preload] Pre-loaded {} animations ({} failed) on {} thread(s) in {}ms, cache size: {}",
+			loaded.load(), failed.load(), threadCount, ms, cache->GetCacheSize());
 	}
 
 	// Full "Reload All Configs" implementation. GAME THREAD ONLY — drained
@@ -2566,6 +2606,12 @@ namespace
 	// reuse made it look like it worked.
 	static void PerformConfigReload()
 	{
+		// The startup load may still be running on its background thread (the
+		// reload job can be queued from the UI at the main menu). Re-parsing
+		// concurrently with it would race ClearAllMods against the parser —
+		// join it first; no-op once the startup load has finished.
+		OpenAnimationReplacer::GetSingleton()->WaitForBackgroundLoad();
+
 		logger::info("[OAR] Config reload (game thread): restoring vanilla state before re-parse");
 
 		// 1) Physically restore originals/triggers into every replaced clip and
@@ -4286,6 +4332,31 @@ namespace
 									replacement = cachePre->GetOrBuildRuntimeAnim(activeSuffix, *animSlotPre,
 										winner->parentSubMod);
 									if (replacement) preSwapWinner = winner;
+								}
+							}
+
+							// No winner this activation, but the slot may still hold OUR
+							// clone installed by a PREVIOUS play of this clip: the
+							// completion path restores triggers, not the slot, and the
+							// Update hook's restore comes one tick too late here —
+							// _Activate builds the clip's animation control from whatever
+							// is in the slot, and a clone has emptied annotationTracks.
+							// Field case (HK416 empty reload right after a tactical
+							// reload): control built from the stale 2.2s clone, conditions
+							// then failed (mag empty), Update restored the original
+							// visuals — but the play had NO native annotations, so
+							// reloadComplete/reloadEnd never fired and the magazine never
+							// refilled. Restore the original NOW so the control is built
+							// from the real animation. A retired clone with no recorded
+							// original is left alone (orphan recovery handles it).
+							if (!replacement && cachePre->IsOurReplacement(*animSlotPre)) {
+								if (auto* staleOrig = cachePre->GetOriginalFromReplacement(*animSlotPre)) {
+									*animSlotPre = staleOrig;
+									logger::info("[OAR] Activation: restored original over stale replacement for '{}' (no winner)",
+										activeSuffix);
+								} else {
+									logger::warn("[OAR] Activation: stale replacement in slot for '{}' has no recorded original — leaving as-is",
+										activeSuffix);
 								}
 							}
 
@@ -9190,11 +9261,17 @@ namespace Hooks
 
 			FileRedirectHooks::BuildFileRedirectMap();
 
-			oar->loadingPhase = "Loading animations...";
+			oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kLoading);
 			PreloadReplacementAnimations();
 
 			oar->isLoading.store(false);
 			oar->loadingComplete.store(true);
+
+			// Per-line flushing is off (see LogSetup.cpp); make sure the whole
+			// load phase is on disk in case anything crashes later.
+			if (auto log = spdlog::default_logger()) {
+				log->flush();
+			}
 
 			return true;
 
@@ -9523,7 +9600,9 @@ namespace Hooks
 						continue;
 					}
 					s_fileRedirectMap[lowerKey] = info.replacementPath;
-					logger::info("[OAR] FileRedirect: '{}' -> '{}'", lowerKey, info.replacementPath);
+					if (Settings::GetSingleton()->bVerboseLogging) {
+						logger::info("[OAR] FileRedirect: '{}' -> '{}'", lowerKey, info.replacementPath);
+					}
 					break;
 				}
 			}

@@ -2,6 +2,7 @@
 build/
 Compile/
 out/
+dist/
 
 # IDE
 .vs/

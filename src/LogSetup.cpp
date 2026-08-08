@@ -39,6 +39,12 @@ void OAR_InitializeLogging(std::string_view a_pluginName)
 		"global"s,
 		std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true));
 	log->set_level(spdlog::level::trace);
-	log->flush_on(spdlog::level::info);
+	// Flushing every info line costs a syscall per message — with per-file
+	// logging during the animation preload that alone froze the main menu for
+	// seconds on large setups. Warnings/errors still flush immediately (crash
+	// forensics); info lines are flushed by the periodic flusher below and by
+	// explicit flushes at the end of each load phase.
+	log->flush_on(spdlog::level::warn);
 	set_default_logger(std::move(log));
+	spdlog::flush_every(std::chrono::seconds(3));
 }

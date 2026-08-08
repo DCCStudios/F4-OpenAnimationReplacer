@@ -18,7 +18,7 @@ void OAR_InitializeLogging(std::string_view a_pluginName);
 namespace Plugin
 {
 	static constexpr auto NAME    = "OpenAnimationReplacer"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 1, 1 };
+	static constexpr auto VERSION = REL::Version{ 1, 1, 3 };
 }
 
 // Version data consumed by the NG/AE F4SE loaders (0.7.x reads the exported
@@ -28,7 +28,7 @@ namespace Plugin
 // load us. OG F4SE (0.6.23) ignores this export and uses F4SEPlugin_Query.
 F4SE_PLUGIN_VERSION = []() noexcept {
 	F4SE::PluginVersionData v{};
-	v.PluginVersion({ 1, 1, 2, 0 });
+	v.PluginVersion({ 1, 1, 3, 0 });
 	v.PluginName("OpenAnimationReplacer");
 	v.AuthorName("");
 	v.UsesAddressLibraryNG(true);  // 1.10.980 / 1.10.984
@@ -343,9 +343,34 @@ namespace
 			AnimationLog::GetSingleton()->SetMaxEntries(Settings::GetSingleton()->iMaxLogEntries);
 			RegisterAllFunctions();
 			Hooks::Install();
-			Parsing::ParseAllMods();
 
-			Hooks::LoadClipsHooks::TryDeferredInjection();
+			// Parse + preload used to run synchronously right here, freezing
+			// the main menu for the whole load (20-30s with tens of thousands
+			// of animations). Run it on a background thread instead: the menu
+			// appears immediately and the progress bar (UIAnimationQueue)
+			// tracks the load. Clip hooks stay pass-through until
+			// TryDeferredInjection flips SetHasActiveReplacements at the very
+			// end, so nothing ever observes half-built state; every path that
+			// needs the finished data (save load, new game, config reload)
+			// joins via WaitForBackgroundLoad first.
+			auto backgroundLoad = []() {
+				Parsing::ParseAllMods();
+				if (!Hooks::LoadClipsHooks::TryDeferredInjection()) {
+					// No replacements found: close out the loading state so
+					// the progress bar doesn't linger forever.
+					auto* oar = OpenAnimationReplacer::GetSingleton();
+					oar->isLoading.store(false);
+					oar->loadingComplete.store(true);
+				}
+				if (auto log = spdlog::default_logger()) {
+					log->flush();
+				}
+			};
+			if (Settings::GetSingleton()->bAsyncParsing) {
+				OpenAnimationReplacer::GetSingleton()->StartBackgroundLoad(backgroundLoad);
+			} else {
+				backgroundLoad();
+			}
 
 			if (Settings::GetSingleton()->bVerboseLogging) {
 				StructProbe::VerifyHavokLayouts();
@@ -363,6 +388,13 @@ namespace
 
 		case F4SE::MessagingInterface::kPreLoadGame:
 			logger::info("[OAR] kPreLoadGame - clearing runtime state");
+			// A save load must never observe a half-finished startup load:
+			// behavior graphs and clips stream in between kPreLoadGame and
+			// kPostLoadGame, and the pre-swap path would silently miss
+			// animations still being cached. Joining here overlaps any
+			// remaining wait with the load screen instead of the main menu;
+			// once the load has finished this is a no-op.
+			OpenAnimationReplacer::GetSingleton()->WaitForBackgroundLoad();
 			SetGameFullyLoaded(false);
 			// Un-replace everything while the recorded originals are still
 			// valid — clips that carry a replacement across the load become
@@ -380,6 +412,8 @@ namespace
 
 		case F4SE::MessagingInterface::kPostLoadGame:
 			logger::info("[OAR] kPostLoadGame");
+			// Backstop join (kPreLoadGame already joined on the save-load path).
+			OpenAnimationReplacer::GetSingleton()->WaitForBackgroundLoad();
 			Settings::GetSingleton()->Load();
 			AnimationLog::GetSingleton()->SetMaxEntries(Settings::GetSingleton()->iMaxLogEntries);
 			ClearCharacterCache();
@@ -399,6 +433,8 @@ namespace
 
 		case F4SE::MessagingInterface::kNewGame:
 			logger::info("[OAR] kNewGame");
+			// New game skips kPreLoadGame — join the startup load here.
+			OpenAnimationReplacer::GetSingleton()->WaitForBackgroundLoad();
 			ActiveClipManager::GetSingleton()->ClearAll();
 			Settings::GetSingleton()->Load();
 			ClearCharacterCache();

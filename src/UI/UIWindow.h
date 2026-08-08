@@ -42,4 +42,8 @@ protected:
 	const char* title;
 	bool isOpen{ false };
 	bool independent{ false };
+	// Tracks the scale used for this window's current pixel dimensions. A live
+	// settings change can then preserve the user's layout while resizing it by
+	// exactly the ratio needed for the new text size.
+	float appliedTextScale{ 0.0f };
 };

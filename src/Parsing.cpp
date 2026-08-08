@@ -100,7 +100,7 @@ namespace Parsing
 
 		auto* oar = OpenAnimationReplacer::GetSingleton();
 		oar->isLoading.store(true);
-		oar->loadingPhase = "Parsing mods...";
+		oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kParsing);
 		oar->loadingParsedAnims.store(0);
 		oar->loadingLoadedAnims.store(0);
 		oar->loadingComplete.store(false);
@@ -161,7 +161,7 @@ namespace Parsing
 
 		oar->loadingTotalAnims.store(animCount);
 		oar->loadingParsedAnims.store(animCount);
-		oar->loadingPhase = "Loading animations...";
+		oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kLoading);
 
 		logger::info("[OAR] Parsed {} mods, {} submods, {} replacement animations in {}ms",
 			modCount, subModCount, animCount, ms);
@@ -435,9 +435,11 @@ namespace Parsing
 
 			replacement->SetVariants(std::move(variants));
 
-			logger::info("[OAR-Variants] Grouped {} variants for '{}' in submod '{}' (mode={})",
-				files.size(), normalizedOriginal, subMod->GetName(),
-				subMod->variantMode == VariantMode::kSequential ? "sequential" : "random");
+			if (Settings::GetSingleton()->bVerboseLogging) {
+				logger::info("[OAR-Variants] Grouped {} variants for '{}' in submod '{}' (mode={})",
+					files.size(), normalizedOriginal, subMod->GetName(),
+					subMod->variantMode == VariantMode::kSequential ? "sequential" : "random");
+			}
 
 			subMod->AddReplacementAnimation(replacement.get());
 			OpenAnimationReplacer::GetSingleton()->AddOwnedAnimation(std::move(replacement));

@@ -1883,14 +1883,39 @@ void UIMain::DrawBottomBar()
 	ImGui::Text("Mode: %s | Mods: %zu | Replacements: %zu",
 		modeStr, oar->GetReplacerMods().size(), oar->GetTotalReplacementCount());
 
-	ImGui::SameLine(ImGui::GetContentRegionAvail().x - 240);
+	// Measure the buttons using the active font scale instead of reserving a
+	// fixed pixel width. The old 240-pixel estimate could place the Settings
+	// button beyond the right edge when larger text was selected.
+	constexpr const char* kAnimLogLabel = "Anim Log";
+	constexpr const char* kEventLogLabel = "Event Log";
+	constexpr const char* kSettingsLabel = "Settings";
+	const auto& style = ImGui::GetStyle();
+	const auto smallButtonWidth = [&](const char* a_label) {
+		return ImGui::CalcTextSize(a_label).x + style.FramePadding.x * 2.0f;
+	};
+	const float buttonGroupWidth =
+		smallButtonWidth(kAnimLogLabel) + smallButtonWidth(kEventLogLabel) +
+		smallButtonWidth(kSettingsLabel) + style.ItemSpacing.x * 2.0f;
+	const ImVec2 nextLineCursor = ImGui::GetCursorScreenPos();
+	const float contentRightScreenX = nextLineCursor.x + ImGui::GetContentRegionAvail().x;
+	const float buttonGroupScreenX = contentRightScreenX - buttonGroupWidth;
+
+	if (ImGui::GetItemRectMax().x + style.ItemSpacing.x <= buttonGroupScreenX) {
+		ImGui::SameLine();
+	}
+	// If the status text and buttons cannot share one row, the cursor remains on
+	// the next row. In either case, right-align the group without exceeding the
+	// available content region.
+	ImVec2 buttonCursor = ImGui::GetCursorScreenPos();
+	buttonCursor.x = std::max(buttonCursor.x, buttonGroupScreenX);
+	ImGui::SetCursorScreenPos(buttonCursor);
 
 	auto* uiMgr = UIManager::GetSingleton();
-	if (ImGui::SmallButton("Anim Log")) uiMgr->ToggleWindow(WindowID::kAnimationLog);
+	if (ImGui::SmallButton(kAnimLogLabel)) uiMgr->ToggleWindow(WindowID::kAnimationLog);
 	ImGui::SameLine();
-	if (ImGui::SmallButton("Event Log")) uiMgr->ToggleWindow(WindowID::kAnimationEventLog);
+	if (ImGui::SmallButton(kEventLogLabel)) uiMgr->ToggleWindow(WindowID::kAnimationEventLog);
 	ImGui::SameLine();
-	if (ImGui::SmallButton("Settings")) showSettings = !showSettings;
+	if (ImGui::SmallButton(kSettingsLabel)) showSettings = !showSettings;
 }
 
 void UIMain::ApplyCapturedToggleKey(std::uint32_t a_dik)
@@ -1905,13 +1930,14 @@ void UIMain::ApplyCapturedToggleKey(std::uint32_t a_dik)
 
 void UIMain::DrawSettingsPanel()
 {
-	ImGui::SetNextWindowSize(ImVec2(350, 500), ImGuiCond_FirstUseEver);
+	auto* settings = Settings::GetSingleton();
+	const float textScale = static_cast<float>(settings->iTextSizePercent) / 100.0f;
+	ImGui::SetNextWindowSize(ImVec2(350.0f * textScale, 500.0f * textScale), ImGuiCond_FirstUseEver);
 	if (!ImGui::Begin("OAR Settings", &showSettings)) {
 		ImGui::End();
 		return;
 	}
 
-	auto* settings = Settings::GetSingleton();
 	bool dirty = false;
 
 	ImGui::TextColored(UICommon::Colors::AccentBlue, "General");
@@ -2036,13 +2062,33 @@ void UIMain::DrawSettingsPanel()
 		}
 	}
 
-	// imgui 1.92 moved io.FontGlobalScale to style.FontScaleMain
-	float scale = ImGui::GetStyle().FontScaleMain;
-	if (ImGui::SliderFloat("UI Scale", &scale, 0.8f, 2.0f, "%.1f")) {
-		ImGui::GetStyle().FontScaleMain = scale;
+	// ImGui 1.92 moved io.FontGlobalScale to style.FontScaleMain. Keep the
+	// user-facing value as an integer percentage for stable INI persistence.
+	const int previousTextSize = settings->iTextSizePercent;
+	if (ImGui::SliderInt("Text Size", &settings->iTextSizePercent, 80, 200, "%d%%")) {
+		const float previousScale = static_cast<float>(previousTextSize) / 100.0f;
+		const float newScale = static_cast<float>(settings->iTextSizePercent) / 100.0f;
+		ImGui::GetStyle().FontScaleMain = newScale;
+
+		// The settings panel is not a UIWindow, so compensate its dimensions here.
+		// Other OAR windows perform the same ratio-based adjustment in TryDraw().
+		const ImVec2 currentSize = ImGui::GetWindowSize();
+		ImVec2 resized(currentSize.x * newScale / previousScale,
+			currentSize.y * newScale / previousScale);
+		if (const auto* viewport = ImGui::GetMainViewport()) {
+			resized.x = std::min(resized.x, std::max(1.0f, viewport->WorkSize.x - 16.0f));
+			resized.y = std::min(resized.y, std::max(1.0f, viewport->WorkSize.y - 16.0f));
+		}
+		ImGui::SetWindowSize(resized, ImGuiCond_Always);
+		dirty = true;
 	}
 
-	ImGui::SliderFloat("Left Panel %", &firstColumnPercent, 0.2f, 0.8f, "%.0f%%");
+	// firstColumnPercent is stored as a 0.0-to-1.0 ratio, while the user-facing
+	// control should show whole percentages rather than rounding to 0 or 1.
+	int leftPanelPercent = static_cast<int>(std::lround(firstColumnPercent * 100.0f));
+	if (ImGui::SliderInt("Left Panel %", &leftPanelPercent, 20, 80, "%d%%")) {
+		firstColumnPercent = static_cast<float>(leftPanelPercent) / 100.0f;
+	}
 
 	ImGui::Spacing();
 	ImGui::Separator();
