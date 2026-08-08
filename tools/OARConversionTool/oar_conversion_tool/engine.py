@@ -236,7 +236,10 @@ def build_preview(opts: JobOptions) -> PreviewResult:
     # keyword-suffix heuristic - see weapon_match.py), so a multi-weapon ESP gets one
     # SubMod per weapon instead of one shared SubMod whose single IsEquipped condition
     # would silently disable every weapon but the first the moment a different one is
-    # drawn. Computed once and reused for both TR and Idle Empty below.
+    # drawn. match_roots_to_weapons already expands a root shared by several weapons
+    # into one group per weapon (expand_groups_per_weapon), so every matched group
+    # below has exactly one weapon; the loops here just turn one group into one plan.
+    # Computed once and reused for both TR and Idle Empty below.
     groups: list[RootWeaponGroup] = []
     if roots and (opts.do_tactical_reload or opts.do_idle_empty):
         groups = match_roots_to_weapons(
@@ -251,11 +254,12 @@ def build_preview(opts: JobOptions) -> PreviewResult:
             for g in matched_groups:
                 names = ", ".join(f"{w.edid} ({w.form_id_hex})" for w in g.weapons)
                 result.messages.append(f"Weapon match: {g.label} -> {names}")
-            unmatched_roots = next((g.roots for g in groups if not g.weapons), [])
+            unmatched_roots = [r for g in groups if not g.weapons for r in g.roots]
             if unmatched_roots:
                 result.messages.append(
                     "Weapon match: no ESP/subgraph coverage for "
-                    f"{', '.join(r.name for r in unmatched_roots)}; grouped into a shared SubMod."
+                    f"{', '.join(r.name for r in unmatched_roots)}; "
+                    "emitting one SubMod per unmatched root (no IsEquipped)."
                 )
             if manual_equipped:
                 result.messages.append(
@@ -270,6 +274,8 @@ def build_preview(opts: JobOptions) -> PreviewResult:
             if manual_equipped:
                 return manual_equipped
         if group.weapons and opts.esp_path is not None:
+            # group.weapons is length 1 for every matched group after the per-weapon
+            # expand in match_roots_to_weapons; the list branch below is defensive only.
             plugin = opts.esp_path.name
             forms = [{"formID": w.form_id_hex, "pluginName": plugin} for w in group.weapons]
             return forms[0] if len(forms) == 1 else forms

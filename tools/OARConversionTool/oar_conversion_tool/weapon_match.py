@@ -59,14 +59,31 @@ class WeaponMatch:
     form_id_hex: str  # already masked to the low 24 bits by esp_io.parse_esp
 
 
+# SubMod folder suffix budget. The in-game path already consumes ~100-140 chars before
+# the SubMod name (mod root + Meshes\\...\\OpenAnimationReplacer\\Pack\\), and attachment
+# nests under a root can add another ~80. Windows MAX_PATH is 260 for tools like MO2 that
+# do not use the \\?\ long-path prefix; keeping the label well under this ceiling is what
+# stops a multi-root "+"-joined name from making the whole mod unopenable in MO2.
+_MAX_LABEL_CHARS = 48
+
+
 @dataclass
 class RootWeaponGroup:
     """One or more AnimRoots that all belong to the same WEAP form(s).
 
-    ``weapons`` is empty for the trailing "unmatched" group (no ESP, no subgraph
-    coverage, or no keyword overlap found) - callers should treat that group like the
-    tool's original, pre-matching behavior: one shared SubMod, no auto-derived
-    ``IsEquipped``.
+    ``weapons`` is empty for unmatched roots (no ESP, no subgraph coverage, or no
+    keyword overlap found) - callers should treat those groups like the tool's original
+    pre-matching behavior: no auto-derived ``IsEquipped``. When *every* root is
+    unmatched they stay in one shared group; when some roots matched and others did
+    not, each unmatched root gets its own group so the SubMod folder name stays a
+    short single root name instead of ``RootA+RootB+RootC+...`` (which has blown past
+    MAX_PATH on large packs like EFT and broken MO2's directory walker).
+
+    Matched groups always carry exactly one weapon by the time ``match_roots_to_weapons``
+    returns (see ``expand_groups_per_weapon``): a root that matches several WEAP forms
+    (e.g. one EFT-style folder shared by five Deagle variants) is expanded into one
+    group per weapon, each still listing the same shared root(s), so the engine emits
+    one SubMod per weapon instead of one SubMod with an OR'd ``IsEquipped``.
     """
 
     roots: list[AnimRoot] = field(default_factory=list)
@@ -74,8 +91,55 @@ class RootWeaponGroup:
 
     @property
     def label(self) -> str:
-        """Short, human/filesystem-friendly name for this group's roots."""
-        return "+".join(r.name for r in self.roots) or "Unmatched"
+        """Short, filesystem-safe name for this group (never a long "+"-joined list)."""
+        if self.weapons:
+            # A matched group is keyed on its own weapon, not the (possibly shared)
+            # root folder name: after expand_groups_per_weapon, several groups can
+            # share the same root(s), and a root-name label would collide on disk
+            # (five Deagle SubMods all named "... - EFTPackDeagle") and silently
+            # overwrite each other.
+            if len(self.weapons) == 1:
+                raw = _short_weapon_label(self.weapons[0])
+            else:
+                # Defensive only: match_roots_to_weapons always expands to one weapon
+                # per group, so this branch should not be reachable in practice.
+                raw = _short_weapon_label(self.weapons[0]) + f"etc{len(self.weapons)}"
+        elif len(self.roots) == 1:
+            raw = self.roots[0].name
+        else:
+            raw = "Unmatched"
+        return _clamp_label(raw)
+
+
+def _short_weapon_label(w: WeaponMatch) -> str:
+    """Weapon EDID with a leading 'WPN_'/'WPN' stripped, e.g. 'WPNDeagleL5' -> 'DeagleL5'.
+
+    Trims Tactical Reload's near-universal WPN(_) naming boilerplate so SubMod folder
+    names read as the weapon name while staying unique per weapon (the EDID itself).
+    """
+    edid = w.edid
+    for prefix in ("WPN_", "WPN"):
+        if edid.lower().startswith(prefix.lower()) and len(edid) > len(prefix):
+            return edid[len(prefix):]
+    return edid
+
+
+# Characters Windows forbids in file/folder names; EDIDs are normally alnum/underscore
+# already, but sanitize defensively since a label can also fall back to a root folder
+# name pulled straight off disk.
+_ILLEGAL_PATH_CHARS = '<>:"/\\|?*'
+
+
+def _clamp_label(raw: str) -> str:
+    """Trim a SubMod suffix to _MAX_LABEL_CHARS without leaving a trailing separator."""
+    cleaned = raw.strip().strip(". ")
+    if not cleaned:
+        return "Unmatched"
+    cleaned = "".join("_" if ch in _ILLEGAL_PATH_CHARS else ch for ch in cleaned)
+    if len(cleaned) <= _MAX_LABEL_CHARS:
+        return cleaned
+    # Keep the start (usually the distinctive weapon/root token); ellipsis marks truncation.
+    return cleaned[: _MAX_LABEL_CHARS - 1].rstrip(" -_+.") + "…"
 
 
 def _normalize_token(s: str) -> str:
@@ -127,13 +191,16 @@ def match_roots_to_weapons(
     include_1st: bool = True,
     include_3rd: bool = False,
 ) -> list[RootWeaponGroup]:
-    """Group roots by the WEAP form(s) that use them.
+    """Group roots by the WEAP form(s) that use them, one group per weapon.
 
-    Returns one group per distinct set of matched weapons (roots that resolve to the
-    exact same weapon(s) are merged into one group), plus a single trailing group with
-    an empty ``weapons`` list for any roots that couldn't be matched. When there is no
-    ESP to match against at all, every root lands in that trailing unmatched group, i.e.
-    the caller's original single-shared-SubMod behavior.
+    Roots are first grouped by the exact set of weapons they resolve to (so a root
+    shared by five weapons and a root shared by the same five weapons merge), then
+    that intermediate grouping is expanded per weapon (see ``expand_groups_per_weapon``)
+    so the caller always gets one group per weapon, not one group per weapon *set*.
+    A single trailing entry (or one group per leftover root) carries an empty
+    ``weapons`` list for anything that couldn't be matched. When there is no ESP to
+    match against at all, every root lands in that unmatched case, i.e. the caller's
+    original single-shared-SubMod behavior.
     """
     if not roots:
         return []
@@ -172,8 +239,17 @@ def match_roots_to_weapons(
         # 2) Keyword-suffix heuristic: Anims<RootName> directly, independent of any
         #    subgraph dump. Runs unconditionally so a root with partial/no subgraph
         #    coverage still benefits from whatever this heuristic can find.
-        for wm in weapon_by_suffix.get(_normalize_token(root.name), []):
-            matched[wm.form_id_hex] = wm
+        #    Also try stripping a trailing "Anims"/"Anim" from the folder name
+        #    (EFT-style ``AK400Anims`` <-> keyword ``AnimsAK400``), which is the same
+        #    TR naming convention written in the opposite order.
+        root_token = _normalize_token(root.name)
+        suffix_tokens = {root_token}
+        for trailer in ("anims", "anim"):
+            if root_token.endswith(trailer) and len(root_token) > len(trailer):
+                suffix_tokens.add(root_token[: -len(trailer)])
+        for token in suffix_tokens:
+            for wm in weapon_by_suffix.get(token, []):
+                matched[wm.form_id_hex] = wm
 
         if not matched:
             unmatched.append(root)
@@ -184,5 +260,38 @@ def match_roots_to_weapons(
 
     result = list(groups.values())
     if unmatched:
-        result.append(RootWeaponGroup(roots=unmatched, weapons=[]))
-    return result
+        if result:
+            # Some roots matched: give each unmatched root its own SubMod so the folder
+            # name is just that root's name. Bundling them into one group would produce
+            # a "+"-joined label of every leftover root - on a pack the size of EFT that
+            # alone pushed full paths past Windows MAX_PATH and made MO2 refuse to open
+            # the destination mod.
+            for root in unmatched:
+                result.append(RootWeaponGroup(roots=[root], weapons=[]))
+        else:
+            # Nothing matched at all (no useful ESP keywords / no subgraph coverage):
+            # keep the classic single shared SubMod with no IsEquipped and no name suffix
+            # (engine only appends group.label when len(groups) > 1).
+            result.append(RootWeaponGroup(roots=unmatched, weapons=[]))
+    return expand_groups_per_weapon(result)
+
+
+def expand_groups_per_weapon(groups: list[RootWeaponGroup]) -> list[RootWeaponGroup]:
+    """Split each multi-weapon group into one group per weapon.
+
+    OAR SubMod ``conditions`` are ANDed as a whole, so one SubMod covering several
+    weapons behind an OR of ``IsEquipped`` conditions is still a single unit; the user
+    wants a separate SubMod folder per weapon instead (the shared root's animation
+    tree is duplicated into each one, matching how a one-root-per-weapon pack like
+    Ozzy M4 Platform was already handled). Unmatched groups have no weapons to split
+    on and pass through unchanged - they're already shaped correctly, one per leftover
+    root (or a single shared fallback group when nothing matched at all).
+    """
+    out: list[RootWeaponGroup] = []
+    for g in groups:
+        if not g.weapons:
+            out.append(g)
+            continue
+        for w in g.weapons:
+            out.append(RootWeaponGroup(roots=list(g.roots), weapons=[w]))
+    return out

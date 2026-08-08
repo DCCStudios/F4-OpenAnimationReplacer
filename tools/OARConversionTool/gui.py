@@ -29,7 +29,7 @@ from oar_conversion_tool.engine import (
 )
 from oar_conversion_tool.esp_io import parse_esp
 from oar_conversion_tool.paths import AnimRoot
-from oar_conversion_tool.weapon_match import RootWeaponGroup, match_roots_to_weapons
+from oar_conversion_tool.weapon_match import RootWeaponGroup, WeaponMatch, match_roots_to_weapons
 
 # Fallout-inspired dark theme
 BG = "#1a1d1a"
@@ -163,6 +163,17 @@ class ConfirmDialog(ctk.CTkToplevel):
     ):
         super().__init__(master)
         self.title(title)
+        # Never request a taller window than the display can show. CTkToplevel.geometry()
+        # scales whatever height we pass by the window's CTk scaling factor before handing
+        # it to Tk (e.g. 1.5x at 150% display scaling), but winfo_screenheight() reports
+        # the unscaled screen size Tk itself operates in - dividing that by the same
+        # factor converts it back to the units `height` is expressed in, so the caller's
+        # content-driven height (which can be large for a job that fans out to 100+
+        # per-weapon SubMods, see weapon_match.py) can't push the window - and the
+        # Confirm/Run button pinned to its bottom - off the bottom of the screen.
+        scaling = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        max_height = int(self.winfo_screenheight() / scaling) - 80
+        height = max(260, min(height, max_height))
         self.geometry(f"{width}x{height}")
         self.minsize(480, 260)
         self.configure(fg_color=BG)
@@ -197,6 +208,33 @@ class ConfirmDialog(ctk.CTkToplevel):
                 wraplength=width - 48,
             ).pack(fill="x", pady=(4, 0))
 
+        # Pack the button row at the bottom BEFORE the scrollable content below: a
+        # large job (e.g. an EFT-style pack fanning out to 100+ per-weapon SubMods)
+        # can produce far more section content than any fixed dialog height can show,
+        # and packing side="bottom" first reserves its space up front so Confirm/Run
+        # stays visible and only the middle content area scrolls, no matter how tall
+        # the sections list grows.
+        brow = ctk.CTkFrame(self, fg_color="transparent")
+        brow.pack(side="bottom", fill="x", padx=18, pady=(8, 16))
+        ctk.CTkButton(
+            brow,
+            text=cancel_text,
+            command=self._cancel,
+            fg_color="#3a3f3a",
+            hover_color="#4a504a",
+            width=110,
+        ).pack(side="left")
+        confirm_fg = DANGER if danger else ACCENT
+        confirm_hover = "#e07038" if danger else ACCENT_HOVER
+        ctk.CTkButton(
+            brow,
+            text=confirm_text,
+            command=self._ok,
+            fg_color=confirm_fg,
+            hover_color=confirm_hover,
+            width=140,
+        ).pack(side="right")
+
         if sections:
             scroll = ctk.CTkScrollableFrame(self, fg_color=BG)
             scroll.pack(fill="both", expand=True, padx=14, pady=(6, 4))
@@ -222,27 +260,6 @@ class ConfirmDialog(ctk.CTkToplevel):
                     ).pack(fill="x", padx=12, pady=1)
                 # Bottom pad inside the card so the last line isn't flush with the edge.
                 ctk.CTkFrame(card, fg_color="transparent", height=8).pack(fill="x")
-
-        brow = ctk.CTkFrame(self, fg_color="transparent")
-        brow.pack(fill="x", padx=18, pady=(8, 16))
-        ctk.CTkButton(
-            brow,
-            text=cancel_text,
-            command=self._cancel,
-            fg_color="#3a3f3a",
-            hover_color="#4a504a",
-            width=110,
-        ).pack(side="left")
-        confirm_fg = DANGER if danger else ACCENT
-        confirm_hover = "#e07038" if danger else ACCENT_HOVER
-        ctk.CTkButton(
-            brow,
-            text=confirm_text,
-            command=self._ok,
-            fg_color=confirm_fg,
-            hover_color=confirm_hover,
-            width=140,
-        ).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.bind("<Escape>", lambda _e: self._cancel())
@@ -978,19 +995,29 @@ class OARConversionApp(ctk.CTk):
         A single matched weapon (or none at all) is the common case already implied by
         the plain root checkbox, so it stays unlabeled to keep that case exactly as
         compact as before Scan ever ran.
+
+        ``match_roots_to_weapons`` expands a root shared by several weapons into one
+        group per weapon (so Run emits one SubMod per weapon), which means the same
+        root can now appear in multiple groups here. Collect those back per root so a
+        checkbox still reads as "this one folder covers N weapons" instead of only
+        showing whichever weapon's group happened to be processed last.
         """
         matched = [g for g in groups if g.weapons]
         if len(matched) < 2:
             return {}
-        labels: dict[str, str] = {}
+        by_root: dict[str, list[WeaponMatch]] = {}
         for g in matched:
-            if len(g.weapons) == 1:
-                w = g.weapons[0]
-                suffix = f"  \u2192  {w.edid} ({w.form_id_hex})"
+            for w in g.weapons:
+                for r in g.roots:
+                    by_root.setdefault(OARConversionApp._root_key(r), []).append(w)
+        labels: dict[str, str] = {}
+        for key, weapons in by_root.items():
+            if len(weapons) == 1:
+                w = weapons[0]
+                labels[key] = f"  \u2192  {w.edid} ({w.form_id_hex})"
             else:
-                suffix = "  \u2192  " + "+".join(w.edid for w in g.weapons)
-            for r in g.roots:
-                labels[OARConversionApp._root_key(r)] = suffix
+                edids = ", ".join(w.edid for w in weapons)
+                labels[key] = f"  \u2192  {len(weapons)} weapons ({edids}) - split into {len(weapons)} SubMods"
         return labels
 
     def _scan(self) -> None:
@@ -1259,7 +1286,13 @@ class OARConversionApp(ctk.CTk):
             confirm_text="Run",
             cancel_text="Cancel",
             width=720,
-            height=min(560, 220 + 110 * max(1, n_jobs)),
+            # Sized off total_plans, not just n_jobs: one job can still fan out to
+            # dozens/hundreds of per-weapon SubMods (see weapon_match.py's per-weapon
+            # split), which dwarfs a single job's card far more than job count implies.
+            # ConfirmDialog itself clamps this to the screen height, so an oversized
+            # value here just means "show more before scrolling," never a window that
+            # opens taller than the display.
+            height=260 + 90 * max(1, n_jobs) + 6 * total_plans,
         )
         if not run_ok:
             return

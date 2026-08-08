@@ -24,7 +24,7 @@ from oar_conversion_tool.convert_idle import plan_idle_empty
 from oar_conversion_tool.convert_tr import execute_plan, plan_tactical_reload
 from oar_conversion_tool.engine import JobOptions, build_preview, discover_roots, discover_subgraphs, run_job, validate_inputs
 from oar_conversion_tool.esp_io import find_used_master_indices, parse_esp, patch_esp_remove_tr
-from oar_conversion_tool.paths import find_files_ci, resolve_oar_base, scan_anim_roots
+from oar_conversion_tool.paths import AnimRoot, find_files_ci, resolve_oar_base, scan_anim_roots
 from oar_conversion_tool.subgraph import find_subgraph_files_near, load_subgraph_file
 
 TEST_SCAR = ROOT / "TestAssets" / "SCAR-H"
@@ -316,9 +316,13 @@ def test_dual_ops_and_overwrite(f: Failures) -> None:
     with tempfile.TemporaryDirectory() as td:
         dest = Path(td)
         opts = JobOptions(
+            # No esp_path here on purpose: SCAR-H.esp's SCAR root is shared by two
+            # weapons (base + "_Unique" variant), which the per-weapon expand (see
+            # weapon_match.expand_groups_per_weapon, tests 15/17) now splits into two
+            # SubMods - out of scope for this test, which only cares about dual TR+Idle
+            # output and the overwrite guard, so it sticks to the manual equipped override.
             source_dirs=[TEST_SCAR],
             subgraph_paths=[SCAR_SUBGRAPH],
-            esp_path=SCAR_ESP,
             destination=dest,
             do_tactical_reload=True,
             do_idle_empty=True,
@@ -620,9 +624,20 @@ def test_engine_anims_plus_esp(f: Failures) -> None:
         f.check(esp_out.is_file(), "ESP output written")
         info = parse_esp(esp_out)
         f.check("TacticalReload.esm" not in info.masters, f"ESP cleaned: {info.masters}")
+        # SCAR-H.esp's SCAR root is shared by two weapons (base "SCAR" + its "SCAR_Unique"
+        # leveled variant, both carrying AnimsSCAR) - the per-weapon expand means this run
+        # produces two SubMods, not one, so the auto-derived IsEquipped wins over the
+        # manually entered equipped_form_id/plugin above. Anims must land in both.
+        f.check(len(result.plans) == 2, f"one SubMod per SCAR weapon: {len(result.plans)}")
+        for plan in result.plans:
+            f.check(
+                (plan.submod_dir / "SCAR" / "WPNReload.hkx").is_file(),
+                f"anims written alongside ESP patch: {plan.submod_dir}",
+            )
         f.check(
-            (dest / "Meshes/Actors/Character/_1stPerson/Animations/OpenAnimationReplacer/SCAR/Tactical Reload/SCAR/WPNReload.hkx").is_file(),
-            "anims written alongside ESP patch",
+            {p.submod_dir.name for p in result.plans}
+            == {"Tactical Reload - SCAR", "Tactical Reload - SCAR_Unique"},
+            f"SubMod names split per weapon: {[p.submod_dir.name for p in result.plans]}",
         )
 
 
@@ -753,6 +768,179 @@ def test_multi_weapon_esp_grouping(f: Failures) -> None:
                     "P226 SubMod IsEquipped matches P226Weapon's own FormID")
 
 
+def test_unmatched_and_anims_suffix_labels(f: Failures) -> None:
+    """Large packs must never emit a SubMod folder named RootA+RootB+RootC+...
+
+    That "+"-joined unmatched-group label is what pushed EFT OAR past Windows MAX_PATH
+    and made Mod Organizer 2 throw recursive_directory_iterator::operator++. Also covers
+    the EFT-style ``AK400Anims`` folder <-> ``AnimsAK400`` keyword heuristic.
+    """
+    print("\n[16] unmatched roots stay short; AK400Anims <-> AnimsAK400")
+    from oar_conversion_tool.weapon_match import (
+        _MAX_LABEL_CHARS,
+        match_roots_to_weapons,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        esp_path = Path(td) / "EFTStyle.esp"
+        # One normal match (SCAR) plus one reversed-order Anims match (AK400).
+        _write_multi_weapon_esp(
+            esp_path,
+            [("SCARWeapon", "SCAR"), ("AK400Weapon", "AK400")],
+        )
+        info = parse_esp(esp_path)
+
+        def _fake_root(name: str) -> AnimRoot:
+            return AnimRoot(
+                name=name,
+                perspective="1st",
+                absolute_path=Path(td) / name,
+                source_mod=Path(td),
+                relative_under_animations=name,
+            )
+
+        # Many leftovers that share no keyword with the ESP (the EFT failure mode),
+        # plus AK400Anims which must match AnimsAK400, plus the normal SCAR root.
+        leftovers = [
+            _fake_root(n)
+            for n in (
+                "APCAnims",
+                "EFTPack416HK",
+                "EFTPackSA58DSA",
+                "EFTPackUSP",
+                "Fiddler's Armaments",
+                "MK47Anims",
+                "MP7A2Anims",
+                "SVDExtra",
+            )
+        ]
+        roots = [_fake_root("SCAR"), _fake_root("AK400Anims"), *leftovers]
+        groups = match_roots_to_weapons(roots, info, [], include_1st=True, include_3rd=False)
+
+        matched = [g for g in groups if g.weapons]
+        unmatched = [g for g in groups if not g.weapons]
+        f.check(len(matched) == 2, f"SCAR + AK400Anims matched: {[g.label for g in matched]}")
+        ak = next((g for g in matched if any(w.edid == "AK400Weapon" for w in g.weapons)), None)
+        f.check(ak is not None, "AK400Anims matched via AnimsAK400 heuristic")
+        if ak:
+            f.check(
+                [r.name for r in ak.roots] == ["AK400Anims"],
+                f"AK400 group roots: {[r.name for r in ak.roots]}",
+            )
+
+        # Critical: unmatched leftovers must each be their own group with a short label,
+        # never one mega group whose label is RootA+RootB+...
+        f.check(
+            len(unmatched) == len(leftovers),
+            f"one unmatched group per leftover root: {len(unmatched)} vs {len(leftovers)}",
+        )
+        for g in unmatched:
+            f.check(len(g.roots) == 1, f"unmatched group is single-root: {[r.name for r in g.roots]}")
+            f.check(
+                "+" not in g.label,
+                f"label must not '+'-join roots (MO2 MAX_PATH bomb): {g.label!r}",
+            )
+            f.check(
+                len(g.label) <= _MAX_LABEL_CHARS,
+                f"label within {_MAX_LABEL_CHARS} chars: {g.label!r} ({len(g.label)})",
+            )
+            f.check(g.label == g.roots[0].name, f"label is the root name: {g.label!r}")
+
+
+# ---------------------------------------------------------------------------
+# 17. One root, many weapons: per-weapon expand must fan out to N SubMods
+# ---------------------------------------------------------------------------
+
+def test_one_root_many_weapons_expand(f: Failures) -> None:
+    """One AnimRoot shared by five WEAPs (EFT-style: one Deagle folder used by five
+    Deagle variant WEAPs) must expand into five per-weapon SubMods, each with its own
+    single IsEquipped, never one SubMod with an OR of five IsEquipped conditions.
+    See HANDOFF_per_weapon_submod_split.md."""
+    print("\n[17] one root -> five weapons: per-weapon SubMod expand")
+    from oar_conversion_tool.weapon_match import match_roots_to_weapons
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        esp_path = tdp / "EFTStyle.esp"
+        # All five WEAPs carry the same "AnimsDeagle" keyword suffix, matching the
+        # single shared "Deagle" root purely via the keyword-suffix heuristic (no
+        # subgraph dump needed) - the common case for packs like EFT.
+        deagle_weapons = [
+            ("WPNDeagleL5", "Deagle"),
+            ("WPNDeagleL6", "Deagle"),
+            ("WPNDeagleL6WTS", "Deagle"),
+            ("WPNDeagleL5_357", "Deagle"),
+            ("WPNMK19", "Deagle"),
+        ]
+        _write_multi_weapon_esp(esp_path, deagle_weapons)
+        info = parse_esp(esp_path)
+
+        root_dir = tdp / "Deagle"
+        root_dir.mkdir()
+        (root_dir / "WPNReloadReserve.hkx").write_bytes(b"fake-hkx-bytes")
+        deagle_root = AnimRoot(
+            name="Deagle",
+            perspective="1st",
+            absolute_path=root_dir,
+            source_mod=tdp,
+            relative_under_animations="Deagle",
+        )
+
+        groups = match_roots_to_weapons([deagle_root], info, [], include_1st=True, include_3rd=False)
+        matched = [g for g in groups if g.weapons]
+        f.check(len(matched) == 5, f"one group per weapon: {len(matched)} group(s)")
+        f.check(all(len(g.weapons) == 1 for g in matched), "each group has exactly one weapon")
+        f.check(
+            all([r.name for r in g.roots] == ["Deagle"] for g in matched),
+            "each group still carries the shared Deagle root",
+        )
+        labels = [g.label for g in matched]
+        f.check(len(set(labels)) == 5, f"labels are unique per weapon: {labels}")
+        f.check(all("+" not in lbl for lbl in labels), f"no label '+'-joins weapons: {labels}")
+        f.check(all(len(lbl) <= 48 for lbl in labels), f"labels stay within the SubMod suffix budget: {labels}")
+
+        dest = tdp / "out"
+        opts = JobOptions(
+            source_dirs=[tdp],
+            esp_path=esp_path,
+            destination=dest,
+            do_tactical_reload=True,
+            do_idle_empty=False,
+            selected_roots=[deagle_root],
+            pack_name="EFTPack",
+            tr_submod_name="Tactical Reload",
+            overwrite=True,
+        )
+        result = run_job(opts)
+        f.check(not result.errors, f"run errors: {result.errors}")
+        f.check(len(result.plans) == 5, f"five TR SubMod plans: {len(result.plans)}")
+
+        submod_dirs = {plan.submod_dir for plan in result.plans}
+        f.check(len(submod_dirs) == 5, f"five distinct SubMod folders: {submod_dirs}")
+        f.check(
+            all("+" not in p.submod_dir.name for p in result.plans),
+            f"no SubMod folder name '+'-joins weapons: {[p.submod_dir.name for p in result.plans]}",
+        )
+
+        eq_form_ids: set[str] = set()
+        for plan in result.plans:
+            f.check(
+                (plan.submod_dir / "Deagle").is_dir(),
+                f"{plan.submod_dir} contains a copy of the shared Deagle root",
+            )
+            cfg = json.loads((plan.submod_dir / "config.json").read_text(encoding="utf-8"))
+            eq_conds = [c for c in cfg["conditions"] if c["condition"] == "IsEquipped"]
+            or_conds = [c for c in cfg["conditions"] if c["condition"] == "OR"]
+            f.check(
+                len(eq_conds) == 1,
+                f"{plan.submod_dir.name}: exactly one IsEquipped, no OR: {cfg['conditions']}",
+            )
+            f.check(not or_conds, f"{plan.submod_dir.name}: no OR condition present")
+            if eq_conds:
+                eq_form_ids.add(eq_conds[0]["Form"]["formID"])
+        f.check(len(eq_form_ids) == 5, f"each SubMod gated to a distinct weapon FormID: {eq_form_ids}")
+
+
 def main() -> int:
     f = Failures()
     tests = [
@@ -771,6 +959,8 @@ def main() -> int:
         test_job_queue_different_options,
         test_engine_anims_plus_esp,
         test_multi_weapon_esp_grouping,
+        test_unmatched_and_anims_suffix_labels,
+        test_one_root_many_weapons_expand,
     ]
     for t in tests:
         try:
