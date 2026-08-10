@@ -179,6 +179,12 @@ struct CharTrackFilterState {
 	float selfAdvanceStartSec = -1.0f;
 	// Donor localTime at the moment self-advance began.
 	float selfAdvanceBaseTime = 0.0f;
+	// End-anchored blend-out (TrackFilter::blendOutAtEnd == false, the default):
+	// the donor has reached blendOutTime before its end, so the fade starts NOW
+	// in order to finish exactly on the final frame. Distinct from oneShotDone,
+	// which clamps localTime and holds the last pose — here the donor keeps
+	// animating normally underneath the fade.
+	bool earlyBlendOutArmed = false;
 	// Donor playback reached its end for the current activation (non-looping
 	// source): the tick updater blends the overlay out even though conditions
 	// may still be true, and re-registration must not cancel that blend-out.
@@ -276,6 +282,10 @@ struct FullBodyBlendState {
 	// SubMod's configured blend-out duration, captured at registration.
 	// Negative = mirror the blend-in duration (default behavior).
 	float blendOutDuration = -1.0f;
+	// Ramp shape, captured alongside blendOutDuration: this state outlives the
+	// evaluation that created it, and the owning SubMod pointer is not safe to
+	// dereference here after a config reload.
+	BlendCurve blendCurve = BlendCurve::kQuadratic;
 	bool blendingIn = false;       // ramping 0→1
 	bool blendingOut = false;      // ramping 1→0
 	bool poseSnapshotValid = false;
@@ -313,6 +323,65 @@ static float EaseInOutQuad(float t)
 	return t < 0.5f ? 2.0f * t * t : t * (4.0f - 2.0f * t) - 1.0f;
 }
 
+// Configurable ramp shape (SubMod::blendCurve). All are ease-in-out forms:
+// monotonic on [0,1] with f(0)=0 and f(1)=1, which is what makes the numeric
+// inverse below valid.
+static float EvaluateBlendCurve(BlendCurve a_curve, float t)
+{
+	if (t <= 0.0f) return 0.0f;
+	if (t >= 1.0f) return 1.0f;
+
+	switch (a_curve) {
+	case BlendCurve::kLinear:
+		return t;
+	case BlendCurve::kCubic:
+		return t < 0.5f
+			? 4.0f * t * t * t
+			: 1.0f - 0.5f * std::pow(-2.0f * t + 2.0f, 3.0f);
+	case BlendCurve::kHermiteCubic:
+		// Classic smoothstep: zero first derivative at both ends.
+		return t * t * (3.0f - 2.0f * t);
+	case BlendCurve::kSinusoidal:
+		return 0.5f * (1.0f - std::cos(t * 3.14159265358979323846f));
+	case BlendCurve::kExponential:
+		return t < 0.5f
+			? 0.5f * std::pow(2.0f, 20.0f * t - 10.0f)
+			: 1.0f - 0.5f * std::pow(2.0f, -20.0f * t + 10.0f);
+	case BlendCurve::kQuadratic:
+	default:
+		return EaseInOutQuad(t);
+	}
+}
+
+// Solve EvaluateBlendCurve(curve, t) == a_alpha for t. Used when a blend starts
+// from a partially-blended alpha (cancelling a blend-out mid-ramp, re-arming a
+// fade) so the ramp resumes at the right place instead of popping. Bisection
+// rather than closed forms: it is one loop for every curve, cannot go unstable,
+// and only runs when a blend begins — never per frame.
+static float InverseBlendCurve(BlendCurve a_curve, float a_alpha)
+{
+	if (a_alpha <= 0.0f) return 0.0f;
+	if (a_alpha >= 1.0f) return 1.0f;
+	if (a_curve == BlendCurve::kLinear) return a_alpha;
+
+	float lo = 0.0f;
+	float hi = 1.0f;
+	for (int i = 0; i < 16; ++i) {
+		const float mid = 0.5f * (lo + hi);
+		if (EvaluateBlendCurve(a_curve, mid) < a_alpha) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	return 0.5f * (lo + hi);
+}
+
+static BlendCurve CurveOf(const SubMod* a_subMod)
+{
+	return a_subMod ? a_subMod->blendCurve : BlendCurve::kQuadratic;
+}
+
 // ---- Quaternion math helpers for bone blending ----
 
 static float QuatDot(const float* a, const float* b)
@@ -320,6 +389,29 @@ static float QuatDot(const float* a, const float* b)
 	return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
 }
 
+static void NormalizeQuat(float* q)
+{
+	const float lenSq = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+	if (lenSq < 1e-12f) {
+		// Degenerate input — fall back to identity rather than emitting NaNs
+		// into a pose the engine is about to render.
+		q[0] = q[1] = q[2] = 0.0f;
+		q[3] = 1.0f;
+		return;
+	}
+	const float inv = 1.0f / std::sqrt(lenSq);
+	for (int i = 0; i < 4; ++i) q[i] *= inv;
+}
+
+// Shortest-path slerp. q and -q are the same orientation (quaternion double
+// cover), so a negative dot means the raw interpolation would travel the LONG
+// way around — up to 360 degrees of unwanted spin through a bone. Flipping the
+// sign of b in that case is what guarantees the short arc.
+//
+// The result is normalized unconditionally: the near-parallel branch is a plain
+// lerp (nlerp), which lands slightly inside the unit sphere, and every additive
+// blend feeds its output back through MultiplyQuat, so without this the drift
+// compounds frame over frame into a visibly shrinking/skewing bone.
 static void SlerpQuat(const float* a, const float* b, float t, float* out)
 {
 	float dot = QuatDot(a, b);
@@ -339,6 +431,7 @@ static void SlerpQuat(const float* a, const float* b, float t, float* out)
 	}
 	for (int i = 0; i < 4; ++i)
 		out[i] = a[i] * s0 + b[i] * s1;
+	NormalizeQuat(out);
 }
 
 static void MultiplyQuat(const float* p, const float* q, float* out)
@@ -560,6 +653,9 @@ static void BlendAdditiveTransform(RE::hkQsTransformRaw& output,
 	float weightedDelta[4];
 	SlerpQuat(kIdentityQuat, deltaRot, w, weightedDelta);
 	MultiplyQuat(output.rotation, weightedDelta, output.rotation);
+	// Composition drifts off unit length; this output is re-composed every frame
+	// (and by every stacked additive filter), so renormalize at each step.
+	NormalizeQuat(output.rotation);
 
 	for (int i = 0; i < 3; ++i) {
 		float deltaScale = (origBase.scale[i] > 0.0001f) ? (rep.scale[i] / origBase.scale[i]) : 1.0f;
@@ -5989,7 +6085,10 @@ namespace
 					if (state.blendingOut || state.dormant) {
 						const bool freshPlay = a_this->GetLocalTime() <= 0.15f;
 						if (freshPlay) {
-							const bool wasEnded = state.dormant || state.oneShotDone;
+							// An armed end-anchored fade counts as ended even before it
+							// reaches dormancy: re-throwing during the fade is a new
+							// play and must re-fire eventsOnStart.
+							const bool wasEnded = state.dormant || state.oneShotDone || state.earlyBlendOutArmed;
 							state.blendingOut = false;
 							state.dormant = false;
 							state.oneShotDone = false;
@@ -5999,11 +6098,13 @@ namespace
 							state.lastAdvanceSec = state.lastSampleSec;
 							state.selfAdvanceStartSec = -1.0f;
 							state.selfAdvanceBaseTime = 0.0f;
+							state.earlyBlendOutArmed = false;
 							// Blend in from the CURRENT alpha (0 if dormant) rather than
 							// snapping, so cancelling a half-done blend-out doesn't pop.
 							float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
 							state.blendDuration = blendIn;
-							state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+							state.blendElapsed = (blendIn > 0.0f)
+	? InverseBlendCurve(CurveOf(state.parentSubMod), state.blendAlpha) * blendIn : 0.0f;
 							if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
 							if (wasEnded) {
 								// The previous play already delivered onEnd; this is a
@@ -6160,6 +6261,7 @@ namespace
 								bs.blendingOut = false;
 								bs.blendDuration = blendTime;
 								bs.blendOutDuration = blendOutCfg;
+								bs.blendCurve = CurveOf(winningInfo ? winningInfo->parentSubMod : nullptr);
 								bs.poseSnapshotValid = false;
 								bs.poseSnapshot.clear();
 								if (isNew) s_fullBodyBlendActiveCount.fetch_add(1, std::memory_order_relaxed);
@@ -7354,18 +7456,23 @@ namespace
 						// finished/dormant overlay and blend back in.
 						if (state.lastSampledLocalTime >= 0.0f &&
 							localTime + 0.05f < state.lastSampledLocalTime) {
-							const bool wasEnded = state.dormant || state.oneShotDone;
+							// An armed end-anchored fade counts as ended even before it
+							// reaches dormancy: re-throwing during the fade is a new
+							// play and must re-fire eventsOnStart.
+							const bool wasEnded = state.dormant || state.oneShotDone || state.earlyBlendOutArmed;
 							state.oneShotDone = false;
 							state.sampleStarved = false;
 							state.lastAdvanceSec = nowSec;
 							state.selfAdvanceStartSec = -1.0f;
 							state.selfAdvanceBaseTime = 0.0f;
+							state.earlyBlendOutArmed = false;
 							if (state.dormant || state.blendingOut) {
 								state.dormant = false;
 								state.blendingOut = false;
 								float blendIn = filterPtr->blendInTime;
 								state.blendDuration = blendIn;
-								state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+								state.blendElapsed = (blendIn > 0.0f)
+	? InverseBlendCurve(CurveOf(state.parentSubMod), state.blendAlpha) * blendIn : 0.0f;
 								if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
 							}
 							if (wasEnded) {
@@ -7403,6 +7510,17 @@ namespace
 							localTime = state.selfAdvanceBaseTime + (nowSec - state.selfAdvanceStartSec);
 						}
 
+						// End-anchored blend-out (default): start the fade
+						// blendOutTime BEFORE the donor's final frame so it
+						// COMPLETES on that frame, with the donor still animating
+						// underneath. blendOutAtEnd restores the legacy behavior of
+						// starting the fade at the end and running past it.
+						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
+							!state.earlyBlendOutArmed &&
+							localTime >= repDuration - filterPtr->blendOutTime) {
+							state.earlyBlendOutArmed = true;
+						}
+
 						const bool donorDone = localTime >= repDuration;
 						if (donorDone) {
 							localTime = repDuration;
@@ -7421,7 +7539,7 @@ namespace
 				// (oneShotDone) stays dormant until the restart detection above
 				// sees the clip's localTime jump backward.
 				if (state.dormant) {
-					if (state.sampleStarved && !state.oneShotDone) {
+					if (state.sampleStarved && !state.oneShotDone && !state.earlyBlendOutArmed) {
 						state.dormant = false;
 						state.sampleStarved = false;
 						state.blendingOut = false;
@@ -7447,7 +7565,8 @@ namespace
 						state.blendingOut = false;
 						float blendIn = filterPtr->blendInTime;
 						state.blendDuration = blendIn;
-						state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+						state.blendElapsed = (blendIn > 0.0f)
+	? InverseBlendCurve(CurveOf(state.parentSubMod), state.blendAlpha) * blendIn : 0.0f;
 						if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
 					}
 				}
@@ -8007,11 +8126,18 @@ namespace
 							// Wake rules by dormancy reason:
 							//  - one-shot completed: only a fresh play (restart
 							//    detection / registration) wakes it, handled elsewhere.
+							//    earlyBlendOutArmed counts as completed even though
+							//    oneShotDone is still false — an end-anchored fade
+							//    finishes a frame or two BEFORE the donor's final
+							//    frame, and without this guard conditions still being
+							//    true woke the overlay right back up and it flapped
+							//    against the re-arming fade at the end of every play.
 							//  - sample-starved: samples resuming wake it, handled in
 							//    the sampling path.
 							//  - condition-ended: conditions turning true again wake
 							//    it here (persistent-overlay semantics).
-							if (!condFalse && !state.oneShotDone && !state.sampleStarved) {
+							if (!condFalse && !state.oneShotDone && !state.earlyBlendOutArmed &&
+								!state.sampleStarved) {
 								state.dormant = false;
 								state.blendingOut = false;
 								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
@@ -8059,7 +8185,7 @@ namespace
 						bool oneShotEnd = false;
 						if (filterPtr && filterPtr->sampleFrame < 0.0f &&
 							!state.blendingOut && !condFalse) {
-							if (state.oneShotDone) {
+							if (state.oneShotDone || state.earlyBlendOutArmed) {
 								oneShotEnd = true;
 							} else if (state.lastSampleSec > 0.0f &&
 								nowSec - state.lastSampleSec > kOneShotSampleGraceSeconds) {
@@ -8076,11 +8202,18 @@ namespace
 							state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
 							// Continue from the current alpha (alpha maps to elapsed
 							// via the inverse of the ease, approximated linearly).
-							state.blendElapsed = (1.0f - state.blendAlpha) * state.blendDuration;
+							// alpha = 1 - curve(t), so resuming at the current alpha means
+							// t = curve⁻¹(1 - alpha). The old linear form only matched
+							// the ramp when the curve was linear.
+							state.blendElapsed = InverseBlendCurve(CurveOf(state.parentSubMod),
+								1.0f - state.blendAlpha) * state.blendDuration;
 							static int s_osLog = 0;
 							if (s_osLog < 10) {
 								logger::info("[OAR-TrackFilter] One-shot end for '{}' ({}) — blending out ({:.2f}s)",
-									state.suffix, state.oneShotDone ? "donor completed" : "source stopped sampling",
+									state.suffix,
+									state.oneShotDone ? "donor completed"
+										: state.earlyBlendOutArmed ? "approaching donor end"
+										: "source stopped sampling",
 									state.blendDuration);
 								s_osLog++;
 							}
@@ -8098,7 +8231,11 @@ namespace
 								// Start from the current alpha, not from 1: restarting
 								// a blend-out that was already in progress used to snap
 								// alpha back to full (part of the 9-restart flap).
-								state.blendElapsed = (1.0f - state.blendAlpha) * state.blendDuration;
+								// alpha = 1 - curve(t), so resuming at the current alpha means
+							// t = curve⁻¹(1 - alpha). The old linear form only matched
+							// the ramp when the curve was linear.
+							state.blendElapsed = InverseBlendCurve(CurveOf(state.parentSubMod),
+								1.0f - state.blendAlpha) * state.blendDuration;
 								static int s_boLog = 0;
 								if (s_boLog < 10) {
 									logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
@@ -8114,11 +8251,24 @@ namespace
 							// blend-outs ignore conditions entirely. This (not the old
 							// unconditional cancel at re-registration) is now the single
 							// authority for condition-driven reactivation.
-							if (state.blendingOut && !state.oneShotDone && !state.sampleStarved) {
+							//
+							// earlyBlendOutArmed belongs to the "ignore conditions" set
+							// too: an end-anchored fade starts while the donor is still
+							// playing, so oneShotDone is still false and the grenade
+							// throw's conditions are still true. Without it this branch
+							// cancelled the fade on the very next tick, the arm branch
+							// re-armed it the tick after, and the pair ping-ponged at
+							// full alpha for the donor's whole tail — then the donor hit
+							// its end, clamped, and held that final pose through a fade
+							// that only started AFTER the animation was over. Exactly
+							// the symptom the feature was meant to remove.
+							if (state.blendingOut && !state.oneShotDone && !state.earlyBlendOutArmed &&
+								!state.sampleStarved) {
 								state.blendingOut = false;
 								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
 								state.blendDuration = blendIn;
-								state.blendElapsed = (blendIn > 0.0f) ? state.blendAlpha * blendIn : 0.0f;
+								state.blendElapsed = (blendIn > 0.0f)
+	? InverseBlendCurve(CurveOf(state.parentSubMod), state.blendAlpha) * blendIn : 0.0f;
 								if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
 							}
 						}
@@ -8152,7 +8302,7 @@ namespace
 							}
 							state.blendElapsed += dt;
 							float t = std::clamp(state.blendElapsed / state.blendDuration, 0.0f, 1.0f);
-							state.blendAlpha = 1.0f - EaseInOutQuad(t);
+							state.blendAlpha = 1.0f - EvaluateBlendCurve(CurveOf(state.parentSubMod), t);
 
 							// Diagnostic: log blend-out progress every ~0.1s
 							static float s_lastBlendLog = 0.0f;
@@ -8180,7 +8330,7 @@ namespace
 							} else {
 								state.blendElapsed += dt;
 								float t = std::clamp(state.blendElapsed / blendInTime, 0.0f, 1.0f);
-								state.blendAlpha = EaseInOutQuad(t);
+								state.blendAlpha = EvaluateBlendCurve(CurveOf(state.parentSubMod), t);
 							}
 						}
 						++stIt;
@@ -8208,7 +8358,7 @@ namespace
 					} else {
 						bs.blendElapsed += dt;
 						float t = std::clamp(bs.blendElapsed / bs.blendDuration, 0.0f, 1.0f);
-						bs.blendAlpha = EaseInOutQuad(t);
+						bs.blendAlpha = EvaluateBlendCurve(bs.blendCurve, t);
 						if (bs.blendAlpha >= 0.999f) {
 							bs.blendAlpha = 1.0f;
 							bs.blendingIn = false;
@@ -8221,7 +8371,7 @@ namespace
 					} else {
 						bs.blendElapsed += dt;
 						float t = std::clamp(bs.blendElapsed / bs.blendDuration, 0.0f, 1.0f);
-						bs.blendAlpha = 1.0f - EaseInOutQuad(t);
+						bs.blendAlpha = 1.0f - EvaluateBlendCurve(bs.blendCurve, t);
 					}
 					if (bs.blendAlpha <= 0.001f) {
 						it = s_fullBodyBlendMap.erase(it);

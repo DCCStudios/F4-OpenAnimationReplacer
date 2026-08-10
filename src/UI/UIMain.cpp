@@ -584,6 +584,23 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"(conditions become false). Set negative to use the blend-in time\n"
 			"above (default behavior). 0 = instant snap back to the original.");
 
+		int curveIdx = static_cast<int>(a_subMod->blendCurve);
+		ImGui::SetNextItemWidth(140);
+		if (ImGui::Combo("Blend curve (?)", &curveIdx,
+				"Linear\0Quadratic\0Cubic\0Hermite Cubic\0Sinusoidal\0Exponential\0")) {
+			a_subMod->blendCurve = static_cast<BlendCurve>(curveIdx);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Shape of the blend ramp, for both the full-body blend and this\n"
+			"submod's track filter blend in/out.\n\n"
+			"Linear: constant rate.\n"
+			"Quadratic: gentle ease in and out (default).\n"
+			"Cubic: stronger ease, more time spent near the endpoints.\n"
+			"Hermite Cubic: smoothstep — flat at both ends, smoothest handoff.\n"
+			"Sinusoidal: cosine ramp, very soft.\n"
+			"Exponential: near-flat then sharp, for snappy transitions.");
+
 		float deactivDelay = a_subMod->GetDeactivationDelay();
 		ImGui::SetNextItemWidth(80);
 		if (ImGui::InputFloat("Deactivation Delay (?)", &deactivDelay, 0, 0, "%.2f")) {
@@ -872,6 +889,13 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["customBlendTimeOnInterrupt"] = a_subMod->GetCustomBlendTimeOnInterrupt();
 			if (a_subMod->GetCustomBlendOutTime() >= 0.f)
 				json["customBlendOutTime"] = a_subMod->GetCustomBlendOutTime();
+				{
+					static constexpr const char* kCurveNames[] = {
+						"linear", "quadratic", "cubic", "hermiteCubic", "sinusoidal", "exponential"
+					};
+					const auto idx = static_cast<size_t>(a_subMod->blendCurve);
+					json["blendCurve"] = kCurveNames[idx < std::size(kCurveNames) ? idx : 1];
+				}
 			if (a_subMod->GetDeactivationDelay() > 0.0f)
 				json["deactivationDelay"] = a_subMod->GetDeactivationDelay();
 			if (a_subMod->GetPlayOnceFullBody())
@@ -889,6 +913,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["weight"] = tf.weight;
 				tfJson["blendInTime"] = tf.blendInTime;
 				tfJson["blendOutTime"] = tf.blendOutTime;
+				tfJson["blendOutAtEnd"] = tf.blendOutAtEnd;
 				tfJson["sampleFrame"] = tf.sampleFrame;
 				tfJson["modelSpaceAnchor"] = tf.modelSpaceAnchor;
 				tfJson["includeChildren"] = tf.includeChildren;
@@ -1378,7 +1403,20 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				a_subMod->SetDirty(true);
 			}
 			if (ImGui::IsItemHovered()) {
-				ImGui::SetTooltip("Time in seconds to ramp from full weight to 0 when conditions become false.\n0 = instant snap.");
+				ImGui::SetTooltip("Time in seconds to ramp from full weight to 0 when conditions become false,\nor when a one-shot animation ends.\n0 = instant snap.");
+			}
+
+			if (ImGui::Checkbox("Blend Out After End##trackFilter", &tf.blendOutAtEnd)) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Controls where Blend Out sits relative to the animation's final frame\n"
+					"when a one-shot overlay ends on its own.\n\n"
+					"Off (default): the fade FINISHES on the final frame, so it starts\n"
+					"Blend Out seconds early and the animation keeps playing as it fades.\n\n"
+					"On: the fade STARTS on the final frame and runs past it, holding the\n"
+					"last pose while it ramps down.");
 			}
 
 			bool useFixedFrame = tf.sampleFrame >= 0.0f;

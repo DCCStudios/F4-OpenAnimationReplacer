@@ -10,6 +10,22 @@
 
 class ReplacementAnimation;
 
+// Shape of the temporal blend ramp (blend in AND blend out). Every curve is an
+// ease-in-out form mapping t in [0,1] to [0,1], monotonic and with f(0)=0,
+// f(1)=1 — the blend code inverts them numerically when resuming a partially
+// finished blend, which only works for monotonic curves.
+// kQuadratic is the default because it is what OAR blended with before the
+// curve became configurable.
+enum class BlendCurve : int
+{
+	kLinear = 0,
+	kQuadratic,
+	kCubic,
+	kHermiteCubic,
+	kSinusoidal,
+	kExponential,
+};
+
 struct ConditionPreset
 {
 	std::string name;
@@ -101,6 +117,9 @@ public:
 	// Full-body blend-out duration when the replacement ends (conditions fail).
 	// Negative = mirror the blend-in duration (existing behavior); 0 = instant.
 	float customBlendOutTime{ -1.0f };
+	// Ramp shape for this submod's blends — both the full-body blend and its
+	// track filter's blend in/out.
+	BlendCurve blendCurve{ BlendCurve::kQuadratic };
 	float deactivationDelay{ 0.0f };
 	bool playOnceFullBody{ false };
 	std::string requiredProjectName;
@@ -130,6 +149,14 @@ public:
 		float weight = 1.0f;
 		float blendInTime = 0.0f;
 		float blendOutTime = 0.0f;
+		// Where blendOutTime sits relative to the donor's final frame when a
+		// one-shot overlay ends on its own.
+		//   false (default): the fade COMPLETES on the final frame, so it
+		//     starts blendOutTime before the end and the donor keeps animating
+		//     underneath it — "blend out to the end of the animation".
+		//   true (legacy): the fade STARTS on the final frame and runs past
+		//     it, holding the donor's last pose while it ramps down.
+		bool blendOutAtEnd = false;
 		// Fixed-frame sampling: when >= 0, the replacement's pose for the
 		// filtered bones is taken from this authored frame (30 fps) instead
 		// of following the clip's playback time — a held static pose.

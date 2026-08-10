@@ -38,6 +38,30 @@ namespace Parsing
 		return lower;
 	}
 
+	// Accepts the curve name as a string ("linear", "hermiteCubic", ...).
+	// Unknown values fall back to the default rather than failing the whole
+	// config — a typo should cost the curve, not the submod.
+	static BlendCurve ParseBlendCurve(const nlohmann::json& a_value)
+	{
+		if (!a_value.is_string()) return BlendCurve::kQuadratic;
+		auto name = a_value.get<std::string>();
+		std::ranges::transform(name, name.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+		if (name == "linear") return BlendCurve::kLinear;
+		if (name == "quadratic" || name == "quad") return BlendCurve::kQuadratic;
+		if (name == "cubic") return BlendCurve::kCubic;
+		if (name == "hermitecubic" || name == "hermite" || name == "smoothstep")
+			return BlendCurve::kHermiteCubic;
+		if (name == "sinusoidal" || name == "sine" || name == "sin")
+			return BlendCurve::kSinusoidal;
+		if (name == "exponential" || name == "expo" || name == "exp")
+			return BlendCurve::kExponential;
+
+		logger::warn("[OAR] Unknown blendCurve '{}' — using quadratic", name);
+		return BlendCurve::kQuadratic;
+	}
+
 	static std::filesystem::path ExtractPathAfterMeshes(const std::filesystem::path& a_fullPath)
 	{
 		auto pathStr = a_fullPath.string();
@@ -501,6 +525,8 @@ namespace Parsing
 			a_subMod->customBlendTimeOnInterrupt = json["customBlendTimeOnInterrupt"].get<float>();
 		if (json.contains("customBlendOutTime"))
 			a_subMod->customBlendOutTime = json["customBlendOutTime"].get<float>();
+		if (json.contains("blendCurve"))
+			a_subMod->blendCurve = ParseBlendCurve(json["blendCurve"]);
 		if (json.contains("customBlendTimeOnLoop"))
 			a_subMod->customBlendTimeOnLoop = json["customBlendTimeOnLoop"].get<float>();
 		if (json.contains("customBlendTimeOnEcho"))
@@ -569,6 +595,7 @@ namespace Parsing
 			a_subMod->trackFilter.weight = tf.value("weight", 1.0f);
 			a_subMod->trackFilter.blendInTime = tf.value("blendInTime", 0.0f);
 			a_subMod->trackFilter.blendOutTime = tf.value("blendOutTime", 0.0f);
+			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", true);
 			a_subMod->trackFilter.includeChildren = tf.value("includeChildren", true);
@@ -621,6 +648,8 @@ namespace Parsing
 			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
 		if (json.contains("playOnceFullBody"))
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
+		if (json.contains("blendCurve"))
+			a_subMod->blendCurve = ParseBlendCurve(json["blendCurve"]);
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
 			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
 		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
