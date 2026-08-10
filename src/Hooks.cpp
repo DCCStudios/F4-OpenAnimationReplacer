@@ -170,6 +170,15 @@ struct CharTrackFilterState {
 	// clip at a fixed localTime while keeping it active and sampling — the
 	// stall detector ends the one-shot instead of freezing on that pose.
 	float lastAdvanceSec = 0.0f;
+	// Donor self-advance (one-shot sources only): when the SOURCE clip finishes
+	// or parks before the donor animation has reached its own end, the donor
+	// keeps playing on wall-clock time from the moment the source parked,
+	// instead of ending the overlay early (KV Broadside grenade throw: 1.29s
+	// vanilla clip cut a longer donor's tail off) or freezing on the parked
+	// frame (the pre-2026-08-04 behavior). -1 = following source playback.
+	float selfAdvanceStartSec = -1.0f;
+	// Donor localTime at the moment self-advance began.
+	float selfAdvanceBaseTime = 0.0f;
 	// Donor playback reached its end for the current activation (non-looping
 	// source): the tick updater blends the overlay out even though conditions
 	// may still be true, and re-registration must not cancel that blend-out.
@@ -1022,12 +1031,38 @@ namespace
 	// erased valid originals whose type differed from the first-seen one, so
 	// GetOrBuildRuntimeAnim got a null template and never built (conditions
 	// passed, track filter / swap silently no-op'd — e.g. 1911 Idle Empty).
+	// Is this address inside the game EXE's actual load range? Replaces the old
+	// "looks like a Windows-ASLR address" 0x7FF... range guess used by the
+	// vtable sanity gates. That guess rejected EVERY vtable when the game loads
+	// at its preferred base 0x140000000 — which is what Proton/Wine does, and
+	// what ASLR-stripped exes used by RE folks do on Windows — so OAR built
+	// replacements, played their sounds, but silently refused the final
+	// animation swap (vanilla visuals + doubled audio, Proton field report,
+	// 2026-08). hkaAnimation vtables always live in the game module (Havok is
+	// statically linked), so exact module bounds are both correct and stricter
+	// than the old heuristic: a stray heap pointer that happened to sit in the
+	// 0x7FF range used to pass.
+	static bool IsInGameModule(uintptr_t a_addr)
+	{
+		static const auto s_bounds = []() -> std::pair<uintptr_t, uintptr_t> {
+			const auto base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+			uintptr_t end = 0;
+			if (base) {
+				const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+				const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+				end = base + nt->OptionalHeader.SizeOfImage;
+			}
+			return { base, end };
+		}();
+		return a_addr >= s_bounds.first && a_addr < s_bounds.second;
+	}
+
 	static bool IsPlausibleGameAnimVtable(uintptr_t a_vtbl)
 	{
 		if (a_vtbl == 0) return false;
 		auto expected = AnimationCache::GetSingleton()->GetGameAnimVtable();
 		if (expected != 0 && a_vtbl == expected) return true;
-		return a_vtbl >= 0x7FF000000000ull && a_vtbl <= 0x7FFF00000000ull;
+		return IsInGameModule(a_vtbl);
 	}
 
 	static RE::hkaAnimation* GetValidOriginal(RE::hkbClipGenerator* a_clip)
@@ -4366,7 +4401,7 @@ namespace
 							if (replacement) {
 								preSwapAttempted = true;
 								auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
-								if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
+								if (IsInGameModule(repVtbl)) {
 									preSwapOriginal = *animSlotPre;
 									*animSlotPre = replacement;
 									preSwapSucceeded = true;
@@ -5962,6 +5997,8 @@ namespace
 							state.lastSampledLocalTime = -1.0f;
 							state.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
 							state.lastAdvanceSec = state.lastSampleSec;
+							state.selfAdvanceStartSec = -1.0f;
+							state.selfAdvanceBaseTime = 0.0f;
 							// Blend in from the CURRENT alpha (0 if dormant) rather than
 							// snapping, so cancelling a half-done blend-out doesn't pop.
 							float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
@@ -6013,7 +6050,7 @@ namespace
 		} else if (replacement) {
 				// ---- Standard full-body replacement path ----
 				auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
-				if (repVtbl >= 0x7FF000000000ull && repVtbl <= 0x7FFF00000000ull) {
+				if (IsInGameModule(repVtbl)) {
 					if (*animSlot != replacement) {
 						static int s_swapLog = 0;
 						if (s_swapLog < 50) {
@@ -7321,6 +7358,8 @@ namespace
 							state.oneShotDone = false;
 							state.sampleStarved = false;
 							state.lastAdvanceSec = nowSec;
+							state.selfAdvanceStartSec = -1.0f;
+							state.selfAdvanceBaseTime = 0.0f;
 							if (state.dormant || state.blendingOut) {
 								state.dormant = false;
 								state.blendingOut = false;
@@ -7341,26 +7380,38 @@ namespace
 						}
 						state.lastSampledLocalTime = localTime;
 
-						// The one-shot ends when ANY of these happen; the tick
-						// updater then starts the blend-out even though conditions
-						// may still be true:
-						//  - donor played through (clamp, never wrap: a donor
-						//    shorter than the original must hold its final frame
-						//    while blending out, not snap back to frame 0 mid-play);
-						//  - the SOURCE clip's own play finished (a source shorter
-						//    than the donor parks localTime at its end while the
-						//    graph holds the clip active — the overlay froze on the
-						//    last sampled frame for seconds, 2026-08-04 session);
-						//  - localTime stalled while samples keep flowing (same
-						//    parking behavior at an arbitrary point).
+						// One-shot end handling. The one-shot ends ONLY when the
+						// DONOR has played through (clamp, never wrap: a donor
+						// shorter than the original must hold its final frame while
+						// blending out, not snap back to frame 0 mid-play).
+						//
+						// A SOURCE that finishes or parks first does NOT end the
+						// overlay anymore — the graph holds the finished clip active
+						// and keeps sampling (2026-08-04 session), so the donor
+						// switches to wall-clock self-advance and plays out its
+						// remaining content. Ending the one-shot here instead cut a
+						// long donor off at the short vanilla clip's end (KV
+						// Broadside grenade throw blended out at 1.29s); before
+						// that, doing nothing froze the overlay on the parked frame.
 						const float srcDuration = (animSlot && *animSlot) ? (*animSlot)->duration : 0.0f;
-						const bool donorDone = localTime >= repDuration;
 						const bool sourceDone = srcDuration > 0.02f && localTime >= srcDuration - 0.02f;
 						const bool stalled = state.lastAdvanceSec > 0.0f &&
 							nowSec - state.lastAdvanceSec > kOneShotStallSeconds;
-						if (donorDone) localTime = repDuration;
-						if (donorDone || sourceDone || stalled) {
+
+						if (state.selfAdvanceStartSec >= 0.0f) {
+							// Source is parked; donor continues on its own clock.
+							localTime = state.selfAdvanceBaseTime + (nowSec - state.selfAdvanceStartSec);
+						}
+
+						const bool donorDone = localTime >= repDuration;
+						if (donorDone) {
+							localTime = repDuration;
 							state.oneShotDone = true;
+						} else if ((sourceDone || stalled) && state.selfAdvanceStartSec < 0.0f) {
+							state.selfAdvanceStartSec = nowSec;
+							state.selfAdvanceBaseTime = localTime;
+							logger::info("[OAR-TrackFilter] Source {} at t={:.3f} before donor end ({:.3f}s) for '{}' — donor self-advancing to completion",
+								sourceDone ? "finished" : "stalled", localTime, repDuration, state.suffix);
 						}
 					}
 				}
