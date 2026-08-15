@@ -564,6 +564,21 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"changes mid-animation (e.g. ammo count refilling during reload)\n"
 			"would incorrectly interrupt the replacement.");
 
+		bool holdShorter = a_subMod->GetEndClipIfShorter();
+		if (ImGui::Checkbox("End Clip If Shorter (?)", &holdShorter)) {
+			a_subMod->SetEndClipIfShorter(holdShorter);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"When the replacement animation is shorter than the original it replaces,\n"
+			"the clip would otherwise keep running for the original's (longer)\n"
+			"length — the original's tail plays out (full body) or the source clip\n"
+			"runs on past the donor (track filter).\n\n"
+			"Enable this to make the replacement's length authoritative: the clip\n"
+			"ends when the replacement ends, as if the original were that length.\n"
+			"No original tail, no held frame. Applies to full-body and track-filtered\n"
+			"replacements; no effect when the replacement is equal length or longer.");
+
 		// Custom blend times
 		float blendInterrupt = a_subMod->GetCustomBlendTimeOnInterrupt();
 		ImGui::SetNextItemWidth(80);
@@ -900,6 +915,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["deactivationDelay"] = a_subMod->GetDeactivationDelay();
 			if (a_subMod->GetPlayOnceFullBody())
 				json["playOnceFullBody"] = true;
+			if (a_subMod->GetEndClipIfShorter())
+				json["endClipIfShorter"] = true;
 			if (!a_subMod->eventsOnStart.empty())
 				json["eventsOnStart"] = a_subMod->eventsOnStart;
 			if (!a_subMod->eventsOnEnd.empty())

@@ -71,6 +71,8 @@ public:
 	void SetDeactivationDelay(float a_val) { deactivationDelay = a_val; }
 	bool GetPlayOnceFullBody() const { return playOnceFullBody; }
 	void SetPlayOnceFullBody(bool a_val) { playOnceFullBody = a_val; }
+	bool GetEndClipIfShorter() const { return endClipIfShorter; }
+	void SetEndClipIfShorter(bool a_val) { endClipIfShorter = a_val; }
 	const std::string& GetRequiredProjectName() const { return requiredProjectName; }
 	const std::string& GetOverrideAnimFolder() const { return overrideAnimationsFolder; }
 	const std::filesystem::path& GetPath() const { return path; }
@@ -122,6 +124,15 @@ public:
 	BlendCurve blendCurve{ BlendCurve::kQuadratic };
 	float deactivationDelay{ 0.0f };
 	bool playOnceFullBody{ false };
+	// Full-body AND track-filtered replacements. When the replacement animation
+	// is SHORTER than the original it replaces, the clip's state would otherwise
+	// stay active for the original's (longer) duration — the original's leftover
+	// tail plays out past the replacement's end (full body), or the source clip
+	// keeps running past the donor's end (track filter). With this set, the
+	// replacement's duration becomes authoritative for the clip's state, so the
+	// clip ends when the replacement ends — as if the original were that length.
+	// No original tail, no held frame.
+	bool endClipIfShorter{ false };
 	std::string requiredProjectName;
 	std::string overrideAnimationsFolder;
 	std::filesystem::path path;

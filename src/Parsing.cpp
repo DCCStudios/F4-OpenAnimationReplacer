@@ -535,6 +535,8 @@ namespace Parsing
 			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
 		if (json.contains("playOnceFullBody"))
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
+		if (json.contains("endClipIfShorter"))
+			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
 			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
 		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
@@ -648,6 +650,8 @@ namespace Parsing
 			a_subMod->deactivationDelay = json["deactivationDelay"].get<float>();
 		if (json.contains("playOnceFullBody"))
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
+		if (json.contains("endClipIfShorter"))
+			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
 		if (json.contains("blendCurve"))
 			a_subMod->blendCurve = ParseBlendCurve(json["blendCurve"]);
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())

@@ -1555,8 +1555,24 @@ namespace
 	// so the ENGINE fires them instead of our manual replay in the Update hook.
 	// See the "FUTURE REDESIGN NOTE" above the annotation-firing block in
 	// hkbClipGenerator_Update for the full rationale.
+	// a_endClipDuration >= 0: "End Clip If Shorter" is active and this is the
+	// REPLACEMENT's duration. Kept triggers flagged relativeToEndOfClip store a
+	// negative offset from the clip's end and are fired by the engine at
+	// (clipDuration + t) — with clipDuration derived from the ORIGINAL, which is
+	// exactly why a shorter replacement's clip kept running to the original's
+	// end (the state-machine transition events fired on the original timeline;
+	// hazord606 wpnmelee: transitions at 2.233s while the donor ended at
+	// 1.767s). Rewriting them to ABSOLUTE times against the replacement's
+	// duration makes the engine fire its own transition events at the
+	// replacement's end — the clip genuinely ends there, no held frame.
+	// (An earlier attempt wrote syncInfo->duration instead; the engine
+	// recomputes that every frame, so it was a no-op.)
+	// a_keepAnnotations: keep annotation-derived triggers too (used when the
+	// submod does NOT replace annotations but still needs the re-timed copy for
+	// End Clip If Shorter — the native annotations must keep firing).
 	static std::shared_ptr<OARBuiltTriggerArray> BuildBehaviorOnlyTriggers(
-		void* a_src, const std::unordered_set<std::string>& a_origAnnotTexts)
+		void* a_src, const std::unordered_set<std::string>& a_origAnnotTexts,
+		float a_endClipDuration = -1.0f, bool a_keepAnnotations = false)
 	{
 		if (!a_src || reinterpret_cast<uintptr_t>(a_src) < 0x10000 ||
 			IsBadReadPtr(a_src, 0x20)) {
@@ -1584,7 +1600,7 @@ namespace
 			const bool isAnnotFlag = trig[0x1A] != 0;  // hkbClipTrigger::isAnnotation
 			const char* text = TriggerPayloadText(trig);
 			const bool matchesOrigAnnot = text && a_origAnnotTexts.count(text) > 0;
-			const bool drop = isAnnotFlag || matchesOrigAnnot;
+			const bool drop = !a_keepAnnotations && (isAnnotFlag || matchesOrigAnnot);
 			if (!drop) keep.push_back(i);
 			if (dump) {
 				logger::info("[OAR-TrigFilter]   [{}] t={:.3f} id={} isAnnot={} text='{}' -> {}",
@@ -1616,6 +1632,29 @@ namespace
 				srcData + static_cast<size_t>(keep[k]) * kTriggerSize, kTriggerSize);
 		}
 
+		// End Clip If Shorter: re-time relative-to-end triggers against the
+		// replacement's duration (see the function comment). Only our private
+		// copy is touched — the source array is untouched and restored at the
+		// end of the play as usual.
+		if (a_endClipDuration > 0.0f) {
+			for (size_t k = 0; k < keep.size(); ++k) {
+				uint8_t* trig = built->triggerEntries + k * kTriggerSize;
+				if (trig[0x18] != 0) {  // hkbClipTrigger::relativeToEndOfClip
+					const float rel = *reinterpret_cast<float*>(trig);
+					float absTime = a_endClipDuration + rel;  // rel is negative
+					if (absTime < 0.0f) absTime = 0.0f;
+					*reinterpret_cast<float*>(trig) = absTime;
+					trig[0x18] = 0;
+					static int s_retimeLog = 0;
+					if (s_retimeLog < 30) {
+						logger::info("[OAR-TrigFilter] EndClipIfShorter: re-timed end trigger id={} rel={:.3f} -> abs={:.3f} (repDur={:.3f})",
+							*reinterpret_cast<const int32_t*>(trig + 0x08), rel, absTime, a_endClipDuration);
+						s_retimeLog++;
+					}
+				}
+			}
+		}
+
 		uint8_t* aMem = built->arrayHeader;
 		*reinterpret_cast<uintptr_t*>(aMem + 0x00) = arrVtbl;
 		// refCount/memSize pattern: huge refcount + "not heap-owned" so the
@@ -1640,12 +1679,31 @@ namespace
 		return nullptr;
 	}
 
+	// Effective "End Clip If Shorter" duration for a play: the replacement's
+	// duration when the submod has the toggle on, the clip is a one-shot, and
+	// the replacement is meaningfully shorter than the original. -1 = no
+	// re-timing (the default trigger behavior).
+	static float EndClipIfShorterDuration(const SubMod* a_subMod, RE::hkbClipGenerator* a_clip,
+		RE::hkaAnimation* a_replacement, RE::hkaAnimation* a_original)
+	{
+		if (!a_subMod || !a_subMod->GetEndClipIfShorter() || !a_clip || !a_replacement) return -1.0f;
+		if (a_clip->mode == RE::MODE_LOOPING) return -1.0f;
+		if (IsBadReadPtr(a_replacement, 0x18)) return -1.0f;
+		if (!a_original || IsBadReadPtr(a_original, 0x18)) return -1.0f;
+		const float repDur = *reinterpret_cast<const float*>(
+			reinterpret_cast<const uint8_t*>(a_replacement) + 0x14);
+		const float origDur = *reinterpret_cast<const float*>(
+			reinterpret_cast<const uint8_t*>(a_original) + 0x14);
+		return (repDur > 0.01f && origDur > repDur + 0.02f) ? repDur : -1.0f;
+	}
+
 	// Replace the clip generator's triggers with a filtered array that keeps
 	// behavior-authored triggers but drops annotation-derived ones (see
 	// BuildBehaviorOnlyTriggers). The replacement's annotations are fired
 	// manually via the dual-path emission system below; behavior triggers
 	// (weapon attach on equip, state-machine transitions) keep firing natively.
-	static void InstallReplacementTriggers(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
+	static void InstallReplacementTriggers(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/,
+		float a_endClipDuration = -1.0f, bool a_keepAnnotations = false)
 	{
 		if (!a_clipGen) return;
 		auto* bytes = reinterpret_cast<uint8_t*>(a_clipGen);
@@ -1661,7 +1719,8 @@ namespace
 
 			const auto origAnnotTexts = CollectAnimAnnotationTexts(OriginalAnimForTriggerFilter(a_clipGen));
 			backup.filteredKeepAlive = BuildBehaviorOnlyTriggers(
-				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts);
+				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts,
+				a_endClipDuration, a_keepAnnotations);
 
 			static int s_installLog = 0;
 			if (s_installLog < 30) {
@@ -1682,7 +1741,8 @@ namespace
 
 	// Every frame: ensure the filtered triggers stay installed (engine may
 	// restore originals between frames).
-	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/)
+	static void EnsureReplacementTriggersInstalled(RE::hkbClipGenerator* a_clipGen, const std::string& /*a_replacementSuffix*/,
+		float a_endClipDuration = -1.0f, bool a_keepAnnotations = false)
 	{
 		if (!a_clipGen) return;
 		auto* bytes = reinterpret_cast<uint8_t*>(a_clipGen);
@@ -1702,7 +1762,8 @@ namespace
 			backup.nulled = true;
 			const auto origAnnotTexts = CollectAnimAnnotationTexts(OriginalAnimForTriggerFilter(a_clipGen));
 			backup.filteredKeepAlive = BuildBehaviorOnlyTriggers(
-				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts);
+				backup.triggers ? backup.triggers : backup.originalTriggers, origAnnotTexts,
+				a_endClipDuration, a_keepAnnotations);
 			filtered = backup.filteredKeepAlive ? backup.filteredKeepAlive->GetTriggerArray() : nullptr;
 		}
 		*triggersPtr = filtered;
@@ -4526,9 +4587,11 @@ namespace
 		// If we pre-swapped, restore the original in the slot so the Update hook
 		// can properly evaluate conditions and decide whether to keep the replacement.
 		// The animation control has already been built with empty annotationTracks.
+		RE::hkaAnimation* preSwapReplacementAnim = nullptr;
 		if (preSwapOriginal) {
 			auto** animSlotPost = a_this->GetAnimationSlot();
 			if (animSlotPost) {
+				preSwapReplacementAnim = *animSlotPost;
 				*animSlotPost = preSwapOriginal;
 			}
 		}
@@ -4540,10 +4603,16 @@ namespace
 		// Deliberately NOT done for the no-winner fallback pre-swap: there the
 		// Update hook may decide against replacing, and NULLing would eat the
 		// original's t=0 events for that first frame (missed real WeaponFire).
+		//
+		// This is the FIRST trigger-array build of the play for pre-swapped
+		// clips (backup.nulled blocks later rebuilds), so End Clip If Shorter's
+		// re-timing must be decided here, not just in the Update hook.
 		if (preSwapSucceeded && preSwapWinner && preSwapWinner->parentSubMod &&
 			preSwapWinner->parentSubMod->GetReplaceAnnotations() &&
 			!preSwapWinner->parentSubMod->GetPlayOnceFullBody()) {
-			InstallReplacementTriggers(a_this, "");
+			const float endClipDurAct = EndClipIfShorterDuration(
+				preSwapWinner->parentSubMod, a_this, preSwapReplacementAnim, preSwapOriginal);
+			InstallReplacementTriggers(a_this, "", endClipDurAct);
 			static int s_actNullLog = 0;
 			if (s_actNullLog < 20) {
 				logger::info("[OAR-Triggers] Activation pre-NULL for clipGen={:X} (winner '{}')",
@@ -6126,14 +6195,42 @@ namespace
 			// NULL the source clip's triggers exactly like the swap path does;
 			// BuildBehaviorOnlyTriggers keeps graph-critical transition events
 			// alive. This runs every Update, doubling as the per-frame re-assert.
-			if (bReplaceAnnot) {
-				bool alreadyRestored = false;
-				{
-					std::lock_guard rg(s_triggersRestoredMutex);
-					alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+			//
+			// End Clip If Shorter rides the same install: the built array's
+			// relative-to-end transition triggers are re-timed to the DONOR's
+			// duration, so the engine ends the clip's state at the donor's end.
+			// When Replace Annotations is OFF, the array is still installed for
+			// the re-timing but KEEPS the native annotations (nothing else may
+			// fire them).
+			{
+				float endClipDur = EndClipIfShorterDuration(
+					winningInfo->parentSubMod, a_this, replacement, originalAnim);
+				// Blend-before-end (tickbox off): shift the effective clip end
+				// earlier by the blend-out time, so the engine's exit transition
+				// overlaps the donor's tail. Before the transition fires there is
+				// nothing to blend INTO — the next state's animation only exists
+				// once the exit begins (2026-08-14: a 0.5s fade spent 0.3s against
+				// an invisible target). With the shift, the incoming state arrives
+				// at the top of the fade window: the source-side stamp is pinned
+				// (see the Generate hook) while the fading stamp on the incoming
+				// clips blends donor -> next state across blendOutTime. Blend Out
+				// After End keeps the exit at the donor's true end.
+				if (endClipDur > 0.0f && !winningInfo->parentSubMod->trackFilter.blendOutAtEnd) {
+					const float bo = winningInfo->parentSubMod->trackFilter.blendOutTime;
+					if (bo > 0.0f && endClipDur - bo > 0.2f) {
+						endClipDur -= bo;
+					}
 				}
-				if (!alreadyRestored) {
-					EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
+				if (bReplaceAnnot || endClipDur > 0.0f) {
+					bool alreadyRestored = false;
+					{
+						std::lock_guard rg(s_triggersRestoredMutex);
+						alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+					}
+					if (!alreadyRestored) {
+						EnsureReplacementTriggersInstalled(a_this, cacheSuffix,
+							endClipDur, /*a_keepAnnotations=*/!bReplaceAnnot);
+					}
 				}
 			}
 			// Record in activeSubModMap so the interruptible check works for track-filtered submods too
@@ -6177,10 +6274,22 @@ namespace
 						// Havok state machine can still transition out of the current state
 						// (e.g. reloadComplete → exit reload). Trigger NULLing blocks internal
 						// hkbStateMachine transitions because it only reads from the trigger array.
+						//
+						// End Clip If Shorter rides the same install (see the TF path):
+						// the built array's relative-to-end transition triggers are
+						// re-timed to the REPLACEMENT's duration so the state ends at
+						// its end. With Replace Annotations off (or playOnce keeping
+						// the originals), the array is still installed for the
+						// re-timing but keeps the native annotations.
 						bool skipTriggerNull = (winningInfo && winningInfo->parentSubMod &&
 							winningInfo->parentSubMod->GetPlayOnceFullBody());
+						const float endClipDurSwap = EndClipIfShorterDuration(
+							winningInfo ? winningInfo->parentSubMod : nullptr, a_this, replacement, originalAnim);
 						if (bReplaceAnnot && !skipTriggerNull) {
-							InstallReplacementTriggers(a_this, cacheSuffix);
+							InstallReplacementTriggers(a_this, cacheSuffix, endClipDurSwap);
+						} else if (endClipDurSwap > 0.0f) {
+							InstallReplacementTriggers(a_this, cacheSuffix, endClipDurSwap,
+								/*a_keepAnnotations=*/true);
 						}
 
 						// Fire custom "on start" events and track active SubMod
@@ -6286,17 +6395,26 @@ namespace
 							}
 						}
 					}
-				if (bReplaceAnnot) {
-					bool alreadyRestored = false;
-					{
-						std::lock_guard rg(s_triggersRestoredMutex);
-						alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+				{
+					// Per-frame re-assert. End Clip If Shorter needs the install even
+					// when Replace Annotations is off — with native annotations kept
+					// (see the swap-site comment). Only when NEITHER applies do the
+					// original triggers get restored.
+					const float endClipDurKeep = EndClipIfShorterDuration(
+						winningInfo ? winningInfo->parentSubMod : nullptr, a_this, replacement, originalAnim);
+					if (bReplaceAnnot || endClipDurKeep > 0.0f) {
+						bool alreadyRestored = false;
+						{
+							std::lock_guard rg(s_triggersRestoredMutex);
+							alreadyRestored = s_triggersRestoredSet.count(a_this) > 0;
+						}
+						if (!alreadyRestored) {
+							EnsureReplacementTriggersInstalled(a_this, cacheSuffix,
+								endClipDurKeep, /*a_keepAnnotations=*/!bReplaceAnnot);
+						}
+					} else {
+						RestoreClipTriggers(a_this);
 					}
-					if (!alreadyRestored) {
-						EnsureReplacementTriggersInstalled(a_this, cacheSuffix);
-					}
-				} else {
-					RestoreClipTriggers(a_this);
 				}
 				}
 			}
@@ -7359,6 +7477,20 @@ namespace
 		auto mode = filterPtr->mode;
 		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+
+		// End Clip If Shorter + end-driven fade: the fading alpha must only
+		// apply to NON-source clips. On the incoming state's clips, fading the
+		// stamp off IS the blend into the state transition (donor pose -> next
+		// animation). But on the SOURCE clip the same fade reveals the ORIGINAL
+		// underneath — the one animation that must never surface here, and one
+		// the engine's exit crossfade is already fading out wholesale. Pin the
+		// source-side stamp at full weight; the crossfade disposes of it.
+		// Condition-driven fades (conditions failed mid-play, clip continues)
+		// keep fading the source too — there the original is the right target.
+		if (isSourceClip && state.parentSubMod && state.parentSubMod->GetEndClipIfShorter() &&
+			(state.earlyBlendOutArmed || state.oneShotDone)) {
+			weight = filterPtr->weight;
+		}
 		// Source clips must proceed even at zero weight: dormant one-shot states
 		// watch the source's localTime here to detect a restart, and a blend-in's
 		// first frame still primes the sample cache. Non-source clips only apply
@@ -7515,6 +7647,14 @@ namespace
 						// COMPLETES on that frame, with the donor still animating
 						// underneath. blendOutAtEnd restores the legacy behavior of
 						// starting the fade at the end and running past it.
+						//
+						// This applies with End Clip If Shorter too (author's call,
+						// 2026-08-14): the fade runs donor -> source over the last
+						// blendOutTime and lands at zero right as the re-timed
+						// transitions exit the state, so the handoff into the next
+						// state starts from the source pose. Ticking Blend Out After
+						// End instead keeps the donor at full weight to its end and
+						// fades during the engine's crossfade to the next state.
 						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
 							!state.earlyBlendOutArmed &&
 							localTime >= repDuration - filterPtr->blendOutTime) {
@@ -7940,12 +8080,13 @@ namespace
 		// natively fire the original's t~0 annotations (WeaponFire!) on the
 		// replay. Re-NULL before the next Update processes the restarted time.
 		if (a_this) {
+			SubMod* echoActiveSub = nullptr;
 			bool replacementActive = false;
 			{
 				std::shared_lock smLock(s_activeSubModMutex);
 				auto smIt = s_activeSubModMap.find(a_this);
-				replacementActive = (smIt != s_activeSubModMap.end() && smIt->second &&
-					smIt->second->GetReplaceAnnotations());
+				if (smIt != s_activeSubModMap.end()) echoActiveSub = smIt->second;
+				replacementActive = (echoActiveSub && echoActiveSub->GetReplaceAnnotations());
 			}
 			if (replacementActive) {
 				bool wasRestored = false;
@@ -7954,7 +8095,18 @@ namespace
 					wasRestored = s_triggersRestoredSet.erase(a_this) > 0;
 				}
 				if (wasRestored) {
-					InstallReplacementTriggers(a_this, "");
+					// This rebuild wins the race against the Update hook's
+					// re-assert (backup.nulled blocks later rebuilds), so the End
+					// Clip If Shorter re-timing must be decided here too. The
+					// replacement is whatever OAR clone sits in the slot.
+					RE::hkaAnimation* echoRep = nullptr;
+					if (auto** echoSlot = a_this->GetAnimationSlot(); echoSlot && *echoSlot &&
+						AnimationCache::GetSingleton()->IsOurReplacement(*echoSlot)) {
+						echoRep = *echoSlot;
+					}
+					const float endClipDurEcho = EndClipIfShorterDuration(
+						echoActiveSub, a_this, echoRep, GetValidOriginal(a_this));
+					InstallReplacementTriggers(a_this, "", endClipDurEcho);
 					static int s_echoRenullLog = 0;
 					if (s_echoRenullLog < 20) {
 						logger::info("[OAR-Triggers] Echo restart — re-NULL'd triggers for clipGen={:X}",
