@@ -128,6 +128,9 @@ static std::atomic<bool> s_idleAnimReverseBuilt{ false };
 // this character's skeleton, expanded by includeChildren if requested.
 struct CharResolved {
 	std::vector<std::pair<std::string, int16_t>> nameAndIndex;
+	// Frozen bones (freezeBoneNames + children), resolved on this skeleton.
+	// Disjoint from nameAndIndex: freeze wins over the donor include set.
+	std::vector<std::pair<std::string, int16_t>> freezeNameAndIndex;
 	uint64_t version = 0; // matches TrackFilter::version when this was resolved
 };
 
@@ -145,8 +148,25 @@ struct CharTrackFilterState {
 	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedBaseByName;
 	bool cacheValid = false;
 
+	// Frozen-bone locals, captured from the SOURCE clip's own pose on the
+	// first sample of each play (so the freeze starts exactly where the
+	// underlying animation left the bone - no pop) and stamped into every
+	// clip at the overlay's weight until the play ends. Cleared on every
+	// fresh play/restart so a weapon switch re-captures the new grip.
+	std::unordered_map<std::string, RE::hkQsTransformRaw> frozenByName;
+
 	// Per-character bone-name → index resolution (rebuilt when filter version changes).
 	std::unordered_map<RE::hkbCharacter*, CharResolved> resolvedByChar;
+
+	// The donor file's OWN track->bone map (from its hkaAnimationBinding),
+	// captured at registration. Sampling MUST use this when present: the host
+	// clip's binding describes the HOST animation's track layout, which only
+	// matches the donor's on the donor's own weapon. donorMapIdentity means
+	// the binding declared identity mapping (empty index array). Empty map
+	// with identity=false -> no binding found, host mapping fallback.
+	std::vector<int16_t> donorTrackToBone;
+	bool donorMapIdentity = false;
+	bool donorMapQueried = false;
 
 	// Wall-clock time (seconds, from s_tfTimeSec) of the last source-clip
 	// Generate. Used to detect that source clips stopped generating (without
@@ -681,6 +701,7 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 	if (a_resolved.version == curVersion) return;
 
 	a_resolved.nameAndIndex.clear();
+	a_resolved.freezeNameAndIndex.clear();
 	a_resolved.version = curVersion;
 
 	auto* setup = a_character->setup._ptr;
@@ -700,6 +721,7 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 
 	std::vector<std::string> wantedNames;
 	std::vector<std::string> excludeNames;
+	std::vector<std::string> freezeNames;
 	bool includeChildren;
 	bool excludeChildren;
 	{
@@ -708,6 +730,7 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		includeChildren = a_filter->includeChildren;
 		excludeNames = a_filter->excludeBoneNames;
 		excludeChildren = a_filter->excludeChildren;
+		freezeNames = a_filter->freezeBoneNames;
 	}
 
 	// Step 1: build the include set
@@ -785,6 +808,42 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		}
 	}
 
+	// Step 3: resolve the freeze set (freeze names + ALL their children - a
+	// frozen weapon means the whole weapon subtree holds still) and subtract
+	// it from the donor set: freeze wins over inclusion.
+	std::unordered_set<int16_t> frozen;
+	if (!freezeNames.empty()) {
+		for (int16_t i = 0; i < numBones; ++i) {
+			auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
+			namePtr &= ~uintptr_t(1);
+			const char* boneName = reinterpret_cast<const char*>(namePtr);
+			if (!boneName) continue;
+			for (const auto& frz : freezeNames) {
+				if (_stricmp(boneName, frz.c_str()) == 0) {
+					frozen.insert(i);
+					break;
+				}
+			}
+		}
+		if (!frozen.empty()) {
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (int16_t i = 0; i < numBones; ++i) {
+					if (frozen.count(i)) continue;
+					int16_t parentIdx = parents[i];
+					if (parentIdx >= 0 && frozen.count(parentIdx)) {
+						frozen.insert(i);
+						changed = true;
+					}
+				}
+			}
+		}
+		for (int16_t idx : frozen) {
+			matched.erase(idx);
+		}
+	}
+
 	std::vector<int16_t> sortedIndices(matched.begin(), matched.end());
 	std::sort(sortedIndices.begin(), sortedIndices.end());
 
@@ -795,6 +854,18 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		const char* name = reinterpret_cast<const char*>(namePtr);
 		if (name) {
 			a_resolved.nameAndIndex.emplace_back(std::string(name), idx);
+		}
+	}
+
+	std::vector<int16_t> sortedFrozen(frozen.begin(), frozen.end());
+	std::sort(sortedFrozen.begin(), sortedFrozen.end());
+	a_resolved.freezeNameAndIndex.reserve(sortedFrozen.size());
+	for (int16_t idx : sortedFrozen) {
+		auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + idx * RE::kHkaBoneStride);
+		namePtr &= ~uintptr_t(1);
+		const char* name = reinterpret_cast<const char*>(namePtr);
+		if (name) {
+			a_resolved.freezeNameAndIndex.emplace_back(std::string(name), idx);
 		}
 	}
 
@@ -1077,6 +1148,14 @@ namespace
 	// Track the active SubMod per clip for firing custom "on end" events at deactivation.
 	static std::shared_mutex s_activeSubModMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, SubMod*> s_activeSubModMap;
+	// Binding original of the clip AT REGISTRATION TIME, same key and mutex.
+	// The engine recycles clip generators without firing Deactivate, so an
+	// entry can outlive the animation it was recorded for; readers that treat
+	// the entry as a non-interruptible LOCK must compare this against the
+	// clip's current binding and drop stale entries (ValidatedActiveSubMod) —
+	// a stale lock skips condition evaluation and re-registered the old
+	// weapon's submod onto the new weapon's clip (2026-08-16).
+	static std::unordered_map<RE::hkbClipGenerator*, RE::hkaAnimation*> s_activeSubModBinding;
 
 	// Clips whose triggers have been restored after the animation completed.
 	// Prevents EnsureReplacementTriggersInstalled from re-NULLing them.
@@ -2318,6 +2397,7 @@ static void PerformGlobalDisableRestore()
 	{
 		std::unique_lock lock(s_activeSubModMutex);
 		s_activeSubModMap.clear();
+		s_activeSubModBinding.clear();
 	}
 	{
 		std::unique_lock lock(s_annotStateMutex);
@@ -2518,6 +2598,13 @@ namespace
 	// Leaf-name -> all full suffixes that share the same leaf (for multi-match evaluation).
 	// E.g., "wpnreload" -> ["scar\wpnreload", "scar\60rddrum\wpnreload", "wpnreload"]
 	static std::unordered_map<std::string, std::vector<std::string>> s_leafToFullSuffixes;
+	// Leaf-name -> suffixes registered by submods with Leaf Matching enabled
+	// ("match by filename, outrank path matches"). Presence of a leaf here
+	// forces the multi-match path for EVERY clip sharing that filename — even
+	// clips whose exact path IS registered or direct-path resolved — so the
+	// flagged submods get first shot. Rebuilt with the priority resort (the
+	// flag is UI-editable). Guarded by s_nameLookupMutex.
+	static std::unordered_map<std::string, std::vector<std::string>> s_leafOverrideSuffixes;
 	static std::vector<std::unique_ptr<std::string>> s_persistentStrings;
 	static bool s_lookupBuilt = false;
 
@@ -2563,14 +2650,41 @@ namespace
 		return lower;
 	}
 
+	// Leaf Matching override: when any submod with the flag registers this
+	// suffix's FILENAME, the clip must go through multi-match evaluation so
+	// the flagged submod gets first shot — even when a_suffix is an exact,
+	// directly-registered (or direct-path resolved) suffix that would
+	// otherwise short-circuit straight to path matching. Returns
+	// "multi:<leaf>" in that case, a_suffix unchanged otherwise.
+	// Caller must hold NO locks on s_nameLookupMutex.
+	static std::string ApplyLeafOverride(const std::string& a_suffix)
+	{
+		if (a_suffix.empty() || a_suffix.rfind("multi:", 0) == 0) return a_suffix;
+		std::string leaf = a_suffix;
+		if (auto lastSlash = a_suffix.rfind('\\'); lastSlash != std::string::npos) {
+			leaf = a_suffix.substr(lastSlash + 1);
+		}
+		std::shared_lock rlock(s_nameLookupMutex);
+		if (s_leafOverrideSuffixes.find(leaf) != s_leafOverrideSuffixes.end()) {
+			return std::string("multi:") + leaf;
+		}
+		return a_suffix;
+	}
+
 	// Given a raw suffix, check if it's directly registered. If so, return it.
 	// If not, extract the leaf name and check the multi-leaf lookup table.
 	// Returns "multi:<leaf>" if multiple candidates exist, the single candidate
 	// if only one exists, or the original suffix if no leaf match is found.
+	// A leaf-override registration (see ApplyLeafOverride) forces multi mode
+	// before either check.
 	// Caller must hold NO locks on s_nameLookupMutex.
 	static std::string ResolveOrLeafFallback(const std::string& a_suffix)
 	{
 		if (a_suffix.empty()) return a_suffix;
+
+		if (auto overridden = ApplyLeafOverride(a_suffix); overridden != a_suffix) {
+			return overridden;
+		}
 
 		{
 			std::shared_lock rlock(s_nameLookupMutex);
@@ -2598,6 +2712,93 @@ namespace
 		}
 
 		return std::string("multi:") + leaf;
+	}
+
+	// Build s_leafToFullSuffixes and s_leafOverrideSuffixes from the current
+	// s_suffixToInfos. Caller must hold s_nameLookupMutex (unique).
+	// Ordering rule for each leaf's suffix list: leaf-override suffixes first
+	// (so multi-match probes give flagged submods first shot), then longest
+	// (most specific) path first — the pre-existing rule that keeps bare-leaf
+	// fallback registrations from hijacking folder-scoped candidates.
+	static void RebuildLeafTablesLocked()
+	{
+		auto leafOf = [](const std::string& a_suffix) {
+			auto lastSlash = a_suffix.rfind('\\');
+			return lastSlash != std::string::npos ? a_suffix.substr(lastSlash + 1) : a_suffix;
+		};
+		auto hasLeafFlag = [](const std::vector<ReplacementAnimFileInfo*>& a_infos) {
+			for (auto* info : a_infos) {
+				if (info && info->parentSubMod && info->parentSubMod->GetLeafMatching()) return true;
+			}
+			return false;
+		};
+
+		// Leaf-to-full-suffix map for multi-match evaluation.
+		// E.g., for suffixes "scar\wpnreload" and "wpnreload", both map to leaf "wpnreload".
+		s_leafToFullSuffixes.clear();
+		s_leafOverrideSuffixes.clear();
+		for (auto& [suffix, infos] : s_suffixToInfos) {
+			auto leaf = leafOf(suffix);
+			s_leafToFullSuffixes[leaf].push_back(suffix);
+			if (hasLeafFlag(infos)) {
+				s_leafOverrideSuffixes[leaf].push_back(suffix);
+			}
+		}
+
+		auto isOverride = [&](const std::string& a_suffix) {
+			auto it = s_leafOverrideSuffixes.find(leafOf(a_suffix));
+			if (it == s_leafOverrideSuffixes.end()) return false;
+			return std::ranges::find(it->second, a_suffix) != it->second.end();
+		};
+		auto maxPriority = [&](const std::string& a_suffix) {
+			int best = INT_MIN;
+			auto it = s_suffixToInfos.find(a_suffix);
+			if (it != s_suffixToInfos.end()) {
+				for (auto* info : it->second) {
+					if (info && info->parentSubMod) best = std::max(best, info->parentSubMod->GetPriority());
+				}
+			}
+			return best;
+		};
+
+		for (auto& [leaf, suffixes] : s_leafToFullSuffixes) {
+			std::ranges::sort(suffixes, [&](const auto& a, const auto& b) {
+				const bool oa = isOverride(a), ob = isOverride(b);
+				if (oa != ob) return oa;
+				if (a.size() != b.size()) return a.size() > b.size();
+				return a < b;
+			});
+			if (suffixes.size() > 1) {
+				logger::info("[OAR] LeafLookup: leaf='{}' -> {} candidates: [{}]",
+					leaf, suffixes.size(),
+					[&]() {
+						std::string joined;
+						for (size_t i = 0; i < suffixes.size(); i++) {
+							if (i > 0) joined += ", ";
+							joined += "'" + suffixes[i] + "'";
+						}
+						return joined;
+					}());
+			}
+		}
+
+		// Override list order = foreign-claim preference: highest priority
+		// first, then the LEAST specific (shortest) suffix — a submod that
+		// mirrors several per-grip paths should serve its base file to foreign
+		// weapons, and a fully deterministic order keeps the claimed suffix
+		// (and its track-filter state identity) stable across frames. Clips on
+		// the submod's own weapon never reach this order: the pre-pass tries
+		// their exact registered suffix first.
+		for (auto& [leaf, suffixes] : s_leafOverrideSuffixes) {
+			std::ranges::sort(suffixes, [&](const auto& a, const auto& b) {
+				const int pa = maxPriority(a), pb = maxPriority(b);
+				if (pa != pb) return pa > pb;
+				if (a.size() != b.size()) return a.size() < b.size();
+				return a < b;
+			});
+			logger::info("[OAR] LeafOverride: leaf='{}' has {} leaf-matching suffix(es); filename matching outranks path matching for this leaf",
+				leaf, suffixes.size());
+		}
 	}
 
 	static void BuildNameLookup()
@@ -2631,37 +2832,7 @@ namespace
 			}
 		}
 
-		// Build leaf-to-full-suffix map for multi-match evaluation.
-		// E.g., for suffixes "scar\wpnreload" and "wpnreload", both map to leaf "wpnreload".
-		s_leafToFullSuffixes.clear();
-		for (auto& [suffix, _] : s_suffixToInfos) {
-			std::string leaf = suffix;
-			auto lastSlash = suffix.rfind('\\');
-			if (lastSlash != std::string::npos) {
-				leaf = suffix.substr(lastSlash + 1);
-			}
-			s_leafToFullSuffixes[leaf].push_back(suffix);
-		}
-
-		// Sort: longer (more specific) paths first, then alphabetically
-		for (auto& [leaf, suffixes] : s_leafToFullSuffixes) {
-			std::ranges::sort(suffixes, [](const auto& a, const auto& b) {
-				if (a.size() != b.size()) return a.size() > b.size();
-				return a < b;
-			});
-			if (suffixes.size() > 1) {
-				logger::info("[OAR] LeafLookup: leaf='{}' -> {} candidates: [{}]",
-					leaf, suffixes.size(),
-					[&]() {
-						std::string joined;
-						for (size_t i = 0; i < suffixes.size(); i++) {
-							if (i > 0) joined += ", ";
-							joined += "'" + suffixes[i] + "'";
-						}
-						return joined;
-					}());
-			}
-		}
+		RebuildLeafTablesLocked();
 
 		s_lookupBuilt = true;
 		logger::info("[OAR] Built name lookup with {} suffix entries, {} leaf entries",
@@ -2686,6 +2857,10 @@ namespace
 				return pa > pb;
 			});
 		}
+		// The Leaf Matching flag is UI-editable and its effect lives in the leaf
+		// tables (override membership + probe ordering), so rebuild them with
+		// every resort — same trigger, same game-thread serialization.
+		RebuildLeafTablesLocked();
 		logger::info("[OAR] Name lookup re-sorted by priority ({} suffix entries)",
 			s_suffixToInfos.size());
 	}
@@ -3458,6 +3633,71 @@ namespace
 		return path;
 	}
 
+	// The clip's real registered-form suffix, best source first: the per-frame
+	// poll's AUTHORITATIVE resolution (clip-keyed, refreshed while the clip is
+	// live), then the leaf-validated binding inheritance. The inheritance
+	// survives clip-pool recycling but is only leaf-validated — a freed
+	// original's address reused by ANOTHER weapon's same-named animation
+	// inherits the old weapon's path (field case: exact='hazord606\m4\...'
+	// claimed on a different weapon's clip, 2026-08-16). Empty when unknown.
+	static std::string RealSuffixForClip(RE::hkbClipGenerator* a_clip, const std::string& a_leafName)
+	{
+		bool authoritative = false;
+		{
+			std::shared_lock slock(s_clipRealPathStateMutex);
+			authoritative = s_clipRealPathAuthoritative.contains(a_clip);
+		}
+		if (authoritative) {
+			std::string cachedPath;
+			{
+				std::shared_lock plock(s_clipRealPathMutex);
+				auto it = s_clipRealPathCache.find(a_clip);
+				if (it != s_clipRealPathCache.end()) cachedPath = it->second;
+			}
+			if (!cachedPath.empty()) {
+				auto sfx = ExtractAnimSuffix(cachedPath);
+				std::string sfxLeaf = sfx;
+				if (auto p = sfx.rfind('\\'); p != std::string::npos) sfxLeaf = sfx.substr(p + 1);
+				if (!sfx.empty() && sfxLeaf == a_leafName) return sfx;
+			}
+		}
+		const auto inh = InheritedBindingPathForClip(a_clip, a_leafName);
+		if (!inh.empty()) return ExtractAnimSuffix(inh);
+		return {};
+	}
+
+	// The clip's active-submod entry, validated against its CURRENT binding.
+	// The engine recycles clip generators without firing Deactivate, so the
+	// entry can describe an animation the clip no longer plays; honoring such
+	// an entry as a non-interruptible lock skips condition evaluation and
+	// re-registers the old weapon's submod onto the new weapon's clip (the
+	// zombie track-filter state behind the 'stepped' blending, 2026-08-16).
+	// A detected mismatch erases the entry and returns null. When either
+	// binding is unknown the entry is honored (legacy behavior).
+	static SubMod* ValidatedActiveSubMod(RE::hkbClipGenerator* a_clip)
+	{
+		RE::hkaAnimation* currentBinding = GetBindingOriginalForClip(a_clip);
+		std::unique_lock smLock(s_activeSubModMutex);
+		auto smIt = s_activeSubModMap.find(a_clip);
+		if (smIt == s_activeSubModMap.end() || !smIt->second) return nullptr;
+		auto bit = s_activeSubModBinding.find(a_clip);
+		if (bit != s_activeSubModBinding.end() && bit->second && currentBinding &&
+			bit->second != currentBinding) {
+			static std::atomic<int> s_staleLockLog{ 0 };
+			if (s_staleLockLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+				logger::info("[OAR] Dropping stale active-submod lock on clip {:X}: binding {:X} -> {:X} (submod '{}')",
+					reinterpret_cast<uintptr_t>(a_clip),
+					reinterpret_cast<uintptr_t>(bit->second),
+					reinterpret_cast<uintptr_t>(currentBinding),
+					smIt->second->GetName());
+			}
+			s_activeSubModMap.erase(smIt);
+			s_activeSubModBinding.erase(bit);
+			return nullptr;
+		}
+		return smIt->second;
+	}
+
 	static void EnsureDirectSuffixForClip(RE::hkbClipGenerator* a_clip, const std::string& a_realPath)
 	{
 		if (!Settings::GetSingleton()->bDirectPathMatching || a_realPath.empty()) return;
@@ -3471,10 +3711,20 @@ namespace
 		// same binding need it to resolve without re-walking.
 		LearnBindingPathForClip(a_clip, a_realPath);
 
+		// The stored key must be override-aware: this cache feeds the matching
+		// layer, which speaks "multi:<leaf>" for leaves claimed by a Leaf
+		// Matching submod. Writing the exact form here flipped an already
+		// claimed clip back to exact mid-play — the Update hook then saw
+		// NoMatch and abandoned the replacement with its track-filter state
+		// stranded (field case: mcxanims\wpnmelee, 2026-08-16). The binding
+		// identity itself is learned exact above; only the matching key is
+		// converted.
+		const auto matchKey = ApplyLeafOverride(exactSuffix);
+
 		{
 			std::shared_lock lock(s_clipSuffixMutex);
 			auto it = s_clipSuffixCache.find(a_clip);
-			if (it != s_clipSuffixCache.end() && it->second == exactSuffix) return;
+			if (it != s_clipSuffixCache.end() && it->second == matchKey) return;
 		}
 
 		if (auto** slot = a_clip->GetAnimationSlot(); slot && *slot &&
@@ -3487,12 +3737,12 @@ namespace
 			std::unique_lock lock(s_clipSuffixMutex);
 			auto it = s_clipSuffixCache.find(a_clip);
 			if (it != s_clipSuffixCache.end()) oldSuffix = it->second;
-			s_clipSuffixCache[a_clip] = exactSuffix;
+			s_clipSuffixCache[a_clip] = matchKey;
 		}
 		static std::atomic<int> s_rekeyLog{ 0 };
 		if (s_rekeyLog.fetch_add(1, std::memory_order_relaxed) < 40) {
 			logger::info("[OAR-DirectPath] Re-keyed clip {:X} suffix '{}' -> '{}' (real path '{}')",
-				reinterpret_cast<uintptr_t>(a_clip), oldSuffix, exactSuffix, a_realPath);
+				reinterpret_cast<uintptr_t>(a_clip), oldSuffix, matchKey, a_realPath);
 		}
 	}
 
@@ -3920,7 +4170,10 @@ namespace
 		if (cachedPath.empty()) return {};
 		const auto clipLeaf = SubgraphGetLeaf(a_clip->animationName.data());
 		if (clipLeaf.empty() || SubgraphGetLeaf(cachedPath.c_str()) != clipLeaf) return {};
-		return ExtractAnimSuffix(cachedPath);
+		// Even the resolved real path yields to a Leaf Matching submod: the
+		// override converts to multi mode, where the flagged submod is probed
+		// first and path candidates remain the fallback.
+		return ApplyLeafOverride(ExtractAnimSuffix(cachedPath));
 	}
 
 	static std::string GetClipSuffixFromContext(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
@@ -3961,7 +4214,7 @@ namespace
 						s_sourceLogCount++;
 					}
 					if (registered) {
-						return suffix;
+						return ApplyLeafOverride(suffix);
 					}
 					// Not registered under the exact real-path suffix.
 					// Direct path matching (default): the real path is the engine's
@@ -3970,7 +4223,7 @@ namespace
 					// only as a fallback for clips whose real path can't be resolved
 					// (it never reaches here in that case — Source S failed).
 					if (Settings::GetSingleton()->bDirectPathMatching) {
-						return suffix;
+						return ApplyLeafOverride(suffix);
 					}
 					// Legacy behavior: bridge through the leaf table so replacer
 					// layouts that only match by leaf name keep working.
@@ -4383,12 +4636,10 @@ namespace
 		// (the Update hook skips re-evaluation for it) — honor that here so the
 		// pre-swap doesn't build the control from a different file on re-Activate.
 		{
-			std::shared_lock smLock(s_activeSubModMutex);
-			auto smIt = s_activeSubModMap.find(a_clipGen);
-			if (smIt != s_activeSubModMap.end() && smIt->second &&
-				!smIt->second->IsInterruptible() && !smIt->second->IsDisabled()) {
+			SubMod* active = ValidatedActiveSubMod(a_clipGen);
+			if (active && !active->IsInterruptible() && !active->IsDisabled()) {
 				for (auto* info : a_candidates) {
-					if (info && info->parentSubMod == smIt->second) return info;
+					if (info && info->parentSubMod == active) return info;
 				}
 			}
 		}
@@ -4498,6 +4749,71 @@ namespace
 								std::shared_lock rlock(s_nameLookupMutex);
 								auto leafIt = s_leafToFullSuffixes.find(leafName);
 								if (leafIt != s_leafToFullSuffixes.end()) {
+									// Same selection rules as the Update hook's multi
+									// block: (1) Leaf Matching claims first — flagged
+									// submods only, the clip's own registered suffix
+									// preferred, ELSE the override-list order; (2) the
+									// exact suffix with normal winner rules; (3) the
+									// legacy leaf-fallback loop ONLY when the clip's
+									// real path is unknown (a known path is settled
+									// identity — foreign paths' unflagged candidates
+									// must not pre-swap onto it).
+									std::string exactPre = RealSuffixForClip(a_this, leafName);
+
+									auto ovIt = s_leafOverrideSuffixes.find(leafName);
+									if (ovIt != s_leafOverrideSuffixes.end()) {
+										auto tryFlagged = [&](const std::string& a_ovSuffix) -> bool {
+											auto candIt = s_suffixToInfos.find(a_ovSuffix);
+											if (candIt == s_suffixToInfos.end()) return false;
+											for (auto* info : candIt->second) {
+												if (!info || !info->parentSubMod) continue;
+												if (!info->parentSubMod->GetLeafMatching()) continue;
+												if (info->parentSubMod->IsDisabled()) continue;
+												auto* cs = info->parentSubMod->GetConditionSet();
+												bool pass = (!cs || cs->IsEmpty());
+												if (!pass && refrPre) {
+													try {
+														pass = info->parentSubMod->EvaluateConditions(refrPre, a_this);
+													} catch (...) { pass = false; }
+												}
+												if (!pass) continue;
+												replacement = cachePre->GetOrBuildRuntimeAnim(
+													a_ovSuffix, *animSlotPre, info->parentSubMod);
+												if (replacement) {
+													preSwapWinner = info;
+													return true;
+												}
+											}
+											return false;
+										};
+										bool claimed = false;
+										if (!exactPre.empty() &&
+											std::ranges::find(ovIt->second, exactPre) != ovIt->second.end()) {
+											claimed = tryFlagged(exactPre);
+										}
+										if (!claimed) {
+											for (const auto& ovSuffix : ovIt->second) {
+												if (ovSuffix == exactPre) continue;
+												if (tryFlagged(ovSuffix)) break;
+											}
+										}
+									}
+
+									if (!replacement && !exactPre.empty()) {
+										auto candIt = s_suffixToInfos.find(exactPre);
+										if (candIt != s_suffixToInfos.end()) {
+											if (auto* winner = EvaluateWinningInfo(candIt->second, refrPre, a_this)) {
+												replacement = cachePre->GetOrBuildRuntimeAnim(
+													exactPre, *animSlotPre, winner->parentSubMod);
+												if (replacement) preSwapWinner = winner;
+											}
+										}
+									}
+
+									// Legacy leaf-bridging (direct path matching OFF)
+									// keeps its fallback loop even with a known path.
+									if (!replacement && (exactPre.empty() ||
+											!Settings::GetSingleton()->bDirectPathMatching))
 									for (const auto& fullSuffix : leafIt->second) {
 										auto candIt = s_suffixToInfos.find(fullSuffix);
 										if (candIt == s_suffixToInfos.end()) continue;
@@ -4542,12 +4858,18 @@ namespace
 							// from the real animation. A retired clone with no recorded
 							// original is left alone (orphan recovery handles it).
 							if (!replacement && cachePre->IsOurReplacement(*animSlotPre)) {
-								if (auto* staleOrig = cachePre->GetOriginalFromReplacement(*animSlotPre)) {
+								auto* staleOrig = cachePre->GetOriginalFromReplacement(*animSlotPre);
+								// Validate before writing into the slot: the recorded
+								// original can be freed (weapon switch since that play),
+								// and the multi-clone cache keeps old clones alive with
+								// their stale originals recorded.
+								if (staleOrig && !IsBadReadPtr(staleOrig, sizeof(uintptr_t)) &&
+									IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(staleOrig))) {
 									*animSlotPre = staleOrig;
 									logger::info("[OAR] Activation: restored original over stale replacement for '{}' (no winner)",
 										activeSuffix);
 								} else {
-									logger::warn("[OAR] Activation: stale replacement in slot for '{}' has no recorded original — leaving as-is",
+									logger::warn("[OAR] Activation: stale replacement in slot for '{}' has no valid recorded original — leaving as-is",
 										activeSuffix);
 								}
 							}
@@ -4564,6 +4886,37 @@ namespace
 									preSwapSucceeded = true;
 								}
 							}
+						}
+					}
+				}
+			}
+		}
+
+		// Catch-all stale-clone guard, independent of suffix resolution: when
+		// this activation is NOT pre-swapping a replacement, the animation
+		// control about to be built by _Activate must be built from the REAL
+		// original. The targeted restore above only runs when the Activate-time
+		// suffix resolved AND was registered — a pre-swap deferred for
+		// direct-path resolution (fresh player clips) or an unregistered guess
+		// skipped it entirely, so a clone left by the PREVIOUS play stayed in
+		// the slot through _Activate. The control then carried the CLONE's
+		// duration: the state's relative-to-end exit trigger fired at the
+		// clone's end, cutting off every native annotation past it on the
+		// un-replaced play (MP7 empty reload dropping 05_Bolt/06_Shoulder,
+		// 2026-08-18 — same family as the HK416 case the targeted restore was
+		// built for).
+		if (!preSwapSucceeded && s_gameFullyLoaded.load() && a_this) {
+			if (auto** slotPre2 = a_this->GetAnimationSlot(); slotPre2 && *slotPre2) {
+				auto* cacheGuard = AnimationCache::GetSingleton();
+				if (cacheGuard->IsOurReplacement(*slotPre2)) {
+					auto* staleOrig = cacheGuard->GetOriginalFromReplacement(*slotPre2);
+					if (staleOrig && !IsBadReadPtr(staleOrig, sizeof(uintptr_t)) &&
+						IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(staleOrig))) {
+						*slotPre2 = staleOrig;
+						static std::atomic<int> s_catchAllRestoreLog{ 0 };
+						if (s_catchAllRestoreLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+							logger::info("[OAR] Activation: catch-all restored original over stale clone (clipGen={:X}, no pre-swap this activation)",
+								reinterpret_cast<uintptr_t>(a_this));
 						}
 					}
 				}
@@ -5335,7 +5688,11 @@ namespace
 							}
 							EnsureDirectSuffixForClip(a_this, realPath);
 							if (auto exact = ExtractAnimSuffix(realPath); !exact.empty()) {
-								suffix = exact;  // match against the REAL path from this frame on
+								// Match against the REAL path from this frame on — unless
+								// a Leaf Matching submod claims this filename, which
+								// converts to multi mode (flagged submod probed first,
+								// the real path's candidates as fallback).
+								suffix = ApplyLeafOverride(exact);
 							}
 							if (inherited) {
 								static std::atomic<int> s_inheritPromoteLog{ 0 };
@@ -5397,6 +5754,14 @@ namespace
 		// don't rebuild/swap, just correct the annotations + triggers".
 		SubMod* orphanRecoverOwner = nullptr;
 		bool orphanAnnotOnly = false;
+		// Set by the Leaf Matching pre-pass when it claims a suffix that is NOT
+		// the clip's own registered path (pure filename match): the claimed
+		// suffix's candidate vector belongs to ANOTHER path, so only the flagged
+		// submod that made the claim may win — priority order over that vector
+		// must not hand the play to a path-scoped submod that never matched
+		// this clip (field case: 'M4A1 - Melee Variants' hijacking a foreign
+		// weapon's claim, 2026-08-16).
+		SubMod* leafForcedSubMod = nullptr;
 
 		std::shared_lock lock(s_nameLookupMutex);
 
@@ -5410,45 +5775,122 @@ namespace
 			RE::TESObjectREFR* multiRefr = GetRefrFromContext(a_context);
 			if (!multiRefr) multiRefr = RE::PlayerCharacter::GetSingleton();
 
-			// Binding-identity safety net. The defer gate normally promotes an
-			// inherited binding path BEFORE the suffix ever reaches here as
-			// "multi:", but some clips arrive in multi mode anyway (gate
-			// skipped while our replacement occupies the slot, non-player
-			// attribution, stale multi suffix cached from a previous frame).
-			// If the real path for this clip's underlying binding is known,
-			// that is ground truth — the condition probe below cannot
-			// discriminate variants whose submods share the same conditions
-			// (all gated on IsEquipped), and its most-specific-first order
-			// then installs the WRONG variant's file. Leaf-validated inside
-			// the helper: a recycled animation address for a different clip
-			// falls through to the normal probe.
-			bool bindingKnown = false;
+			// ===== Leaf Matching pre-pass =====
+			// Submods with the Leaf Matching flag match this clip by FILENAME
+			// alone and outrank everything below it — the binding-identity
+			// ground truth and the most-specific-path probe both only decide
+			// which PATH-scoped candidate applies, and this flag exists to beat
+			// path scoping. A locked (non-interruptible, active) path submod
+			// still wins: yanking it mid-play is what non-interruptible forbids.
+			// The clip's REAL registered suffix, when its identity is known —
+			// authoritative poll resolution first, binding inheritance second
+			// (see RealSuffixForClip). Shared by the Leaf Matching pre-pass (a
+			// flagged submod usually mirrors SEVERAL paths sharing the filename;
+			// on its own weapon the file whose registered path matches the clip
+			// must play, and claims elsewhere are FOREIGN) and by the
+			// binding-identity safety net below.
+			std::string exactSuffix = RealSuffixForClip(a_this, leafName);
+
 			{
-				const auto inheritedPath = InheritedBindingPathForClip(a_this, leafName);
-				if (!inheritedPath.empty()) {
-					const auto inherited = ExtractAnimSuffix(inheritedPath);
-					if (!inherited.empty()) {
-						bindingKnown = true;
-						auto candIt = s_suffixToInfos.find(inherited);
-						if (candIt != s_suffixToInfos.end()) {
-							resolvedSuffix = inherited;
-							candidatesPtr = &candIt->second;
+				SubMod* lockedActive = nullptr;
+				{
+					SubMod* active = ValidatedActiveSubMod(a_this);
+					if (active && !active->IsInterruptible() && !active->IsDisabled()) {
+						lockedActive = active;
+					}
+				}
+				auto ovIt = s_leafOverrideSuffixes.find(leafName);
+				if (ovIt != s_leafOverrideSuffixes.end() &&
+					(!lockedActive || lockedActive->GetLeafMatching())) {
+					auto tryClaim = [&](const std::string& a_ovSuffix) -> bool {
+						auto candIt = s_suffixToInfos.find(a_ovSuffix);
+						if (candIt == s_suffixToInfos.end()) return false;
+						for (auto* info : candIt->second) {
+							if (!info || !info->parentSubMod) continue;
+							if (!info->parentSubMod->GetLeafMatching()) continue;
+							if (info->parentSubMod->IsDisabled()) continue;
+							bool pass = false;
+							if (lockedActive) {
+								// Locked leaf-matching submod stays selected without
+								// re-evaluating conditions (non-interruptible semantics).
+								pass = (info->parentSubMod == lockedActive);
+							} else {
+								auto* cs = info->parentSubMod->GetConditionSet();
+								pass = (!cs || cs->IsEmpty());
+								if (!pass && multiRefr) {
+									try {
+										pass = info->parentSubMod->EvaluateConditions(multiRefr, a_this);
+									} catch (...) { pass = false; }
+								}
+							}
+							if (pass) {
+								resolvedSuffix = a_ovSuffix;
+								candidatesPtr = &candIt->second;
+								if (a_ovSuffix != exactSuffix) {
+									leafForcedSubMod = info->parentSubMod;
+								}
+								return true;
+							}
 						}
-						// Registered or not, the identity is settled: when no
-						// replacement exists under the real suffix, fall through
-						// to the no-candidate restore below rather than letting
-						// the probe pick a different variant's file.
-						static std::atomic<int> s_bindInheritLog{ 0 };
-						if (s_bindInheritLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-							logger::info("[OAR-MultiMatch] leaf='{}' inherited binding suffix='{}' (registered={})",
-								leafName, inherited, candidatesPtr != nullptr);
+						return false;
+					};
+
+					// Selection order: the clip's own registered suffix first (when
+					// it is itself flagged), then the override list (priority desc,
+					// base/least-specific file first).
+					bool claimed = false;
+					if (!exactSuffix.empty() &&
+						std::ranges::find(ovIt->second, exactSuffix) != ovIt->second.end()) {
+						claimed = tryClaim(exactSuffix);
+					}
+					if (!claimed) {
+						for (auto& ovSuffix : ovIt->second) {
+							if (ovSuffix == exactSuffix) continue;  // already tried
+							if (tryClaim(ovSuffix)) break;
+						}
+					}
+					if (candidatesPtr) {
+						static std::atomic<int> s_leafOvLog{ 0 };
+						if (s_leafOvLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+							logger::info("[OAR-LeafMatch] leaf='{}' claimed by leaf-matching suffix='{}' (exact='{}', foreign={})",
+								leafName, resolvedSuffix, exactSuffix, leafForcedSubMod != nullptr);
 						}
 					}
 				}
 			}
 
+			// Binding-identity safety net. The defer gate normally promotes an
+			// inherited binding path BEFORE the suffix ever reaches here as
+			// "multi:", but some clips arrive in multi mode anyway (gate
+			// skipped while our replacement occupies the slot, non-player
+			// attribution, stale multi suffix cached from a previous frame).
+			// If the real path for this clip is known, that is ground truth —
+			// the condition probe below cannot discriminate variants whose
+			// submods share the same conditions (all gated on IsEquipped), and
+			// its most-specific-first order then installs the WRONG variant's
+			// file. Uses the shared exactSuffix (authoritative poll resolution
+			// first, leaf-validated binding inheritance second).
+			bool bindingKnown = false;
+			if (!candidatesPtr && !exactSuffix.empty()) {
+				bindingKnown = true;
+				auto candIt = s_suffixToInfos.find(exactSuffix);
+				if (candIt != s_suffixToInfos.end()) {
+					resolvedSuffix = exactSuffix;
+					candidatesPtr = &candIt->second;
+				}
+				// Registered or not, the identity is settled: when no
+				// replacement exists under the real suffix, fall through
+				// to the no-candidate restore below rather than letting
+				// the probe pick a different variant's file.
+				static std::atomic<int> s_bindInheritLog{ 0 };
+				if (s_bindInheritLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+					logger::info("[OAR-MultiMatch] leaf='{}' settled real suffix='{}' (registered={})",
+						leafName, exactSuffix, candidatesPtr != nullptr);
+				}
+			}
+
 			// Evaluate each candidate suffix's conditions, most-specific (longest) first
-			if (!bindingKnown)
+			if (!candidatesPtr && !bindingKnown)
 			for (auto& candidateSuffix : leafIt->second) {
 				auto candIt = s_suffixToInfos.find(candidateSuffix);
 				if (candIt == s_suffixToInfos.end()) continue;
@@ -5774,35 +6216,34 @@ namespace
 		bool skipConditionEval = false;
 		SubMod* lockedSubMod = nullptr;
 		{
-			std::shared_lock smLock(s_activeSubModMutex);
-			auto smIt = s_activeSubModMap.find(a_this);
-			if (smIt != s_activeSubModMap.end() && smIt->second) {
-				if (!smIt->second->IsInterruptible() && !smIt->second->IsDisabled()) {
-					bool allowReeval = false;
+			// Validated: a stale entry on a recycled clip must not lock in the
+			// old weapon's submod (see ValidatedActiveSubMod).
+			SubMod* activeSub = ValidatedActiveSubMod(a_this);
+			if (activeSub && !activeSub->IsInterruptible() && !activeSub->IsDisabled()) {
+				bool allowReeval = false;
 
-					// Check if a loop/echo event allows re-evaluation
-					{
-						std::unique_lock leLock(s_loopEchoFlagMutex);
-						auto loopIt = s_clipLoopPending.find(a_this);
-						if (loopIt != s_clipLoopPending.end() && loopIt->second) {
-							if (smIt->second->GetReplaceOnLoop()) {
-								allowReeval = true;
-							}
-							loopIt->second = false;
+				// Check if a loop/echo event allows re-evaluation
+				{
+					std::unique_lock leLock(s_loopEchoFlagMutex);
+					auto loopIt = s_clipLoopPending.find(a_this);
+					if (loopIt != s_clipLoopPending.end() && loopIt->second) {
+						if (activeSub->GetReplaceOnLoop()) {
+							allowReeval = true;
 						}
-						auto echoIt = s_clipEchoPending.find(a_this);
-						if (echoIt != s_clipEchoPending.end() && echoIt->second) {
-							if (smIt->second->GetReplaceOnEcho()) {
-								allowReeval = true;
-							}
-							echoIt->second = false;
-						}
+						loopIt->second = false;
 					}
+					auto echoIt = s_clipEchoPending.find(a_this);
+					if (echoIt != s_clipEchoPending.end() && echoIt->second) {
+						if (activeSub->GetReplaceOnEcho()) {
+							allowReeval = true;
+						}
+						echoIt->second = false;
+					}
+				}
 
-					if (!allowReeval) {
-						skipConditionEval = true;
-						lockedSubMod = smIt->second;
-					}
+				if (!allowReeval) {
+					skipConditionEval = true;
+					lockedSubMod = activeSub;
 				}
 			}
 		}
@@ -5814,6 +6255,15 @@ namespace
 		if (!skipConditionEval && orphanAnnotOnly && orphanRecoverOwner) {
 			skipConditionEval = true;
 			lockedSubMod = orphanRecoverOwner;
+		}
+
+		// A Leaf Matching claim on a foreign path: only the flagged submod may
+		// win — its conditions already passed in the pre-pass this frame. Reuse
+		// the locked-winner machinery so the winner loop below cannot hand the
+		// play to a path-scoped submod registered under the claimed suffix.
+		if (!skipConditionEval && leafForcedSubMod) {
+			skipConditionEval = true;
+			lockedSubMod = leafForcedSubMod;
 		}
 
 		bool shouldReplace = false;
@@ -6072,6 +6522,7 @@ namespace
 			if (winningInfo && winningInfo->parentSubMod) {
 				std::unique_lock smLock(s_activeSubModMutex);
 				s_activeSubModMap[a_this] = winningInfo->parentSubMod;
+				s_activeSubModBinding[a_this] = originalAnim;
 			}
 		} else {
 
@@ -6110,6 +6561,21 @@ namespace
 					// during frame hitches. The stale values are same-filter/same-bone
 					// (typically a different variant of the same pose) and get
 					// overwritten by the source clip's very next Generate anyway.
+					// The donor's OWN track->bone map (from its file's binding),
+					// refreshed whenever the served suffix changes. Sampling the
+					// donor through the HOST clip's binding is only correct when
+					// both share a track layout — true for the donor's own weapon
+					// (path matching), false for Leaf Matching claims on other
+					// weapons' clips (the MCX glitch, 2026-08-16).
+					if (state.replacement != replacement || state.suffix != cacheSuffix ||
+						(!state.donorMapQueried)) {
+						state.donorTrackToBone.clear();
+						state.donorMapIdentity = false;
+						state.donorMapQueried = true;
+						AnimationCache::GetSingleton()->GetDonorTrackMap(
+							cacheSuffix, winningInfo->parentSubMod,
+							state.donorTrackToBone, state.donorMapIdentity);
+					}
 					state.replacement = replacement;
 					state.parentSubMod = winningInfo->parentSubMod;
 					state.sourceClip = a_this;
@@ -6125,6 +6591,7 @@ namespace
 					if (isNew) {
 						s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
 						// Initialize blend-in state
+						state.frozenByName.clear();
 						float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
 						state.blendAlpha = (blendIn <= 0.0f) ? 1.0f : 0.0f;
 						state.blendElapsed = 0.0f;
@@ -6162,6 +6629,7 @@ namespace
 							state.dormant = false;
 							state.oneShotDone = false;
 							state.sampleStarved = false;
+							state.frozenByName.clear();
 							state.lastSampledLocalTime = -1.0f;
 							state.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
 							state.lastAdvanceSec = state.lastSampleSec;
@@ -6237,6 +6705,7 @@ namespace
 			if (winningInfo->parentSubMod) {
 				std::unique_lock smLock(s_activeSubModMutex);
 				s_activeSubModMap[a_this] = winningInfo->parentSubMod;
+				s_activeSubModBinding[a_this] = originalAnim;
 			}
 			static int s_tfLog = 0;
 			if (s_tfLog < 3) {
@@ -6297,6 +6766,7 @@ namespace
 							QueueCustomEvents(refr, winningInfo->parentSubMod->eventsOnStart, "onStart");
 							std::unique_lock smLock(s_activeSubModMutex);
 							s_activeSubModMap[a_this] = winningInfo->parentSubMod;
+							s_activeSubModBinding[a_this] = originalAnim;
 						}
 
 						if (AnimationLog::GetSingleton()->IsEnabled() && winningInfo) {
@@ -6929,6 +7399,7 @@ namespace
 						{
 							std::unique_lock smLock(s_activeSubModMutex);
 							s_activeSubModMap.erase(a_this);
+							s_activeSubModBinding.erase(a_this);
 						}
 						{
 							std::lock_guard rg(s_triggersRestoredMutex);
@@ -7110,6 +7581,7 @@ namespace
 			{
 				std::unique_lock smLock(s_activeSubModMutex);
 				s_activeSubModMap.erase(a_this);
+				s_activeSubModBinding.erase(a_this);
 			}
 			{
 				std::lock_guard rg(s_triggersRestoredMutex);
@@ -7437,6 +7909,28 @@ namespace
 					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
 
+				// Frozen bones: hold the captured local (additive clips get the
+				// identity so sway cannot wiggle a frozen bone). Skipped until
+				// the source clip's first sample captures the value.
+				for (auto& [name, idx] : cr.freezeNameAndIndex) {
+					if (idx < 0 || idx >= numOutputBones) continue;
+					if (isAdditiveClip) {
+						RE::hkQsTransformRaw identity{};
+						identity.translation[0] = 0.f; identity.translation[1] = 0.f;
+						identity.translation[2] = 0.f; identity.translation[3] = 0.f;
+						identity.rotation[0] = 0.f; identity.rotation[1] = 0.f;
+						identity.rotation[2] = 0.f; identity.rotation[3] = 1.f;
+						identity.scale[0] = 1.f; identity.scale[1] = 1.f;
+						identity.scale[2] = 1.f; identity.scale[3] = 0.f;
+						outputPose[idx] = identity;
+					} else {
+						auto fIt = state.frozenByName.find(name);
+						if (fIt == state.frozenByName.end()) continue;
+						LerpTransform(outputPose[idx], fIt->second, weight);
+					}
+					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+				}
+
 				static int s_nonSrcFastLog = 0;
 				if (s_nonSrcFastLog < 5) {
 					int dumped = 0;
@@ -7542,15 +8036,26 @@ namespace
 			// fixed-frame sampling (seen on 'Sig Idle Empty' / p226 wpnidleready).
 			const bool haveIdentityBinding = !haveMapping && animSlot && *animSlot;
 
+			// The donor's OWN track->bone map wins over the host clip's binding:
+			// the host binding describes the HOST animation's track layout,
+			// which only matches the donor's when the donor was authored for
+			// this weapon's animation set. A Leaf Matching donor sampled under
+			// another weapon's clip through the host mapping put wrong tracks
+			// on wrong bones (the MCX glitch, 2026-08-16).
+			const int16_t* donorMap =
+				state.donorTrackToBone.empty() ? nullptr : state.donorTrackToBone.data();
+			const int32_t donorMapSize = static_cast<int32_t>(state.donorTrackToBone.size());
+			const bool donorIdentity = state.donorMapIdentity;
+
 			static int s_pathLog = 0;
 			if (s_pathLog < 6) {
-				logger::info("[OAR-TrackFilter] Source path: clip={:X} mapping={} identity={} bindingTracks={}",
+				logger::info("[OAR-TrackFilter] Source path: clip={:X} mapping={} identity={} bindingTracks={} donorMap={} donorIdentity={}",
 					reinterpret_cast<uintptr_t>(a_this), haveMapping, haveIdentityBinding,
-					haveMapping ? trackToBoneArr->size : 0);
+					haveMapping ? trackToBoneArr->size : 0, donorMapSize, donorIdentity);
 				s_pathLog++;
 			}
 
-			if (haveMapping || haveIdentityBinding) {
+			if (donorMap || donorIdentity || haveMapping || haveIdentityBinding) {
 				// ============== Direct sampling path ==============
 				const auto* trackToBoneData = haveMapping
 					? reinterpret_cast<const int16_t*>(trackToBoneArr->data) : nullptr;
@@ -7594,6 +8099,7 @@ namespace
 							const bool wasEnded = state.dormant || state.oneShotDone || state.earlyBlendOutArmed;
 							state.oneShotDone = false;
 							state.sampleStarved = false;
+							state.frozenByName.clear();
 							state.lastAdvanceSec = nowSec;
 							state.selfAdvanceStartSec = -1.0f;
 							state.selfAdvanceBaseTime = 0.0f;
@@ -7777,6 +8283,15 @@ namespace
 				}
 
 				auto donorTrackFor = [&](int16_t boneIdx) -> int32_t {
+					if (donorMap) {
+						const int32_t n = std::min(donorMapSize, animNumTracks);
+						for (int32_t t = 0; t < n; ++t)
+							if (donorMap[t] == boneIdx) return t;
+						return -1;
+					}
+					if (donorIdentity) {
+						return (boneIdx < animNumTracks) ? static_cast<int32_t>(boneIdx) : -1;
+					}
 					if (haveMapping) {
 						for (int32_t t = 0; t < numTracksToSample; ++t)
 							if (trackToBoneData[t] == boneIdx) return t;
@@ -7811,15 +8326,9 @@ namespace
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
 
-					int32_t trackIdx = -1;
-					if (haveMapping) {
-						for (int32_t t = 0; t < numTracksToSample; ++t) {
-							if (trackToBoneData[t] == idx) { trackIdx = t; break; }
-						}
-					} else if (idx < numTracksToSample) {
-						// Identity binding: track index == bone index.
-						trackIdx = idx;
-					}
+					// Same resolution order as donorTrackFor: donor's own map,
+					// donor identity, host mapping, host identity.
+					const int32_t trackIdx = donorTrackFor(idx);
 
 					if (wantBindingDiag) {
 						logger::info("[OAR-TrackFilter-Binding]   '{}': boneIdx={} trackIdx={} (identity={})",
@@ -7866,6 +8375,23 @@ namespace
 					}
 				}
 				if (wantBindingDiag) s_bindingDiagLog++;
+
+				// Frozen bones: neither the donor nor the native animation drives
+				// them. Capture the native local on the first sample of this play
+				// (outputPose still holds the source clip's own value here - the
+				// freeze set is disjoint from the donor set), then hold it at the
+				// overlay's weight so blend-in/out release it smoothly.
+				for (auto& [name, idx] : cr.freezeNameAndIndex) {
+					if (idx < 0 || idx >= numOutputBones) continue;
+					auto fIt = state.frozenByName.find(name);
+					if (fIt == state.frozenByName.end()) {
+						fIt = state.frozenByName.emplace(name, outputPose[idx]).first;
+					}
+					if (weight > 0.001f) {
+						LerpTransform(outputPose[idx], fIt->second, weight);
+						SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+					}
+				}
 
 				// onFraction is > 0 here (source path has an early-out at the top).
 
@@ -7965,6 +8491,18 @@ namespace
 				}
 				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 			}
+
+			// Frozen bones (see the direct path): capture from the restored base
+			// pose (the clip's own native locals), then hold.
+			for (auto& [name, idx] : cr2.freezeNameAndIndex) {
+				if (idx < 0 || idx >= numOutputBones) continue;
+				auto fIt = state2.frozenByName.find(name);
+				if (fIt == state2.frozenByName.end()) {
+					fIt = state2.frozenByName.emplace(name, outputPose[idx]).first;
+				}
+				LerpTransform(outputPose[idx], fIt->second, weight);
+				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+			}
 			// onFraction is > 0 here (source path has an early-out at the top).
 
 			static int s_fbFinalLog = 0;
@@ -8040,6 +8578,26 @@ namespace
 						LerpTransform(outputPose[idx], rIt->second, weight);
 					}
 				}
+			}
+			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+		}
+
+		// Frozen bones (see the fast path).
+		for (auto& [name, idx] : cr.freezeNameAndIndex) {
+			if (idx < 0 || idx >= numOutputBones) continue;
+			if (isAdditiveClip) {
+				RE::hkQsTransformRaw identity{};
+				identity.translation[0] = 0.f; identity.translation[1] = 0.f;
+				identity.translation[2] = 0.f; identity.translation[3] = 0.f;
+				identity.rotation[0] = 0.f; identity.rotation[1] = 0.f;
+				identity.rotation[2] = 0.f; identity.rotation[3] = 1.f;
+				identity.scale[0] = 1.f; identity.scale[1] = 1.f;
+				identity.scale[2] = 1.f; identity.scale[3] = 0.f;
+				outputPose[idx] = identity;
+			} else {
+				auto fIt = state.frozenByName.find(name);
+				if (fIt == state.frozenByName.end()) continue;
+				LerpTransform(outputPose[idx], fIt->second, weight);
 			}
 			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}

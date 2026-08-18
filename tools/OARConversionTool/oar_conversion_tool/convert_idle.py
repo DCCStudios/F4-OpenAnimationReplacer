@@ -80,7 +80,7 @@ def plan_idle_empty(
     bones: list[str] | None = None,
     equipped: dict[str, str] | list[dict[str, str]] | None = None,
     author: str = "",
-    deactivation_delay: float = 0.1,
+    deactivation_delay: float = 0.2,
 ) -> ConversionPlan:
     """Plan Idle Empty outputs for selected anim roots.
 

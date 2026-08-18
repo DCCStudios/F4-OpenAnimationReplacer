@@ -41,6 +41,33 @@ Data/Meshes/Actors/Character/Animations/
 - Priority lives in the SubMod’s `config.json`, not the folder name.
 - Conditions decide *when*; the path decides *which* animation.
 
+### The two mistakes that fail silently
+
+The structure is always exactly **four levels**:
+`OpenAnimationReplacer / Mod / SubMod / mirrored path`. Get a level wrong and
+everything loads without errors — and never applies.
+
+1. **One level too shallow.** If the game plays
+   `...\Animations\F4Parkour\Vault.hkx`, your file must be at
+   `<SubMod>\F4Parkour\Vault.hkx` — with the `F4Parkour` folder *inside* the
+   SubMod. Skip a level and the file registers as plain `vault`, which matches
+   nothing.
+
+2. **Behavior config at the Mod level.** The Mod `config.json` is only read
+   for `name` / `author` / `description`. Conditions, priority, trackFilter —
+   everything else there is silently ignored. All behavior goes in the
+   **SubMod's** `config.json`.
+
+**Verify:** set `bVerboseLogging=1` in `OpenAnimationReplacer.ini` and find
+your suffix in the log:
+
+```
+[OAR] NameLookup: suffix='f4parkour\vault' -> ... (1 candidates)
+```
+
+Wrong suffix = files at the wrong depth. No line = folder never discovered
+(must be named exactly `OpenAnimationReplacer`, inside an `Animations` tree).
+
 ### Matching (short version)
 
 1. **Default:** exact path match after `Animations\` (`bDirectPathMatching=1`).

@@ -260,28 +260,54 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 
 	auto& entry = *selected;
 
-	// If clone exists but was built from a DIFFERENT game animation, the game reloaded
-	// animations (weapon switch). Rebuild from fresh data to avoid stale struct fields.
-	if (entry.runtimeAnimation && entry.gameOriginal != a_gameAnim && a_gameAnim != nullptr) {
-		logger::info("[OAR-Cache] Game animation changed for '{}': old={:X} new={:X} — rebuilding clone (old buffer retired)",
-			a_suffix, reinterpret_cast<uintptr_t>(entry.gameOriginal),
-			reinterpret_cast<uintptr_t>(a_gameAnim));
-		// Retire (don't clear) — another still-active clip may reference the
-		// old clone; rebuilding in place would zero its vtable mid-generate.
-		RetireCloneLocked(entry, /*a_retireBackingData=*/false, a_suffix);
+	// One clone per distinct game original (see RuntimeClone in the header):
+	// a Leaf Matching file serves several originals AT THE SAME TIME (both
+	// perspective graphs, multiple weapons), and per-frame callers alternate
+	// originals — the old one-clone-per-entry rebuild would thrash every frame.
+	if (a_gameAnim) {
+		for (size_t i = 0; i < entry.clones.size(); ++i) {
+			auto& rc = entry.clones[i];
+			if (rc.gameOriginal != a_gameAnim) continue;
+			// Address-reuse guard: the engine can free an original and hand the
+			// same address to a different animation (weapon switch). Compare
+			// the original's duration + track count against build time; on
+			// mismatch retire this clone (a clip may still play it) and rebuild.
+			const auto* origBytes = reinterpret_cast<const uint8_t*>(a_gameAnim);
+			const float dur = *reinterpret_cast<const float*>(origBytes + 0x14);
+			const int32_t trk = *reinterpret_cast<const int32_t*>(origBytes + 0x18);
+			if (dur == rc.originalDuration && trk == rc.originalNumTracks) {
+				return rc.clone;
+			}
+			logger::info("[OAR-Cache] Original address {:X} reused by a different animation for '{}' (dur {:.3f}->{:.3f} tracks {}->{}) — retiring stale clone",
+				reinterpret_cast<uintptr_t>(a_gameAnim), a_suffix,
+				rc.originalDuration, dur, rc.originalNumTracks, trk);
+			RetireSingleCloneLocked(entry, i, a_suffix);
+			break;
+		}
+	} else if (!entry.clones.empty()) {
+		// Legacy callers pass no original: hand back the freshest clone.
+		return entry.clones.back().clone;
 	}
 
-	if (entry.runtimeAnimation) return entry.runtimeAnimation;
-
 	if (!a_gameAnim || !entry.animation) return nullptr;
+
+	// Bound the per-entry clone set. Path-scoped entries only ever hold one
+	// live clone (weapon switches retire via the address-reuse guard or leave
+	// stale-original clones that simply stop being requested); Leaf Matching
+	// entries hold one per original. Retire the oldest on overflow.
+	static constexpr size_t kMaxClonesPerEntry = 16;
+	while (entry.clones.size() >= kMaxClonesPerEntry) {
+		RetireSingleCloneLocked(entry, 0, a_suffix);
+	}
 
 	// Clone the game's animation struct (guaranteed correct layout) then patch data pointers.
 	// Use 0x100 bytes to cover the full hkaSplineCompressedAnimation struct with margin.
 	static constexpr size_t kStructSize = 0x100;
-	entry.runtimeStruct.resize(kStructSize + 16, 0);
+	CachedAnimation::RuntimeClone newClone;
+	newClone.structBuffer.resize(kStructSize + 16, 0);
 
 	// Ensure 16-byte alignment for SIMD
-	uintptr_t rawAddr = reinterpret_cast<uintptr_t>(entry.runtimeStruct.data());
+	uintptr_t rawAddr = reinterpret_cast<uintptr_t>(newClone.structBuffer.data());
 	uintptr_t aligned = (rawAddr + 15) & ~uintptr_t(15);
 	uint8_t* cloneBase = reinterpret_cast<uint8_t*>(aligned);
 
@@ -407,14 +433,20 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	// uncharted territory in the struct — zero it all to be safe.
 	std::memset(cloneBase + 0xA8, 0, kStructSize - 0xA8);
 
-	entry.runtimeAnimation = reinterpret_cast<RE::hkaAnimation*>(cloneBase);
-	entry.gameOriginal = a_gameAnim;
+	newClone.clone = reinterpret_cast<RE::hkaAnimation*>(cloneBase);
+	newClone.gameOriginal = a_gameAnim;
+	{
+		const auto* origBytes = reinterpret_cast<const uint8_t*>(a_gameAnim);
+		newClone.originalDuration = *reinterpret_cast<const float*>(origBytes + 0x14);
+		newClone.originalNumTracks = *reinterpret_cast<const int32_t*>(origBytes + 0x18);
+	}
+	entry.clones.push_back(std::move(newClone));
 
-	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}'",
+	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}' ({} clone(s) live)",
 		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim),
-		entry.filePath);
+		entry.filePath, entry.clones.size());
 
-	return entry.runtimeAnimation;
+	return entry.clones.back().clone;
 }
 
 const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotations(const std::string& a_suffix,
@@ -428,6 +460,25 @@ const std::vector<AnimationCache::ParsedAnnotation>* AnimationCache::GetAnnotati
 		return &entry->annotations;
 	}
 	return nullptr;
+}
+
+bool AnimationCache::GetDonorTrackMap(const std::string& a_suffix, const void* a_owner,
+	std::vector<int16_t>& a_outMap, bool& a_outIdentity) const
+{
+	std::shared_lock lock(m_mutex);
+	auto* entry = SelectEntry(a_suffix, a_owner);
+	if (!entry) return false;
+	if (!entry->trackToBoneIndices.empty()) {
+		a_outMap = entry->trackToBoneIndices;
+		a_outIdentity = false;
+		return true;
+	}
+	if (entry->bindingIdentity) {
+		a_outMap.clear();
+		a_outIdentity = true;
+		return true;
+	}
+	return false;
 }
 
 size_t AnimationCache::GetCacheSize() const
@@ -446,7 +497,10 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 	std::shared_lock lock(m_mutex);
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (entry && entry->runtimeAnimation == a_anim) return true;
+			if (!entry) continue;
+			for (auto& rc : entry->clones) {
+				if (rc.clone == a_anim) return true;
+			}
 		}
 	}
 	// Retired clones are still "ours": a clip that held a clone across an
@@ -467,10 +521,13 @@ bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::strin
 	// Live entries first: the clip is still playing a current clone.
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (entry && entry->runtimeAnimation == a_anim) {
-				a_outSuffix = key;
-				a_outOwner = entry->owner;
-				return true;
+			if (!entry) continue;
+			for (auto& rc : entry->clones) {
+				if (rc.clone == a_anim) {
+					a_outSuffix = key;
+					a_outOwner = entry->owner;
+					return true;
+				}
 			}
 		}
 	}
@@ -493,7 +550,8 @@ RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_
 	auto it = m_cache.find(a_suffix);
 	if (it == m_cache.end()) return nullptr;
 	for (auto& entry : it->second) {
-		if (entry && entry->gameOriginal) return entry->gameOriginal;
+		// Clones append in build order, so the back is the freshest original.
+		if (entry && !entry->clones.empty()) return entry->clones.back().gameOriginal;
 	}
 	return nullptr;
 }
@@ -504,45 +562,65 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 	std::shared_lock lock(m_mutex);
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (entry && entry->runtimeAnimation == a_replacement && entry->gameOriginal) {
-				return entry->gameOriginal;
+			if (!entry) continue;
+			for (auto& rc : entry->clones) {
+				// The recorded original may be stale (freed on weapon switch
+				// while the clone stays live for other originals) — callers
+				// already validate the returned pointer before use.
+				if (rc.clone == a_replacement && rc.gameOriginal) {
+					return rc.gameOriginal;
+				}
 			}
 		}
 	}
 	return nullptr;
 }
 
-void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData,
+void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_index,
 	const std::string& a_suffix)
 {
-	// See header comment: the buffer must survive intact because active clips
-	// may still hold a pointer into it. Move it to the keep-alive list instead
-	// of clearing it in place. When the entry itself is going away
-	// (a_retireBackingData), its fileData must be kept alive too — even if the
-	// entry has no CURRENT clone, clones retired on earlier invalidations
-	// still point into that buffer.
-	const bool retireData = a_retireBackingData && !a_entry.fileData.empty();
-	if (!a_entry.runtimeStruct.empty() || retireData) {
+	if (a_index >= a_entry.clones.size()) return;
+	auto& rc = a_entry.clones[a_index];
+	if (!rc.structBuffer.empty()) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
 		RetiredClone rec;
-		rec.buffer = std::move(a_entry.runtimeStruct);
-		rec.clonePtr = a_entry.runtimeAnimation;
+		rec.buffer = std::move(rc.structBuffer);
+		rec.clonePtr = rc.clone;
 		rec.suffix = a_suffix;
 		rec.owner = a_entry.owner;
-		if (retireData) {
-			rec.backingFileData = std::move(a_entry.fileData);
-			a_entry.fileData = std::vector<uint8_t>{};
-		}
 		m_retiredClones.push_back(std::move(rec));
 	}
-	// Guarantee the entry gets a FRESH allocation on next build (moved-from
-	// vector state is unspecified; assign a new empty one explicitly).
-	a_entry.runtimeStruct = std::vector<uint8_t>{};
-	a_entry.runtimeAnimation = nullptr;
-	a_entry.gameOriginal = nullptr;
+	a_entry.clones.erase(a_entry.clones.begin() + a_index);
+}
+
+void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData,
+	const std::string& a_suffix)
+{
+	// See header comment: the buffers must survive intact because active clips
+	// may still hold pointers into them. Move every clone to the keep-alive
+	// list instead of clearing in place. When the entry itself is going away
+	// (a_retireBackingData), its fileData must be kept alive too — even if the
+	// entry has no CURRENT clone, clones retired on earlier invalidations
+	// still point into that buffer.
+	while (!a_entry.clones.empty()) {
+		RetireSingleCloneLocked(a_entry, a_entry.clones.size() - 1, a_suffix);
+	}
+	const bool retireData = a_retireBackingData && !a_entry.fileData.empty();
+	if (retireData) {
+		constexpr size_t kMaxRetiredClones = 256;
+		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			m_retiredClones.erase(m_retiredClones.begin());
+		}
+		RetiredClone rec;
+		rec.suffix = a_suffix;
+		rec.owner = a_entry.owner;
+		rec.backingFileData = std::move(a_entry.fileData);
+		a_entry.fileData = std::vector<uint8_t>{};
+		m_retiredClones.push_back(std::move(rec));
+	}
 }
 
 void AnimationCache::MarkAllForRebind()
@@ -581,9 +659,9 @@ void AnimationCache::InvalidateRuntimeClones()
 	int count = 0;
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (entry && entry->runtimeAnimation) {
+			if (entry && !entry->clones.empty()) {
+				count += static_cast<int>(entry->clones.size());
 				RetireCloneLocked(*entry, /*a_retireBackingData=*/false, key);
-				count++;
 			}
 		}
 	}
@@ -833,6 +911,45 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
 	}
 
+	// Locate the file's hkaAnimationBinding to capture the DONOR'S OWN
+	// track->bone map. The binding holds a fixed-up pointer to the animation
+	// at +0x18 (hkReferencedObject 0x10 + originalSkeletonName 0x08), with
+	// transformTrackToBoneIndices as an hkArray<int16> at +0x20/+0x28. Scan
+	// the payload for the animation pointer and validate the surrounding
+	// struct. Required for Leaf Matching: the donor gets sampled under OTHER
+	// weapons' clips whose bindings describe a different track layout.
+	auto captureBinding = [&](uintptr_t a_animAddr) {
+		for (size_t off = 0x18; off + 8 <= sectionSize; off += 8) {
+			if (*reinterpret_cast<uintptr_t*>(sectionData + off) != a_animAddr) continue;
+			uint8_t* base = sectionData + (off - 0x18);
+			const auto arrPtr = *reinterpret_cast<uintptr_t*>(base + 0x20);
+			const auto arrSize = *reinterpret_cast<int32_t*>(base + 0x28);
+			if (arrSize == 0) {
+				// Empty index array = Havok identity mapping (track i -> bone i).
+				a_entry.bindingIdentity = true;
+				return true;
+			}
+			if (arrSize < 0 || arrSize > 4096) continue;
+			// The map covers exactly the animation's transform tracks.
+			if (arrSize != a_entry.numTransformTracks) continue;
+			const auto secBase = reinterpret_cast<uintptr_t>(sectionData);
+			if (arrPtr < secBase || arrPtr + arrSize * sizeof(int16_t) > secBase + sectionSize) continue;
+			const auto* vals = reinterpret_cast<const int16_t*>(arrPtr);
+			bool sane = true;
+			for (int32_t i = 0; i < arrSize; ++i) {
+				if (vals[i] < -1 || vals[i] >= 4096) { sane = false; break; }
+			}
+			if (!sane) continue;
+			a_entry.trackToBoneIndices.assign(vals, vals + arrSize);
+			if (verbose) {
+				logger::info("[OAR-Cache]   Binding found at 0x{:X}: {} track->bone indices",
+					off - 0x18, arrSize);
+			}
+			return true;
+		}
+		return false;
+	};
+
 	// Now find the animation object - should be at contentsSectionOffset within the payload
 	uint32_t rootOffset = header->contentsSectionOffset;
 	if (rootOffset < sectionSize) {
@@ -844,6 +961,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			a_entry.duration = candidate->duration;
 			a_entry.numTransformTracks = candidate->numberOfTransformTracks;
 			a_entry.numFloatTracks = candidate->numberOfFloatTracks;
+			captureBinding(reinterpret_cast<uintptr_t>(candidate));
 
 			auto* bytes = reinterpret_cast<uint8_t*>(candidate);
 			if (verbose) {
@@ -874,6 +992,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			a_entry.duration = anim->duration;
 			a_entry.numTransformTracks = anim->numberOfTransformTracks;
 			a_entry.numFloatTracks = anim->numberOfFloatTracks;
+			captureBinding(reinterpret_cast<uintptr_t>(anim));
 			ComputeSplineOffsets(reinterpret_cast<uint8_t*>(anim), a_entry);
 			return true;
 		}
@@ -902,6 +1021,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 				logger::info("[OAR-Cache]   Found animation (heuristic) at 0x{:X}: type={}, dur={:.3f}, tracks={}",
 					off, type, dur, tracks);
 			}
+			captureBinding(reinterpret_cast<uintptr_t>(bytes));
 
 			// Compute missing m_transformOffsets if the HKX didn't serialize them
 			ComputeSplineOffsets(bytes, a_entry);

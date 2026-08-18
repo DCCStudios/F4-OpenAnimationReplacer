@@ -537,6 +537,8 @@ namespace Parsing
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
 		if (json.contains("endClipIfShorter"))
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
+		if (json.contains("leafMatching"))
+			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
 			a_subMod->eventsOnStart = json["eventsOnStart"].get<std::vector<std::string>>();
 		if (json.contains("eventsOnEnd") && json["eventsOnEnd"].is_array())
@@ -612,13 +614,19 @@ namespace Parsing
 					a_subMod->trackFilter.excludeBoneNames.push_back(b.get<std::string>());
 				}
 			}
+			if (tf.contains("freezeBones") && tf["freezeBones"].is_array()) {
+				for (const auto& b : tf["freezeBones"]) {
+					a_subMod->trackFilter.freezeBoneNames.push_back(b.get<std::string>());
+				}
+			}
 			if (a_subMod->trackFilter.enabled) {
-				logger::info("[OAR] SubMod '{}' has trackFilter: mode={} weight={:.2f} bones={} exclude={}",
+				logger::info("[OAR] SubMod '{}' has trackFilter: mode={} weight={:.2f} bones={} exclude={} freeze={}",
 					a_subMod->GetName(),
 					a_subMod->trackFilter.mode == SubMod::TrackFilter::Mode::Override ? "override" : "additive",
 					a_subMod->trackFilter.weight,
 					a_subMod->trackFilter.boneNames.size(),
-					a_subMod->trackFilter.excludeBoneNames.size());
+					a_subMod->trackFilter.excludeBoneNames.size(),
+					a_subMod->trackFilter.freezeBoneNames.size());
 			}
 		}
 	}
@@ -652,6 +660,8 @@ namespace Parsing
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
 		if (json.contains("endClipIfShorter"))
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
+		if (json.contains("leafMatching"))
+			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("blendCurve"))
 			a_subMod->blendCurve = ParseBlendCurve(json["blendCurve"]);
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())

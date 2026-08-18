@@ -287,7 +287,7 @@ def test_idle_empty_design(f: Failures) -> None:
         cfg = json.loads(plan.config_path.read_text(encoding="utf-8"))
         f.check(cfg["trackFilter"]["sampleFrame"] == 0.0, "sampleFrame 0")
         f.check(cfg["trackFilter"]["bones"] == ["WeaponBolt"], "default bone")
-        f.check(abs(cfg["deactivationDelay"] - 0.1) < 1e-6, "deactivationDelay 0.1")
+        f.check(abs(cfg["deactivationDelay"] - 0.2) < 1e-6, "deactivationDelay 0.2")
         f.check(cfg["trackFilter"]["enabled"] is True, "trackFilter on")
         f.check(cfg["trackFilter"]["mode"] == "override", "override mode")
         conds = {c["condition"] for c in cfg["conditions"]}

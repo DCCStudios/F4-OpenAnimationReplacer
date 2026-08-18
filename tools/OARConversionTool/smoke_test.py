@@ -215,7 +215,7 @@ def test_idle_empty(f: Failures) -> None:
         f.check(tf.get("enabled") is True, "trackFilter enabled")
         f.check(tf.get("sampleFrame") == 0.0, "sampleFrame 0")
         f.check(tf.get("bones") == ["WeaponBolt"], "default WeaponBolt bone")
-        f.check(abs(float(cfg.get("deactivationDelay", -1)) - 0.1) < 1e-6, "deactivationDelay 0.1")
+        f.check(abs(float(cfg.get("deactivationDelay", -1)) - 0.2) < 1e-6, "deactivationDelay 0.2")
 
 
 def test_batch_multi_source(f: Failures) -> None:

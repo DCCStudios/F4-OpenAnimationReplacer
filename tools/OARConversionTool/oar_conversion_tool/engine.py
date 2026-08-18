@@ -51,7 +51,7 @@ class JobOptions:
     description: str = ""
     priority: int = 3000
     idle_bones: list[str] = field(default_factory=lambda: ["WeaponBolt"])
-    deactivation_delay: float = 0.1
+    deactivation_delay: float = 0.2
 
     equipped_form_id: str | None = None  # e.g. "0x2E1F"
     equipped_plugin: str | None = None

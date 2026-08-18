@@ -73,6 +73,8 @@ public:
 	void SetPlayOnceFullBody(bool a_val) { playOnceFullBody = a_val; }
 	bool GetEndClipIfShorter() const { return endClipIfShorter; }
 	void SetEndClipIfShorter(bool a_val) { endClipIfShorter = a_val; }
+	bool GetLeafMatching() const { return leafMatching; }
+	void SetLeafMatching(bool a_val) { leafMatching = a_val; }
 	const std::string& GetRequiredProjectName() const { return requiredProjectName; }
 	const std::string& GetOverrideAnimFolder() const { return overrideAnimationsFolder; }
 	const std::filesystem::path& GetPath() const { return path; }
@@ -133,6 +135,14 @@ public:
 	// clip ends when the replacement ends — as if the original were that length.
 	// No original tail, no held frame.
 	bool endClipIfShorter{ false };
+	// Leaf matching: this submod's animations match by FILENAME alone. A
+	// wpnmelee.hkx here replaces ANY clip whose animation file is named
+	// wpnmelee.hkx, whatever folder it lives in — and it outranks exact-path
+	// registrations (including direct-path resolved clips) whenever its
+	// conditions pass. When they fail, normal path matching proceeds
+	// untouched. Intended to be gated with conditions; without any, it
+	// replaces every clip sharing the filename.
+	bool leafMatching{ false };
 	std::string requiredProjectName;
 	std::string overrideAnimationsFolder;
 	std::filesystem::path path;
@@ -185,6 +195,15 @@ public:
 		// Exclude list: bones matching here are removed from the final resolved set
 		bool excludeChildren = true;
 		std::vector<std::string> excludeBoneNames;
+		// Freeze list: these bones (and their children) are driven by NEITHER
+		// the donor NOR the underlying animation while the overlay is active.
+		// Each holds the local transform it had when the overlay started
+		// (captured from the source clip, so there is no pop), released
+		// through the normal blend-out. Exclusion alone means "the underlying
+		// animation keeps driving the bone" - for a weapon gripped by
+		// donor-driven hands that plays each weapon's native swing under the
+		// overlay; freezing pins the grip instead.
+		std::vector<std::string> freezeBoneNames;
 		std::atomic<uint64_t> version{ 1 };
 		std::mutex boneMutex;
 	};

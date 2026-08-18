@@ -120,7 +120,7 @@ def idle_empty_config(
     priority: int = 3000,
     bones: list[str] | None = None,
     equipped: dict[str, str] | list[dict[str, str]] | None = None,
-    deactivation_delay: float = 0.1,
+    deactivation_delay: float = 0.2,
 ) -> dict[str, Any]:
     """Sig/P890-style Idle Empty with sampleFrame 0 and deactivationDelay."""
     if bones is None:

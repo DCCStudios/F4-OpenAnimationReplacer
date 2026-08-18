@@ -579,6 +579,26 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"No original tail, no held frame. Applies to full-body and track-filtered\n"
 			"replacements; no effect when the replacement is equal length or longer.");
 
+		bool leafMatch = a_subMod->GetLeafMatching();
+		if (ImGui::Checkbox("Match By Filename (Leaf Matching) (?)", &leafMatch)) {
+			a_subMod->SetLeafMatching(leafMatch);
+			a_subMod->SetDirty(true);
+			// Membership + probe order live in the leaf lookup tables — queue the
+			// game-thread rebuild so the toggle applies immediately (same path as
+			// a priority edit).
+			RequestLookupResort();
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			"Match this submod's animations by FILENAME alone, ignoring the folder\n"
+			"path. A wpnmelee.hkx in this submod replaces ANY clip whose animation\n"
+			"file is named wpnmelee.hkx — every weapon, every path — and it WINS\n"
+			"over submods that registered the exact path, whenever this submod's\n"
+			"conditions pass. When they fail, normal path matching applies as usual.\n\n"
+			"Use this to cover a whole family of per-weapon animation files with one\n"
+			"submod instead of mirroring every weapon's folder. Gate it with\n"
+			"conditions — with no conditions it replaces every clip that shares the\n"
+			"filename.");
+
 		// Custom blend times
 		float blendInterrupt = a_subMod->GetCustomBlendTimeOnInterrupt();
 		ImGui::SetNextItemWidth(80);
@@ -917,6 +937,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["playOnceFullBody"] = true;
 			if (a_subMod->GetEndClipIfShorter())
 				json["endClipIfShorter"] = true;
+			if (a_subMod->GetLeafMatching())
+				json["leafMatching"] = true;
 			if (!a_subMod->eventsOnStart.empty())
 				json["eventsOnStart"] = a_subMod->eventsOnStart;
 			if (!a_subMod->eventsOnEnd.empty())
@@ -937,6 +959,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["bones"] = tf.boneNames;
 				tfJson["excludeChildren"] = tf.excludeChildren;
 				tfJson["excludeBones"] = tf.excludeBoneNames;
+				tfJson["freezeBones"] = tf.freezeBoneNames;
 				json["trackFilter"] = tfJson;
 			}
 
@@ -1005,12 +1028,20 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 
 void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_depth)
 {
-	if (!a_condSet || a_condSet->IsEmpty()) {
-		UICommon::TextUnformattedDisabled("No conditions (always matches)");
-		return;
-	}
+	if (!a_condSet) return;
 
 	bool editable = currentMode != UICommon::EditorMode::kInspect;
+
+	if (a_condSet->IsEmpty()) {
+		UICommon::TextUnformattedDisabled("No conditions (always matches)");
+		// Do NOT return in edit mode: the "Add new condition" button below is
+		// the only way to put the FIRST child into an OR/AND/XOR/TARGET/PLAYER
+		// set — returning here made freshly-added composites impossible to
+		// fill from the UI.
+		if (!editable) {
+			return;
+		}
+	}
 
 	ImDrawList* drawList = ImGui::GetWindowDrawList();
 	const ImGuiStyle& style = ImGui::GetStyle();
@@ -1129,9 +1160,23 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 	bool hasValue = a_condition->lastEvalResult.has_value();
 	bool evalResult = a_condition->lastEvalResult.value_or(false);
 
-	auto* orCond = dynamic_cast<ORCondition*>(a_condition);
-	auto* andCond = dynamic_cast<ANDCondition*>(a_condition);
-	bool hasChildren = orCond || andCond;
+	// Every composite condition type that owns a child ConditionSet. XOR and
+	// the TARGET/PLAYER context wrappers were missing here — their children
+	// were invisible in the UI (and could never be added), even though parsing
+	// and evaluation handled them fine.
+	ConditionSet* childSet = nullptr;
+	if (auto* orCond = dynamic_cast<ORCondition*>(a_condition)) {
+		childSet = &orCond->GetConditionSet();
+	} else if (auto* andCond = dynamic_cast<ANDCondition*>(a_condition)) {
+		childSet = &andCond->GetConditionSet();
+	} else if (auto* xorCond = dynamic_cast<XORCondition*>(a_condition)) {
+		childSet = &xorCond->GetConditionSet();
+	} else if (auto* targetWrap = dynamic_cast<TargetConditionWrapper*>(a_condition)) {
+		childSet = &targetWrap->GetConditionSet();
+	} else if (auto* playerWrap = dynamic_cast<PlayerConditionWrapper*>(a_condition)) {
+		childSet = &playerWrap->GetConditionSet();
+	}
+	bool hasChildren = childSet != nullptr;
 
 	std::string condName = a_condition->GetName();
 	if (isNegated) condName = "NOT " + condName;
@@ -1277,16 +1322,10 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 			}
 
 			if (!deletedViaButton) {
-				if (hasChildren) {
-					if (orCond) {
-						ImGui::Indent();
-						DrawConditionSet(&orCond->GetConditionSet(), a_subMod, a_depth + 1);
-						ImGui::Unindent();
-					} else if (andCond) {
-						ImGui::Indent();
-						DrawConditionSet(&andCond->GetConditionSet(), a_subMod, a_depth + 1);
-						ImGui::Unindent();
-					}
+				if (childSet) {
+					ImGui::Indent();
+					DrawConditionSet(childSet, a_subMod, a_depth + 1);
+					ImGui::Unindent();
 				}
 
 				if (editable) {
@@ -1724,6 +1763,124 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				}
 				ImGui::EndPopup();
 			}
+
+			// ---- Freeze Bones ----
+			ImGui::Spacing();
+			ImGui::Separator();
+
+			std::vector<std::string> freezeSnapshot;
+			{
+				std::lock_guard lock(tf.boneMutex);
+				freezeSnapshot = tf.freezeBoneNames;
+			}
+
+			ImGui::TextColored(UICommon::Colors::AccentBlue, "Frozen Bones (%zu)", freezeSnapshot.size());
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Bones listed here (with their children) are driven by NEITHER\n"
+					"the replacement NOR the underlying animation while this filter\n"
+					"is active: each holds the pose it had when the overlay started,\n"
+					"and releases through the normal blend-out.\n\n"
+					"Excluding a bone leaves the underlying animation driving it -\n"
+					"a weapon gripped by replacement-driven hands would still play\n"
+					"each weapon's own swing. Freezing pins the grip instead.");
+			}
+			ImGui::Spacing();
+
+			int frzRemoveIdx = -1;
+			for (int i = 0; i < static_cast<int>(freezeSnapshot.size()); ++i) {
+				ImGui::PushID(2000 + i);
+				ImGui::BulletText("%s", freezeSnapshot[i].c_str());
+				ImGui::SameLine();
+				if (ImGui::SmallButton("X##removeFrzBone")) {
+					frzRemoveIdx = i;
+				}
+				ImGui::SameLine();
+				DrawBoneDebugButtons(freezeSnapshot[i]);
+				ImGui::PopID();
+			}
+			if (frzRemoveIdx >= 0) {
+				std::lock_guard lock(tf.boneMutex);
+				if (frzRemoveIdx < static_cast<int>(tf.freezeBoneNames.size())) {
+					tf.freezeBoneNames.erase(tf.freezeBoneNames.begin() + frzRemoveIdx);
+				}
+				tf.version.fetch_add(1, std::memory_order_relaxed);
+				a_subMod->SetDirty(true);
+			}
+
+			ImGui::Spacing();
+
+			if (ImGui::Button("Add Freeze...")) {
+				ImGui::OpenPopup("AddFrzBonePopup");
+			}
+			ImGui::SameLine();
+
+			static char customFrzBoneName[128]{};
+			ImGui::SetNextItemWidth(160);
+			ImGui::InputTextWithHint("##customFrzBone", "Custom bone name", customFrzBoneName, sizeof(customFrzBoneName));
+			ImGui::SameLine();
+			bool canAddFrzCustom = customFrzBoneName[0] != '\0';
+			if (!canAddFrzCustom) ImGui::BeginDisabled();
+			if (ImGui::Button("Add Custom##frz")) {
+				std::lock_guard lock(tf.boneMutex);
+				bool alreadyExists = false;
+				for (auto& name : tf.freezeBoneNames) {
+					if (name == customFrzBoneName) { alreadyExists = true; break; }
+				}
+				if (!alreadyExists) {
+					tf.freezeBoneNames.emplace_back(customFrzBoneName);
+					tf.version.fetch_add(1, std::memory_order_relaxed);
+					a_subMod->SetDirty(true);
+				}
+				customFrzBoneName[0] = '\0';
+			}
+			if (!canAddFrzCustom) ImGui::EndDisabled();
+
+			if (ImGui::BeginPopup("AddFrzBonePopup")) {
+				static char frzBoneFilter[64]{};
+				ImGui::InputTextWithHint("##frzBoneSearch", "Search or type a bone name...", frzBoneFilter, sizeof(frzBoneFilter));
+				ImGui::Separator();
+
+				if (frzBoneFilter[0] != '\0') {
+					bool exactKnown = false;
+					for (const char* bone : kKnownBones) {
+						if (_stricmp(bone, frzBoneFilter) == 0) { exactKnown = true; break; }
+					}
+					bool alreadyAdded = false;
+					for (const auto& name : freezeSnapshot) {
+						if (name == frzBoneFilter) { alreadyAdded = true; break; }
+					}
+					if (!exactKnown && !alreadyAdded) {
+						std::string typedLabel = std::string("Add typed name: \"") + frzBoneFilter + "\"";
+						if (ImGui::MenuItem(typedLabel.c_str())) {
+							std::lock_guard lock(tf.boneMutex);
+							tf.freezeBoneNames.emplace_back(frzBoneFilter);
+							tf.version.fetch_add(1, std::memory_order_relaxed);
+							a_subMod->SetDirty(true);
+							frzBoneFilter[0] = '\0';
+						}
+					}
+				}
+
+				for (const char* bone : kKnownBones) {
+					if (frzBoneFilter[0] != '\0' && !UICommon::FuzzyMatch(frzBoneFilter, bone)) continue;
+
+					bool alreadyAdded = false;
+					for (const auto& name : freezeSnapshot) {
+						if (name == bone) { alreadyAdded = true; break; }
+					}
+
+					if (alreadyAdded) {
+						ImGui::TextDisabled("  %s (already added)", bone);
+					} else if (ImGui::MenuItem(bone)) {
+						std::lock_guard lock(tf.boneMutex);
+						tf.freezeBoneNames.emplace_back(bone);
+						tf.version.fetch_add(1, std::memory_order_relaxed);
+						a_subMod->SetDirty(true);
+					}
+				}
+				ImGui::EndPopup();
+			}
 		}
 	} else {
 		ImGui::Text("Enabled: %s", tf.enabled ? "Yes" : "No");
@@ -1903,6 +2060,13 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 			for (auto* anim : anims) {
 				if (!anim || !anim->HasVariants()) continue;
 
+				// Several variant GROUPS can coexist in one submod (one per
+				// replaced original), and their variant files share names
+				// ("wpnmelee.hkx", "wpnmelee_1.hkx") and indices — so the
+				// label alone collides across groups ("3 visible items with
+				// conflicting ID"). Scope each group's IDs by its animation.
+				ImGui::PushID(anim);
+
 				auto* variants = anim->GetVariants();
 				auto& entries = variants->GetEntriesMutable();
 
@@ -1921,6 +2085,8 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 						ImGui::Text("%s: %.2f", ve.filename.c_str(), ve.weight);
 					}
 				}
+
+				ImGui::PopID();
 			}
 		}
 		} // end variantsEnabled

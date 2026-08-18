@@ -212,19 +212,67 @@ A flat `WPNReload.hkx` in the SubMod root only matches clips directly under
 
 OAR looks for folders named `OpenAnimationReplacer` under `Data/Meshes/`.
 
+**The structure is always exactly four levels — no more, no less:**
+
+```
+OpenAnimationReplacer / <Replacer Mod> / <SubMod> / <mirrored path to .hkx>
+```
+
 ```
 Data/Meshes/Actors/Character/_1stPerson/Animations/   ← note the underscore
 └── OpenAnimationReplacer/
     └── SCAR OAR Test/                 ← Replacer Mod (any name)
-        ├── config.json                ← optional pack metadata
+        ├── config.json                ← optional pack metadata: name/author/description ONLY
         └── SCAR Reload Test/          ← SubMod (any name)
-            ├── config.json            ← conditions, priority, …
+            ├── config.json            ← ALL behavior lives here: conditions, priority, …
             ├── user.json              ← optional player overrides
             └── SCAR/                  ← mirrors ...\Animations\SCAR\
                 ├── WPNReload.hkx
                 ├── WPNReload_1.hkx
                 └── …
 ```
+
+### The two silent structure mistakes
+
+Both of these load without any error and simply don't work. Check for them
+first whenever a SubMod "does nothing".
+
+**Mistake 1 — one level too shallow.** If your `.hkx` sits directly in the
+SubMod folder but the game's animation lives in a subfolder, the file registers
+under the wrong path and never matches:
+
+```
+WRONG (3 levels)                            RIGHT (4 levels)
+OpenAnimationReplacer/                      OpenAnimationReplacer/
+└── My Pack/            ← parsed as MOD     └── My Pack/           ← Replacer Mod
+    ├── config.json     ← read as MOD           └── My SubMod/     ← SubMod
+    │                     config: behavior          ├── config.json
+    │                     settings IGNORED          └── F4Parkour/  ← mirrors path
+    └── F4Parkour/      ← parsed as SUBMOD             └── Vault.hkx
+        └── Vault.hkx   ← registers as
+                          "vault", not
+                          "f4parkour\vault"
+```
+
+In the WRONG tree, `Vault.hkx`'s path *relative to its SubMod* is just
+`Vault.hkx` — so it targets `...\Animations\Vault.hkx` (which doesn't exist)
+instead of `...\Animations\F4Parkour\Vault.hkx`.
+
+**Mistake 2 — behavior config at the Mod level.** The Replacer Mod
+`config.json` is read for **`name`, `author`, `description` — nothing else**.
+Conditions, `priority`, `trackFilter`, and every other setting placed there are
+silently discarded. All behavior belongs in the **SubMod's** `config.json`.
+
+**How to verify your structure loaded correctly:** set `bVerboseLogging=1` in
+`OpenAnimationReplacer.ini` and check the log for your suffix:
+
+```
+[OAR] NameLookup: suffix='f4parkour\vault' -> 'Animations\F4Parkour\Vault.hkx' (1 candidates)
+```
+
+Wrong suffix (e.g. `suffix='vault'`) means your files are at the wrong depth.
+No line at all means the folder was never discovered (name must be exactly
+`OpenAnimationReplacer`, placed inside an `Animations` tree).
 
 ### Matching rules
 
@@ -309,8 +357,9 @@ OAR also scans `Actors/<race>/Character/Animations/` and, if needed, all of `Dat
     "weight": 1.0,
     "blendInTime": 0.15,
     "blendOutTime": 0.15,
-    "boneNames": ["LArm_Collarbone", "RArm_Collarbone"],
-    "excludeBoneNames": []
+    "bones": ["LArm_Collarbone", "RArm_Collarbone"],
+    "excludeBones": [],
+    "freezeBones": ["Weapon"]
   },
   "eventsOnStart": [],
   "eventsOnEnd": ["ReloadComplete"]
@@ -330,6 +379,7 @@ OAR also scans `Actors/<race>/Character/Animations/` and, if needed, all of `Dat
 | `replaceAnnotations` | bool | true | Use the replacement `.hkx`'s annotations (sounds, WeaponFire, CullBone, etc.). Behavior-authored triggers (weapon attach on equip, state-machine transitions) stay installed and fire natively; only annotation-derived triggers are filtered out. OAR then fires the replacement's annotations manually |
 | `suppressAnnotations` | bool or string[] | -- | `true` mutes ALL of the replacement file's annotations; an array (e.g. `["WeaponFire", "SoundPlay.WPNRifleFire"]`) mutes only those, case-insensitive. Needs `replaceAnnotations: true`. Use for dry-fire/silent replacements whose source `.hkx` still carries annotations |
 | `playOnceFullBody` | bool | false | Keep vanilla triggers until anim completes (state machine exit). Prefer this for clips whose behavior graph needs its own exit signal |
+| `leafMatching` | bool | false | Match by **filename alone**, ignoring the folder path — and **outrank** exact-path submods whenever this submod's conditions pass. One `wpnmelee.hkx` here covers *every* weapon's `WPNMelee` clip, so a single conditioned submod replaces what would otherwise need a mirrored submod per weapon folder. When conditions fail, normal path matching applies untouched. Gate it with conditions: unconditioned, it claims every clip sharing the filename |
 | `deactivationDelay` | float | 0 | Seconds to hold replacement after conditions fail |
 | `conditions` | array | `[]` | AND list; empty = always match |
 | `variants` | object | -- | Variant selection settings (see below) |
@@ -497,8 +547,10 @@ flowchart TB
 ```
 
 - Does **not** swap `animSlot`; samples the replacement per filtered bone.
-- `trackFilter.boneNames` -- bones to override or additively blend.
-- `blendInTime` / `blendOutTime` -- alpha ramp when conditions toggle.
+- `trackFilter.bones`: bones to override or additively blend.
+- `trackFilter.excludeBones`: removed from the filtered set; the underlying animation keeps driving them.
+- `trackFilter.freezeBones`: driven by neither the replacement nor the underlying animation. Each (with its children) holds the pose it had when the overlay started and releases through the normal blend-out. Use for a weapon gripped by replacement-driven hands: excluding it would let each weapon's own animation keep swinging it, freezing pins the grip.
+- `blendInTime` / `blendOutTime`: alpha ramp when conditions toggle.
 - `localTime` is wrapped to the replacement duration when sampling (different-length clips).
 
 | `trackFilter.mode` | Effect |
@@ -1042,6 +1094,7 @@ Dependencies are declared in `vcpkg.json` (e.g. `spdlog`, `nlohmann-json`, `imgu
 
 | Symptom | Things to check |
 |---------|------------------|
+| **SubMod loads silently but never applies (nothing in log)** | Structure is one level too shallow, or behavior config is at the Mod level — see [The two silent structure mistakes](#the-two-silent-structure-mistakes). Verify with `bVerboseLogging=1` and look for `NameLookup: suffix='...'` — the suffix must match the path after `Animations\` |
 | **No replacement in game** | `bEnabled=1`; conditions in log (`OpenAnimationReplacer.log`); priority vs other SubMods; correct `_1stPerson` path; with direct path matching, mirror the path after `Animations\` (use the Animation Log) |
 | **Only one variant plays** | `variants.enabled`; `rerollPolicy`; ensure multiple `_N` files + base exist |
 | **Reload anim cancels mid-play** | Often interruptible SubMod or competing priority; check transition logs |

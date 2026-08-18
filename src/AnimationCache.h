@@ -37,9 +37,39 @@ public:
 
 		std::vector<ParsedAnnotation> annotations;
 
-		std::vector<uint8_t> runtimeStruct;
-		RE::hkaAnimation* runtimeAnimation{ nullptr };
-		RE::hkaAnimation* gameOriginal{ nullptr };
+		// The donor file's OWN track->bone map, from its hkaAnimationBinding
+		// (transformTrackToBoneIndices). Empty vector + bindingIdentity=false
+		// means no binding was found (caller falls back to the host clip's
+		// binding). bindingIdentity=true means the binding was found with an
+		// empty index array — Havok's convention for identity (track i drives
+		// bone i). Needed because a Leaf Matching donor is sampled under OTHER
+		// weapons' clips, whose bindings describe THEIR animations' track
+		// layout, not the donor's — indexing the donor's sampled tracks through
+		// the host mapping stamps wrong data on wrong bones (MCX glitch,
+		// 2026-08-16).
+		std::vector<int16_t> trackToBoneIndices;
+		bool bindingIdentity{ false };
+
+		// One runtime clone per DISTINCT game original this file replaces.
+		// A path-scoped file only ever sees one original (per weapon switch),
+		// but a Leaf Matching file serves every clip sharing its filename —
+		// 1st and 3rd person graphs at once, multiple weapons, NPCs — and a
+		// single-clone entry would retire/rebuild every frame as the callers
+		// alternate originals (each per-frame GetOrBuildRuntimeAnim passes its
+		// own clip's original). Clone structs are ~0x110 bytes; keeping one per
+		// original is cheap and each stays valid for the clips playing it.
+		struct RuntimeClone
+		{
+			std::vector<uint8_t> structBuffer;
+			RE::hkaAnimation* clone{ nullptr };
+			RE::hkaAnimation* gameOriginal{ nullptr };
+			// Identity of the original AT BUILD TIME. The engine can free an
+			// original and reuse its address for a different animation; these
+			// detect the swap so the stale clone is retired and rebuilt.
+			float originalDuration{ 0.f };
+			int32_t originalNumTracks{ 0 };
+		};
+		std::vector<RuntimeClone> clones;
 
 		// Per-file identity: the SubMod that provided this file (opaque tag,
 		// only compared — never dereferenced) and its priority at load time.
@@ -72,6 +102,11 @@ public:
 		const void* a_owner = nullptr);
 	const std::vector<ParsedAnnotation>* GetAnnotations(const std::string& a_suffix,
 		const void* a_owner = nullptr) const;
+	// The donor's own track->bone map (see CachedAnimation::trackToBoneIndices).
+	// Returns true when the file's binding was found; a_outMap empty with
+	// a_outIdentity=true means identity mapping.
+	bool GetDonorTrackMap(const std::string& a_suffix, const void* a_owner,
+		std::vector<int16_t>& a_outMap, bool& a_outIdentity) const;
 	void SetVtableFromGame(uintptr_t a_vtable);
 	uintptr_t GetGameAnimVtable() const { return m_gameAnimVtable.load(); }
 	size_t GetCacheSize() const;
@@ -113,14 +148,20 @@ private:
 	// Caller must hold m_mutex (shared or unique).
 	CachedAnimation* SelectEntry(const std::string& a_suffix, const void* a_owner) const;
 
-	// Move a clone buffer into the keep-alive retirement list and reset the
-	// entry's runtime fields. Caller must hold m_mutex (unique).
+	// Move ONE clone's buffer into the keep-alive retirement list and remove
+	// it from the entry's clone set. Caller must hold m_mutex (unique).
+	void RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_index,
+		const std::string& a_suffix);
+
+	// Retire EVERY clone of the entry into the keep-alive retirement list.
+	// Caller must hold m_mutex (unique).
 	// a_retireBackingData: also move the entry's fileData into the retirement
 	// record. REQUIRED whenever the entry itself is about to be destroyed or
 	// replaced — the clone's spline data pointers target fileData, and clones
 	// retired on EARLIER invalidations still point into it too.
 	//
-	// WHY: active hkbClipGenerators hold a raw pointer into runtimeStruct.
+	// WHY: active hkbClipGenerators hold a raw pointer into a clone's
+	// structBuffer.
 	// Clearing/reusing that buffer while the game's render-job thread is still
 	// generating from it zero-fills the clone's vtable in place -> the game
 	// tail-calls through a null vtable (crash at decompressAnimation,
