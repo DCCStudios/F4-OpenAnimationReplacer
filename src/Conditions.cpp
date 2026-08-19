@@ -674,18 +674,57 @@ bool CurrentMagazineAmmoCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::h
 	if (!a_refr) return false;
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
-	auto* mh = actor->currentProcess->middleHigh;
-	RE::BSAutoLock lock{ mh->equippedItemsLock };
-	for (auto& eq : mh->equippedItems) {
-		if (!eq.data) continue;
-		auto* wd = static_cast<RE::EquippedWeaponData*>(eq.data.get());
-		if (!wd || !wd->ammo) continue;
-		float ammoCount = static_cast<float>(wd->ammoCount);
-		float compareVal = numericValue.GetValue(a_refr);
-		bool result = CompareValues(ammoCount, comparison, compareVal);
-		return result;
+
+	// Graph variable FIRST: EquippedWeaponData::ammoCount lags the final shot —
+	// on a full-auto weapon the empty reload auto-triggers the same instant the
+	// last round fires, and ammoCount still reads non-zero at that instant, so
+	// 'NOT ammo == 0' falsely passed and the tactical-reload replacement won
+	// the empty reload (MP7A2, 2026-08-19). The behavior graph chose the
+	// empty-reload branch at that same instant, so reading the graph's own
+	// ammo variable synchronizes this condition with the engine's animation
+	// choice by construction. Fall back to EquippedWeaponData when the graph
+	// does not expose the variable.
+	float ammoCount = -1.0f;
+	const char* ammoSource = "none";
+	{
+		int32_t graphAmmo = 0;
+		static const RE::BSFixedString kLoadedAmmoVar("LoadedAmmoCount");
+		if (actor->GetGraphVariableImplInt(kLoadedAmmoVar, graphAmmo)) {
+			ammoCount = static_cast<float>(graphAmmo);
+			ammoSource = "graph";
+		}
 	}
-	return false;
+
+	float weaponDataAmmo = -1.0f;
+	{
+		auto* mh = actor->currentProcess->middleHigh;
+		RE::BSAutoLock lock{ mh->equippedItemsLock };
+		for (auto& eq : mh->equippedItems) {
+			if (!eq.data) continue;
+			auto* wd = static_cast<RE::EquippedWeaponData*>(eq.data.get());
+			if (!wd || !wd->ammo) continue;
+			weaponDataAmmo = static_cast<float>(wd->ammoCount);
+			break;
+		}
+	}
+	if (ammoCount < 0.0f) {
+		if (weaponDataAmmo < 0.0f) return false;
+		ammoCount = weaponDataAmmo;
+		ammoSource = "weaponData";
+	}
+
+	// Field-verification diagnostic: a weapon whose graph exposes the variable
+	// but never maintains it shows up here as a persistent divergence.
+	if (weaponDataAmmo >= 0.0f && ammoCount != weaponDataAmmo) {
+		static std::atomic<int> s_ammoDivergeLog{ 0 };
+		if (s_ammoDivergeLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+			logger::info("[OAR-Cond] CurrentMagazineAmmo source divergence: graph={:.0f} weaponData={:.0f} (using {})",
+				ammoCount, weaponDataAmmo, ammoSource);
+		}
+	}
+
+	float compareVal = numericValue.GetValue(a_refr);
+	return CompareValues(ammoCount, comparison, compareVal);
 }
 
 void CurrentMagazineAmmoCondition::InitializeImpl(const nlohmann::json& a_json)

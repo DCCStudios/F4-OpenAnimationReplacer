@@ -626,6 +626,29 @@ Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
 - **Active Replacements** -- debug view of current swaps (includes variant suffix).
 - **Animation Log** -- real-time activate/replace/loop events.
 
+### Creating a config from the UI
+
+A folder placed in the OAR structure with animations but no `config.json` still
+loads: it matches unconditionally and shows under its raw folder name. Such
+folders are marked **(no config)** in the tree, dimmed for mod folders. You can
+formalize one without editing files by hand:
+
+1. Right-click the **(no config)** entry in the Replacer tree.
+2. Choose **Create config.json...**.
+3. Fill in the fields:
+   - SubMod: name (prefilled from the folder), description, priority.
+   - Mod folder: name, author, description.
+4. Click **Create**. A `config.json` is written into that folder and the live
+   entry updates in place; the **(no config)** marker clears.
+5. Edit it like any other submod (conditions, track filter, variants). A
+   freshly created submod config starts with an empty conditions list, so it
+   still matches everything until you add conditions. Switch to **Author** mode
+   and use the save button to write your edits back to `config.json`.
+
+The starter file is minimal (`name`, `description`, `priority`, and an empty
+`conditions` array for a submod; `name`, `author`, `description` for a mod), so
+nothing about the folder's current behavior changes until you edit it.
+
 ---
 
 ## Plugin API (for developers)

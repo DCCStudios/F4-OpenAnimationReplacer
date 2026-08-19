@@ -148,6 +148,12 @@ public:
 	std::filesystem::path path;
 	bool dirty{ false };
 	bool hasUserConfig{ false };
+	// True when a config.json exists on disk for this SubMod folder. A folder
+	// with animations but no config.json still loads (always-matches, folder
+	// name), but shows as "(no config)" in the UI with a "Create config.json"
+	// action to formalize it. Set at parse time; set true after the UI writes
+	// one so the tree stops flagging it without a full reload.
+	bool hasConfig{ false };
 
 	std::unique_ptr<ConditionSet> conditionSet;
 	std::vector<ReplacementAnimation*> replacementAnimations;
@@ -249,6 +255,10 @@ public:
 	std::string author;
 	std::string description;
 	std::filesystem::path path;
+	// True when a config.json exists on disk for this Mod folder (holds only
+	// name/author/description). A folder without one still loads under its
+	// folder name; the UI offers "Create config.json" to name it.
+	bool hasConfig{ false };
 	std::vector<ConditionPreset> conditionPresets;
 	std::vector<std::unique_ptr<SubMod>> subMods;
 };

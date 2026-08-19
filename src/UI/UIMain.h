@@ -66,6 +66,19 @@ private:
 	SubMod* editingDescSubMod{ nullptr };
 	char descEditBuffer[2048]{};
 
+	// "Create config.json" popup state. A folder in the OAR structure with no
+	// config.json still loads (always-matches, folder name); these let the user
+	// formalize it with a name/description/priority, write config.json, and then
+	// edit it like any other submod. One target is non-null at a time.
+	SubMod* creatingConfigSubMod{ nullptr };
+	ReplacerMod* creatingConfigMod{ nullptr };
+	char createNameBuffer[256]{};
+	char createDescBuffer[2048]{};
+	char createAuthorBuffer[256]{};
+	int createPriorityValue{ 0 };
+	void BeginCreateSubModConfig(SubMod* a_subMod);
+	void BeginCreateModConfig(ReplacerMod* a_mod);
+
 	// Last OpenAnimationReplacer::GetModsGeneration() seen; when it changes
 	// (config reload rebuilt all mods) the cached SubMod pointers above are
 	// dropped before drawing (see DrawReplacerModsTab).

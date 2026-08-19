@@ -1758,6 +1758,244 @@ namespace
 		return nullptr;
 	}
 
+	// ===== Vanilla annotation backup ==========================================
+	// Safety net for UN-replaced plays that start while engine-side trigger
+	// state was built against a stale clone. Field-proven failure (MP7A2
+	// 2026-08-19, three builds): the empty reload decides correctly at t=0.000
+	// and plays the vanilla animation, yet its tail sounds never fire — the
+	// play-local trigger data was constructed at _Activate from the 2.292s
+	// clone still parked in the shared binding (9-of-12 array in the field
+	// log), and no post-activation slot restore can bring back triggers the
+	// engine never created for the play. Instead of depending on any engine
+	// theory, this diffs the ORIGINAL animation's annotation tracks against
+	// the clip's LIVE trigger array by time and manually fires only the
+	// MISSING ones at their authored times — the same dispatch the replacement
+	// annotation path uses on every tactical reload. On a healthy play nothing
+	// is missing and nothing is armed; double-firing is impossible by
+	// construction. Early state exits are covered by the Deactivate-side
+	// flush (same end-window rule as FlushPendingEndAnnotations).
+	// Defined later in this file; needed by the flush below.
+	static bool PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr);
+	static void QueueCustomEvents(RE::TESObjectREFR* a_refr, const std::vector<std::string>& a_events, const char* a_label);
+
+	struct VanillaAnnotEntry
+	{
+		float time;
+		std::string text;
+	};
+	struct VanillaAnnotBackup
+	{
+		std::vector<VanillaAnnotEntry> entries;  // sorted by time; only the missing ones
+		float prevT{ 0.f };
+		int32_t lastFired{ -1 };
+		float origDuration{ 0.f };
+	};
+	static std::shared_mutex s_vanillaAnnotMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, VanillaAnnotBackup> s_vanillaAnnotMap;
+	static std::atomic<int> s_vanillaAnnotCount{ 0 };  // cheap empty check for the hot Update path
+
+	// Per-play integrity-check bookkeeping: last localTime seen per clip; a
+	// regression = new play on the same generator = re-run the check.
+	static std::mutex s_annotIntegrityMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, float> s_annotIntegrityLastT;
+
+	// Enumerate (time, text) annotation pairs from a game hkaAnimation's raw
+	// annotation tracks — same guarded offsets as CollectAnimAnnotationTexts.
+	static void CollectAnimAnnotationsTimed(RE::hkaAnimation* a_anim,
+		std::vector<VanillaAnnotEntry>& a_out)
+	{
+		a_out.clear();
+		if (!a_anim || IsBadReadPtr(a_anim, 0x40)) return;
+		auto* bytes = reinterpret_cast<uint8_t*>(a_anim);
+		auto* trackPtr = *reinterpret_cast<uint8_t**>(bytes + 0x28);
+		int32_t trackCount = *reinterpret_cast<int32_t*>(bytes + 0x30);
+		if (!trackPtr || trackCount <= 0 || trackCount > 0x200 ||
+			reinterpret_cast<uintptr_t>(trackPtr) < 0x10000 ||
+			IsBadReadPtr(trackPtr, static_cast<size_t>(trackCount) * 0x18)) {
+			return;
+		}
+		for (int32_t t = 0; t < trackCount; ++t) {
+			auto* trackBase = trackPtr + (t * 0x18);
+			auto* annots = *reinterpret_cast<uint8_t**>(trackBase + 0x08);
+			int32_t annotCount = *reinterpret_cast<int32_t*>(trackBase + 0x10);
+			if (!annots || annotCount <= 0 || annotCount > 0x1000 ||
+				reinterpret_cast<uintptr_t>(annots) < 0x10000 ||
+				IsBadReadPtr(annots, static_cast<size_t>(annotCount) * 0x10)) {
+				continue;
+			}
+			for (int32_t a = 0; a < annotCount; ++a) {
+				const float time = *reinterpret_cast<float*>(annots + a * 0x10 + 0x00);
+				auto rawTxt = *reinterpret_cast<uintptr_t*>(annots + a * 0x10 + 0x08) & ~uintptr_t(1);
+				auto* txt = reinterpret_cast<const char*>(rawTxt);
+				if (txt && rawTxt > 0x10000 && !IsBadReadPtr(txt, 1) && txt[0] != '\0') {
+					a_out.push_back({ time, txt });
+				}
+			}
+		}
+		std::sort(a_out.begin(), a_out.end(),
+			[](const VanillaAnnotEntry& a, const VanillaAnnotEntry& b) { return a.time < b.time; });
+	}
+
+	// Arm the backup for a play whose annotations must come from the given
+	// animation's tracks: diff them against the clip's live trigger array and
+	// register only the missing ones. Matching is time (20ms epsilon) PLUS
+	// text: two annotations sharing a timestamp cannot mask each other. An
+	// annotation's trigger stores its text with the "SoundPlay."/"CullBone."
+	// style prefix stripped, so the annotation text is compared both whole and
+	// as ".<triggerText>" suffix; a trigger without readable text (id-only
+	// payload, e.g. reloadComplete) covers any annotation at its time — that
+	// asymmetry prevents double-fires on id-converted triggers at the cost of
+	// one vanishingly-rare miss (two same-time annotations where exactly the
+	// untexted one survived). a_startTime = the clip's current localTime so a
+	// mid-play arm never replays earlier annotations.
+	static void ArmVanillaAnnotationBackup(RE::hkbClipGenerator* a_clip,
+		RE::hkaAnimation* a_original, float a_startTime)
+	{
+		if (!a_clip || !a_original) return;
+
+		std::vector<VanillaAnnotEntry> origAnnots;
+		CollectAnimAnnotationsTimed(a_original, origAnnots);
+		if (origAnnots.empty()) return;
+
+		// Live triggers (time + payload text) from the clip's current array.
+		std::vector<std::pair<float, const char*>> liveTrigs;
+		int32_t liveCount = 0;
+		{
+			auto* bytes = reinterpret_cast<uint8_t*>(a_clip);
+			auto* trigArr = *reinterpret_cast<uint8_t**>(bytes + kClipGenTriggersOffset);
+			if (trigArr && reinterpret_cast<uintptr_t>(trigArr) > 0x10000 &&
+				!IsBadReadPtr(trigArr, 0x20)) {
+				constexpr size_t kTriggerSize = 0x20;
+				auto* data = *reinterpret_cast<uint8_t**>(trigArr + 0x10);
+				liveCount = *reinterpret_cast<int32_t*>(trigArr + 0x18);
+				if (data && liveCount > 0 && liveCount <= 0x400 &&
+					reinterpret_cast<uintptr_t>(data) > 0x10000 &&
+					!IsBadReadPtr(data, static_cast<size_t>(liveCount) * kTriggerSize)) {
+					liveTrigs.reserve(static_cast<size_t>(liveCount));
+					for (int32_t i = 0; i < liveCount; ++i) {
+						const uint8_t* trig = data + i * kTriggerSize;
+						liveTrigs.emplace_back(
+							*reinterpret_cast<const float*>(trig),
+							TriggerPayloadText(trig));
+					}
+				} else {
+					liveCount = 0;
+				}
+			}
+		}
+
+		auto annotCoveredBy = [](const std::string& a_annot, const char* a_trigText) -> bool {
+			if (!a_trigText || a_trigText[0] == '\0') return true;  // untexted trigger at the time covers
+			if (_stricmp(a_annot.c_str(), a_trigText) == 0) return true;
+			const size_t tLen = std::strlen(a_trigText);
+			if (a_annot.size() > tLen + 1) {
+				const size_t off = a_annot.size() - tLen;
+				if (a_annot[off - 1] == '.' &&
+					_stricmp(a_annot.c_str() + off, a_trigText) == 0) {
+					return true;
+				}
+			}
+			return false;
+		};
+
+		VanillaAnnotBackup backup;
+		for (auto& ann : origAnnots) {
+			bool covered = false;
+			for (auto& [lt, ltext] : liveTrigs) {
+				if (std::abs(lt - ann.time) <= 0.02f && annotCoveredBy(ann.text, ltext)) {
+					covered = true;
+					break;
+				}
+			}
+			if (!covered) backup.entries.push_back(std::move(ann));
+		}
+
+		static std::atomic<int> s_armLog{ 0 };
+		if (backup.entries.empty()) {
+			if (s_armLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+				logger::info("[OAR-VanillaBackup] engine trigger array complete for clipGen={:X} ({} triggers, {} annots) — no backup needed",
+					reinterpret_cast<uintptr_t>(a_clip), liveCount, origAnnots.size());
+			}
+			return;
+		}
+
+		backup.prevT = a_startTime;
+		backup.lastFired = -1;
+		// Skip entries already behind the arm point (mid-play arm).
+		for (size_t i = 0; i < backup.entries.size(); ++i) {
+			if (backup.entries[i].time <= a_startTime) {
+				backup.lastFired = static_cast<int32_t>(i);
+			} else {
+				break;
+			}
+		}
+		if (!IsBadReadPtr(a_original, 0x18)) {
+			backup.origDuration = *reinterpret_cast<const float*>(
+				reinterpret_cast<const uint8_t*>(a_original) + 0x14);
+		}
+
+		if (s_armLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+			std::string names;
+			for (auto& e : backup.entries) {
+				if (!names.empty()) names += ", ";
+				names += std::format("'{}'@{:.3f}", e.text, e.time);
+			}
+			logger::info("[OAR-VanillaBackup] armed {} missing annotation(s) for clipGen={:X} (live triggers={}, original annots={}, from t={:.3f}): {}",
+				backup.entries.size(), reinterpret_cast<uintptr_t>(a_clip),
+				liveCount, origAnnots.size(), a_startTime, names);
+		}
+
+		{
+			std::unique_lock lock(s_vanillaAnnotMutex);
+			auto [it, inserted] = s_vanillaAnnotMap.insert_or_assign(a_clip, std::move(backup));
+			if (inserted) s_vanillaAnnotCount.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	// Fire and erase whatever remains for a clip whose play is ending. Same
+	// end-window rule as FlushPendingEndAnnotations: only flush when tracking
+	// got within 1.0s of the original's end (a genuine early cancel flushes
+	// nothing). Sounds fire immediately; graph events go through the deferred
+	// queue.
+	static void FlushVanillaAnnotBackup(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr, const char* a_reason)
+	{
+		VanillaAnnotBackup backup;
+		{
+			std::unique_lock lock(s_vanillaAnnotMutex);
+			auto it = s_vanillaAnnotMap.find(a_clip);
+			if (it == s_vanillaAnnotMap.end()) return;
+			backup = std::move(it->second);
+			s_vanillaAnnotMap.erase(it);
+			s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+		}
+		const int32_t total = static_cast<int32_t>(backup.entries.size());
+		if (backup.lastFired + 1 >= total) return;
+		if (backup.origDuration <= 0.01f ||
+			backup.prevT < backup.origDuration - 1.0f) {
+			return;
+		}
+		auto* refr = a_refr;
+		if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+		std::vector<std::string> events;
+		for (int32_t i = backup.lastFired + 1; i < total; ++i) {
+			const auto& e = backup.entries[i];
+			static constexpr const char* kSoundPlayPrefix = "SoundPlay.";
+			if (e.text.size() > 10 && _strnicmp(e.text.c_str(), kSoundPlayPrefix, 10) == 0) {
+				if (refr) PlaySoundDirect(e.text.c_str() + 10, refr);
+			} else {
+				events.push_back(e.text);
+			}
+			static std::atomic<int> s_vbFlushLog{ 0 };
+			if (s_vbFlushLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+				logger::info("[OAR-VanillaBackup] End-flush '{}' (clipGen={:X}, {}, prevT={:.3f})",
+					e.text, reinterpret_cast<uintptr_t>(a_clip), a_reason, backup.prevT);
+			}
+		}
+		if (refr && !events.empty()) {
+			QueueCustomEvents(refr, events, "vanilla-backup end-flush");
+		}
+	}
+
 	// Effective "End Clip If Shorter" duration for a play: the replacement's
 	// duration when the submod has the toggle on, the clip is a one-shot, and
 	// the replacement is meaningfully shorter than the original. -1 = no
@@ -1795,6 +2033,17 @@ namespace
 			backup.triggers = *triggersPtr;
 			backup.originalTriggers = *origTriggersPtr;
 			backup.nulled = true;
+
+			// OAR now owns this play's annotations (manual replacement firing,
+			// or an ECIS-re-timed native copy): disarm any vanilla backup the
+			// per-play integrity check registered — its "original annotations
+			// at original times" contract no longer applies to this play.
+			{
+				std::unique_lock vbLock(s_vanillaAnnotMutex);
+				if (s_vanillaAnnotMap.erase(a_clipGen)) {
+					s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+				}
+			}
 
 			const auto origAnnotTexts = CollectAnimAnnotationTexts(OriginalAnimForTriggerFilter(a_clipGen));
 			backup.filteredKeepAlive = BuildBehaviorOnlyTriggers(
@@ -2243,6 +2492,15 @@ void ClearClipRuntimeState()
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		s_originalAnimMap.clear();
+	}
+	{
+		std::unique_lock lock(s_vanillaAnnotMutex);
+		s_vanillaAnnotMap.clear();
+		s_vanillaAnnotCount.store(0, std::memory_order_relaxed);
+	}
+	{
+		std::lock_guard lock(s_annotIntegrityMutex);
+		s_annotIntegrityLastT.clear();
 	}
 	{
 		// Binding identities are keyed by GAME animation pointers, which a
@@ -4657,8 +4915,103 @@ namespace
 		return nullptr;
 	}
 
+	// Pre-_Activate binding-set scrub. A FRESH clip generator has no animation
+	// control at Activate-hook entry (the control is built inside _Activate), so
+	// every GetAnimationSlot()-based restore is blind to a stale clone parked in
+	// the shared per-character binding by a previous play. _Activate then builds
+	// the play from the CLONE: the engine culls the clip's triggers against the
+	// bound animation's duration, so every native annotation past the clone's
+	// end is gone from the play before our first Update can restore the slot
+	// (MP7A2 2026-08-19: empty reload evaluated correctly at t=0.000 and STILL
+	// dropped 05_Bolt/06_Shoulder — 9-of-12 trigger array, cropped at the
+	// clone's 2.292s). This path reaches the binding WITHOUT the control:
+	// context -> character -> animationBindingSet[clip->animationBindingIndex],
+	// all valid pre-activation (the Activate-time suffix resolvers already use
+	// animationBindingIndex the same way).
+	//
+	// Self-validating by construction: the only write happens when the pointer
+	// read from the binding is one of OUR live clone pointers (cache lookup) and
+	// its recorded original passes the pointer/vtable checks — a wrong walk or a
+	// wrong layout assumption reads a value that matches nothing and does
+	// nothing. Layout assumption (hkbAnimationBindingSet: bindings hkArray at
+	// +0x10 data / +0x18 size; hkaAnimationBinding: animation at +0x18, same as
+	// the control-side slot) is additionally bounded by the size sanity check.
+	//
+	// The overlap cost is accepted: if another generator is mid-play on the
+	// same binding with this clone, the scrub yanks it for one frame and that
+	// generator's next Update re-asserts the swap (standard per-frame re-assert)
+	// — brief, rare (reload-cancel spam), and strictly better than a play with
+	// culled triggers.
+	static void ScrubStaleCloneFromBindingSet(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
+	{
+		// Walk-failure diagnostics (2026-08-19: the scrub silently never fired
+		// in the field). Benign outcomes (walk succeeded, nothing of ours
+		// bound) stay silent; every abnormal bail logs its stage, capped.
+		static std::atomic<int> s_scrubBailLog{ 0 };
+		auto bail = [&](const char* a_stage) {
+			if (s_scrubBailLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+				logger::info("[OAR-Scrub] bail: {} (clipGen={:X})",
+					a_stage, reinterpret_cast<uintptr_t>(a_this));
+			}
+		};
+
+		if (!a_this || !a_context) return;
+		if (!s_gameFullyLoaded.load()) return;
+
+		auto* character = a_context->character;
+		if (!character || IsBadReadPtr(character, sizeof(RE::hkbCharacter))) return bail("character null/unreadable");
+
+		auto* bindingSet = character->animationBindingSet._ptr;
+		if (!bindingSet || IsBadReadPtr(bindingSet, 0x20)) return bail("bindingSet null/unreadable");
+
+		const auto* setBytes = reinterpret_cast<const uint8_t*>(bindingSet);
+		auto* const* bindings = *reinterpret_cast<uintptr_t* const* const*>(setBytes + 0x10);
+		const int32_t bindingCount = *reinterpret_cast<const int32_t*>(setBytes + 0x18);
+		const int16_t bindIdx = a_this->animationBindingIndex;
+		if (!bindings || bindingCount <= 0 || bindingCount > 4096) return bail("bindings array invalid");
+		if (bindIdx < 0 || bindIdx >= bindingCount) {
+			static std::atomic<int> s_scrubIdxLog{ 0 };
+			if (s_scrubIdxLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+				logger::info("[OAR-Scrub] bail: bindIdx {} out of range [0,{}) (clipGen={:X})",
+					bindIdx, bindingCount, reinterpret_cast<uintptr_t>(a_this));
+			}
+			return;
+		}
+		if (IsBadReadPtr(bindings + bindIdx, sizeof(uintptr_t))) return bail("binding entry unreadable");
+
+		auto* binding = reinterpret_cast<uint8_t*>(bindings[bindIdx]);
+		if (!binding || IsBadReadPtr(binding, 0x20)) return;
+
+		auto** slotAddr = reinterpret_cast<RE::hkaAnimation**>(binding + 0x18);
+		auto* bound = *slotAddr;
+		if (!bound) return;
+
+		auto* cache = AnimationCache::GetSingleton();
+		if (!cache->IsOurReplacement(bound)) return;
+
+		auto* orig = cache->GetOriginalFromReplacement(bound);
+		if (!orig || IsBadReadPtr(orig, sizeof(uintptr_t)) ||
+			!IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(orig))) {
+			return;
+		}
+
+		*slotAddr = orig;
+		static std::atomic<int> s_scrubLog{ 0 };
+		if (s_scrubLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+			logger::info("[OAR] Activation: scrubbed stale clone from binding set (clipGen={:X}, bindIdx={})",
+				reinterpret_cast<uintptr_t>(a_this), bindIdx);
+		}
+	}
+
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		// Clean the shared binding BEFORE anything reads it: _Activate builds
+		// the control and the play's trigger window from whatever is bound
+		// here, and the pre-swap below re-installs the current winner's clone
+		// afterwards when conditions pass — so scrubbing first is correct in
+		// both directions (see ScrubStaleCloneFromBindingSet).
+		ScrubStaleCloneFromBindingSet(a_this, a_context);
+
 		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
 		// the original _Activate runs. This ensures the hkaDefaultAnimationControl
 		// is built from our clone (which has NULLed annotationTracks), preventing
@@ -5583,6 +5936,187 @@ namespace
 
 		if (suffix.empty()) return;
 
+		// ===== Entry grace window =====
+		// The decisive condition evaluation at play entry can read racy game
+		// state: on a full-auto weapon the empty reload auto-triggers the same
+		// instant the last round fires, and CurrentMagazineAmmo still reads
+		// non-zero at that instant — so 'NOT CurrentMagazineAmmo == 0' falsely
+		// PASSES and a non-interruptible tactical-reload replacement replays
+		// over what should be the vanilla empty reload (MP7A2, 2026-08-19 log:
+		// eval '?->true evalFalse=0' at reload entry, ammo verifiably 0 four
+		// frames later). During the first moments of a SINGLE_PLAY clip the
+		// non-interruptible/play-once locks therefore must NOT suppress
+		// re-evaluation: a flip inside this window can only mean the entry
+		// read was stale (ammo cannot legitimately change during a reload —
+		// firing is impossible mid-reload), and the conditions-failed restore
+		// this early in a play is field-proven clean (Dragunov empty #1, MP7
+		// empty #2: full native tail annotations). Looping and user-controlled
+		// clips are excluded: loop wraps restart localTime every pass and
+		// would turn this into a permanent re-eval (SCAR dry-fire history).
+		// Window kept SHORT: with CurrentMagazineAmmo now reading the graph's
+		// LoadedAmmoCount first (frame-0 accurate), this is only the safety
+		// net for graphs without the variable and for other racy entry reads;
+		// a wider window would erode non-interruptible semantics for
+		// legitimately fast condition flips. localTime-based, so frame
+		// hitches at play start cannot close it early.
+		const bool inEntryGrace =
+			(a_this->mode == RE::MODE_SINGLE_PLAY) &&
+			(a_this->GetLocalTime() < 0.15f);
+
+		// ===== Vanilla annotation backup driver =====
+		// Fires the armed missing annotations of an UN-replaced play at their
+		// authored times (see VanillaAnnotBackup). Passive while nested inside
+		// an outer graph notify, mirroring the replacement annotation tracker.
+		if (s_vanillaAnnotCount.load(std::memory_order_relaxed) > 0 &&
+			s_notifyAnimGraphDepth == 0) {
+			bool vbFound = false;
+			float vbPrevT = 0.f;
+			int32_t vbLastFired = -1;
+			size_t vbTotal = 0;
+			{
+				std::shared_lock lock(s_vanillaAnnotMutex);
+				auto it = s_vanillaAnnotMap.find(a_this);
+				if (it != s_vanillaAnnotMap.end()) {
+					vbFound = true;
+					vbPrevT = it->second.prevT;
+					vbLastFired = it->second.lastFired;
+					vbTotal = it->second.entries.size();
+				}
+			}
+			if (vbFound) {
+				const float vbCurT = a_this->GetLocalTime();
+				if (vbCurT < vbPrevT - 0.01f) {
+					// Time went backwards: new play (or loop wrap) — this backup
+					// belonged to the previous play. Drop it; the restore path
+					// re-arms if the new play needs one.
+					std::unique_lock lock(s_vanillaAnnotMutex);
+					if (s_vanillaAnnotMap.erase(a_this)) {
+						s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+					}
+				} else if (vbCurT > vbPrevT) {
+					// Same catch-up cap as the replacement tracker: a jump larger
+					// than this is a seek/hitch — advance without dumping sounds.
+					const bool fire = (vbCurT - vbPrevT) <= 0.30f;
+					std::vector<std::string> vbSounds;
+					std::vector<std::string> vbEvents;
+					bool vbDone = false;
+					{
+						std::unique_lock lock(s_vanillaAnnotMutex);
+						auto it = s_vanillaAnnotMap.find(a_this);
+						if (it != s_vanillaAnnotMap.end()) {
+							auto& vb = it->second;
+							const int32_t total = static_cast<int32_t>(vb.entries.size());
+							for (int32_t i = vb.lastFired + 1; i < total; ++i) {
+								if (vb.entries[i].time > vbCurT) break;
+								if (fire) {
+									static constexpr const char* kSp = "SoundPlay.";
+									if (vb.entries[i].text.size() > 10 &&
+										_strnicmp(vb.entries[i].text.c_str(), kSp, 10) == 0) {
+										vbSounds.push_back(vb.entries[i].text);
+									} else {
+										vbEvents.push_back(vb.entries[i].text);
+									}
+								}
+								vb.lastFired = i;
+							}
+							vb.prevT = vbCurT;
+							if (vb.lastFired + 1 >= total) {
+								s_vanillaAnnotMap.erase(it);
+								s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+								vbDone = true;
+							}
+						}
+					}
+					if (!vbSounds.empty() || !vbEvents.empty()) {
+						auto* vbRefr = GetRefrFromContext(a_context);
+						if (!vbRefr) vbRefr = RE::PlayerCharacter::GetSingleton();
+						if (vbRefr) {
+							for (auto& s : vbSounds) {
+								PlaySoundDirect(s.c_str() + 10, vbRefr);
+								static std::atomic<int> s_vbFireLog{ 0 };
+								if (s_vbFireLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+									logger::info("[OAR-VanillaBackup] Fired '{}' (clipGen={:X}, t={:.3f})",
+										s, reinterpret_cast<uintptr_t>(a_this), vbCurT);
+								}
+							}
+							if (!vbEvents.empty()) {
+								QueueCustomEvents(vbRefr, vbEvents, "vanilla-backup");
+								static std::atomic<int> s_vbEvtLog{ 0 };
+								for (auto& e : vbEvents) {
+									if (s_vbEvtLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+										logger::info("[OAR-VanillaBackup] Queued event '{}' (clipGen={:X}, t={:.3f})",
+											e, reinterpret_cast<uintptr_t>(a_this), vbCurT);
+									}
+								}
+							}
+						}
+					}
+					(void)vbDone;
+					(void)vbLastFired;
+					(void)vbTotal;
+				}
+			}
+		}
+
+		// ===== Per-play annotation integrity check =====
+		// NON-NEGOTIABLE CONTRACT: every annotation of the animation actually
+		// playing must fire at its authored time — for donor/vanilla plays and
+		// for replacement plays whose annotations come from the original file
+		// (Replace Annotations unticked). The engine's play-local trigger data
+		// can be built wrong at _Activate (stale clone bound in the shared
+		// binding → triggers past the clone's end never exist for the play),
+		// so once per play, verify the live trigger array against the
+		// authoritative annotation source and arm the manual backup for
+		// anything missing. Plays where OAR NULLs the triggers (Replace
+		// Annotations ticked) are exempt — manual firing is already the
+		// authority there, and the trigger install below disarms any backup
+		// this check registered earlier in the same play.
+		if (s_gameFullyLoaded.load() && s_notifyAnimGraphDepth == 0 &&
+			a_this->GetLocalTime() >= 0.f) {
+			bool needCheck = false;
+			{
+				// Once per PLAY, not per generator: a localTime regression on
+				// the same generator is a re-entered play and re-runs the check.
+				const float icT = a_this->GetLocalTime();
+				std::unique_lock lock(s_annotIntegrityMutex);
+				auto [it, inserted] = s_annotIntegrityLastT.try_emplace(a_this, icT);
+				if (inserted) {
+					needCheck = true;
+				} else {
+					if (icT < it->second - 0.05f) needCheck = true;
+					it->second = icT;
+				}
+			}
+			if (needCheck) {
+				bool triggersOurs = false;
+				{
+					std::shared_lock tLock(s_triggersBackupMutex);
+					auto tIt = s_triggersBackup.find(a_this);
+					triggersOurs = (tIt != s_triggersBackup.end() && tIt->second.nulled);
+				}
+				if (!triggersOurs) {
+					if (auto** icSlot = a_this->GetAnimationSlot(); icSlot && *icSlot) {
+						auto* icCache = AnimationCache::GetSingleton();
+						RE::hkaAnimation* icSource = *icSlot;
+						if (icCache->IsOurReplacement(icSource)) {
+							// Clone in the slot with native triggers: the contract
+							// says the ORIGINAL's annotations fire (Replace
+							// Annotations off, or the swap just hasn't decided
+							// yet — the install path disarms if it takes over).
+							icSource = icCache->GetOriginalFromReplacement(icSource);
+							if (icSource && (IsBadReadPtr(icSource, sizeof(uintptr_t)) ||
+								!IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(icSource)))) {
+								icSource = nullptr;
+							}
+						}
+						if (icSource) {
+							ArmVanillaAnnotationBackup(a_this, icSource, a_this->GetLocalTime());
+						}
+					}
+				}
+			}
+		}
+
 		// ===== Direct-path defer gate =====
 		// For the first frames after Activate the cached suffix is only the
 		// authored/leaf-derived GUESS (the subgraph walk fails during graph
@@ -5795,7 +6329,11 @@ namespace
 				SubMod* lockedActive = nullptr;
 				{
 					SubMod* active = ValidatedActiveSubMod(a_this);
-					if (active && !active->IsInterruptible() && !active->IsDisabled()) {
+					// Entry grace: no lock during the play's first moments — the
+					// pre-pass must re-evaluate conditions so a racy entry read
+					// (see inEntryGrace) self-corrects on leaf-matched clips too.
+					if (active && !active->IsInterruptible() && !active->IsDisabled() &&
+						!inEntryGrace) {
 						lockedActive = active;
 					}
 				}
@@ -6200,7 +6738,11 @@ namespace
 		bool playOnceLocked = false;
 		bool playOnceLockedResult = false;
 		SubMod* playOnceLockedWinner = nullptr;
-		if (hasPlayOnceCandidate) {
+		// Entry grace: don't replay a cached play-once decision while the
+		// window is open — the fresh evaluation below re-records it each
+		// frame, and the LAST record when the window closes is the one that
+		// locks (see the inEntryGrace comment).
+		if (hasPlayOnceCandidate && !inEntryGrace) {
 			std::shared_lock poLock(s_playOnceDecisionMutex);
 			auto it = s_playOnceDecision.find(a_this);
 			if (it != s_playOnceDecision.end()) {
@@ -6239,6 +6781,15 @@ namespace
 						}
 						echoIt->second = false;
 					}
+				}
+
+				// Entry grace: keep evaluating during the play's first moments
+				// so a winner decided on a racy entry read self-corrects (see
+				// the inEntryGrace comment). Once the window closes the lock
+				// resumes normal non-interruptible semantics for the rest of
+				// the play.
+				if (inEntryGrace) {
+					allowReeval = true;
 				}
 
 				if (!allowReeval) {
@@ -6342,6 +6893,16 @@ namespace
 			}
 		}
 
+		// NOTE (2026-08-18): a "redirect force" block lived here briefly — it
+		// forced the FileRedirect submod as the winner when conditions failed,
+		// on the premise that the engine had loaded the submod's file as the
+		// original. The premise was wrong for archive-shipped animations: the
+		// CreateFileW redirect never fires for BA2 loads (zero runtime
+		// 'FILE REDIRECT:' lines in the field), so the engine original really
+		// is the vanilla animation and a conditions-failed play must stay fully
+		// vanilla. The tail-annotation drop that motivated it was the
+		// stale-clone control build, fixed by the Activate catch-all restore.
+
 		// Per-clip transition logging: log whenever shouldReplace flips for this clip
 		{
 			static std::shared_mutex s_lastShouldReplaceMutex;
@@ -6363,10 +6924,11 @@ namespace
 			if (transCount < 50) {
 				std::string winnerName = (winningInfo && winningInfo->parentSubMod)
 					? winningInfo->parentSubMod->GetName() : "(none)";
-				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={})",
+				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={} clipGen={:X} t={:.3f})",
 					resolvedSuffix, prevKnown ? (prev ? "true" : "false") : "?",
 					shouldReplace ? "true" : "false", winnerName,
-					totalCands, disabledCands, evalFalseCands, noCondCands);
+					totalCands, disabledCands, evalFalseCands, noCondCands,
+					reinterpret_cast<uintptr_t>(a_this), a_this->GetLocalTime());
 
 				if (!shouldReplace && evalFalseCands > 0) {
 					for (auto* info : candidates) {
@@ -6721,7 +7283,8 @@ namespace
 					if (*animSlot != replacement) {
 						static int s_swapLog = 0;
 						if (s_swapLog < 50) {
-							logger::info("[OAR] Swapping clip '{}' -> replacement (conditions passed)", resolvedSuffix);
+							logger::info("[OAR] Swapping clip '{}' -> replacement (conditions passed, clipGen={:X})",
+								resolvedSuffix, reinterpret_cast<uintptr_t>(a_this));
 							s_swapLog++;
 						}
 						*animSlot = replacement;
@@ -7278,8 +7841,8 @@ namespace
 					}
 					static int s_trigRestoreLog = 0;
 					if (s_trigRestoreLog < 20) {
-						logger::info("[OAR-Triggers] Restored triggers for '{}' (anim completed, localTime={:.3f} duration={:.3f}) [playOnce unlocked]",
-							resolvedSuffix, localTime, duration);
+						logger::info("[OAR-Triggers] Restored triggers for '{}' (anim completed, localTime={:.3f} duration={:.3f} clipGen={:X}) [playOnce unlocked]",
+							resolvedSuffix, localTime, duration, reinterpret_cast<uintptr_t>(a_this));
 						s_trigRestoreLog++;
 					}
 				}
@@ -7408,7 +7971,8 @@ namespace
 
 						static int s_restoreLog = 0;
 						if (s_restoreLog < 50) {
-							logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled)", suffix);
+							logger::info("[OAR] Restoring original for clip '{}' (conditions failed/disabled, clipGen={:X}, t={:.3f})",
+								suffix, reinterpret_cast<uintptr_t>(a_this), a_this->GetLocalTime());
 							s_restoreLog++;
 						}
 						*animSlot = originalAnim;
@@ -7441,6 +8005,19 @@ namespace
 		// Restore the engine's trigger arrays so the original animation's annotations
 		// resume firing natively.
 		RestoreClipTriggers(a_this);
+
+		// Vanilla annotation backup: the play now runs un-replaced, but its
+		// engine-side trigger data may have been built against a stale clone at
+		// _Activate (see the VanillaAnnotBackup block). Diff the original's
+		// annotations against whatever the clip's live array holds AFTER the
+		// trigger restore above, and arm manual firing for any that are
+		// missing. Healthy plays arm nothing.
+		if (s_gameFullyLoaded.load()) {
+			if (auto** vbSlot = a_this->GetAnimationSlot(); vbSlot && *vbSlot &&
+				!AnimationCache::GetSingleton()->IsOurReplacement(*vbSlot)) {
+				ArmVanillaAnnotationBackup(a_this, *vbSlot, a_this->GetLocalTime());
+			}
+		}
 
 		uint32_t actorID = refr ? refr->GetFormID() : 0;
 		ActiveReplacementTracker::GetSingleton()->Remove(actorID, resolvedSuffix);
@@ -7504,12 +8081,62 @@ namespace
 			{
 				auto* deactRefr = GetRefrFromContext(a_context);
 				FlushPendingEndAnnotations(a_this, deactRefr, "deactivate");
+				// Vanilla backup: fire whatever the un-replaced play still owed
+				// when the graph tore it down near its end (same end-window rule),
+				// and always drop the entry — the clip is going away.
+				FlushVanillaAnnotBackup(a_this, deactRefr, "deactivate");
+			}
+			{
+				std::lock_guard icLock(s_annotIntegrityMutex);
+				s_annotIntegrityLastT.erase(a_this);
 			}
 
-			// Do NOT restore the original animation or triggers during deactivation.
-			// The clip is being freed and ALL backed-up pointers (animation, triggers)
-			// will become stale. If the address is recycled by a new clip, stale entries
-			// would cause crashes. Erase everything for this clip.
+			// Restore the ORIGINAL into the shared animation binding before this
+			// clip goes away. The binding belongs to the CHARACTER's binding set
+			// and outlives the clip generator: a clone left here is inherited by
+			// the NEXT generator that activates on the same binding. A FRESH
+			// generator has no animation control at Activate-hook entry (the
+			// control is built inside _Activate from this binding), so BOTH
+			// Activate-side restores are structurally blind to it — the new
+			// control captures the CLONE's duration and the state's
+			// relative-to-end exit then cuts every native annotation past the
+			// clone's end on an un-replaced play (MP7 empty reload dropping
+			// 05_Bolt/06_Shoulder through a fresh clip generator, 2026-08-18;
+			// same family as the Activate catch-all, which still covers RECYCLED
+			// generators whose control survives). Restoring the slot AFTER
+			// _Activate provably does not help — the Update-hook restore ran on
+			// the first frame of that play and the tail was still cut — so the
+			// binding must already be clean when _Activate runs.
+			// Cache-based lookup (not the per-clip backups erased below), with
+			// the same pointer/vtable validation as the Activate catch-all:
+			// during graph teardown (weapon switch) the recorded original may
+			// already be freed, and then the binding is being torn down too, so
+			// leaving the clone is harmless.
+			// Runs after the annotation flush above, which needs the clone still
+			// in the slot for its duration read.
+			if (s_gameFullyLoaded.load()) {
+				if (auto** deactSlot = a_this->GetAnimationSlot(); deactSlot && *deactSlot) {
+					auto* deactCache = AnimationCache::GetSingleton();
+					if (deactCache->IsOurReplacement(*deactSlot)) {
+						auto* deactOrig = deactCache->GetOriginalFromReplacement(*deactSlot);
+						if (deactOrig && !IsBadReadPtr(deactOrig, sizeof(uintptr_t)) &&
+							IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(deactOrig))) {
+							*deactSlot = deactOrig;
+							static std::atomic<int> s_deactRestoreLog{ 0 };
+							if (s_deactRestoreLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+								logger::info("[OAR] Deactivate: restored original into shared binding (clipGen={:X})",
+									reinterpret_cast<uintptr_t>(a_this));
+							}
+						}
+					}
+				}
+			}
+
+			// Do NOT restore triggers or touch the per-clip backups during
+			// deactivation beyond the validated binding restore above. The clip
+			// is being freed and ALL backed-up pointers (animation, triggers)
+			// will become stale. If the address is recycled by a new clip, stale
+			// entries would cause crashes. Erase everything for this clip.
 			{
 				std::unique_lock lock(s_triggersBackupMutex);
 				s_triggersBackup.erase(a_this);
@@ -8623,6 +9250,28 @@ namespace
 
 	void hkbClipGenerator_StartEcho(RE::hkbClipGenerator* a_this, float a_duration)
 	{
+		// Diagnostic only: an echo re-enters the clip WITHOUT Deactivate or
+		// Activate, so none of the stale-clone restores run before whatever the
+		// echo captures. The Deactivate-time binding restore closes the proven
+		// fresh-generator window (2026-08-18); if a clone can still be live here
+		// on a play whose conditions are about to fail (completed play, entry
+		// still active, echo replay), this line is the field evidence for it.
+		if (a_this && s_gameFullyLoaded.load()) {
+			if (auto** echoDiagSlot = a_this->GetAnimationSlot(); echoDiagSlot && *echoDiagSlot &&
+				AnimationCache::GetSingleton()->IsOurReplacement(*echoDiagSlot)) {
+				bool echoDiagActive = false;
+				{
+					std::shared_lock smLock(s_activeSubModMutex);
+					echoDiagActive = s_activeSubModMap.find(a_this) != s_activeSubModMap.end();
+				}
+				static std::atomic<int> s_echoCloneDiagLog{ 0 };
+				if (s_echoCloneDiagLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+					logger::info("[OAR] StartEcho: clone in slot at echo entry (clipGen={:X}, activeSubMod={})",
+						reinterpret_cast<uintptr_t>(a_this), echoDiagActive);
+				}
+			}
+		}
+
 		Hooks::ClipGeneratorHooks::_StartEcho(a_this, a_duration);
 
 		// Signal that an echo event occurred — non-interruptible submods with
@@ -10521,6 +11170,7 @@ namespace Hooks
 			s_fileMapBuilt = true;
 			logger::info("[OAR] File redirect map ready with {} entries", s_fileRedirectMap.size());
 		}
+
 
 		static HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
 			LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,

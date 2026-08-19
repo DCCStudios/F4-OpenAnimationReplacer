@@ -183,6 +183,8 @@ void UIMain::DrawReplacerModsTab()
 		selectedSubMod = nullptr;
 		renamingSubMod = nullptr;
 		editingDescSubMod = nullptr;
+		creatingConfigSubMod = nullptr;
+		creatingConfigMod = nullptr;
 	}
 
 	float availWidth = ImGui::GetContentRegionAvail().x;
@@ -270,6 +272,121 @@ void UIMain::DrawReplacerModsTab()
 		}
 		ImGui::EndPopup();
 	}
+
+	// Create SubMod config.json modal. Writes a minimal config.json into the
+	// folder and populates the live (already-loaded) SubMod object in place, so
+	// the user can keep editing it without a full reload. hasConfig flips true
+	// so the tree stops flagging it.
+	if (creatingConfigSubMod) {
+		ImGui::OpenPopup("Create SubMod Config");
+	}
+	if (ImGui::BeginPopupModal("Create SubMod Config", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextWrapped("Create config.json for this folder. Afterwards you can edit it (conditions, track filter, etc.) like any other submod.");
+		ImGui::Spacing();
+
+		ImGui::Text("Name:");
+		ImGui::SetNextItemWidth(420);
+		if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+		ImGui::InputText("##CreateSubName", createNameBuffer, sizeof(createNameBuffer));
+
+		ImGui::Text("Description:");
+		ImGui::InputTextMultiline("##CreateSubDesc", createDescBuffer, sizeof(createDescBuffer), ImVec2(420, 90));
+
+		ImGui::Text("Priority:");
+		ImGui::SetNextItemWidth(120);
+		ImGui::InputInt("##CreateSubPriority", &createPriorityValue);
+
+		ImGui::Spacing();
+		const bool canCreate = createNameBuffer[0] != '\0';
+		if (!canCreate) ImGui::BeginDisabled();
+		if (ImGui::Button("Create", ImVec2(120, 0))) {
+			auto* sm = creatingConfigSubMod;
+			// Populate the live object so editing continues seamlessly.
+			sm->SetName(createNameBuffer);
+			sm->SetDescription(createDescBuffer);
+			sm->SetPriority(createPriorityValue);
+			sm->hasConfig = true;
+
+			// Minimal starter config: identity + an empty conditions array
+			// (empty = always matches, matching the folder's current behavior).
+			nlohmann::json json;
+			json["name"] = createNameBuffer;
+			json["description"] = createDescBuffer;
+			json["priority"] = createPriorityValue;
+			json["conditions"] = nlohmann::json::array();
+
+			auto savePath = sm->GetPath() / "config.json";
+			JobQueue::GetSingleton()->Enqueue(
+				std::make_unique<SaveConfigJob>(savePath, std::move(json)));
+			logger::info("[OAR-UI] Created config.json for '{}' at '{}'",
+				createNameBuffer, savePath.string());
+
+			selectedSubMod = sm;
+			creatingConfigSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		if (!canCreate) ImGui::EndDisabled();
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			creatingConfigSubMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
+
+	// Create Mod config.json modal (name / author / description only, per
+	// ParseModConfig).
+	if (creatingConfigMod) {
+		ImGui::OpenPopup("Create Mod Config");
+	}
+	if (ImGui::BeginPopupModal("Create Mod Config", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextWrapped("Create config.json for this mod folder. This names the mod group in the list; behavior lives in each submod's own config.");
+		ImGui::Spacing();
+
+		ImGui::Text("Name:");
+		ImGui::SetNextItemWidth(420);
+		if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+		ImGui::InputText("##CreateModName", createNameBuffer, sizeof(createNameBuffer));
+
+		ImGui::Text("Author:");
+		ImGui::SetNextItemWidth(420);
+		ImGui::InputText("##CreateModAuthor", createAuthorBuffer, sizeof(createAuthorBuffer));
+
+		ImGui::Text("Description:");
+		ImGui::InputTextMultiline("##CreateModDesc", createDescBuffer, sizeof(createDescBuffer), ImVec2(420, 90));
+
+		ImGui::Spacing();
+		const bool canCreateMod = createNameBuffer[0] != '\0';
+		if (!canCreateMod) ImGui::BeginDisabled();
+		if (ImGui::Button("Create", ImVec2(120, 0))) {
+			auto* m = creatingConfigMod;
+			m->SetName(createNameBuffer);
+			m->SetAuthor(createAuthorBuffer);
+			m->SetDescription(createDescBuffer);
+			m->hasConfig = true;
+
+			nlohmann::json json;
+			json["name"] = createNameBuffer;
+			json["author"] = createAuthorBuffer;
+			json["description"] = createDescBuffer;
+
+			auto savePath = m->GetPath() / "config.json";
+			JobQueue::GetSingleton()->Enqueue(
+				std::make_unique<SaveConfigJob>(savePath, std::move(json)));
+			logger::info("[OAR-UI] Created mod config.json for '{}' at '{}'",
+				createNameBuffer, savePath.string());
+
+			creatingConfigMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		if (!canCreateMod) ImGui::EndDisabled();
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+			creatingConfigMod = nullptr;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
+	}
 }
 
 void UIMain::BeginEditDescription(SubMod* a_subMod)
@@ -277,6 +394,28 @@ void UIMain::BeginEditDescription(SubMod* a_subMod)
 	if (!a_subMod) return;
 	editingDescSubMod = a_subMod;
 	strncpy_s(descEditBuffer, a_subMod->GetDescription().c_str(), sizeof(descEditBuffer) - 1);
+}
+
+void UIMain::BeginCreateSubModConfig(SubMod* a_subMod)
+{
+	if (!a_subMod) return;
+	creatingConfigSubMod = a_subMod;
+	creatingConfigMod = nullptr;
+	// Prefill from what the folder already parsed to: name = folder name,
+	// priority = the number parsed from the folder name (0 if not numeric).
+	strncpy_s(createNameBuffer, a_subMod->GetName().c_str(), sizeof(createNameBuffer) - 1);
+	createDescBuffer[0] = '\0';
+	createPriorityValue = a_subMod->GetPriority();
+}
+
+void UIMain::BeginCreateModConfig(ReplacerMod* a_mod)
+{
+	if (!a_mod) return;
+	creatingConfigMod = a_mod;
+	creatingConfigSubMod = nullptr;
+	strncpy_s(createNameBuffer, a_mod->GetName().c_str(), sizeof(createNameBuffer) - 1);
+	strncpy_s(createAuthorBuffer, a_mod->GetAuthor().c_str(), sizeof(createAuthorBuffer) - 1);
+	createDescBuffer[0] = '\0';
 }
 
 void UIMain::DrawReplacementAnimsTab()
@@ -357,8 +496,17 @@ void UIMain::DrawModTree()
 
 		ImGui::PushID(mod.get());
 
+		// Flag mods with no config.json on disk so the user knows the folder is
+		// running under its raw folder name and can formalize it.
+		const bool modNoConfig = !mod->hasConfig;
+		std::string modLabel = mod->GetName();
+		if (modNoConfig) modLabel += "  (no config)";
+		if (modNoConfig) ImGui::PushStyleColor(ImGuiCol_Text, UICommon::Colors::Disabled);
+
 		ImGuiTreeNodeFlags modFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
-		bool modOpen = ImGui::TreeNodeEx(mod->GetName().c_str(), modFlags);
+		bool modOpen = ImGui::TreeNodeEx(modLabel.c_str(), modFlags);
+
+		if (modNoConfig) ImGui::PopStyleColor();
 
 		if (ImGui::IsItemHovered() && !mod->GetDescription().empty()) {
 			ImGui::BeginTooltip();
@@ -367,6 +515,19 @@ void UIMain::DrawModTree()
 				ImGui::TextColored(UICommon::Colors::Disabled, "Author: %s", mod->GetAuthor().c_str());
 			}
 			ImGui::EndTooltip();
+		}
+
+		// Right-click a mod folder: offer to create its config.json (name /
+		// author / description) when it has none.
+		if (ImGui::BeginPopupContextItem("ModContext")) {
+			if (modNoConfig) {
+				if (ImGui::MenuItem("Create config.json...")) {
+					BeginCreateModConfig(mod.get());
+				}
+			} else {
+				ImGui::TextDisabled("config.json present");
+			}
+			ImGui::EndPopup();
 		}
 
 		if (modOpen) {
@@ -401,9 +562,11 @@ void UIMain::DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod)
 	                   ImGui::GetStyleColorVec4(ImGuiCol_Text);
 	ImGui::PushStyleColor(ImGuiCol_Text, textColor);
 
+	const bool noConfig = !a_subMod->hasConfig;
 	std::string label = std::format("[{}] {}", a_subMod->GetPriority(), a_subMod->GetName());
 	if (isDirty) label += " *";
 	if (a_subMod->hasUserConfig) label += " (User)";
+	if (noConfig) label += "  (no config)";
 
 	ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
 	if (isSelected) flags |= ImGuiTreeNodeFlags_Selected;
@@ -413,8 +576,21 @@ void UIMain::DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod)
 		selectedSubMod = a_subMod;
 	}
 
+	if (ImGui::IsItemHovered() && noConfig) {
+		ImGui::SetTooltip(
+			"This folder has no config.json. It loads under its folder name and\n"
+			"matches unconditionally. Right-click to create a config and give it\n"
+			"a name, description, and conditions.");
+	}
+
 	// Right-click context menu
 	if (ImGui::BeginPopupContextItem("SubModContext")) {
+		if (noConfig) {
+			if (ImGui::MenuItem("Create config.json...")) {
+				BeginCreateSubModConfig(a_subMod);
+			}
+			ImGui::Separator();
+		}
 		if (ImGui::MenuItem("Rename...")) {
 			renamingSubMod = a_subMod;
 			strncpy_s(renameBuffer, a_subMod->GetName().c_str(), sizeof(renameBuffer) - 1);

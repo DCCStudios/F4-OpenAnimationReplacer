@@ -199,6 +199,7 @@ namespace Parsing
 
 		auto configPath = a_modPath / "config.json";
 		if (std::filesystem::exists(configPath)) {
+			mod->hasConfig = true;
 			ParseModConfig(mod.get(), configPath);
 		}
 
@@ -235,6 +236,7 @@ namespace Parsing
 
 		auto configPath = a_subModPath / "config.json";
 		if (std::filesystem::exists(configPath)) {
+			subMod->hasConfig = true;
 			ParseSubModConfig(subMod.get(), configPath);
 		}
 

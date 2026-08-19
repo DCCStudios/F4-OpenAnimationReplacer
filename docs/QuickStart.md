@@ -266,6 +266,8 @@ Press **F2** (default) to toggle the overlay. Rebind it in **Settings → Activa
 - **User mode** — toggle submods, change priorities, save to `user.json`.
 - **Author mode** — full editing: add/remove/negate conditions, save to `config.json`.
 
+A folder with animations but no `config.json` loads anyway (it matches everything under its folder name) and is tagged **(no config)** in the tree. Right-click it and choose **Create config.json...** to give it a name, description, and priority; it writes the file and you can then edit it like any other submod.
+
 The **Animation Log** (View menu) shows replacements as they happen in real time.
 
 ---
