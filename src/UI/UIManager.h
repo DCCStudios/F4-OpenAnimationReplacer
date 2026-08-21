@@ -30,6 +30,8 @@ public:
 	UIWindow* GetWindow(WindowID a_id);
 	void ToggleWindow(WindowID a_id);
 	void ShowWelcomeBanner();
+	float GetDPIScale() const { return dpiScale; }
+	float GetEffectiveUIScale() const;
 
 	// Bethesda RE::InputEvent → ImGui key / mouse / char translation.
 	// Ported from F4SE Menu Framework 3 (Input.cpp).  Call from a
@@ -58,6 +60,7 @@ private:
 
 	void InitImGui(IDXGISwapChain* a_swapChain);
 	void RenderFrame();
+	void UpdateDPIScale();
 
 	// ── State ──────────────────────────────────────────────────────────
 	std::atomic<bool> initialized{ false };
@@ -68,6 +71,7 @@ private:
 
 	HWND gameWindow{ nullptr };
 	WNDPROC originalWndProc{ nullptr };
+	float dpiScale{ 1.0f };
 
 	// ── Present VTable hook ────────────────────────────────────────────
 	using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);

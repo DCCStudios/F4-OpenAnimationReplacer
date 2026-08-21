@@ -18,7 +18,8 @@ Add an opt-in submod setting for special idles that prevents the source idle fro
 - The test donor animation itself has only weapon-cull and foley annotations.
 - A behavior-authored end trigger from the source special idle coincides with `wpnequipfast`; filtering pose tracks cannot suppress that trigger while the source idle remains active.
 - The old raw call-site offsets from the standalone IdleStopFix do not point to calls in the currently loaded OG executable, so they must not be reused blindly.
-- CommonLib exposes `RE::ID::AIProcess::SetupSpecialIdle`; exact direct calls to this target can be discovered in executable code and patched with validation.
+- CommonLib exposes `RE::ID::AIProcess::SetupSpecialIdle`, but patching only direct calls to that target missed the tested Papyrus `PlayIdle` route even though 27 call sites were found.
+- Weapons that share an animation folder can recycle a clip generator and binding. Retiring runtime clones without clearing per-clip active-submod, suffix/path, and variant state lets the first weapon's replacement remain locked onto later weapons.
 
 ## Planned implementation
 
@@ -34,35 +35,43 @@ Add an opt-in submod setting for special idles that prevents the source idle fro
 - Added the default-off `trackFilter.triggerOnlySpecialIdle` JSON setting.
 - Added `Play Special Idle as Filter-Only Layer (?)` to the editable track-filter GUI with a detailed fallback and annotation warning.
 - Added owner-aware cached-animation selection so the independently sampled donor is the file owned by the winning submod.
-- Added validated runtime discovery of direct calls to CommonLib's `AIProcess::SetupSpecialIdle` relocation. Only exact call targets are patched; no legacy raw offsets are used.
+- Replaced direct-call discovery with a MinHook function-entry detour on CommonLib's runtime-selected `AIProcess::SetupSpecialIdle` relocation. This covers direct and indirect/Papyrus callers, preserves a callable relocated original, validates executable target memory, and fails open to vanilla behavior if hook creation or enablement fails.
+- Added entry and fallback-reason logging for every intercepted `SetupSpecialIdle` request so runtime tests distinguish missed eligibility from a successful standalone start.
 - The interceptor preserves TESIdle conditions, ordinary path versus Leaf Matching semantics, OAR conditions, cached donor validation, and donor binding validation before suppressing the native start.
 - Added standalone per-actor track-filter state with independent one-shot timing. One active non-additive graph output samples the donor per actor-update generation; later clips use the existing filtered-pose cache.
 - Standalone playback supports ordinary playback-following and fixed-frame pose donors, the existing blend-in/end behavior, model-space anchoring, custom start/end events, and stale-state cleanup.
 - Source and donor graph annotations are intentionally absent in filter-only mode, preventing behavior-authored source triggers such as the observed EquipFast end trigger.
 - Renamed the existing GUI option to `Apply IdleStop Fix After Special Idle (?)`. When armed, OAR now calls `UpdateAnimation(1000.0f)` and then invokes the original IdleStop sink, matching the reference plugin's essential behavior.
 - Removed the accidental `.xmake` cache produced by an incorrect build-tool probe. No user files were removed.
+- Same-folder equipped-weapon changes now clear clip runtime state after retiring clones, matching folder-change cleanup without restoring potentially freed animation pointers.
+- The latest 10mm-to-shared-path test proved condition evaluation was correct (`IsEquipped [Fallout4.esm:0x4822] -> FAIL`, winner none), but the stale replacement remained. The log had no `[OAR-WeaponChange]` entries and the activation scrub repeatedly reported `bindingSet null/unreadable`.
+- Activation-time player ownership and binding cleanup now use `PlayerGraphIndexForClip` plus the real `manager->graph[index]->character`. This replaces the invalid `hkbContext::character` dummy for both weapon fingerprint invalidation and stale shared-binding restoration.
+- The UI now treats Windows DPI and the text-size percentage as independent multipliers. ImGui font DPI, style geometry, default window dimensions, live window resizing, and the standalone Settings panel all follow the combined effective scale; monitor DPI changes are detected per rendered frame.
+- The text-size slider and persisted-setting clamp now allow 50% through 200%, while retaining 125% as the default.
 
 ## Build, deployment, and runtime state
 
 - Source implementation: complete for static testing
-- Build: succeeded with MSVC Release; warnings are existing warning classes and no errors were emitted
+- Build: succeeded with MSVC Release after the DPI and activation-owner corrections; warnings are existing warning classes and no errors were emitted
 - DLL: `E:\Fallout 4 Modding\F4SE\OpenAnimationReplacer\Compile\F4SE\Plugins\OpenAnimationReplacer.dll`
-- DLL SHA-256: `CDC781E19CBD675F3AAB45BA22462EF5DE2844A097BAAF70CF7E79CAC9FE52A1`
-- Deployment: complete for LoreOut and Magnum Opus. DLL and PDB hashes match the staged artifacts; both installed INIs retained their pre-deployment hashes.
-- Runtime validation: failed for the first `CC Anims Additive` test. The hook installed across 27 validated direct call sites, but no standalone-start marker appeared. Five `1stgo` plays used the ordinary source-clip path, so the native full-body idle remained active.
+- DLL SHA-256: `252ED49B4C942FFA643F953099A60B2C370C66F4AA6B791320CD7901F8263F51`
+- Deployment: the DPI and real-player-binding build is deployed to LoreOut and Magnum Opus. The later 50% slider-bound rebuild is staged and packaged but not deployed; each modlist's customized INI remains untouched.
+- GitHub release: the replacement `OpenAnimationReplacer-v1.1.8.zip` retains the MO2-ready four-entry layout and has SHA-256 `7F2F79A61FEBF671EB9456FECBA70DD9843555955D17C4A6E230CDBE33013A25`. The release description documents DPI-aware scaling and the 50% through 200% text-scale range.
+- Runtime validation: pending for the new function-entry hook and same-folder cleanup. The prior direct-call build failed because no standalone-start marker appeared and five `1stgo` plays used the ordinary full-body source-clip path.
 
 ## Risks and runtime-only unknowns
 
 - Some special-idle callers may depend on engine-maintained current-idle state even when the call reports success.
-- Direct-call discovery must find and validate the actual runtime call sites; failure must fall back to vanilla behavior.
+- Another plugin may already detour `SetupSpecialIdle`; MinHook creation/enablement failure is logged and must leave vanilla behavior intact.
 - Independent sampling must choose a non-additive graph output once per frame so the filtered pose is not based on another additive clip.
 - Static build success cannot prove that the PlayIdle caller, pose layering, end timing, or IdleStop behavior is correct in game.
-- The Papyrus `PlayerRef.PlayIdle()` route either bypasses the 27 patched direct callers or reaches the detour and fails a silent eligibility gate. The current log cannot distinguish those cases because hook entry and rejection reasons are not logged.
+- The new entry detour is statically built but still needs runtime proof that the Papyrus `PlayerRef.PlayIdle()` route reaches it and starts the standalone layer.
 - The `LArm_Collarbone` descendant expansion also includes `WeaponIKTargetR` and `WeaponIKTargetRMirror`. Those helper tracks can move the right hand even though the explicit `RArm_Collarbone` subtree is excluded.
 
 ## Remaining work
 
-1. Add bounded entry and rejection-reason telemetry to the special-idle detour, or hook the actual Papyrus PlayIdle boundary, to distinguish a missed caller from a match rejection.
-2. Explicitly exclude `WeaponIKTargetR` and `WeaponIKTargetRMirror`, or prevent cross-chain IK helpers from entering left-arm descendant expansion.
-3. Retest `CC Anims Additive` and require a `[OAR-TrackFilter-Standalone] Started` line before evaluating its pose behavior.
-4. Confirm the right arm and normal graph continue to animate, the selected left-side tracks use the donor, and `wpnequipfast` does not activate at the donor end.
+1. Retest `CC Anims Additive` and require a `SetupSpecialIdle entry` followed by `[OAR-TrackFilter-Standalone] Started`; if it falls back, use the new reason in the same log entry.
+2. Confirm the right arm and normal graph continue to animate, the selected left-side tracks use the donor, and `wpnequipfast` does not activate at the donor end.
+3. If right-hand motion remains after standalone playback starts, explicitly exclude `WeaponIKTargetR` and `WeaponIKTargetRMirror`, or prevent cross-chain IK helpers from entering left-arm descendant expansion.
+4. In third person, equip the 10mm, then at least two other pistols that share its animation folder. Require a new `[OAR-WeaponChange]` fingerprint transition, an activation scrub against the real binding set when a clone is present, a false Heel Chambering condition, and the vanilla animation on the non-10mm weapon.
+5. At a known Windows display scale, open OAR and verify `[OAR-UI]` reports DPI, text, and their product (for example, 150% DPI times 125% text = 1.875 effective). Move the game window between differently scaled monitors if available and verify text, style geometry, and window dimensions update together.

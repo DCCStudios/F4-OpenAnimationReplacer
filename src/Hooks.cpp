@@ -12,6 +12,8 @@
 #include "RE_Additions.h"
 #include "UI/BoneDebugViz.h"
 
+#include <MinHook.h>
+
 // Full declaration lives in Conditions.h; forward-declared here to avoid
 // pulling the entire conditions header into this TU.
 namespace ConditionTracking
@@ -444,13 +446,6 @@ struct ActorClipKeyHash {
 static std::shared_mutex s_fullBodyBlendMutex;
 static std::unordered_map<ActorClipKey, FullBodyBlendState, ActorClipKeyHash> s_fullBodyBlendMap;
 static std::atomic<int> s_fullBodyBlendActiveCount{ 0 };
-
-static RE::TESObjectREFR* GetRefrFromCharacter(RE::hkbCharacter* a_char) {
-	if (!a_char) return nullptr;
-	std::shared_lock lock(s_characterCacheMutex);
-	auto it = s_characterCache.find(a_char);
-	return (it != s_characterCache.end()) ? it->second : nullptr;
-}
 
 // ---- Easing for temporal blend ----
 
@@ -2566,13 +2561,14 @@ static void CheckAndInvalidateOnWeaponChange()
 		lock.unlock();
 
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
-		// Preserve the established folder-transition cleanup: suffix/path maps are
-		// tied to a graph generation and must not survive an actual folder swap.
-		// Same-folder instance switches only need clone retirement, avoiding the
-		// broad actor/clip reset introduced by the PR.
-		if (folderChanged) {
-			ClearClipRuntimeState();
-		}
+		// Clone retirement alone is insufficient for weapons that share an animation
+		// folder. The engine can recycle the same clip generator and binding while
+		// s_activeSubModMap, suffix/path caches, and variant state still describe the
+		// previously equipped weapon. Clear those locks on every equipped-set change,
+		// not only when the graph folder changes. This deliberately does not call
+		// RestoreAllActiveReplacements: weapon transitions can already have freed
+		// recorded originals, so writing those pointers back would be unsafe.
+		ClearClipRuntimeState();
 	} else if (currentFolder.empty() && !s_lastKnownWeaponFolder.empty()) {
 		// Weapon unequipped (holstered or no weapon) — also invalidate
 		logger::info("[OAR-WeaponChange] Weapon folder cleared (was '{}') — retiring runtime clones",
@@ -5320,26 +5316,50 @@ namespace
 		bool donorIdentity = false;
 	};
 
+	static void SetStandaloneSpecialIdleRejection(std::string* a_reason, std::string a_value)
+	{
+		if (a_reason) *a_reason = std::move(a_value);
+	}
+
 	// SetupSpecialIdle has no hkbClipGenerator yet, so resolve its IDLE filename
 	// through the same leaf tables used by clip replacement. Only explicitly
 	// opted-in track filters participate; clip-dependent conditions naturally
 	// fail when evaluated with a null clip.
 	static bool FindStandaloneSpecialIdleMatch(
-		RE::Actor* a_actor, RE::TESIdleForm* a_idle, StandaloneSpecialIdleMatch& a_out)
+		RE::Actor* a_actor, RE::TESIdleForm* a_idle, StandaloneSpecialIdleMatch& a_out,
+		std::string* a_rejectionReason)
 	{
-		if (!a_actor || !a_idle) return false;
+		if (!a_actor) {
+			SetStandaloneSpecialIdleRejection(a_rejectionReason, "actor is null");
+			return false;
+		}
+		if (!a_idle) {
+			SetStandaloneSpecialIdleRejection(a_rejectionReason, "idle form is null");
+			return false;
+		}
 		const char* fileName = a_idle->animFileName.c_str();
-		if (!fileName || !fileName[0]) return false;
+		if (!fileName || !fileName[0]) {
+			SetStandaloneSpecialIdleRejection(a_rejectionReason, "idle form has no animation filename");
+			return false;
+		}
 
 		const auto rawSuffix = ExtractAnimSuffix(fileName);
-		if (rawSuffix.empty()) return false;
+		if (rawSuffix.empty()) {
+			SetStandaloneSpecialIdleRejection(a_rejectionReason,
+				std::format("could not extract a replacement suffix from '{}'", fileName));
+			return false;
+		}
 		const std::string leaf(GetSuffixLeaf(rawSuffix));
 
 		std::vector<std::pair<std::string, ReplacementAnimFileInfo*>> candidates;
 		{
 			std::shared_lock lock(s_nameLookupMutex);
 			auto leafIt = s_leafToFullSuffixes.find(leaf);
-			if (leafIt == s_leafToFullSuffixes.end()) return false;
+			if (leafIt == s_leafToFullSuffixes.end()) {
+				SetStandaloneSpecialIdleRejection(a_rejectionReason,
+					std::format("no replacement candidate has leaf '{}'", leaf));
+				return false;
+			}
 			for (const auto& suffix : leafIt->second) {
 				auto infoIt = s_suffixToInfos.find(suffix);
 				if (infoIt == s_suffixToInfos.end()) continue;
@@ -5356,21 +5376,50 @@ namespace
 		});
 
 		auto* cache = AnimationCache::GetSingleton();
-		if (!cache->GetGameAnimVtable()) return false;
+		if (!cache->GetGameAnimVtable()) {
+			SetStandaloneSpecialIdleRejection(a_rejectionReason, "game animation vtable is unavailable");
+			return false;
+		}
+		std::string lastCandidateRejection = "no candidate was eligible";
 		for (auto& [suffix, info] : candidates) {
-			if (!info || !info->parentSubMod) continue;
+			if (!info || !info->parentSubMod) {
+				lastCandidateRejection = "replacement candidate has no owning submod";
+				continue;
+			}
 			auto* subMod = info->parentSubMod;
 			auto& filter = subMod->trackFilter;
-			if (subMod->IsDisabled() || !filter.enabled || !filter.triggerOnlySpecialIdle) continue;
+			if (subMod->IsDisabled()) {
+				lastCandidateRejection = std::format("submod '{}' is disabled", subMod->GetName());
+				continue;
+			}
+			if (!filter.enabled) {
+				lastCandidateRejection = std::format("submod '{}' has no track filter", subMod->GetName());
+				continue;
+			}
+			if (!filter.triggerOnlySpecialIdle) {
+				lastCandidateRejection = std::format(
+					"submod '{}' has filter-only special-idle playback disabled", subMod->GetName());
+				continue;
+			}
 			// Preserve ordinary path semantics: a foreign folder is eligible only
 			// when this submod explicitly claims filenames through Leaf Matching.
-			if (suffix != rawSuffix && !subMod->GetLeafMatching()) continue;
+			if (suffix != rawSuffix && !subMod->GetLeafMatching()) {
+				lastCandidateRejection = std::format(
+					"submod '{}' matched the leaf but Leaf Matching is disabled", subMod->GetName());
+				continue;
+			}
 
 			auto* conditions = subMod->GetConditionSet();
 			if (conditions && !conditions->IsEmpty()) {
 				try {
-					if (!subMod->EvaluateConditions(a_actor, nullptr)) continue;
+					if (!subMod->EvaluateConditions(a_actor, nullptr)) {
+						lastCandidateRejection = std::format(
+							"submod '{}' conditions evaluated false", subMod->GetName());
+						continue;
+					}
 				} catch (...) {
+					lastCandidateRejection = std::format(
+						"submod '{}' condition evaluation threw an exception", subMod->GetName());
 					continue;
 				}
 			}
@@ -5378,6 +5427,8 @@ namespace
 			auto* animation = cache->GetCachedAnimation(suffix, subMod);
 			if (!animation || reinterpret_cast<uintptr_t>(animation) < 0x10000 ||
 				IsBadReadPtr(animation, sizeof(RE::hkaAnimation))) {
+				lastCandidateRejection = std::format(
+					"submod '{}' has no valid cached donor animation", subMod->GetName());
 				continue;
 			}
 			std::vector<int16_t> donorMap;
@@ -5387,6 +5438,8 @@ namespace
 				logger::warn(
 					"[OAR-TrackFilter-Standalone] '{}' matched '{}' but its donor binding has no track map; using vanilla SetupSpecialIdle",
 					subMod->GetName(), fileName);
+				lastCandidateRejection = std::format(
+					"submod '{}' donor binding has no track map", subMod->GetName());
 				continue;
 			}
 
@@ -5397,13 +5450,15 @@ namespace
 			a_out.donorIdentity = donorIdentity;
 			return true;
 		}
+		SetStandaloneSpecialIdleRejection(a_rejectionReason, std::move(lastCandidateRejection));
 		return false;
 	}
 
-	static bool StartStandaloneSpecialIdle(RE::Actor* a_actor, RE::TESIdleForm* a_idle)
+	static bool StartStandaloneSpecialIdle(
+		RE::Actor* a_actor, RE::TESIdleForm* a_idle, std::string* a_rejectionReason)
 	{
 		StandaloneSpecialIdleMatch match;
-		if (!FindStandaloneSpecialIdleMatch(a_actor, a_idle, match)) return false;
+		if (!FindStandaloneSpecialIdleMatch(a_actor, a_idle, match, a_rejectionReason)) return false;
 
 		auto* subMod = match.info->parentSubMod;
 		auto* filter = &subMod->trackFilter;
@@ -5490,7 +5545,8 @@ namespace
 	// generator's next Update re-asserts the swap (standard per-frame re-assert)
 	// — brief, rare (reload-cancel spam), and strictly better than a play with
 	// culled triggers.
-	static void ScrubStaleCloneFromBindingSet(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
+	static void ScrubStaleCloneFromBindingSet(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context,
+		int32_t a_playerGraphIndex)
 	{
 		// Walk-failure diagnostics (2026-08-19: the scrub silently never fired
 		// in the field). Benign outcomes (walk succeeded, nothing of ours
@@ -5498,15 +5554,31 @@ namespace
 		static std::atomic<int> s_scrubBailLog{ 0 };
 		auto bail = [&](const char* a_stage) {
 			if (s_scrubBailLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-				logger::info("[OAR-Scrub] bail: {} (clipGen={:X})",
-					a_stage, reinterpret_cast<uintptr_t>(a_this));
+				logger::info("[OAR-Scrub] bail: {} (clipGen={:X}, playerGraph={})",
+					a_stage, reinterpret_cast<uintptr_t>(a_this), a_playerGraphIndex);
 			}
 		};
 
 		if (!a_this || !a_context) return;
 		if (!s_gameFullyLoaded.load()) return;
 
-		auto* character = a_context->character;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> playerManager;
+		RE::hkbCharacter* character = nullptr;
+		if (a_playerGraphIndex >= 0) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || !player->GetAnimationGraphManagerImpl(playerManager) || !playerManager) {
+				return bail("player graph manager unavailable");
+			}
+			const auto graphIndex = static_cast<uint32_t>(a_playerGraphIndex);
+			if (graphIndex >= playerManager->graph.size() || !playerManager->graph[graphIndex]) {
+				return bail("resolved player graph unavailable");
+			}
+			// hkbContext::character is a static dummy in this runtime. The actual
+			// binding set lives on the owning BShkbAnimationGraph character.
+			character = &playerManager->graph[graphIndex]->character;
+		} else {
+			character = a_context->character;
+		}
 		if (!character || IsBadReadPtr(character, sizeof(RE::hkbCharacter))) return bail("character null/unreadable");
 
 		auto* bindingSet = character->animationBindingSet._ptr;
@@ -5546,26 +5618,31 @@ namespace
 		*slotAddr = orig;
 		static std::atomic<int> s_scrubLog{ 0 };
 		if (s_scrubLog.fetch_add(1, std::memory_order_relaxed) < 30) {
-			logger::info("[OAR] Activation: scrubbed stale clone from binding set (clipGen={:X}, bindIdx={})",
-				reinterpret_cast<uintptr_t>(a_this), bindIdx);
+			logger::info("[OAR] Activation: scrubbed stale clone from binding set (clipGen={:X}, bindIdx={}, playerGraph={})",
+				reinterpret_cast<uintptr_t>(a_this), bindIdx, a_playerGraphIndex);
 		}
 	}
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		const int32_t playerGraphIndex = PlayerGraphIndexForClip(a_this, a_context);
+		if (playerGraphIndex >= 0) {
+			std::unique_lock lock(s_playerClipMutex);
+			s_playerClipGraph[a_this] = static_cast<uint8_t>(playerGraphIndex);
+		}
+
 		// Clean the shared binding BEFORE anything reads it: _Activate builds
 		// the control and the play's trigger window from whatever is bound
 		// here, and the pre-swap below re-installs the current winner's clone
 		// afterwards when conditions pass — so scrubbing first is correct in
 		// both directions (see ScrubStaleCloneFromBindingSet).
-		ScrubStaleCloneFromBindingSet(a_this, a_context);
+		ScrubStaleCloneFromBindingSet(a_this, a_context, playerGraphIndex);
 
 		// Detect the transition after scrubbing the currently activating binding,
 		// then retire all clones so this play rebuilds from the weapon's fresh game
 		// animation. The retired records retain their original reverse links for
 		// any other shared binding encountered later.
-		if (a_this && a_context && s_gameFullyLoaded.load() &&
-			GetRefrFromCharacter(a_context->character) == RE::PlayerCharacter::GetSingleton()) {
+		if (playerGraphIndex >= 0 && s_gameFullyLoaded.load()) {
 			CheckAndInvalidateOnWeaponChange();
 		}
 
@@ -10812,75 +10889,90 @@ namespace Hooks
 			RE::DEFAULT_OBJECT a_defaultObject, RE::TESIdleForm* a_idle,
 			bool a_testConditions, RE::TESObjectREFR* a_targetOverride)
 		{
+			const auto actorFormID = a_actor.GetFormID();
+			const auto idleFormID = a_idle ? a_idle->GetFormID() : 0;
+			const char* fileName = a_idle ? a_idle->animFileName.c_str() : nullptr;
+			logger::info(
+				"[OAR-TrackFilter-Standalone] SetupSpecialIdle entry: actor={:08X}, idle={:08X}, file='{}', defaultObject={}, testConditions={}",
+				actorFormID, idleFormID, fileName ? fileName : "<null>",
+				static_cast<std::uint32_t>(a_defaultObject), a_testConditions);
+
 			// The intercepted path must honor the IDLE record's own conditions;
 			// otherwise we could report success for an idle vanilla would reject.
 			const bool idleConditionsPass = a_idle && (!a_testConditions ||
 				a_idle->CheckConditions(&a_actor, a_targetOverride, true));
-			if (idleConditionsPass && StartStandaloneSpecialIdle(&a_actor, a_idle)) {
+			std::string rejectionReason;
+			if (idleConditionsPass && StartStandaloneSpecialIdle(&a_actor, a_idle, &rejectionReason)) {
 				// Report success to the PlayIdle caller without creating the native
 				// special-idle state or its behavior-authored end trigger.
 				return true;
 			}
+			if (!idleConditionsPass) {
+				rejectionReason = "TESIdleForm conditions evaluated false";
+			}
+			logger::info(
+				"[OAR-TrackFilter-Standalone] SetupSpecialIdle fallback: actor={:08X}, idle={:08X}, reason='{}'",
+				actorFormID, idleFormID,
+				rejectionReason.empty() ? "no filter-only match" : rejectionReason);
 			return _Original ? _Original(a_process, a_actor, a_defaultObject, a_idle,
 				a_testConditions, a_targetOverride) : false;
 		}
 
-		void Install(REL::Trampoline& a_trampoline)
+		void Install()
 		{
 			REL::Relocation<std::uintptr_t> setupTarget{ RE::ID::AIProcess::SetupSpecialIdle };
 			const auto target = setupTarget.address();
-			const auto moduleBase = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
-			if (!target || !moduleBase) {
-				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: runtime addresses are null");
+			if (!target) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook unavailable: runtime address is null");
 				return;
 			}
 
-			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
-			if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: invalid DOS header");
+			MEMORY_BASIC_INFORMATION memoryInfo{};
+			if (::VirtualQuery(reinterpret_cast<const void*>(target), &memoryInfo, sizeof(memoryInfo)) == 0 ||
+				memoryInfo.State != MEM_COMMIT) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook unavailable: target memory is not committed");
 				return;
 			}
-			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dos->e_lfanew);
-			if (nt->Signature != IMAGE_NT_SIGNATURE) {
-				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: invalid NT header");
-				return;
-			}
-
-			std::vector<std::uintptr_t> callSites;
-			const auto* section = IMAGE_FIRST_SECTION(nt);
-			for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-				if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
-				const auto begin = moduleBase + section->VirtualAddress;
-				const auto size = static_cast<std::size_t>(section->Misc.VirtualSize);
-				const auto* code = reinterpret_cast<const std::uint8_t*>(begin);
-				for (std::size_t off = 0; off + 5 <= size; ++off) {
-					if (code[off] != 0xE8) continue;
-					const auto rel = *reinterpret_cast<const std::int32_t*>(code + off + 1);
-					const auto resolved = begin + off + 5 + static_cast<std::intptr_t>(rel);
-					if (resolved == target) callSites.push_back(begin + off);
-				}
-			}
-
-			if (callSites.empty()) {
-				logger::warn(
-					"[OAR-TrackFilter-Standalone] No validated direct calls to SetupSpecialIdle were found; filter-only special idles will fall back to vanilla behavior");
+			const DWORD protection = memoryInfo.Protect & 0xFF;
+			if (protection != PAGE_EXECUTE && protection != PAGE_EXECUTE_READ &&
+				protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook unavailable: target memory is not executable");
 				return;
 			}
 
-			for (const auto site : callSites) {
-				auto original = reinterpret_cast<SetupFn>(
-					a_trampoline.write_call<5>(site, &HookedSetupSpecialIdle));
-				if (!_Original) _Original = original;
-				if (original != _Original) {
-					logger::critical(
-						"[OAR-TrackFilter-Standalone] SetupSpecialIdle call at +0x{:X} resolved to an unexpected target; hook disabled for safety",
-						site - moduleBase);
-					return;
-				}
+			const auto initStatus = MH_Initialize();
+			if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
+				logger::warn("[OAR-TrackFilter-Standalone] MinHook initialization failed: {}",
+					MH_StatusToString(initStatus));
+				return;
+			}
+
+			const auto createStatus = MH_CreateHook(
+				reinterpret_cast<void*>(target),
+				reinterpret_cast<void*>(&HookedSetupSpecialIdle),
+				reinterpret_cast<void**>(&_Original));
+			if (createStatus != MH_OK) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook creation failed: {}",
+					MH_StatusToString(createStatus));
+				_Original = nullptr;
+				return;
+			}
+			if (!_Original) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook produced no original trampoline; hook removed");
+				MH_RemoveHook(reinterpret_cast<void*>(target));
+				return;
+			}
+			const auto enableStatus = MH_EnableHook(reinterpret_cast<void*>(target));
+			if (enableStatus != MH_OK) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle entry hook enable failed: {}",
+					MH_StatusToString(enableStatus));
+				MH_RemoveHook(reinterpret_cast<void*>(target));
+				_Original = nullptr;
+				return;
 			}
 			logger::info(
-				"[OAR-TrackFilter-Standalone] Hooked {} validated SetupSpecialIdle call site(s), target={:X}",
-				callSites.size(), target);
+				"[OAR-TrackFilter-Standalone] Hooked SetupSpecialIdle function entry at {:X}; all direct and indirect PlayIdle callers are covered",
+				target);
 		}
 	}
 
@@ -11424,7 +11516,7 @@ namespace Hooks
 		UpdateHooks::Install();
 		FileRedirectHooks::Install();
 		ActionFireEmptyHook::Install();
-		SetupSpecialIdleHook::Install(REL::GetTrampoline());
+		SetupSpecialIdleHook::Install();
 		AnimGraphEventFeedHook::Install();
 		PlayerFireEmptyHook::Install(REL::GetTrampoline());
 		AutoReloadSuppression::Install();

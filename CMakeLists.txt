@@ -48,6 +48,7 @@ endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(spdlog REQUIRED CONFIG)
 find_package(imgui CONFIG REQUIRED)
+find_package(minhook CONFIG REQUIRED)
 
 set(SOURCES
 	src/PCH.cpp
@@ -152,6 +153,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	nlohmann_json::nlohmann_json
 	spdlog::spdlog
 	imgui::imgui
+	minhook::minhook
 	d3d11
 	dxgi
 )

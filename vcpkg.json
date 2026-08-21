@@ -9,6 +9,7 @@
       "name": "imgui",
       "features": [ "dx11-binding", "win32-binding" ]
     },
+    "minhook",
     "nlohmann-json",
     "spdlog"
   ]

@@ -32,7 +32,7 @@ void Settings::Load()
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
-	iTextSizePercent = std::clamp(getI("UI", "iTextSizePercent", iTextSizePercent), 80, 200);
+	iTextSizePercent = std::clamp(getI("UI", "iTextSizePercent", iTextSizePercent), 50, 200);
 	sLanguage = ini.GetValue("UI", "sLanguage", sLanguage.c_str());
 	sCJKFontPath = ini.GetValue("UI", "sCJKFontPath", sCJKFontPath.c_str());
 

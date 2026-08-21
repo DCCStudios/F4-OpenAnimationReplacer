@@ -69,8 +69,9 @@ public:
 	std::string sLanguage{ "en_US" };
 	std::string sCJKFontPath{};
 	// Text is intentionally larger than Dear ImGui's base size by default.
-	// UIWindow applies the same ratio to window dimensions so increasing the
-	// text size does not reduce the amount of editor content that remains visible.
+	// This multiplies the game window's Windows DPI scale. UIWindow applies the
+	// combined ratio to window dimensions so increasing either scale does not
+	// reduce the amount of editor content that remains visible.
 	int   iTextSizePercent{ 125 };
 
 	bool  bLogActivate{ true };

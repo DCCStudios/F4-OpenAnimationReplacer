@@ -807,10 +807,17 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 
 	UICommon::ApplyOARStyle();
 	UICommon::LoadCJKFont();
-	// Settings are loaded before renderer initialization. Apply the persisted
-	// text size before the first frame so every OAR window starts consistently.
-	ImGui::GetStyle().FontScaleMain =
-		static_cast<float>(Settings::GetSingleton()->iTextSizePercent) / 100.0f;
+	// Keep the user preference and Windows DPI as independent multipliers.
+	// FontScaleMain is the persisted percentage; FontScaleDpi follows the game
+	// window's monitor. Style geometry is scaled only for DPI because UIWindow
+	// separately compensates its dimensions for the combined effective scale.
+	auto& style = ImGui::GetStyle();
+	style.FontScaleMain = static_cast<float>(Settings::GetSingleton()->iTextSizePercent) / 100.0f;
+	dpiScale = std::clamp(ImGui_ImplWin32_GetDpiScaleForHwnd(gameWindow), 0.5f, 4.0f);
+	style.FontScaleDpi = dpiScale;
+	style.ScaleAllSizes(dpiScale);
+	logger::info("[OAR-UI] DPI scale {:.3f}, text scale {:.3f}, effective scale {:.3f}",
+		dpiScale, style.FontScaleMain, dpiScale * style.FontScaleMain);
 
 	auto& io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -857,6 +864,27 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 // whatever render target Present already has bound (matches framework).
 // ============================================================================
 
+float UIManager::GetEffectiveUIScale() const
+{
+	return dpiScale * static_cast<float>(Settings::GetSingleton()->iTextSizePercent) / 100.0f;
+}
+
+void UIManager::UpdateDPIScale()
+{
+	if (!gameWindow || !ImGui::GetCurrentContext()) return;
+
+	const float newScale = std::clamp(ImGui_ImplWin32_GetDpiScaleForHwnd(gameWindow), 0.5f, 4.0f);
+	if (std::abs(newScale - dpiScale) <= 0.001f) return;
+
+	auto& style = ImGui::GetStyle();
+	const float previousScale = dpiScale > 0.0f ? dpiScale : 1.0f;
+	style.ScaleAllSizes(newScale / previousScale);
+	style.FontScaleDpi = newScale;
+	dpiScale = newScale;
+	logger::info("[OAR-UI] DPI changed to {:.3f}; text scale {:.3f}, effective scale {:.3f}",
+		dpiScale, style.FontScaleMain, dpiScale * style.FontScaleMain);
+}
+
 void UIManager::RenderFrame()
 {
 	// Process pending background jobs (config saves, reloads, etc.)
@@ -899,6 +927,7 @@ void UIManager::RenderFrame()
 		ImGui_ImplDX11_CreateDeviceObjects();
 	}
 
+	UpdateDPIScale();
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 

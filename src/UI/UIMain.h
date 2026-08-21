@@ -55,6 +55,7 @@ private:
 	bool showSettings{ false };
 	bool capturingToggleKey{ false };
 	float firstColumnPercent{ 0.45f };
+	float settingsAppliedUIScale{ 0.0f };
 	std::string copiedConditionJson;
 
 	// Rename popup state

@@ -2427,10 +2427,23 @@ void UIMain::ApplyCapturedToggleKey(std::uint32_t a_dik)
 void UIMain::DrawSettingsPanel()
 {
 	auto* settings = Settings::GetSingleton();
-	const float textScale = static_cast<float>(settings->iTextSizePercent) / 100.0f;
-	ImGui::SetNextWindowSize(ImVec2(350.0f * textScale, 500.0f * textScale), ImGuiCond_FirstUseEver);
+	auto* uiManager = UIManager::GetSingleton();
+	const float effectiveScale = uiManager->GetEffectiveUIScale();
+	ImGui::SetNextWindowSize(ImVec2(350.0f * effectiveScale, 500.0f * effectiveScale), ImGuiCond_FirstUseEver);
 	const std::string settingsWindowTitle = std::string(UICommon::T("OAR Settings")) + "###OARSettings";
-	if (!ImGui::Begin(settingsWindowTitle.c_str(), &showSettings)) {
+	const bool settingsVisible = ImGui::Begin(settingsWindowTitle.c_str(), &showSettings);
+	if (settingsAppliedUIScale > 0.0f && std::abs(settingsAppliedUIScale - effectiveScale) > 0.001f) {
+		const float ratio = effectiveScale / settingsAppliedUIScale;
+		const ImVec2 currentSize = ImGui::GetWindowSize();
+		ImVec2 resized(currentSize.x * ratio, currentSize.y * ratio);
+		if (const auto* viewport = ImGui::GetMainViewport()) {
+			resized.x = std::min(resized.x, std::max(1.0f, viewport->WorkSize.x - 16.0f));
+			resized.y = std::min(resized.y, std::max(1.0f, viewport->WorkSize.y - 16.0f));
+		}
+		ImGui::SetWindowSize(resized, ImGuiCond_Always);
+	}
+	settingsAppliedUIScale = effectiveScale;
+	if (!settingsVisible) {
 		ImGui::End();
 		return;
 	}
@@ -2599,21 +2612,24 @@ void UIMain::DrawSettingsPanel()
 	// ImGui 1.92 moved io.FontGlobalScale to style.FontScaleMain. Keep the
 	// user-facing value as an integer percentage for stable INI persistence.
 	const int previousTextSize = settings->iTextSizePercent;
-	if (ImGui::SliderInt(UICommon::T("Text Size"), &settings->iTextSizePercent, 80, 200, UICommon::T("%d%%"))) {
+	if (ImGui::SliderInt(UICommon::T("Text Size"), &settings->iTextSizePercent, 50, 200, UICommon::T("%d%%"))) {
 		const float previousScale = static_cast<float>(previousTextSize) / 100.0f;
 		const float newScale = static_cast<float>(settings->iTextSizePercent) / 100.0f;
 		ImGui::GetStyle().FontScaleMain = newScale;
+		const float previousEffectiveScale = uiManager->GetDPIScale() * previousScale;
+		const float newEffectiveScale = uiManager->GetDPIScale() * newScale;
 
 		// The settings panel is not a UIWindow, so compensate its dimensions here.
 		// Other OAR windows perform the same ratio-based adjustment in TryDraw().
 		const ImVec2 currentSize = ImGui::GetWindowSize();
-		ImVec2 resized(currentSize.x * newScale / previousScale,
-			currentSize.y * newScale / previousScale);
+		ImVec2 resized(currentSize.x * newEffectiveScale / previousEffectiveScale,
+			currentSize.y * newEffectiveScale / previousEffectiveScale);
 		if (const auto* viewport = ImGui::GetMainViewport()) {
 			resized.x = std::min(resized.x, std::max(1.0f, viewport->WorkSize.x - 16.0f));
 			resized.y = std::min(resized.y, std::max(1.0f, viewport->WorkSize.y - 16.0f));
 		}
 		ImGui::SetWindowSize(resized, ImGuiCond_Always);
+		settingsAppliedUIScale = newEffectiveScale;
 		dirty = true;
 	}
 
