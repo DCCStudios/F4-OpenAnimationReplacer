@@ -622,7 +622,27 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	const auto fileEnd = fileBegin + entry.fileData.size();
 	const bool extractedMotionInBackingFile = extractedMotion >= fileBegin && extractedMotion < fileEnd;
 	const bool referenceFrameVtableAvailable = m_referenceFrameVtable.load() != 0;
-	if (entry.preserveExtractedMotion && extractedMotionInBackingFile && referenceFrameVtableAvailable) {
+	bool extractedMotionVtableValid = false;
+	if (entry.preserveExtractedMotion && extractedMotionInBackingFile && referenceFrameVtableAvailable &&
+		extractedMotion <= fileEnd - sizeof(uintptr_t)) {
+		// The HKX virtual-fixup table normally initializes this slot, but the
+		// extracted-motion object is the only object whose vtable is required by
+		// the runtime clone. Patch the object reached through m_extractedMotion
+		// directly as well, then validate the write before exposing the pointer
+		// to Havok. This covers packfiles whose virtual-fixup source section is
+		// not represented by the contents-section-relative offset we recorded.
+		auto* extractedMotionObject = reinterpret_cast<uintptr_t*>(extractedMotion);
+		const auto referenceFrameVtable = m_referenceFrameVtable.load();
+		const auto previousVtable = *extractedMotionObject;
+		if (previousVtable != referenceFrameVtable) {
+			*extractedMotionObject = referenceFrameVtable;
+			logger::info("[OAR-Motion] Patched extractedMotion vtable {:X}->{:X} for '{}'",
+				previousVtable, referenceFrameVtable, entry.filePath);
+		}
+		extractedMotionVtableValid = *extractedMotionObject == referenceFrameVtable;
+	}
+	if (entry.preserveExtractedMotion && extractedMotionInBackingFile &&
+		referenceFrameVtableAvailable && extractedMotionVtableValid) {
 		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = extractedMotion;
 		logger::info("[OAR-Motion] Preserved extractedMotion for '{}' (reference={:X})",
 			entry.filePath, extractedMotion);
@@ -630,6 +650,10 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = 0;
 		if (entry.preserveExtractedMotion && extractedMotion != 0 && !referenceFrameVtableAvailable) {
 			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because no runtime reference-frame vtable has been captured yet",
+				entry.filePath);
+		} else if (entry.preserveExtractedMotion && extractedMotion != 0 && extractedMotionInBackingFile &&
+			!extractedMotionVtableValid) {
+			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because its vtable could not be validated",
 				entry.filePath);
 		} else if (entry.preserveExtractedMotion && extractedMotion != 0) {
 			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because the reference is outside the backing HKX buffer ({:X})",
