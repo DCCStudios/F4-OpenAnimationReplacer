@@ -15,6 +15,9 @@ namespace UICommon
     // string when a translation is missing.
     void LoadLocalization();
     const char* T(const char* a_source);
+	// ImGui storage keys and hidden labels are program identifiers, not display
+	// text. Keeping them untranslated preserves window state and popup pairing.
+	constexpr const char* StableID(const char* a_source) { return a_source; }
 
     const std::vector<LanguageOption>& GetAvailableLanguages();
     bool SetLanguage(const std::string& a_language);

@@ -119,7 +119,7 @@ void UIMain::DrawFilterBar()
 
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, UICommon::Colors::FilterBg);
 	ImGui::SetNextItemWidth(availWidth * 0.4f);
-	ImGui::InputTextWithHint(UICommon::T("##filter"), UICommon::T("Filter mods..."), filterText, sizeof(filterText));
+	ImGui::InputTextWithHint(UICommon::StableID("##filter"), UICommon::T("Filter mods..."), filterText, sizeof(filterText));
 	ImGui::PopStyleColor();
 
 	ImGui::SameLine(availWidth * 0.5f);
@@ -147,14 +147,14 @@ void UIMain::DrawFilterBar()
 	char buf[16];
 	snprintf(buf, sizeof(buf), "0x%X", evalTargetFormID);
 	ImGui::SetNextItemWidth(80);
-	if (ImGui::InputText(UICommon::T("##evalTarget"), buf, sizeof(buf))) {
+	if (ImGui::InputText(UICommon::StableID("##evalTarget"), buf, sizeof(buf))) {
 		try { evalTargetFormID = std::stoul(buf, nullptr, 16); } catch (...) {}
 	}
 }
 
 void UIMain::DrawTabBar()
 {
-	if (ImGui::BeginTabBar(UICommon::T("MainTabs"))) {
+	if (ImGui::BeginTabBar(UICommon::StableID("MainTabs"))) {
 		if (ImGui::BeginTabItem(UICommon::T("Replacer Mods"))) {
 			DrawReplacerModsTab();
 			ImGui::EndTabItem();
@@ -196,13 +196,13 @@ void UIMain::DrawReplacerModsTab()
 
 	float childHeight = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 4;
 
-	ImGui::BeginChild(UICommon::T("ModTreeCol"), ImVec2(firstColW, childHeight), true);
+	ImGui::BeginChild(UICommon::StableID("ModTreeCol"), ImVec2(firstColW, childHeight), true);
 	DrawModTree();
 	ImGui::EndChild();
 
 	ImGui::SameLine();
 
-	ImGui::BeginChild(UICommon::T("DetailsCol"), ImVec2(secondColW, childHeight), true);
+	ImGui::BeginChild(UICommon::StableID("DetailsCol"), ImVec2(secondColW, childHeight), true);
 	if (selectedSubMod) {
 		DrawSubModDetails(selectedSubMod);
 	} else {
@@ -424,7 +424,7 @@ void UIMain::BeginCreateModConfig(ReplacerMod* a_mod)
 void UIMain::DrawReplacementAnimsTab()
 {
 	float childHeight = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 4;
-	ImGui::BeginChild(UICommon::T("AnimList"), ImVec2(0, childHeight), true);
+	ImGui::BeginChild(UICommon::StableID("AnimList"), ImVec2(0, childHeight), true);
 
 	auto* oar = OpenAnimationReplacer::GetSingleton();
 	ReadLocker modsLock(oar->GetModsMutex());
@@ -522,7 +522,7 @@ void UIMain::DrawModTree()
 
 		// Right-click a mod folder: offer to create its config.json (name /
 		// author / description) when it has none.
-		if (ImGui::BeginPopupContextItem(UICommon::T("ModContext"))) {
+		if (ImGui::BeginPopupContextItem(UICommon::StableID("ModContext"))) {
 			if (modNoConfig) {
 				if (ImGui::MenuItem(UICommon::T("Create config.json..."))) {
 					BeginCreateModConfig(mod.get());
@@ -587,7 +587,7 @@ void UIMain::DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod)
 	}
 
 	// Right-click context menu
-	if (ImGui::BeginPopupContextItem(UICommon::T("SubModContext"))) {
+	if (ImGui::BeginPopupContextItem(UICommon::StableID("SubModContext"))) {
 		if (noConfig) {
 			if (ImGui::MenuItem(UICommon::T("Create config.json..."))) {
 				BeginCreateSubModConfig(a_subMod);
@@ -623,7 +623,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 	// Description: clickable in Author/Condition modes so a double-click or
 	// right-click opens the edit popup. Empty descriptions still render a
 	// placeholder so there's always something to interact with.
-	ImGui::PushID(UICommon::T("SubModDesc"));
+	ImGui::PushID(UICommon::StableID("SubModDesc"));
 	if (!a_subMod->GetDescription().empty()) {
 		ImGui::TextWrapped(UICommon::T("%s"), a_subMod->GetDescription().c_str());
 	} else if (editable) {
@@ -638,7 +638,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				BeginEditDescription(a_subMod);
 			}
 		}
-		if (ImGui::BeginPopupContextItem(UICommon::T("DescContext"))) {
+		if (ImGui::BeginPopupContextItem(UICommon::StableID("DescContext"))) {
 			if (ImGui::MenuItem(UICommon::T("Edit Description..."))) {
 				BeginEditDescription(a_subMod);
 			}
@@ -759,17 +759,17 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"replacements; no effect when the replacement is equal length or longer."));
 
 		bool disableIdleStop = a_subMod->GetDisableIdleStop();
-		if (ImGui::Checkbox("Apply IdleStop Fix After Special Idle (?)", &disableIdleStop)) {
+		if (ImGui::Checkbox(UICommon::T("Apply IdleStop Fix After Special Idle (?)"), &disableIdleStop)) {
 			a_subMod->SetDisableIdleStop(disableIdleStop);
 			a_subMod->SetDirty(true);
 		}
 		if (ImGui::IsItemHovered()) {
-			ImGui::SetTooltip(
+			ImGui::SetTooltip("%s", UICommon::T(
 				"After this submod's replacement plays, handle the actor's next IdleStop\n"
 				"using the fallout4-idlestopfix method: advance animation processing by\n"
 				"1000 seconds, then deliver IdleStop normally. Default: OFF.\n\n"
 				"This avoids leaving the actor in a lingering special-idle state without\n"
-				"swallowing the event or bypassing the graph's normal cleanup.");
+				"swallowing the event or bypassing the graph's normal cleanup."));
 		}
 
 		bool leafMatch = a_subMod->GetLeafMatching();
@@ -813,9 +813,16 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"above (default behavior). 0 = instant snap back to the original."));
 
 		int curveIdx = static_cast<int>(a_subMod->blendCurve);
+		const char* curveLabels[] = {
+			UICommon::T("Linear"),
+			UICommon::T("Quadratic"),
+			UICommon::T("Cubic"),
+			UICommon::T("Hermite Cubic"),
+			UICommon::T("Sinusoidal"),
+			UICommon::T("Exponential")
+		};
 		ImGui::SetNextItemWidth(140);
-		if (ImGui::Combo(UICommon::T("Blend curve (?)"), &curveIdx,
-				UICommon::T("Linear\0Quadratic\0Cubic\0Hermite Cubic\0Sinusoidal\0Exponential\0"))) {
+		if (ImGui::Combo(UICommon::T("Blend curve (?)"), &curveIdx, curveLabels, IM_ARRAYSIZE(curveLabels))) {
 			a_subMod->blendCurve = static_cast<BlendCurve>(curveIdx);
 			a_subMod->SetDirty(true);
 		}
@@ -926,7 +933,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				}
 			} else {
 				ImGui::Indent(16.f);
-				ImGui::TextDisabled(UICommon::T("%s which bone?"), std::strcmp(selEvtName, UICommon::T("CullBone")) == 0 ? UICommon::T("Hide (cull)") : UICommon::T("Show (uncull)"));
+				ImGui::TextDisabled(UICommon::T("%s which bone?"), std::strcmp(selEvtName, "CullBone") == 0 ? UICommon::T("Hide (cull)") : UICommon::T("Show (uncull)"));
 				static int selectedCullBone = 0;
 				ImGui::SetNextItemWidth(180);
 				ImGui::Combo(UICommon::T("##cullBoneList"), &selectedCullBone, kKnownBones, kNumKnownBones);
@@ -986,7 +993,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"controls annotation emission)."));
 
 		if (!a_subMod->suppressAllAnnotations) {
-			ImGui::PushID(UICommon::T("suppressAnnot"));
+			ImGui::PushID(UICommon::StableID("suppressAnnot"));
 			ImGui::TextUnformatted(UICommon::T("Suppressed annotations (?):"));
 			if (ImGui::IsItemHovered()) ImGui::SetTooltip(
 				UICommon::T("Annotations with these exact names (case-insensitive) are muted\n"
@@ -1280,13 +1287,13 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 	if (editable) {
 		ImGui::Spacing();
 		if (ImGui::SmallButton(UICommon::T("Add new condition"))) {
-			ImGui::OpenPopup(UICommon::T("AddCondition"));
+			ImGui::OpenPopup(UICommon::StableID("AddCondition"));
 		}
 		ImGui::SameLine();
 		if (ImGui::SmallButton(UICommon::T("Condition set..."))) {
-			ImGui::OpenPopup(UICommon::T("CondSetMenu"));
+			ImGui::OpenPopup(UICommon::StableID("CondSetMenu"));
 		}
-		if (ImGui::BeginPopup(UICommon::T("CondSetMenu"))) {
+		if (ImGui::BeginPopup(UICommon::StableID("CondSetMenu"))) {
 			if (ImGui::MenuItem(UICommon::T("Copy all conditions"))) {
 				nlohmann::json arr = nlohmann::json::array();
 				for (const auto& cond : a_condSet->GetConditions()) {
@@ -1319,7 +1326,7 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 			ImGui::EndPopup();
 		}
 
-		if (ImGui::BeginPopup(UICommon::T("AddCondition"))) {
+		if (ImGui::BeginPopup(UICommon::StableID("AddCondition"))) {
 			static char condFilter[128]{};
 			ImGui::InputTextWithHint(UICommon::T("##condSearch"), UICommon::T("Search..."), condFilter, sizeof(condFilter));
 
@@ -1347,7 +1354,8 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 				const auto& fn = factories.at(name);
 				auto tempCond = fn();
 				bool condIsStub = tempCond && tempCond->IsStub();
-				std::string displayName = condIsStub ? name + "  [N/A]" : name;
+				std::string displayName = UICommon::T(name.c_str());
+				if (condIsStub) displayName += "  [N/A]";
 				if (condIsStub) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.1f, 1.0f));
 				if (ImGui::MenuItem(displayName.c_str())) {
 					a_condSet->AddCondition(fn());
@@ -1453,10 +1461,10 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 		}
 
 		if (wantsContextMenu) {
-			ImGui::OpenPopup(UICommon::T("ConditionContextMenu"));
+			ImGui::OpenPopup(UICommon::StableID("ConditionContextMenu"));
 		}
 		bool deletedViaContextMenu = false;
-		if (ImGui::BeginPopup(UICommon::T("ConditionContextMenu"))) {
+		if (ImGui::BeginPopup(UICommon::StableID("ConditionContextMenu"))) {
 			if (ImGui::MenuItem(UICommon::T("Copy condition"))) {
 				nlohmann::json condJson;
 				a_condition->Serialize(condJson);
@@ -1654,8 +1662,9 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			ImGui::Spacing();
 
 			int modeInt = (tf.mode == SubMod::TrackFilter::Mode::Override) ? 0 : 1;
+			const char* modeLabels[] = { UICommon::T("Override"), UICommon::T("Additive") };
 			ImGui::SetNextItemWidth(140);
-			if (ImGui::Combo(UICommon::T("Blend Mode##trackFilter"), &modeInt, UICommon::T("Override\0Additive\0"))) {
+			if (ImGui::Combo(UICommon::T("Blend Mode##trackFilter"), &modeInt, modeLabels, IM_ARRAYSIZE(modeLabels))) {
 				tf.mode = (modeInt == 0) ? SubMod::TrackFilter::Mode::Override : SubMod::TrackFilter::Mode::Additive;
 				a_subMod->SetDirty(true);
 			}
@@ -1823,7 +1832,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			ImGui::Spacing();
 
 			if (ImGui::Button(UICommon::T("Add Bone..."))) {
-				ImGui::OpenPopup(UICommon::T("AddBonePopup"));
+				ImGui::OpenPopup(UICommon::StableID("AddBonePopup"));
 			}
 			ImGui::SameLine();
 
@@ -1848,7 +1857,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			}
 			if (!canAddCustom) ImGui::EndDisabled();
 
-			if (ImGui::BeginPopup(UICommon::T("AddBonePopup"))) {
+			if (ImGui::BeginPopup(UICommon::StableID("AddBonePopup"))) {
 				static char boneFilter[64]{};
 				ImGui::InputTextWithHint(UICommon::T("##boneSearch"), UICommon::T("Search or type a bone name..."), boneFilter, sizeof(boneFilter));
 				ImGui::Separator();
@@ -1955,7 +1964,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			ImGui::Spacing();
 
 			if (ImGui::Button(UICommon::T("Add Exclude..."))) {
-				ImGui::OpenPopup(UICommon::T("AddExclBonePopup"));
+				ImGui::OpenPopup(UICommon::StableID("AddExclBonePopup"));
 			}
 			ImGui::SameLine();
 
@@ -1980,7 +1989,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			}
 			if (!canAddExclCustom) ImGui::EndDisabled();
 
-			if (ImGui::BeginPopup(UICommon::T("AddExclBonePopup"))) {
+			if (ImGui::BeginPopup(UICommon::StableID("AddExclBonePopup"))) {
 				static char exclBoneFilter[64]{};
 				ImGui::InputTextWithHint(UICommon::T("##exclBoneSearch"), UICommon::T("Search or type a bone name..."), exclBoneFilter, sizeof(exclBoneFilter));
 				ImGui::Separator();
@@ -2074,7 +2083,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			ImGui::Spacing();
 
 			if (ImGui::Button(UICommon::T("Add Freeze..."))) {
-				ImGui::OpenPopup(UICommon::T("AddFrzBonePopup"));
+				ImGui::OpenPopup(UICommon::StableID("AddFrzBonePopup"));
 			}
 			ImGui::SameLine();
 
@@ -2099,7 +2108,7 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 			}
 			if (!canAddFrzCustom) ImGui::EndDisabled();
 
-			if (ImGui::BeginPopup(UICommon::T("AddFrzBonePopup"))) {
+			if (ImGui::BeginPopup(UICommon::StableID("AddFrzBonePopup"))) {
 				static char frzBoneFilter[64]{};
 				ImGui::InputTextWithHint(UICommon::T("##frzBoneSearch"), UICommon::T("Search or type a bone name..."), frzBoneFilter, sizeof(frzBoneFilter));
 				ImGui::Separator();
@@ -2194,7 +2203,7 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 
 	bool editable = (currentMode != UICommon::EditorMode::kInspect);
 
-	if (ImGui::BeginTable(UICommon::T("AnimTable"), 3,
+	if (ImGui::BeginTable(UICommon::StableID("AnimTable"), 3,
 		ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable)) {
 		ImGui::TableSetupColumn(UICommon::T("Original"), ImGuiTableColumnFlags_None, 0.4f);
 		ImGui::TableSetupColumn(UICommon::T("Replacement"), ImGuiTableColumnFlags_None, 0.5f);
@@ -2454,16 +2463,16 @@ void UIMain::DrawSettingsPanel()
 			"path cannot be resolved. Disable to restore the legacy leaf-matching\n"
 			"behavior everywhere."));
 	}
-	dirty |= ImGui::Checkbox("Skeleton Compatibility Gate", &settings->bSkeletonCompatibilityGate);
+	dirty |= ImGui::Checkbox(UICommon::T("Skeleton Compatibility Gate"), &settings->bSkeletonCompatibilityGate);
 	if (ImGui::IsItemHovered()) {
-		ImGui::SetTooltip(
+		ImGui::SetTooltip("%s", UICommon::T(
 			"Reject replacement candidates whose authored skeleton root or perspective\n"
 			"differs from the playing clip. Default: OFF.\n\n"
 			"Enabling this can prevent corrupted poses from cross-skeleton or foreign\n"
 			"leaf-matching claims, but it can also reject valid special idles that play\n"
 			"a third-person asset through the first-person behavior graph.\n\n"
 			"WARNING: With this disabled, a wrongly matched animation from another\n"
-			"skeleton may corrupt the current game session.");
+			"skeleton may corrupt the current game session."));
 	}
 	{
 		// The engine's own auto-reloads are always suppressed (they are

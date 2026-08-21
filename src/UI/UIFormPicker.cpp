@@ -17,7 +17,7 @@ namespace UIFormPicker
 		bool changed = false;
 		if (ImGui::BeginCombo(a_label, a_preview)) {
 			ImGui::SetNextItemWidth(-1);
-			ImGui::InputText(UICommon::T("##filter"), a_filterBuf, a_filterBufSize);
+			ImGui::InputText(UICommon::StableID("##filter"), a_filterBuf, a_filterBufSize);
 
 			std::string filter(a_filterBuf);
 			std::ranges::transform(filter, filter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

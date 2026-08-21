@@ -192,8 +192,15 @@ configure_file(
 )
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/locales")
-	file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/locales"
-		DESTINATION "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/OpenAnimationReplacer")
+	add_custom_command(
+		TARGET ${PROJECT_NAME}
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/OpenAnimationReplacer/locales"
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+			"${CMAKE_CURRENT_SOURCE_DIR}/locales"
+			"${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/OpenAnimationReplacer/locales"
+		COMMENT "Staging OpenAnimationReplacer locale files"
+	)
 endif()
 
 option(COPY_BUILD "Copy the build output to the Fallout 4 directory." OFF)

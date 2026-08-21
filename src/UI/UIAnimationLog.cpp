@@ -33,7 +33,7 @@ void UIAnimationLog::DrawContents()
 			snprintf(targetFormIDBuf, sizeof(targetFormIDBuf), "0x%X", targetFormID);
 		}
 		ImGui::SetNextItemWidth(120);
-		if (ImGui::InputText(UICommon::T("##targetID"), targetFormIDBuf, sizeof(targetFormIDBuf))) {
+		if (ImGui::InputText(UICommon::StableID("##targetID"), targetFormIDBuf, sizeof(targetFormIDBuf))) {
 			try { targetFormID = std::stoul(targetFormIDBuf, nullptr, 16); } catch (...) {}
 		}
 		if (ImGui::IsItemHovered()) {
@@ -48,7 +48,7 @@ void UIAnimationLog::DrawContents()
 	}
 
 	ImGui::SetNextItemWidth(200);
-	ImGui::InputTextWithHint(UICommon::T("##logFilter"), UICommon::T("Filter..."), filterText, sizeof(filterText));
+	ImGui::InputTextWithHint(UICommon::StableID("##logFilter"), UICommon::T("Filter..."), filterText, sizeof(filterText));
 
 	ImGui::SameLine(ImGui::GetContentRegionAvail().x - 130);
 	if (ImGui::Button(UICommon::T("Clear"))) {
@@ -61,7 +61,7 @@ void UIAnimationLog::DrawContents()
 
 	auto& entries = AnimationLog::GetSingleton()->GetEntries();
 
-	ImGui::BeginChild(UICommon::T("LogEntries"), ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+	ImGui::BeginChild(UICommon::StableID("LogEntries"), ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
 	for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
 		const auto& e = *it;

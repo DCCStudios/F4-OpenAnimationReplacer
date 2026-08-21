@@ -109,7 +109,7 @@ namespace UICommon
 	{
 		ImGui::TextColored(Colors::Warning, UICommon::T("!"));
 		if (ImGui::IsItemHovered() && a_tooltip) {
-			ImGui::SetTooltip(UICommon::T("%s"), a_tooltip);
+			ImGui::SetTooltip("%s", UICommon::T(a_tooltip));
 		}
 	}
 

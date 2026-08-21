@@ -2482,39 +2482,59 @@ namespace
 
 }
 
-// Weapon change detection — called from Activate hook when we notice the weapon
-// animation folder or equipped item set has changed. Proactively restores the
-// live binding slots and invalidates clones so they rebuild from fresh game
-// animation data before the new clip's _Activate constructs its control.
+// Weapon change detection — called from Activate when the weapon animation
+// folder or equipped weapon instance changes. Runtime clones are retired only
+// after the activating binding has been scrubbed. Do not globally restore slot
+// backups here: unlike pre-load, a weapon transition may already have freed
+// some of the recorded game originals.
 static std::string s_lastKnownWeaponFolder;
 static std::shared_mutex s_lastKnownWeaponMutex;
 static uint64_t s_lastKnownEquippedFingerprint{ 0 };
 static bool s_lastKnownEquippedFingerprintValid{ false };
 
-static uint64_t GetPlayerEquippedFingerprint()
+static uint64_t GetPlayerWeaponFingerprint()
 {
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	if (!player || !player->currentProcess || !player->currentProcess->middleHigh) {
 		return 0;
 	}
 
-	std::vector<uint32_t> equippedForms;
+	struct WeaponIdentity
+	{
+		uint32_t formID;
+		uintptr_t instanceData;
+		uint32_t equipIndex;
+	};
+	std::vector<WeaponIdentity> equippedWeapons;
 	auto* middleHigh = player->currentProcess->middleHigh;
 	{
 		RE::BSAutoLock lock{ middleHigh->equippedItemsLock };
 		for (auto& equipped : middleHigh->equippedItems) {
 			auto* object = equipped.item.object;
-			if (object) {
-				equippedForms.push_back(object->GetFormID());
+			if (object && object->GetFormType() == RE::ENUM_FORM_ID::kWEAP) {
+				equippedWeapons.push_back({
+					object->GetFormID(),
+					reinterpret_cast<uintptr_t>(equipped.item.instanceData.get()),
+					equipped.equipIndex.index
+				});
 			}
 		}
 	}
 
-	std::sort(equippedForms.begin(), equippedForms.end());
+	std::sort(equippedWeapons.begin(), equippedWeapons.end(), [](const auto& a_lhs, const auto& a_rhs) {
+		if (a_lhs.formID != a_rhs.formID) return a_lhs.formID < a_rhs.formID;
+		if (a_lhs.instanceData != a_rhs.instanceData) return a_lhs.instanceData < a_rhs.instanceData;
+		return a_lhs.equipIndex < a_rhs.equipIndex;
+	});
 	uint64_t fingerprint = 1469598103934665603ull;
-	for (auto formID : equippedForms) {
-		fingerprint ^= formID;
+	auto mix = [&](uint64_t a_value) {
+		fingerprint ^= a_value;
 		fingerprint *= 1099511628211ull;
+	};
+	for (const auto& weapon : equippedWeapons) {
+		mix(weapon.formID);
+		mix(weapon.instanceData);
+		mix(weapon.equipIndex);
 	}
 	return fingerprint;
 }
@@ -2526,7 +2546,7 @@ static void CheckAndInvalidateOnWeaponChange()
 		std::shared_lock lock(s_graphAnimPathMutex);
 		currentFolder = s_weaponAnimFolder;
 	}
-	const auto currentEquippedFingerprint = GetPlayerEquippedFingerprint();
+	const auto currentEquippedFingerprint = GetPlayerWeaponFingerprint();
 
 	std::unique_lock lock(s_lastKnownWeaponMutex);
 	const bool folderChanged = !currentFolder.empty() && currentFolder != s_lastKnownWeaponFolder;
@@ -2538,27 +2558,28 @@ static void CheckAndInvalidateOnWeaponChange()
 	}
 
 	if (folderChanged || equippedSetChanged) {
-		logger::info("[OAR-WeaponChange] Weapon state changed: folder '{}' -> '{}', equipped fingerprint {:X} -> {:X} — restoring slots and invalidating clones",
+		logger::info("[OAR-WeaponChange] Weapon state changed: folder '{}' -> '{}', weapon fingerprint {:X} -> {:X} — retiring runtime clones",
 			s_lastKnownWeaponFolder, currentFolder,
 			s_lastKnownEquippedFingerprint, currentEquippedFingerprint);
 		s_lastKnownWeaponFolder = currentFolder;
 		s_lastKnownEquippedFingerprint = currentEquippedFingerprint;
 		lock.unlock();
 
-		// This runs on the game thread from Activate. Restore while the recorded
-		// game originals are still available, then retire the replacement clones.
-		// Clearing first would leave a recycled clip with no safe original to use.
-		RestoreAllActiveReplacements();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
-		ClearClipRuntimeState();
+		// Preserve the established folder-transition cleanup: suffix/path maps are
+		// tied to a graph generation and must not survive an actual folder swap.
+		// Same-folder instance switches only need clone retirement, avoiding the
+		// broad actor/clip reset introduced by the PR.
+		if (folderChanged) {
+			ClearClipRuntimeState();
+		}
 	} else if (currentFolder.empty() && !s_lastKnownWeaponFolder.empty()) {
 		// Weapon unequipped (holstered or no weapon) — also invalidate
-		logger::info("[OAR-WeaponChange] Weapon folder cleared (was '{}') — invalidating clones+state",
+		logger::info("[OAR-WeaponChange] Weapon folder cleared (was '{}') — retiring runtime clones",
 			s_lastKnownWeaponFolder);
 		s_lastKnownWeaponFolder.clear();
 		lock.unlock();
 
-		RestoreAllActiveReplacements();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 		ClearClipRuntimeState();
 	}
@@ -5532,21 +5553,21 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
-		// Detect an equipped-weapon transition BEFORE the engine builds the new
-		// animation control. The generic pistol equip clip uses one shared source
-		// path for several weapons, so a folder-only check at the end of Activate
-		// is too late to prevent a previous weapon's runtime clone from becoming
-		// the new play's template.
-		if (a_this && a_context && s_gameFullyLoaded.load()) {
-			CheckAndInvalidateOnWeaponChange();
-		}
-
 		// Clean the shared binding BEFORE anything reads it: _Activate builds
 		// the control and the play's trigger window from whatever is bound
 		// here, and the pre-swap below re-installs the current winner's clone
 		// afterwards when conditions pass — so scrubbing first is correct in
 		// both directions (see ScrubStaleCloneFromBindingSet).
 		ScrubStaleCloneFromBindingSet(a_this, a_context);
+
+		// Detect the transition after scrubbing the currently activating binding,
+		// then retire all clones so this play rebuilds from the weapon's fresh game
+		// animation. The retired records retain their original reverse links for
+		// any other shared binding encountered later.
+		if (a_this && a_context && s_gameFullyLoaded.load() &&
+			GetRefrFromCharacter(a_context->character) == RE::PlayerCharacter::GetSingleton()) {
+			CheckAndInvalidateOnWeaponChange();
+		}
 
 		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
 		// the original _Activate runs. This ensures the hkaDefaultAnimationControl

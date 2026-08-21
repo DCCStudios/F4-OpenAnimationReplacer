@@ -505,8 +505,8 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 	}
 	// Retired clones are still "ours": a clip that held a clone across an
 	// invalidation must not mistake it for a game animation (see RetiredClone
-	// comment in the header). Recovery for such clips intentionally fails —
-	// they keep playing the retired buffer (kept alive) until they deactivate.
+	// comment in the header). Their original reverse link is retained so a
+	// later activation can scrub a shared binding safely.
 	for (auto& retired : m_retiredClones) {
 		if (retired.clonePtr == a_anim) return true;
 	}
@@ -559,6 +559,12 @@ RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_
 RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const
 {
 	if (!a_replacement) return nullptr;
+	auto originalStillMatches = [](RE::hkaAnimation* a_original, float a_duration, int32_t a_numTracks) {
+		if (!a_original || IsBadReadPtr(a_original, 0x1C)) return false;
+		const auto* bytes = reinterpret_cast<const uint8_t*>(a_original);
+		return *reinterpret_cast<const float*>(bytes + 0x14) == a_duration &&
+			*reinterpret_cast<const int32_t*>(bytes + 0x18) == a_numTracks;
+	};
 	std::shared_lock lock(m_mutex);
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
@@ -567,10 +573,17 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 				// The recorded original may be stale (freed on weapon switch
 				// while the clone stays live for other originals) — callers
 				// already validate the returned pointer before use.
-				if (rc.clone == a_replacement && rc.gameOriginal) {
+				if (rc.clone == a_replacement &&
+					originalStillMatches(rc.gameOriginal, rc.originalDuration, rc.originalNumTracks)) {
 					return rc.gameOriginal;
 				}
 			}
+		}
+	}
+	for (auto& retired : m_retiredClones) {
+		if (retired.clonePtr == a_replacement &&
+			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
+			return retired.gameOriginal;
 		}
 	}
 	return nullptr;
@@ -589,6 +602,9 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 		RetiredClone rec;
 		rec.buffer = std::move(rc.structBuffer);
 		rec.clonePtr = rc.clone;
+		rec.gameOriginal = rc.gameOriginal;
+		rec.originalDuration = rc.originalDuration;
+		rec.originalNumTracks = rc.originalNumTracks;
 		rec.suffix = a_suffix;
 		rec.owner = a_entry.owner;
 		m_retiredClones.push_back(std::move(rec));

@@ -4,10 +4,14 @@
 
 #include <imgui.h>
 #include <nlohmann/json.hpp>
+#include <Windows.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <memory>
+#include <regex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,10 +24,34 @@ namespace
     bool g_fontReloadRequested{ false };
     std::vector<UICommon::LanguageOption> g_languages;
 
+	std::filesystem::path GetPluginDirectory()
+	{
+		HMODULE module = nullptr;
+		const auto anchor = reinterpret_cast<LPCWSTR>(std::addressof(g_translations));
+		if (!GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				anchor, &module)) {
+			logger::warn("[OAR] Could not resolve the plugin module for localization paths");
+			return {};
+		}
+
+		std::array<wchar_t, 32768> modulePath{};
+		const DWORD length = GetModuleFileNameW(module, modulePath.data(), static_cast<DWORD>(modulePath.size()));
+		if (length == 0 || length >= modulePath.size()) {
+			logger::warn("[OAR] Could not resolve the plugin path for localization files");
+			return {};
+		}
+		return std::filesystem::path(std::wstring_view(modulePath.data(), length)).parent_path();
+	}
+
     std::filesystem::path GetLocaleDirectory()
     {
-        return std::filesystem::path("Data") / "F4SE" / "Plugins" /
-               "OpenAnimationReplacer" / "locales";
+		const auto pluginDirectory = GetPluginDirectory();
+		if (!pluginDirectory.empty()) {
+			return pluginDirectory / "OpenAnimationReplacer" / "locales";
+		}
+		return std::filesystem::path("Data") / "F4SE" / "Plugins" /
+			"OpenAnimationReplacer" / "locales";
     }
 
     std::filesystem::path GetLocalePath(const std::string& a_language)
@@ -44,6 +72,73 @@ namespace
             std::filesystem::path("C:\\Windows\\Fonts\\simsun.ttc")
         };
     }
+
+	std::vector<std::string> ExtractFormatTokens(const std::string& a_text)
+	{
+		static const std::regex printfToken(
+			R"(%(?:[1-9][0-9]*\$)?[-+ #0']*(?:\*|[0-9]+)?(?:\.(?:\*|[0-9]+))?(?:hh|h|ll|l|j|z|t|L)?[diuoxXfFeEgGaAcspn])");
+		std::vector<std::string> tokens;
+		for (std::sregex_iterator it(a_text.begin(), a_text.end(), printfToken), end; it != end; ++it) {
+			tokens.push_back(it->str());
+		}
+
+		for (size_t i = 0; i < a_text.size(); ++i) {
+			if (a_text[i] != '{') continue;
+			if (i + 1 < a_text.size() && a_text[i + 1] == '{') {
+				++i;
+				continue;
+			}
+			const auto close = a_text.find('}', i + 1);
+			if (close == std::string::npos) break;
+			tokens.push_back(a_text.substr(i, close - i + 1));
+			i = close;
+		}
+		return tokens;
+	}
+
+	bool HasValidFormatBraces(const std::string& a_text)
+	{
+		for (size_t i = 0; i < a_text.size(); ++i) {
+			if (a_text[i] == '{') {
+				if (i + 1 < a_text.size() && a_text[i + 1] == '{') {
+					++i;
+					continue;
+				}
+				const auto close = a_text.find('}', i + 1);
+				if (close == std::string::npos || a_text.find('{', i + 1) < close) return false;
+				i = close;
+			} else if (a_text[i] == '}') {
+				if (i + 1 < a_text.size() && a_text[i + 1] == '}') {
+					++i;
+					continue;
+				}
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ValidateAndNormalizeTranslation(const std::string& a_source, std::string& a_translation)
+	{
+		if (a_source.starts_with("##")) {
+			return false;
+		}
+
+		if (!HasValidFormatBraces(a_translation) ||
+			ExtractFormatTokens(a_source) != ExtractFormatTokens(a_translation)) {
+			logger::warn("[OAR] Ignoring translation with incompatible format tokens: '{}'", a_source);
+			return false;
+		}
+
+		const auto idPos = a_source.find("##");
+		if (idPos != std::string::npos) {
+			if (const auto translatedID = a_translation.find("##"); translatedID != std::string::npos) {
+				a_translation.erase(translatedID);
+			}
+			a_translation.append(a_source.substr(idPos));
+		}
+		return true;
+	}
 
     bool AddCurrentLanguageFont()
     {
@@ -117,7 +212,10 @@ namespace UICommon
 
             for (const auto& [key, value] : json.items()) {
                 if (value.is_string()) {
-                    g_translations.emplace(key, value.get<std::string>());
+					auto translation = value.get<std::string>();
+					if (ValidateAndNormalizeTranslation(key, translation)) {
+						g_translations.emplace(key, std::move(translation));
+					}
                 }
             }
             logger::info("[OAR] UI language '{}' loaded: {} translations", g_language, g_translations.size());

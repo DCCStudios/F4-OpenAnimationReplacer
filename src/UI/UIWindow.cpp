@@ -1,6 +1,7 @@
 #include "UI/UIWindow.h"
 
 #include "Settings.h"
+#include "UI/Localization.h"
 
 namespace
 {
@@ -36,7 +37,15 @@ void UIWindow::TryDraw()
 		ImGuiCond_FirstUseEver);
 
 	bool open = isOpen;
-	const bool visible = ImGui::Begin(title, &open, flags);
+	std::string localizedTitle;
+	const char* windowLabel = title;
+	if (title && !std::string_view(title).starts_with("##")) {
+		localizedTitle = UICommon::T(title);
+		localizedTitle += "###OARWindow";
+		localizedTitle += std::to_string(static_cast<int32_t>(windowID));
+		windowLabel = localizedTitle.c_str();
+	}
+	const bool visible = ImGui::Begin(windowLabel, &open, flags);
 
 	// Always-auto-resize overlays already follow their scaled text content.
 	// Normal editor windows need an explicit proportional resize when the user

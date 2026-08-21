@@ -25,7 +25,7 @@ void UIDebugOverlay::DrawContents()
 		return a.clipSuffix < b.clipSuffix;
 	});
 
-	if (ImGui::BeginTable(UICommon::T("##ActiveReplacements"), 5,
+	if (ImGui::BeginTable(UICommon::StableID("##ActiveReplacements"), 5,
 		ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
 		ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp)) {
 

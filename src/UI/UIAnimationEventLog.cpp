@@ -8,7 +8,7 @@
 void UIAnimationEventLog::DrawContents()
 {
 	ImGui::SetNextItemWidth(200);
-	ImGui::InputTextWithHint(UICommon::T("##evtFilter"), UICommon::T("Filter events..."), filterText, sizeof(filterText));
+	ImGui::InputTextWithHint(UICommon::StableID("##evtFilter"), UICommon::T("Filter events..."), filterText, sizeof(filterText));
 	ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50);
 	if (ImGui::Button(UICommon::T("Clear"))) {
 		AnimationLog::GetSingleton()->ClearAnimEvents();
@@ -18,7 +18,7 @@ void UIAnimationEventLog::DrawContents()
 
 	auto& entries = AnimationLog::GetSingleton()->GetAnimEventEntries();
 
-	ImGui::BeginChild(UICommon::T("EventEntries"), ImVec2(0, 0), false);
+	ImGui::BeginChild(UICommon::StableID("EventEntries"), ImVec2(0, 0), false);
 
 	for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
 		const auto& e = *it;
