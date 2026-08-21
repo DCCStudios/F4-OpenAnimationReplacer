@@ -83,6 +83,7 @@ set(SOURCES
 	src/UI/UIDebugOverlay.cpp
 	src/UI/UIFormPicker.cpp
 	src/UI/BoneDebugViz.cpp
+	src/UI/Localization.cpp
 	src/FormRegistry.cpp
 	src/API/OpenAnimationReplacerAPI.cpp
 )
@@ -119,6 +120,7 @@ set(HEADERS
 	src/UI/UIDebugOverlay.h
 	src/UI/UIFormPicker.h
 	src/UI/BoneDebugViz.h
+	src/UI/Localization.h
 	src/FormRegistry.h
 	src/ActiveReplacementTracker.h
 	src/RE_Additions.h
@@ -189,6 +191,11 @@ configure_file(
 	COPYONLY
 )
 
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/locales")
+	file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/locales"
+		DESTINATION "${CMAKE_SOURCE_DIR}/Compile/F4SE/Plugins/OpenAnimationReplacer")
+endif()
+
 option(COPY_BUILD "Copy the build output to the Fallout 4 directory." OFF)
 if (COPY_BUILD AND DEFINED Fallout4Path)
 	add_custom_command(
@@ -197,5 +204,6 @@ if (COPY_BUILD AND DEFINED Fallout4Path)
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_PDB_FILE:${PROJECT_NAME}> "${Fallout4Path}/Data/F4SE/Plugins/"
 		COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/OpenAnimationReplacer.ini" "${Fallout4Path}/Data/F4SE/Plugins/"
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/locales" "${Fallout4Path}/Data/F4SE/Plugins/OpenAnimationReplacer/locales"
 	)
 endif()

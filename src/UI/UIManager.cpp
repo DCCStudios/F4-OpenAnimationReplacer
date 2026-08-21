@@ -805,6 +805,7 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 	ImGui::CreateContext();
 
 	UICommon::ApplyOARStyle();
+	UICommon::LoadCJKFont();
 	// Settings are loaded before renderer initialization. Apply the persisted
 	// text size before the first frame so every OAR window starts consistently.
 	ImGui::GetStyle().FontScaleMain =

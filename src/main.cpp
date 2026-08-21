@@ -7,6 +7,7 @@
 #include "Functions.h"
 #include "Parsing.h"
 #include "UI/UIManager.h"
+#include "UI/UICommon.h"
 #include "UI/BoneDebugViz.h"
 #include "Offsets.h"
 #include "FormRegistry.h"
@@ -498,6 +499,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* F4S
 
 	// Load settings early so the toggle hotkey is correct from the start
 	Settings::GetSingleton()->Load();
+	UICommon::LoadLocalization();
 
 	// D3D11 hooks MUST be installed here in F4SEPlugin_Load — before the game
 	// creates its D3D11 device. Installing them in kGameDataReady is too late

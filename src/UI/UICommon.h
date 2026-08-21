@@ -6,6 +6,10 @@
 
 namespace UICommon
 {
+	void LoadLocalization();
+	const char* T(const char* a_source);
+	bool LoadCJKFont();
+
 	enum class EditorMode : int32_t
 	{
 		kInspect = 0,
