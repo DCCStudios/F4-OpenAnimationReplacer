@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 class Settings
 {
 public:
@@ -64,6 +66,8 @@ public:
 	bool  bRequireShift{ false };
 	bool  bPauseOnMenuOpen{ true };
 	int   iEditorMode{ 0 };
+	std::string sLanguage{ "en_US" };
+	std::string sCJKFontPath{};
 	// Text is intentionally larger than Dear ImGui's base size by default.
 	// UIWindow applies the same ratio to window dimensions so increasing the
 	// text size does not reduce the amount of editor content that remains visible.

@@ -1,4 +1,5 @@
 #include "UI/UIAnimationQueue.h"
+#include "UI/Localization.h"
 #include "OpenAnimationReplacer.h"
 #include "Settings.h"
 
@@ -52,7 +53,7 @@ void UIAnimationQueue::DrawContents()
 	ImGui::SetNextWindowBgAlpha(0.25f);
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
 
-	const char* phaseText = oar->GetLoadingPhaseText();
+	const char* phaseText = UICommon::T(oar->GetLoadingPhaseText());
 	float windowWidth = ImGui::GetWindowSize().x;
 	float textWidth = ImGui::CalcTextSize(phaseText).x;
 	ImGui::SetCursorPosX((windowWidth - textWidth) * 0.5f);

@@ -1,3 +1,4 @@
+#include "UI/Localization.h"
 #include "UI/UIWelcomeBanner.h"
 #include "UI/UICommon.h"
 #include "Settings.h"
@@ -59,14 +60,14 @@ void UIWelcomeBanner::DrawContents()
 
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
 
-	float textW = ImGui::CalcTextSize("Open Animation Replacer").x;
+	float textW = ImGui::CalcTextSize(UICommon::T("Open Animation Replacer")).x;
 	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - textW) * 0.5f);
-	ImGui::TextColored(UICommon::Colors::AccentBlue, "Open Animation Replacer");
+	ImGui::TextColored(UICommon::Colors::AccentBlue, UICommon::T("Open Animation Replacer"));
 
-	std::string hotkeyMsg = std::format("Press {} to open the editor", keyStr);
+	std::string hotkeyMsg = std::vformat(UICommon::T("Press {} to open the editor"), std::make_format_args(keyStr));
 	float msgW = ImGui::CalcTextSize(hotkeyMsg.c_str()).x;
 	ImGui::SetCursorPosX((ImGui::GetWindowWidth() - msgW) * 0.5f);
-	ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "%s", hotkeyMsg.c_str());
+	ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), UICommon::T("%s"), hotkeyMsg.c_str());
 
 	ImGui::PopStyleVar();
 }
