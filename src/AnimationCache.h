@@ -113,6 +113,11 @@ public:
 	size_t GetCacheSize() const;
 	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
 	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
+	// Return the exact game animation replaced by a RETIRED clone. Unlike
+	// GetOriginalFromReplacement, this deliberately ignores live clones so
+	// lifecycle hooks can scrub invalidated shared bindings without disrupting
+	// a legitimate replacement that is still current for the equipped weapon.
+	RE::hkaAnimation* GetOriginalFromRetiredReplacement(RE::hkaAnimation* a_replacement) const;
 	// Reverse-lookup the suffix + owning SubMod for a clone still installed in a
 	// clip's animation slot. Checks live cache entries first, then RETIRED
 	// clones (kept-alive buffers whose owning clip survived an invalidation,

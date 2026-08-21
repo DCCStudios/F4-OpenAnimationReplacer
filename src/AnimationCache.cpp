@@ -589,6 +589,26 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 	return nullptr;
 }
 
+RE::hkaAnimation* AnimationCache::GetOriginalFromRetiredReplacement(RE::hkaAnimation* a_replacement) const
+{
+	if (!a_replacement) return nullptr;
+	auto originalStillMatches = [](RE::hkaAnimation* a_original, float a_duration, int32_t a_numTracks) {
+		if (!a_original || IsBadReadPtr(a_original, 0x1C)) return false;
+		const auto* bytes = reinterpret_cast<const uint8_t*>(a_original);
+		return *reinterpret_cast<const float*>(bytes + 0x14) == a_duration &&
+			*reinterpret_cast<const int32_t*>(bytes + 0x18) == a_numTracks;
+	};
+
+	std::shared_lock lock(m_mutex);
+	for (auto& retired : m_retiredClones) {
+		if (retired.clonePtr == a_replacement &&
+			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
+			return retired.gameOriginal;
+		}
+	}
+	return nullptr;
+}
+
 void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_index,
 	const std::string& a_suffix)
 {

@@ -2479,13 +2479,56 @@ namespace
 
 // Weapon change detection — called from Activate when the weapon animation
 // folder or equipped weapon instance changes. Runtime clones are retired only
-// after the activating binding has been scrubbed. Do not globally restore slot
-// backups here: unlike pre-load, a weapon transition may already have freed
-// some of the recorded game originals.
+// after the activating binding has been scrubbed and every surviving recorded
+// binding slot has had its exact clone restored to its validated game original.
 static std::string s_lastKnownWeaponFolder;
 static std::shared_mutex s_lastKnownWeaponMutex;
 static uint64_t s_lastKnownEquippedFingerprint{ 0 };
 static bool s_lastKnownEquippedFingerprintValid{ false };
+
+// Restore clones from the exact binding slots recorded when OAR installed
+// them. This runs BEFORE clone retirement, while AnimationCache can still
+// validate the live clone's original by pointer, duration, and track count.
+//
+// The exact *slot == clone check is essential. A weapon graph transition can
+// free or recycle a binding before the next Activate; readable memory alone is
+// not proof that the old slot still belongs to us. If the slot changed, leave
+// it untouched. StartEcho's retired-clone restore remains the fallback for any
+// stale shared binding that was not recorded or could not be restored here.
+static size_t RestoreRecordedBindingSlotsBeforeWeaponInvalidation()
+{
+	std::vector<std::pair<RE::hkaAnimation**, BindingSlotBackup>> backups;
+	{
+		std::shared_lock lock(s_bindingSlotBackupMutex);
+		backups.reserve(s_bindingSlotBackup.size());
+		for (const auto& entry : s_bindingSlotBackup) backups.push_back(entry);
+	}
+
+	auto* cache = AnimationCache::GetSingleton();
+	size_t restored = 0;
+	for (const auto& [slot, backup] : backups) {
+		if (!slot || !backup.clone || !backup.original) continue;
+		if (IsBadReadPtr(slot, sizeof(void*)) || *slot != backup.clone) continue;
+
+		// Use the cache reverse link instead of trusting the backup by itself.
+		// GetOriginalFromReplacement also verifies that the recorded duration and
+		// transform-track count still match the pointed-to game animation.
+		auto* original = cache->GetOriginalFromReplacement(backup.clone);
+		if (!original || original != backup.original ||
+			IsBadReadPtr(original, sizeof(uintptr_t))) {
+			continue;
+		}
+		if (!IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(original))) continue;
+
+		*slot = original;
+		restored++;
+	}
+
+	if (restored > 0) {
+		logger::info("[OAR-WeaponChange] Restored {} recorded binding slot(s) before clone retirement", restored);
+	}
+	return restored;
+}
 
 static uint64_t GetPlayerWeaponFingerprint()
 {
@@ -2560,6 +2603,7 @@ static void CheckAndInvalidateOnWeaponChange()
 		s_lastKnownEquippedFingerprint = currentEquippedFingerprint;
 		lock.unlock();
 
+		RestoreRecordedBindingSlotsBeforeWeaponInvalidation();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 		// Clone retirement alone is insufficient for weapons that share an animation
 		// folder. The engine can recycle the same clip generator and binding while
@@ -2576,6 +2620,7 @@ static void CheckAndInvalidateOnWeaponChange()
 		s_lastKnownWeaponFolder.clear();
 		lock.unlock();
 
+		RestoreRecordedBindingSlotsBeforeWeaponInvalidation();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 		ClearClipRuntimeState();
 	}
@@ -10038,24 +10083,39 @@ namespace
 
 	void hkbClipGenerator_StartEcho(RE::hkbClipGenerator* a_this, float a_duration)
 	{
-		// Diagnostic only: an echo re-enters the clip WITHOUT Deactivate or
-		// Activate, so none of the stale-clone restores run before whatever the
-		// echo captures. The Deactivate-time binding restore closes the proven
-		// fresh-generator window (2026-08-18); if a clone can still be live here
-		// on a play whose conditions are about to fail (completed play, entry
-		// still active, echo replay), this line is the field evidence for it.
+		// StartEcho re-enters a clip WITHOUT Deactivate or Activate. A shared
+		// binding can therefore still contain a clone retired by a weapon-change
+		// invalidation, and the engine captures that stale animation before the
+		// next Update gets a chance to re-evaluate the now-false conditions.
+		// Restore only RETIRED clones here. activeSubMod=false is not sufficient:
+		// field logs also show legitimate, still-live clones entering StartEcho
+		// through a different generator while the original weapon remains active.
 		if (a_this && s_gameFullyLoaded.load()) {
-			if (auto** echoDiagSlot = a_this->GetAnimationSlot(); echoDiagSlot && *echoDiagSlot &&
-				AnimationCache::GetSingleton()->IsOurReplacement(*echoDiagSlot)) {
-				bool echoDiagActive = false;
-				{
-					std::shared_lock smLock(s_activeSubModMutex);
-					echoDiagActive = s_activeSubModMap.find(a_this) != s_activeSubModMap.end();
-				}
-				static std::atomic<int> s_echoCloneDiagLog{ 0 };
-				if (s_echoCloneDiagLog.fetch_add(1, std::memory_order_relaxed) < 30) {
-					logger::info("[OAR] StartEcho: clone in slot at echo entry (clipGen={:X}, activeSubMod={})",
-						reinterpret_cast<uintptr_t>(a_this), echoDiagActive);
+			if (auto** echoSlot = a_this->GetAnimationSlot(); echoSlot && *echoSlot) {
+				auto* cache = AnimationCache::GetSingleton();
+				auto* retiredClone = *echoSlot;
+				auto* original = cache->GetOriginalFromRetiredReplacement(retiredClone);
+				if (original && !IsBadReadPtr(original, sizeof(uintptr_t)) &&
+					IsPlausibleGameAnimVtable(*reinterpret_cast<uintptr_t*>(original))) {
+					*echoSlot = original;
+					RestoreClipTriggers(a_this);
+					static std::atomic<int> s_echoRetiredRestoreLog{ 0 };
+					if (s_echoRetiredRestoreLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+						logger::info("[OAR] StartEcho: restored retired clone before echo (clipGen={:X}, clone={:X}, original={:X})",
+							reinterpret_cast<uintptr_t>(a_this), reinterpret_cast<uintptr_t>(retiredClone),
+							reinterpret_cast<uintptr_t>(original));
+					}
+				} else if (cache->IsOurReplacement(retiredClone)) {
+					bool echoActive = false;
+					{
+						std::shared_lock smLock(s_activeSubModMutex);
+						echoActive = s_activeSubModMap.find(a_this) != s_activeSubModMap.end();
+					}
+					static std::atomic<int> s_echoCloneDiagLog{ 0 };
+					if (s_echoCloneDiagLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+						logger::info("[OAR] StartEcho: clone remains in slot at echo entry (clipGen={:X}, activeSubMod={})",
+							reinterpret_cast<uintptr_t>(a_this), echoActive);
+					}
 				}
 			}
 		}
