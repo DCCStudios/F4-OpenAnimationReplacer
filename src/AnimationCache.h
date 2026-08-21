@@ -126,9 +126,8 @@ public:
 	// a_outIdentity=true means identity mapping.
 	bool GetDonorTrackMap(const std::string& a_suffix, const void* a_owner,
 		std::vector<int16_t>& a_outMap, bool& a_outIdentity) const;
-	void SetVtableFromGame(uintptr_t a_vtable, uintptr_t a_referenceFrameVtable = 0);
+	void SetVtableFromGame(uintptr_t a_vtable);
 	uintptr_t GetGameAnimVtable() const { return m_gameAnimVtable.load(); }
-	uintptr_t GetReferenceFrameVtable() const { return m_referenceFrameVtable.load(); }
 	size_t GetCacheSize() const;
 	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
 	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
