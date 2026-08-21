@@ -14,17 +14,16 @@ static bool VerboseCacheLog()
 	return Settings::GetSingleton()->bVerboseLogging;
 }
 
-static uintptr_t ResolveVtable(AnimationCache::CachedAnimation::VtableFixupKind a_kind, uintptr_t a_gameAnimationVtable)
+static uintptr_t ResolveVtable(AnimationCache::CachedAnimation::VtableFixupKind a_kind,
+	uintptr_t a_gameAnimationVtable, uintptr_t a_referenceFrameVtable)
 {
 	switch (a_kind) {
-	case AnimationCache::CachedAnimation::VtableFixupKind::kAnimatedReferenceFrame: {
-		static REL::Relocation<uintptr_t> vtable{ RE::VTABLE::hkaAnimatedReferenceFrame[0] };
-		return vtable.address();
-	}
-	case AnimationCache::CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame: {
-		static REL::Relocation<uintptr_t> vtable{ RE::VTABLE::hkaDefaultAnimatedReferenceFrame[0] };
-		return vtable.address();
-	}
+	case AnimationCache::CachedAnimation::VtableFixupKind::kAnimatedReferenceFrame:
+	case AnimationCache::CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame:
+		// The frame vtable is captured from an actual game animation instance.
+		// This avoids assuming that a generated VTABLE ID has the same coverage
+		// on every OG/NG/AE Address Library database.
+		return a_referenceFrameVtable;
 	case AnimationCache::CachedAnimation::VtableFixupKind::kGameAnimation:
 	default:
 		return a_gameAnimationVtable;
@@ -412,10 +411,18 @@ AnimationCache::CachedAnimation* AnimationCache::SelectEntry(const std::string& 
 	return it->second[0].get();
 }
 
-void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
+void AnimationCache::SetVtableFromGame(uintptr_t a_vtable, uintptr_t a_referenceFrameVtable)
 {
-	uintptr_t prev = m_gameAnimVtable.exchange(a_vtable);
-	if (prev != 0) return;
+	const uintptr_t prevAnimationVtable = m_gameAnimVtable.exchange(a_vtable);
+	const uintptr_t prevReferenceFrameVtable = m_referenceFrameVtable.load();
+	if (a_referenceFrameVtable != 0) {
+		m_referenceFrameVtable.store(a_referenceFrameVtable);
+	}
+
+	const uintptr_t gameAnimationVtable = m_gameAnimVtable.load();
+	const uintptr_t referenceFrameVtable = m_referenceFrameVtable.load();
+	const bool referenceFrameChanged = referenceFrameVtable != 0 && referenceFrameVtable != prevReferenceFrameVtable;
+	if (prevAnimationVtable != 0 && !referenceFrameChanged) return;
 
 	std::shared_lock lock(m_mutex);
 	int patched = 0;
@@ -425,7 +432,7 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 			if (!entry || entry->fileData.empty()) continue;
 			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
 			for (const auto& fixup : entry->vtableFixups) {
-				const auto vtable = ResolveVtable(fixup.kind, a_vtable);
+				const auto vtable = ResolveVtable(fixup.kind, gameAnimationVtable, referenceFrameVtable);
 				if (vtable == 0) continue;
 				*reinterpret_cast<uintptr_t*>(sectionData + fixup.offset) = vtable;
 				if (fixup.kind == CachedAnimation::VtableFixupKind::kGameAnimation) {
@@ -437,9 +444,22 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 		}
 	}
 	if (patched > 0 || referenceFramePatched > 0) {
-		logger::info("[OAR-Cache] Retroactively patched {} animation and {} reference-frame vtable slots across {} cached suffixes",
-			patched, referenceFramePatched, m_cache.size());
+		logger::info("[OAR-Cache] Retroactively patched {} animation and {} reference-frame vtable slots across {} cached suffixes (runtime reference-frame vtable {:X})",
+			patched, referenceFramePatched, m_cache.size(), referenceFrameVtable);
 	}
+}
+
+static uintptr_t ReadReferenceFrameVtable(RE::hkaAnimation* a_animation)
+{
+	if (!a_animation || IsBadReadPtr(a_animation, 0x28)) return 0;
+
+	const auto referenceFrame = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(a_animation) + 0x20);
+	if (referenceFrame < 0x10000 || IsBadReadPtr(reinterpret_cast<void*>(referenceFrame), sizeof(uintptr_t))) {
+		return 0;
+	}
+
+	const auto vtable = *reinterpret_cast<uintptr_t*>(referenceFrame);
+	return vtable >= 0x10000 && !IsBadReadPtr(reinterpret_cast<void*>(vtable), sizeof(uintptr_t)) ? vtable : 0;
 }
 
 RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix, const void* a_owner) const
@@ -459,6 +479,21 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	if (!selected) return nullptr;
 
 	auto& entry = *selected;
+
+	// Capture the reference-frame vtable from the live game animation rather
+	// than from a fixed-version address. This is the first reliable point for
+	// pre-swap callers, which can build a clone before the normal Update hook
+	// captures the animation vtable.
+	if (m_referenceFrameVtable.load() == 0) {
+		if (const auto referenceFrameVtable = ReadReferenceFrameVtable(a_gameAnim); referenceFrameVtable != 0) {
+			m_referenceFrameVtable.store(referenceFrameVtable);
+			for (const auto& fixup : entry.vtableFixups) {
+				if (fixup.kind == CachedAnimation::VtableFixupKind::kGameAnimation) continue;
+				*reinterpret_cast<uintptr_t*>(entry.fileData.data() + entry.sectionFileOffset + fixup.offset) = referenceFrameVtable;
+			}
+			logger::info("[OAR-Cache] Captured runtime hkaAnimatedReferenceFrame vtable: {:X}", referenceFrameVtable);
+		}
+	}
 
 	// One clone per distinct game original (see RuntimeClone in the header):
 	// a Leaf Matching file serves several originals AT THE SAME TIME (both
@@ -592,13 +627,17 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	const auto fileBegin = reinterpret_cast<uintptr_t>(entry.fileData.data());
 	const auto fileEnd = fileBegin + entry.fileData.size();
 	const bool extractedMotionInBackingFile = extractedMotion >= fileBegin && extractedMotion < fileEnd;
-	if (entry.preserveExtractedMotion && extractedMotionInBackingFile) {
+	const bool referenceFrameVtableAvailable = m_referenceFrameVtable.load() != 0;
+	if (entry.preserveExtractedMotion && extractedMotionInBackingFile && referenceFrameVtableAvailable) {
 		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = extractedMotion;
 		logger::info("[OAR-Motion] Preserved extractedMotion for '{}' (reference={:X})",
 			entry.filePath, extractedMotion);
 	} else {
 		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = 0;
-		if (entry.preserveExtractedMotion && extractedMotion != 0) {
+		if (entry.preserveExtractedMotion && extractedMotion != 0 && !referenceFrameVtableAvailable) {
+			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because no runtime reference-frame vtable has been captured yet",
+				entry.filePath);
+		} else if (entry.preserveExtractedMotion && extractedMotion != 0) {
 			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because the reference is outside the backing HKX buffer ({:X})",
 				entry.filePath, extractedMotion);
 		}
@@ -1114,6 +1153,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 	// selects the correct Havok vtable; animation vtables are deferred until a
 	// live game animation supplies the runtime-specific address.
 	uintptr_t gameVtable = m_gameAnimVtable.load();
+	uintptr_t referenceFrameVtable = m_referenceFrameVtable.load();
 	int vtableFixCount = 0;
 	int referenceFrameFixCount = 0;
 
@@ -1166,7 +1206,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 				});
 
 				const auto vtableKind = a_entry.vtableFixups.back().kind;
-				const auto vtable = ResolveVtable(vtableKind, gameVtable);
+				const auto vtable = ResolveVtable(vtableKind, gameVtable, referenceFrameVtable);
 				if (vtable != 0) {
 					*reinterpret_cast<uintptr_t*>(sectionData + src) = vtable;
 				}
@@ -1179,8 +1219,10 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 		}
 	}
 	if (verbose) {
-		logger::info("[OAR-Cache] Recorded {} animation and {} reference-frame virtual fixups (animation vtable {}, reference-frame vtables resolved)",
-			vtableFixCount, referenceFrameFixCount, gameVtable != 0 ? "applied" : "deferred");
+		logger::info("[OAR-Cache] Recorded {} animation and {} reference-frame virtual fixups (animation vtable {}, reference-frame vtable {})",
+			vtableFixCount, referenceFrameFixCount,
+			gameVtable != 0 ? "applied" : "deferred",
+			referenceFrameVtable != 0 ? "applied" : "deferred");
 	}
 
 	// Locate the file's hkaAnimationBinding to capture the DONOR'S OWN
