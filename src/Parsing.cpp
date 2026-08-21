@@ -488,6 +488,7 @@ namespace Parsing
 		if (json.contains("keepRandomResultsOnLoop")) a_subMod->SetKeepRandomResultsOnLoop(json["keepRandomResultsOnLoop"].get<bool>());
 		if (json.contains("shareRandomResults")) a_subMod->SetShareRandomResults(json["shareRandomResults"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
+		if (json.contains("preserveExtractedMotion")) a_subMod->SetPreserveExtractedMotion(json["preserveExtractedMotion"].get<bool>());
 
 		// "suppressAnnotations": true mutes ALL annotations of the replacement
 		// file; an array of strings mutes only those (case-insensitive, full
@@ -639,6 +640,7 @@ namespace Parsing
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
+		if (json.contains("preserveExtractedMotion")) a_subMod->SetPreserveExtractedMotion(json["preserveExtractedMotion"].get<bool>());
 		if (json.contains("suppressAnnotations")) {
 			const auto& sa = json["suppressAnnotations"];
 			if (sa.is_boolean()) {

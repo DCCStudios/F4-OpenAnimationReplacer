@@ -24,13 +24,26 @@ public:
 
 	struct CachedAnimation
 	{
+		enum class VtableFixupKind : uint8_t
+		{
+			kGameAnimation,
+			kAnimatedReferenceFrame,
+			kDefaultAnimatedReferenceFrame
+		};
+
+		struct VtableFixup
+		{
+			uint32_t offset{ 0 };
+			VtableFixupKind kind{ VtableFixupKind::kGameAnimation };
+		};
+
 		RE::hkaAnimation* animation{ nullptr };
 		std::vector<uint8_t> fileData;
 		std::string filePath;
 		float duration{ 0.f };
 		int32_t numTransformTracks{ 0 };
 		int32_t numFloatTracks{ 0 };
-		std::vector<uint32_t> vtableFixupOffsets;
+		std::vector<VtableFixup> vtableFixups;
 		uint32_t sectionFileOffset{ 0 };
 		std::unique_ptr<uint32_t[]> computedTransformOffsets;
 		std::unique_ptr<uint32_t[]> computedFloatOffsets;
@@ -78,6 +91,10 @@ public:
 		// condition-winning SubMod's actual file is the one that plays.
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
+		// Keep the replacement hkaAnimatedReferenceFrame when building the
+		// runtime clone. Disabled by default because most weapon animation
+		// replacements are pose-only and should not inherit donor root motion.
+		bool preserveExtractedMotion{ false };
 
 		// Disk identity at load time. A config reload recreates every SubMod,
 		// so `owner` always misses — LoadAnimation matches by filePath instead
@@ -93,7 +110,8 @@ public:
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
-		const void* a_owner = nullptr, int32_t a_priority = 0);
+		const void* a_owner = nullptr, int32_t a_priority = 0,
+		bool a_preserveExtractedMotion = false);
 	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix,
 		const void* a_owner = nullptr) const;
 	// a_owner: the winning SubMod (from condition evaluation). Selects that

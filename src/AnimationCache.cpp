@@ -2,6 +2,8 @@
 #include "OpenAnimationReplacer.h"
 #include "Settings.h"
 
+#include <string_view>
+
 // Per-file load logging is gated behind bVerboseLogging: at tens of thousands
 // of animations the ~15 info lines each file emits during preload dominate
 // the entire menu-load time (they used to be flushed line-by-line on top).
@@ -9,6 +11,23 @@
 static bool VerboseCacheLog()
 {
 	return Settings::GetSingleton()->bVerboseLogging;
+}
+
+static uintptr_t ResolveVtable(AnimationCache::CachedAnimation::VtableFixupKind a_kind, uintptr_t a_gameAnimationVtable)
+{
+	switch (a_kind) {
+	case AnimationCache::CachedAnimation::VtableFixupKind::kAnimatedReferenceFrame: {
+		static REL::Relocation<uintptr_t> vtable{ RE::VTABLE::hkaAnimatedReferenceFrame[0] };
+		return vtable.address();
+	}
+	case AnimationCache::CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame: {
+		static REL::Relocation<uintptr_t> vtable{ RE::VTABLE::hkaDefaultAnimatedReferenceFrame[0] };
+		return vtable.address();
+	}
+	case AnimationCache::CachedAnimation::VtableFixupKind::kGameAnimation:
+	default:
+		return a_gameAnimationVtable;
+	}
 }
 
 namespace
@@ -76,7 +95,7 @@ namespace
 }
 
 bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
-	const void* a_owner, int32_t a_priority)
+	const void* a_owner, int32_t a_priority, bool a_preserveExtractedMotion)
 {
 	std::error_code ec;
 	const auto diskSize = std::filesystem::file_size(a_absolutePath, ec);
@@ -103,8 +122,12 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 			for (auto& existing : it->second) {
 				if (!existing || existing->filePath != pathStr) continue;
 				if (existing->fileSize == diskSize && existing->fileMTime == diskMTime) {
+					if (existing->preserveExtractedMotion != a_preserveExtractedMotion) {
+						RetireCloneLocked(*existing, /*a_retireBackingData=*/false, a_suffix);
+					}
 					existing->owner = a_owner;
 					existing->priority = a_priority;
+					existing->preserveExtractedMotion = a_preserveExtractedMotion;
 					existing->pendingRebind = false;
 					// Priority may have changed; keep index 0 = highest.
 					std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
@@ -123,6 +146,7 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	entry->filePath = pathStr;
 	entry->owner = a_owner;
 	entry->priority = a_priority;
+	entry->preserveExtractedMotion = a_preserveExtractedMotion;
 	entry->fileSize = diskSize;
 	entry->fileMTime = diskMTime;
 
@@ -226,19 +250,26 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 
 	std::shared_lock lock(m_mutex);
 	int patched = 0;
+	int referenceFramePatched = 0;
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
 			if (!entry || entry->fileData.empty()) continue;
 			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
-			for (uint32_t off : entry->vtableFixupOffsets) {
-				*reinterpret_cast<uintptr_t*>(sectionData + off) = a_vtable;
-				patched++;
+			for (const auto& fixup : entry->vtableFixups) {
+				const auto vtable = ResolveVtable(fixup.kind, a_vtable);
+				if (vtable == 0) continue;
+				*reinterpret_cast<uintptr_t*>(sectionData + fixup.offset) = vtable;
+				if (fixup.kind == CachedAnimation::VtableFixupKind::kGameAnimation) {
+					patched++;
+				} else {
+					referenceFramePatched++;
+				}
 			}
 		}
 	}
-	if (patched > 0) {
-		logger::info("[OAR-Cache] Retroactively patched {} vtable slots across {} cached suffixes",
-			patched, m_cache.size());
+	if (patched > 0 || referenceFramePatched > 0) {
+		logger::info("[OAR-Cache] Retroactively patched {} animation and {} reference-frame vtable slots across {} cached suffixes",
+			patched, referenceFramePatched, m_cache.size());
 	}
 }
 
@@ -384,10 +415,25 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	// original animation, so any pointer fields reference game memory that gets freed
 	// on weapon switch. We must eliminate all stale references.
 
-	// 1. m_extractedMotion at +0x20: points to game's hkaAnimatedReferenceFrame.
-	//    NULL it out — weapon animations don't use root motion extraction, and our packfile
-	//    data has unfixed local pointers that can't be used directly.
-	*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = 0;
+	// 1. m_extractedMotion at +0x20: points to hkaAnimatedReferenceFrame.
+	//    Replacement packfiles have already had their local/global fixups applied
+	//    into entry.fileData. Preserve that pointer only when the SubMod opts in;
+	//    the entry and its retired backing buffer keep the pointed-to object alive.
+	const auto extractedMotion = *reinterpret_cast<uintptr_t*>(ourBytes + 0x20);
+	const auto fileBegin = reinterpret_cast<uintptr_t>(entry.fileData.data());
+	const auto fileEnd = fileBegin + entry.fileData.size();
+	const bool extractedMotionInBackingFile = extractedMotion >= fileBegin && extractedMotion < fileEnd;
+	if (entry.preserveExtractedMotion && extractedMotionInBackingFile) {
+		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = extractedMotion;
+		logger::info("[OAR-Motion] Preserved extractedMotion for '{}' (reference={:X})",
+			entry.filePath, extractedMotion);
+	} else {
+		*reinterpret_cast<uintptr_t*>(cloneBase + 0x20) = 0;
+		if (entry.preserveExtractedMotion && extractedMotion != 0) {
+			logger::warn("[OAR-Motion] Skipped extractedMotion for '{}' because the reference is outside the backing HKX buffer ({:X})",
+				entry.filePath, extractedMotion);
+		}
+	}
 
 	// 2. annotationTracks at +0x28: points to game's annotation data.
 	//    Use a safe dummy pointer with size=0 and DONT_DEALLOCATE.
@@ -910,10 +956,32 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 	// === Apply virtual fixups (vtable patching) ===
 	// Virtual fixups are 12-byte records (src_u32, section_u32, nameOffset_u32)
-	// Each says: object at sectionData+src needs its vtable set
-	// Store all vtable offsets so we can retroactively patch when vtable is captured
+	// Each says: object at sectionData+src needs its vtable set. The class name
+	// selects the correct Havok vtable; animation vtables are deferred until a
+	// live game animation supplies the runtime-specific address.
 	uintptr_t gameVtable = m_gameAnimVtable.load();
 	int vtableFixCount = 0;
+	int referenceFrameFixCount = 0;
+
+	auto getVirtualClassName = [&](uint32_t a_nameOffset) -> std::string_view {
+		if (header->classNameSectionIndex >= sections.size()) return {};
+		const auto& classNameSection = sections[header->classNameSectionIndex];
+		if (classNameSection.absoluteDataStart >= dataSize) return {};
+
+		const uint64_t namePos = static_cast<uint64_t>(classNameSection.absoluteDataStart) + a_nameOffset;
+		if (namePos >= dataSize) return {};
+
+		uint64_t nameEnd = dataSize;
+		if (classNameSection.endOffset != 0 && classNameSection.endOffset != 0xFFFFFFFF) {
+			nameEnd = std::min<uint64_t>(nameEnd,
+				static_cast<uint64_t>(classNameSection.absoluteDataStart) + classNameSection.endOffset);
+		}
+		if (nameEnd <= namePos) return {};
+
+		const auto maxLength = static_cast<size_t>(nameEnd - namePos);
+		const auto* name = reinterpret_cast<const char*>(data + namePos);
+		return std::string_view(name, strnlen(name, maxLength));
+	};
 
 	if (ds.virtualFixupsOffset != 0 && ds.virtualFixupsOffset != 0xFFFFFFFF) {
 		uint32_t fixFileStart = sectionFileOffset + ds.virtualFixupsOffset;
@@ -931,20 +999,34 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 			for (size_t i = 0; i + 12 <= fixupBytes; i += 12) {
 				uint32_t src = *reinterpret_cast<uint32_t*>(fixups + i);
+				uint32_t nameOffset = *reinterpret_cast<uint32_t*>(fixups + i + 8);
 				if (src == 0xFFFFFFFF) continue;
 				if (src + 8 > sectionSize) continue;
 
-				a_entry.vtableFixupOffsets.push_back(src);
-				if (gameVtable != 0) {
-					*reinterpret_cast<uintptr_t*>(sectionData + src) = gameVtable;
+				const auto className = getVirtualClassName(nameOffset);
+				a_entry.vtableFixups.push_back({
+					src,
+					className == "hkaDefaultAnimatedReferenceFrame" ? CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame :
+					className == "hkaAnimatedReferenceFrame" ? CachedAnimation::VtableFixupKind::kAnimatedReferenceFrame :
+					CachedAnimation::VtableFixupKind::kGameAnimation
+				});
+
+				const auto vtableKind = a_entry.vtableFixups.back().kind;
+				const auto vtable = ResolveVtable(vtableKind, gameVtable);
+				if (vtable != 0) {
+					*reinterpret_cast<uintptr_t*>(sectionData + src) = vtable;
 				}
-				vtableFixCount++;
+				if (vtableKind == CachedAnimation::VtableFixupKind::kGameAnimation) {
+					vtableFixCount++;
+				} else {
+					referenceFrameFixCount++;
+				}
 			}
 		}
 	}
 	if (verbose) {
-		logger::info("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
-			vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
+		logger::info("[OAR-Cache] Recorded {} animation and {} reference-frame virtual fixups (animation vtable {}, reference-frame vtables resolved)",
+			vtableFixCount, referenceFrameFixCount, gameVtable != 0 ? "applied" : "deferred");
 	}
 
 	// Locate the file's hkaAnimationBinding to capture the DONOR'S OWN

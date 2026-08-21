@@ -3465,7 +3465,8 @@ namespace
 				if (i >= work.size()) break;
 				const auto& item = work[i];
 				if (cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod,
-						item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0)) {
+						item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0,
+						item.info->parentSubMod ? item.info->parentSubMod->GetPreserveExtractedMotion() : false)) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {
 					failed.fetch_add(1, std::memory_order_relaxed);
