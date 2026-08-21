@@ -190,6 +190,13 @@ private:
 	{
 		std::vector<uint8_t> buffer;
 		RE::hkaAnimation* clonePtr{ nullptr };
+		// Preserve the exact game animation this clone replaced. A weapon switch
+		// can retire the clone while a shared binding still points at it; keeping
+		// this reverse link lets the activation scrub restore that binding instead
+		// of treating the retired clone as an unrecoverable game animation.
+		RE::hkaAnimation* gameOriginal{ nullptr };
+		float originalDuration{ 0.f };
+		int32_t originalNumTracks{ 0 };
 		// Backing .hkx file buffer of a destroyed/replaced entry (see
 		// RetireCloneLocked's a_retireBackingData). Empty for plain clone
 		// invalidations, where fileData stays in the live entry.

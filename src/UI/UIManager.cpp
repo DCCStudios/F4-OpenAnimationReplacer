@@ -6,6 +6,7 @@
 #include "UI/UIAnimationQueue.h"
 #include "UI/UIDebugOverlay.h"
 #include "UI/UICommon.h"
+#include "UI/Localization.h"
 #include "UI/BoneDebugViz.h"
 #include "Jobs.h"
 #include "Offsets.h"
@@ -805,6 +806,7 @@ void UIManager::InitImGui(IDXGISwapChain* a_swapChain)
 	ImGui::CreateContext();
 
 	UICommon::ApplyOARStyle();
+	UICommon::LoadCJKFont();
 	// Settings are loaded before renderer initialization. Apply the persisted
 	// text size before the first frame so every OAR window starts consistently.
 	ImGui::GetStyle().FontScaleMain =
@@ -886,6 +888,16 @@ void UIManager::RenderFrame()
 	UpdateLockState();
 
 	if (!mainOpen && !anyIndependentOpen) return;
+
+	// A language change is requested by the settings panel while the current
+	// ImGui frame is being drawn. Rebuild the DX11 font texture at the start of
+	// the next frame so the active frame is never rendered against a modified
+	// font atlas.
+	if (UICommon::ConsumeFontReloadRequest()) {
+		ImGui_ImplDX11_InvalidateDeviceObjects();
+		UICommon::RebuildFontAtlas();
+		ImGui_ImplDX11_CreateDeviceObjects();
+	}
 
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();

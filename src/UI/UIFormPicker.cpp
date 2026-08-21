@@ -1,3 +1,4 @@
+#include "UI/Localization.h"
 #include "UIFormPicker.h"
 #include "FormRegistry.h"
 #include <imgui.h>
@@ -16,7 +17,7 @@ namespace UIFormPicker
 		bool changed = false;
 		if (ImGui::BeginCombo(a_label, a_preview)) {
 			ImGui::SetNextItemWidth(-1);
-			ImGui::InputText("##filter", a_filterBuf, a_filterBufSize);
+			ImGui::InputText(UICommon::StableID("##filter"), a_filterBuf, a_filterBufSize);
 
 			std::string filter(a_filterBuf);
 			std::ranges::transform(filter, filter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -109,7 +110,7 @@ namespace UIFormPicker
 		char plugBuf[256]{};
 		strncpy_s(plugBuf, a_pluginName.c_str(), sizeof(plugBuf) - 1);
 		ImGui::SetNextItemWidth(150);
-		if (ImGui::InputText("Plugin##manual", plugBuf, sizeof(plugBuf))) {
+		if (ImGui::InputText(UICommon::T("Plugin##manual"), plugBuf, sizeof(plugBuf))) {
 			a_pluginName = plugBuf;
 			a_dirty = true;
 			changed = true;
@@ -119,7 +120,7 @@ namespace UIFormPicker
 		char formBuf[32]{};
 		snprintf(formBuf, sizeof(formBuf), "0x%X", a_localFormID);
 		ImGui::SetNextItemWidth(90);
-		if (ImGui::InputText("ID##manual", formBuf, sizeof(formBuf))) {
+		if (ImGui::InputText(UICommon::T("ID##manual"), formBuf, sizeof(formBuf))) {
 			try { a_localFormID = std::stoul(formBuf, nullptr, 16); } catch (...) {}
 			a_dirty = true;
 			changed = true;
@@ -197,7 +198,7 @@ namespace UIFormPicker
 		char buf[256]{};
 		strncpy_s(buf, a_editorID.c_str(), sizeof(buf) - 1);
 		ImGui::SetNextItemWidth(200);
-		if (ImGui::InputText("EditorID##manual", buf, sizeof(buf))) {
+		if (ImGui::InputText(UICommon::T("EditorID##manual"), buf, sizeof(buf))) {
 			a_editorID = buf;
 			a_dirty = true;
 			changed = true;

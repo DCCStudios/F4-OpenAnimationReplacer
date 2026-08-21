@@ -33,6 +33,8 @@ void Settings::Load()
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
 	iTextSizePercent = std::clamp(getI("UI", "iTextSizePercent", iTextSizePercent), 80, 200);
+	sLanguage = ini.GetValue("UI", "sLanguage", sLanguage.c_str());
+	sCJKFontPath = ini.GetValue("UI", "sCJKFontPath", sCJKFontPath.c_str());
 
 	bLogActivate   = getB("AnimationLog", "bLogActivate", bLogActivate);
 	bLogReplace    = getB("AnimationLog", "bLogReplace", bLogReplace);
@@ -91,6 +93,8 @@ void Settings::Save()
 	setB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	setI("UI", "iEditorMode", iEditorMode);
 	setI("UI", "iTextSizePercent", iTextSizePercent);
+	ini.SetValue("UI", "sLanguage", sLanguage.c_str());
+	ini.SetValue("UI", "sCJKFontPath", sCJKFontPath.c_str());
 	setB("UI", "bEnableAnimationQueueProgressBar", bEnableAnimationQueueProgressBar);
 	ini.SetDoubleValue("UI", "fAnimationQueueLingerTime", static_cast<double>(fAnimationQueueLingerTime));
 

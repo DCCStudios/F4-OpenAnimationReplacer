@@ -1,3 +1,4 @@
+#include "UI/Localization.h"
 #include "UI/UIAnimationEventLog.h"
 #include "UI/UICommon.h"
 #include "AnimationLog.h"
@@ -7,9 +8,9 @@
 void UIAnimationEventLog::DrawContents()
 {
 	ImGui::SetNextItemWidth(200);
-	ImGui::InputTextWithHint("##evtFilter", "Filter events...", filterText, sizeof(filterText));
+	ImGui::InputTextWithHint(UICommon::StableID("##evtFilter"), UICommon::T("Filter events..."), filterText, sizeof(filterText));
 	ImGui::SameLine(ImGui::GetContentRegionAvail().x - 50);
-	if (ImGui::Button("Clear")) {
+	if (ImGui::Button(UICommon::T("Clear"))) {
 		AnimationLog::GetSingleton()->ClearAnimEvents();
 	}
 
@@ -17,7 +18,7 @@ void UIAnimationEventLog::DrawContents()
 
 	auto& entries = AnimationLog::GetSingleton()->GetAnimEventEntries();
 
-	ImGui::BeginChild("EventEntries", ImVec2(0, 0), false);
+	ImGui::BeginChild(UICommon::StableID("EventEntries"), ImVec2(0, 0), false);
 
 	for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
 		const auto& e = *it;
@@ -36,11 +37,11 @@ void UIAnimationEventLog::DrawContents()
 		else if (ms < 2000) timingColor = UICommon::Colors::TimingMedium;
 		else timingColor = UICommon::Colors::TimingLong;
 
-		ImGui::TextColored(timingColor, "[%lldms]", ms);
+		ImGui::TextColored(timingColor, UICommon::T("[%lldms]"), ms);
 		ImGui::SameLine();
-		ImGui::Text("%s (0x%08X):", e.refrName.c_str(), e.refrFormID);
+		ImGui::Text(UICommon::T("%s (0x%08X):"), e.refrName.c_str(), e.refrFormID);
 		ImGui::SameLine();
-		ImGui::TextColored(UICommon::Colors::LogEvent, "%s", e.originalAnim.c_str());
+		ImGui::TextColored(UICommon::Colors::LogEvent, UICommon::T("%s"), e.originalAnim.c_str());
 	}
 
 	ImGui::EndChild();

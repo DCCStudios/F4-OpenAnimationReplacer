@@ -1,3 +1,4 @@
+#include "UI/Localization.h"
 #include "UI/UICommon.h"
 #include "BaseConditions.h"
 #include "Conditions.h"
@@ -19,10 +20,10 @@ namespace UICommon
 	void HelpMarker(const char* a_desc)
 	{
 		ImGui::SameLine();
-		ImGui::TextDisabled("(?)");
+		ImGui::TextDisabled(UICommon::T("(?)"));
 		if (ImGui::BeginItemTooltip()) {
 			ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-			ImGui::TextUnformatted(a_desc);
+			ImGui::TextUnformatted(UICommon::T(a_desc));
 			ImGui::PopTextWrapPos();
 			ImGui::EndTooltip();
 		}
@@ -35,14 +36,14 @@ namespace UICommon
 
 		char pluginBuf[256];
 		strncpy_s(pluginBuf, a_form.pluginName.c_str(), sizeof(pluginBuf) - 1);
-		if (ImGui::InputText("Plugin", pluginBuf, sizeof(pluginBuf))) {
+		if (ImGui::InputText(UICommon::T("Plugin"), pluginBuf, sizeof(pluginBuf))) {
 			a_form.pluginName = pluginBuf;
 			changed = true;
 		}
 
 		char formIDBuf[32];
 		snprintf(formIDBuf, sizeof(formIDBuf), "0x%X", a_form.localFormID);
-		if (ImGui::InputText("Form ID", formIDBuf, sizeof(formIDBuf))) {
+		if (ImGui::InputText(UICommon::T("Form ID"), formIDBuf, sizeof(formIDBuf))) {
 			try {
 				a_form.localFormID = std::stoul(formIDBuf, nullptr, 16);
 				changed = true;
@@ -56,7 +57,7 @@ namespace UICommon
 	void TextUnformattedColored(const ImVec4& a_color, const char* a_text)
 	{
 		ImGui::PushStyleColor(ImGuiCol_Text, a_color);
-		ImGui::TextUnformatted(a_text);
+		ImGui::TextUnformatted(UICommon::T(a_text));
 		ImGui::PopStyleColor();
 	}
 
@@ -106,9 +107,9 @@ namespace UICommon
 
 	void DrawWarningIcon(const char* a_tooltip)
 	{
-		ImGui::TextColored(Colors::Warning, "!");
+		ImGui::TextColored(Colors::Warning, UICommon::T("!"));
 		if (ImGui::IsItemHovered() && a_tooltip) {
-			ImGui::SetTooltip("%s", a_tooltip);
+			ImGui::SetTooltip("%s", UICommon::T(a_tooltip));
 		}
 	}
 
@@ -116,20 +117,20 @@ namespace UICommon
 	{
 		bool confirmed = false;
 
-		if (ImGui::Button(a_buttonLabel)) {
-			ImGui::OpenPopup(a_modalTitle);
+		if (ImGui::Button(UICommon::T(a_buttonLabel))) {
+			ImGui::OpenPopup(UICommon::T(a_modalTitle));
 		}
 
-		if (ImGui::BeginPopupModal(a_modalTitle, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-			ImGui::TextUnformatted(a_message);
+		if (ImGui::BeginPopupModal(UICommon::T(a_modalTitle), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+			ImGui::TextUnformatted(UICommon::T(a_message));
 			ImGui::Separator();
 
-			if (ImGui::Button("Yes", ImVec2(120, 0))) {
+			if (ImGui::Button(UICommon::T("Yes"), ImVec2(120, 0))) {
 				confirmed = true;
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::SameLine();
-			if (ImGui::Button("No", ImVec2(120, 0))) {
+			if (ImGui::Button(UICommon::T("No"), ImVec2(120, 0))) {
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::EndPopup();
