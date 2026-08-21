@@ -49,6 +49,7 @@ public:
 	bool GetKeepRandomResultsOnLoop() const { return keepRandomResultsOnLoop; }
 	bool GetShareRandomResults() const { return shareRandomResults; }
 	bool GetReplaceAnnotations() const { return replaceAnnotations; }
+	bool GetPreserveExtractedMotion() const { return preserveExtractedMotion; }
 	// True when the given annotation text must NOT be fired for this SubMod's
 	// replacements. Matches the FULL annotation text case-insensitively (e.g.
 	// "WeaponFire" or "SoundPlay.WPNRifleFire"). suppressAllAnnotations mutes
@@ -94,6 +95,7 @@ public:
 	void SetKeepRandomResultsOnLoop(bool a_val) { keepRandomResultsOnLoop = a_val; }
 	void SetShareRandomResults(bool a_val) { shareRandomResults = a_val; }
 	void SetReplaceAnnotations(bool a_val) { replaceAnnotations = a_val; }
+	void SetPreserveExtractedMotion(bool a_val) { preserveExtractedMotion = a_val; }
 	void SetDirty(bool a_dirty) { dirty = a_dirty; }
 	void SetConditionSet(std::unique_ptr<ConditionSet> a_set) { conditionSet = std::move(a_set); }
 	void AddReplacementAnimation(ReplacementAnimation* a_anim) { replacementAnimations.push_back(a_anim); }
@@ -110,6 +112,9 @@ public:
 	bool keepRandomResultsOnLoop{ false };
 	bool shareRandomResults{ false };
 	bool replaceAnnotations{ true };
+	// Preserve the replacement hkaAnimation's extracted-motion reference frame
+	// when OAR builds its runtime clone. Off by default for pose-only donors.
+	bool preserveExtractedMotion{ false };
 	// Annotation suppression: config "suppressAnnotations" accepts true (mute
 	// ALL annotations of the replacement file) or an array of annotation names
 	// to mute selectively. Only applies while this SubMod's replacement is
