@@ -411,18 +411,12 @@ AnimationCache::CachedAnimation* AnimationCache::SelectEntry(const std::string& 
 	return it->second[0].get();
 }
 
-void AnimationCache::SetVtableFromGame(uintptr_t a_vtable, uintptr_t a_referenceFrameVtable)
+void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 {
 	const uintptr_t prevAnimationVtable = m_gameAnimVtable.exchange(a_vtable);
-	const uintptr_t prevReferenceFrameVtable = m_referenceFrameVtable.load();
-	if (a_referenceFrameVtable != 0) {
-		m_referenceFrameVtable.store(a_referenceFrameVtable);
-	}
-
 	const uintptr_t gameAnimationVtable = m_gameAnimVtable.load();
 	const uintptr_t referenceFrameVtable = m_referenceFrameVtable.load();
-	const bool referenceFrameChanged = referenceFrameVtable != 0 && referenceFrameVtable != prevReferenceFrameVtable;
-	if (prevAnimationVtable != 0 && !referenceFrameChanged) return;
+	if (prevAnimationVtable != 0) return;
 
 	std::shared_lock lock(m_mutex);
 	int patched = 0;
