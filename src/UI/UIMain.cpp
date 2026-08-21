@@ -15,6 +15,7 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <algorithm>
 #include <mutex>
 
 // Havok skeleton bones — matches the actual animation skeleton definition.
@@ -2201,7 +2202,7 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 		// Reroll policy dropdown
 		ImGui::Spacing();
 		if (editable) {
-			static const char* rerollLabels[] = { UICommon::T("On Each Play"), UICommon::T("While Conditions Active") };
+			const char* rerollLabels[] = { UICommon::T("On Each Play"), UICommon::T("While Conditions Active") };
 			int rerollInt = static_cast<int>(a_subMod->variantRerollPolicy);
 			ImGui::TextUnformatted(UICommon::T("Variant Selection Timing:"));
 			if (ImGui::Combo(UICommon::T("##reroll_policy"), &rerollInt, rerollLabels, IM_ARRAYSIZE(rerollLabels))) {
@@ -2224,7 +2225,7 @@ void UIMain::DrawReplacementAnimList(SubMod* a_subMod)
 					"variant instead of rolling independently."));
 			}
 		} else {
-			static const char* rerollLabels[] = { UICommon::T("On Each Play"), UICommon::T("While Conditions Active") };
+			const char* rerollLabels[] = { UICommon::T("On Each Play"), UICommon::T("While Conditions Active") };
 			int rerollInt = static_cast<int>(a_subMod->variantRerollPolicy);
 			ImGui::Text(UICommon::T("Variant Selection Timing: %s"), rerollLabels[rerollInt]);
 		}
@@ -2331,7 +2332,8 @@ void UIMain::DrawSettingsPanel()
 	auto* settings = Settings::GetSingleton();
 	const float textScale = static_cast<float>(settings->iTextSizePercent) / 100.0f;
 	ImGui::SetNextWindowSize(ImVec2(350.0f * textScale, 500.0f * textScale), ImGuiCond_FirstUseEver);
-	if (!ImGui::Begin(UICommon::T("OAR Settings"), &showSettings)) {
+	const std::string settingsWindowTitle = std::string(UICommon::T("OAR Settings")) + "###OARSettings";
+	if (!ImGui::Begin(settingsWindowTitle.c_str(), &showSettings)) {
 		ImGui::End();
 		return;
 	}
@@ -2369,7 +2371,7 @@ void UIMain::DrawSettingsPanel()
 		// attack-initiated and get cut short at reloadComplete). This picks
 		// what OAR does instead; its reloads use the reload-key path and
 		// play the full animation.
-		static const char* kAutoReloadModes[] = {
+		const char* kAutoReloadModes[] = {
 			UICommon::T("Auto-Reload On Last Round"),
 			UICommon::T("Auto-Reload On Fire Press When Empty"),
 			UICommon::T("Suppress Auto-Reload"),
@@ -2408,6 +2410,32 @@ void UIMain::DrawSettingsPanel()
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::TextColored(UICommon::Colors::AccentBlue, UICommon::T("UI"));
+
+	{
+		const auto& languages = UICommon::GetAvailableLanguages();
+		const auto selected = std::find_if(languages.begin(), languages.end(),
+			[&](const auto& option) { return option.id == settings->sLanguage; });
+		const auto& current = selected != languages.end() ? *selected : languages.front();
+		const std::string currentName = UICommon::T(current.sourceName.c_str());
+
+		ImGui::SetNextItemWidth(280.0f);
+		if (ImGui::BeginCombo(UICommon::T("Language"), currentName.c_str())) {
+			for (const auto& option : languages) {
+				const bool isSelected = option.id == settings->sLanguage;
+				const std::string optionName = UICommon::T(option.sourceName.c_str());
+				if (ImGui::Selectable(optionName.c_str(), isSelected)) {
+					UICommon::SetLanguage(option.id);
+				}
+				if (isSelected) {
+					ImGui::SetItemDefaultFocus();
+				}
+			}
+			ImGui::EndCombo();
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(UICommon::T("Select the OAR interface language. The change is saved to the INI file and applied immediately."));
+		}
+	}
 
 	// Toggle hotkey — click the button, then press the new key. Escape cancels.
 	{

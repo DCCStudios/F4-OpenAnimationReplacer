@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,11 +17,18 @@ namespace
     std::unordered_map<std::string, std::string> g_translations;
     std::string g_language;
     ImVector<ImWchar> g_glyph_ranges;
+    bool g_fontReloadRequested{ false };
+    std::vector<UICommon::LanguageOption> g_languages;
+
+    std::filesystem::path GetLocaleDirectory()
+    {
+        return std::filesystem::path("Data") / "F4SE" / "Plugins" /
+               "OpenAnimationReplacer" / "locales";
+    }
 
     std::filesystem::path GetLocalePath(const std::string& a_language)
     {
-        return std::filesystem::path("Data") / "F4SE" / "Plugins" /
-               "OpenAnimationReplacer" / "locales" / (a_language + ".json");
+        return GetLocaleDirectory() / (a_language + ".json");
     }
 
     std::vector<std::filesystem::path> GetFontCandidates()
@@ -35,6 +43,46 @@ namespace
             std::filesystem::path("C:\\Windows\\Fonts\\simhei.ttf"),
             std::filesystem::path("C:\\Windows\\Fonts\\simsun.ttc")
         };
+    }
+
+    bool AddCurrentLanguageFont()
+    {
+        auto& io = ImGui::GetIO();
+        ImFontConfig defaultFontConfig;
+        defaultFontConfig.SizePixels = 18.0f;
+        if (g_translations.empty()) {
+            io.FontDefault = io.Fonts->AddFontDefault(&defaultFontConfig);
+            return false;
+        }
+
+        ImFontGlyphRangesBuilder rangesBuilder;
+        rangesBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        for (const auto& [source, translation] : g_translations) {
+            rangesBuilder.AddText(translation.c_str());
+        }
+        g_glyph_ranges.clear();
+        rangesBuilder.BuildRanges(&g_glyph_ranges);
+
+        for (const auto& path : GetFontCandidates()) {
+            if (!std::filesystem::exists(path)) {
+                continue;
+            }
+
+            ImFont* font = io.Fonts->AddFontFromFileTTF(
+                path.string().c_str(),
+                18.0f,
+                nullptr,
+                g_glyph_ranges.Data);
+            if (font) {
+                io.FontDefault = font;
+                logger::info("[OAR] CJK UI font loaded: '{}'", path.string());
+                return true;
+            }
+        }
+
+        io.FontDefault = io.Fonts->AddFontDefault(&defaultFontConfig);
+        logger::warn("[OAR] No CJK UI font found; Chinese text may render as missing-glyph boxes");
+        return false;
     }
 }
 
@@ -89,35 +137,77 @@ namespace UICommon
         return it != g_translations.end() ? it->second.c_str() : a_source;
     }
 
-    bool LoadCJKFont()
+    const std::vector<LanguageOption>& GetAvailableLanguages()
     {
-        auto& io = ImGui::GetIO();
-        for (const auto& path : GetFontCandidates()) {
-            if (!std::filesystem::exists(path)) {
-                continue;
-            }
+        if (!g_languages.empty()) {
+            return g_languages;
+        }
 
-            ImFontGlyphRangesBuilder rangesBuilder;
-            rangesBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-            for (const auto& [source, translation] : g_translations) {
-                rangesBuilder.AddText(translation.c_str());
-            }
-            g_glyph_ranges.clear();
-            rangesBuilder.BuildRanges(&g_glyph_ranges);
+        g_languages.push_back({ "en_US", "English" });
 
-            ImFont* font = io.Fonts->AddFontFromFileTTF(
-                path.string().c_str(),
-                18.0f,
-                nullptr,
-                g_glyph_ranges.Data);
-            if (font) {
-                io.FontDefault = font;
-                logger::info("[OAR] CJK UI font loaded: '{}'", path.string());
-                return true;
+        std::error_code error;
+        const auto localeDirectory = GetLocaleDirectory();
+        if (std::filesystem::is_directory(localeDirectory, error)) {
+            for (const auto& entry : std::filesystem::directory_iterator(localeDirectory, error)) {
+                if (error || !entry.is_regular_file(error) || entry.path().extension() != ".json") {
+                    continue;
+                }
+
+                const auto id = entry.path().stem().string();
+                if (id.empty() || std::any_of(g_languages.begin(), g_languages.end(),
+                        [&](const auto& option) { return option.id == id; })) {
+                    continue;
+                }
+
+                const auto sourceName = id == "zh_CN" ? "Simplified Chinese" : id;
+                g_languages.push_back({ id, sourceName });
             }
         }
 
-        logger::warn("[OAR] No CJK UI font found; Chinese text may render as missing-glyph boxes");
-        return false;
+        std::sort(g_languages.begin(), g_languages.end(),
+            [](const auto& left, const auto& right) { return left.id < right.id; });
+        return g_languages;
+    }
+
+    bool SetLanguage(const std::string& a_language)
+    {
+        const auto& languages = GetAvailableLanguages();
+        const auto it = std::find_if(languages.begin(), languages.end(),
+            [&](const auto& option) { return option.id == a_language; });
+        if (it == languages.end()) {
+            logger::warn("[OAR] Ignoring unknown UI language '{}'", a_language);
+            return false;
+        }
+
+        auto* settings = Settings::GetSingleton();
+        settings->sLanguage = it->id;
+        LoadLocalization();
+        settings->Save();
+        g_fontReloadRequested = true;
+        logger::info("[OAR] UI language changed to '{}'", settings->sLanguage);
+        return true;
+    }
+
+    bool ConsumeFontReloadRequest()
+    {
+        const bool requested = g_fontReloadRequested;
+        g_fontReloadRequested = false;
+        return requested;
+    }
+
+    bool LoadCJKFont()
+    {
+        auto& io = ImGui::GetIO();
+        io.Fonts->Clear();
+        return AddCurrentLanguageFont();
+    }
+
+    bool RebuildFontAtlas()
+    {
+        if (!ImGui::GetCurrentContext()) {
+            return false;
+        }
+
+        return LoadCJKFont();
     }
 }
