@@ -2316,10 +2316,41 @@ namespace
 }
 
 // Weapon change detection — called from Activate hook when we notice the weapon
-// animation folder has changed. Proactively invalidates clones so they rebuild
-// from fresh game animation data on next access.
+// animation folder or equipped item set has changed. Proactively restores the
+// live binding slots and invalidates clones so they rebuild from fresh game
+// animation data before the new clip's _Activate constructs its control.
 static std::string s_lastKnownWeaponFolder;
 static std::shared_mutex s_lastKnownWeaponMutex;
+static uint64_t s_lastKnownEquippedFingerprint{ 0 };
+static bool s_lastKnownEquippedFingerprintValid{ false };
+
+static uint64_t GetPlayerEquippedFingerprint()
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player || !player->currentProcess || !player->currentProcess->middleHigh) {
+		return 0;
+	}
+
+	std::vector<uint32_t> equippedForms;
+	auto* middleHigh = player->currentProcess->middleHigh;
+	{
+		RE::BSAutoLock lock{ middleHigh->equippedItemsLock };
+		for (auto& equipped : middleHigh->equippedItems) {
+			auto* object = equipped.item.object;
+			if (object) {
+				equippedForms.push_back(object->GetFormID());
+			}
+		}
+	}
+
+	std::sort(equippedForms.begin(), equippedForms.end());
+	uint64_t fingerprint = 1469598103934665603ull;
+	for (auto formID : equippedForms) {
+		fingerprint ^= formID;
+		fingerprint *= 1099511628211ull;
+	}
+	return fingerprint;
+}
 
 static void CheckAndInvalidateOnWeaponChange()
 {
@@ -2328,14 +2359,29 @@ static void CheckAndInvalidateOnWeaponChange()
 		std::shared_lock lock(s_graphAnimPathMutex);
 		currentFolder = s_weaponAnimFolder;
 	}
+	const auto currentEquippedFingerprint = GetPlayerEquippedFingerprint();
 
 	std::unique_lock lock(s_lastKnownWeaponMutex);
-	if (!currentFolder.empty() && currentFolder != s_lastKnownWeaponFolder) {
-		logger::info("[OAR-WeaponChange] Weapon folder changed: '{}' -> '{}' — invalidating clones+state",
-			s_lastKnownWeaponFolder, currentFolder);
+	const bool folderChanged = !currentFolder.empty() && currentFolder != s_lastKnownWeaponFolder;
+	const bool equippedSetChanged = s_lastKnownEquippedFingerprintValid &&
+		currentEquippedFingerprint != s_lastKnownEquippedFingerprint;
+	if (!s_lastKnownEquippedFingerprintValid) {
+		s_lastKnownEquippedFingerprint = currentEquippedFingerprint;
+		s_lastKnownEquippedFingerprintValid = true;
+	}
+
+	if (folderChanged || equippedSetChanged) {
+		logger::info("[OAR-WeaponChange] Weapon state changed: folder '{}' -> '{}', equipped fingerprint {:X} -> {:X} — restoring slots and invalidating clones",
+			s_lastKnownWeaponFolder, currentFolder,
+			s_lastKnownEquippedFingerprint, currentEquippedFingerprint);
 		s_lastKnownWeaponFolder = currentFolder;
+		s_lastKnownEquippedFingerprint = currentEquippedFingerprint;
 		lock.unlock();
 
+		// This runs on the game thread from Activate. Restore while the recorded
+		// game originals are still available, then retire the replacement clones.
+		// Clearing first would leave a recycled clip with no safe original to use.
+		RestoreAllActiveReplacements();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 		ClearClipRuntimeState();
 	} else if (currentFolder.empty() && !s_lastKnownWeaponFolder.empty()) {
@@ -2345,6 +2391,7 @@ static void CheckAndInvalidateOnWeaponChange()
 		s_lastKnownWeaponFolder.clear();
 		lock.unlock();
 
+		RestoreAllActiveReplacements();
 		AnimationCache::GetSingleton()->InvalidateRuntimeClones();
 		ClearClipRuntimeState();
 	}
@@ -5005,6 +5052,15 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		// Detect an equipped-weapon transition BEFORE the engine builds the new
+		// animation control. The generic pistol equip clip uses one shared source
+		// path for several weapons, so a folder-only check at the end of Activate
+		// is too late to prevent a previous weapon's runtime clone from becoming
+		// the new play's template.
+		if (a_this && a_context && s_gameFullyLoaded.load()) {
+			CheckAndInvalidateOnWeaponChange();
+		}
+
 		// Clean the shared binding BEFORE anything reads it: _Activate builds
 		// the control and the play's trigger window from whatever is bound
 		// here, and the pre-swap below re-installs the current winner's clone
@@ -5343,8 +5399,6 @@ namespace
 			}
 		}
 
-		// Detect weapon folder changes and proactively invalidate stale clones
-		CheckAndInvalidateOnWeaponChange();
 		auto* cache = AnimationCache::GetSingleton();
 
 		auto* currentAnim = a_this->GetAnimation();
