@@ -4557,8 +4557,12 @@ namespace
 				if (i >= looseWork.size()) break;
 				const auto& item = looseWork[i];
 				const auto priority = item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0;
-				const bool loadedFromSource =
-					cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
+				const auto loadedFromSource = cache->LoadAnimation(
+					item.suffix,
+					item.info->absoluteDiskPath,
+					item.info->parentSubMod,
+					priority,
+					item.info->parentSubMod ? item.info->parentSubMod->GetPreserveExtractedMotion() : false);
 				if (loadedFromSource) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {

@@ -26,13 +26,26 @@ public:
 
 	struct CachedAnimation
 	{
+		enum class VtableFixupKind : uint8_t
+		{
+			kGameAnimation,
+			kAnimatedReferenceFrame,
+			kDefaultAnimatedReferenceFrame
+		};
+
+		struct VtableFixup
+		{
+			uint32_t offset{ 0 };
+			VtableFixupKind kind{ VtableFixupKind::kGameAnimation };
+		};
+
 		RE::hkaAnimation* animation{ nullptr };
 		std::vector<uint8_t> fileData;
 		std::string filePath;
 		float duration{ 0.f };
 		int32_t numTransformTracks{ 0 };
 		int32_t numFloatTracks{ 0 };
-		std::vector<uint32_t> vtableFixupOffsets;
+		std::vector<VtableFixup> vtableFixups;
 		uint32_t sectionFileOffset{ 0 };
 		std::unique_ptr<uint32_t[]> computedTransformOffsets;
 		std::unique_ptr<uint32_t[]> computedFloatOffsets;
@@ -80,6 +93,10 @@ public:
 		// condition-winning SubMod's actual file is the one that plays.
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
+		// Keep the replacement hkaAnimatedReferenceFrame when building the
+		// runtime clone. Disabled by default because most weapon animation
+		// replacements are pose-only and should not inherit donor root motion.
+		bool preserveExtractedMotion{ false };
 
 		// Source identity at load time. A config reload recreates every SubMod,
 		// so `owner` always misses — the load functions match by filePath instead
@@ -112,9 +129,11 @@ public:
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
-		const void* a_owner = nullptr, int32_t a_priority = 0);
+		const void* a_owner = nullptr, int32_t a_priority = 0,
+		bool a_preserveExtractedMotion = false);
 	bool LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
-		const void* a_owner = nullptr, int32_t a_priority = 0);
+		const void* a_owner = nullptr, int32_t a_priority = 0,
+		bool a_preserveExtractedMotion = false);
 	// Read an archived (BSResource) text file fully into a_out via the same
 	// resource-stream idiom LoadAnimationResource uses. Intended for small OAR
 	// config.json / user.json files packaged inside a BA2. Returns false on any
@@ -187,10 +206,11 @@ private:
 	bool TryRebindCached(const std::string& a_suffix, std::string_view a_sourceIdentity,
 		bool a_hasFileMTime, std::uint64_t a_sourceSize,
 		std::filesystem::file_time_type a_sourceMTime, const void* a_owner,
-		int32_t a_priority);
+		int32_t a_priority, bool a_preserveExtractedMotion);
 	bool LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
 		std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
-		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority);
+		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority,
+		bool a_preserveExtractedMotion);
 	RE::hkaAnimation* FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable);
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 
