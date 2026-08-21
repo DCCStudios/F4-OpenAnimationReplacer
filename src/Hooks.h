@@ -42,6 +42,18 @@ bool WasFireEmptyRecent(uint32_t a_formID, int64_t a_windowMs);
 // for the given actor. Used by the retriggerable logic to detect new presses.
 uint32_t GetFireEmptyGeneration(uint32_t a_formID);
 
+// Perspective of the animation graph that owns a playing clip. The player has
+// simultaneous first- and third-person graphs, so this is deliberately clip
+// specific rather than a camera-state query. Unknown means the player graph
+// has not been identified yet and no resolved animation path is available.
+enum class OARClipPerspective : uint8_t
+{
+	kUnknown = 0,
+	kFirstPerson = 1,
+	kThirdPerson = 2,
+};
+OARClipPerspective GetPlayingClipPerspective(RE::hkbClipGenerator* a_clip);
+
 // ===== Clip query support (backs the external Clips API) ======================
 // Internal, std::string-based representation of one active animation clip.
 // The API layer (API/OpenAnimationReplacerAPI.cpp) copies these into the

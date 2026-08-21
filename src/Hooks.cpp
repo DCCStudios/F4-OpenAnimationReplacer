@@ -67,6 +67,111 @@ uint32_t GetFireEmptyGeneration(uint32_t a_formID)
 static std::shared_mutex s_bypassMutex;
 static std::unordered_set<RE::hkbClipGenerator*> s_bypassSet;
 
+// Per-play IdleStop suppression for special-idle replacements. The reference
+// IdleStopFix plugin arms a global flag when SetupSpecialIdle runs; OAR already
+// knows the exact winning replacement, so it can scope the same correlation to
+// an actor, a clip, and an opted-in SubMod without fixed executable offsets.
+struct IdleStopSuppressionArm
+{
+	uint32_t actorFormID{ 0 };
+	SubMod* owner{ nullptr };
+	std::string subModName;
+	std::string originalPath;
+};
+
+static std::mutex s_idleStopSuppressionMutex;
+static std::unordered_map<RE::hkbClipGenerator*, IdleStopSuppressionArm> s_idleStopArmedClips;
+static std::unordered_map<uint32_t, std::pair<RE::hkbClipGenerator*, IdleStopSuppressionArm>> s_pendingIdleStopByActor;
+
+static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr,
+	const ReplacementAnimFileInfo* a_info)
+{
+	if (!a_clip || !a_refr || !a_info || !a_info->parentSubMod) return;
+
+	auto* subMod = a_info->parentSubMod;
+	const bool enabled = subMod->GetDisableIdleStop();
+
+	std::lock_guard lock(s_idleStopSuppressionMutex);
+	if (!enabled) {
+		// Turning the option off while this exact play is active must cancel the
+		// pending suppression. Condition-fail/deactivation paths deliberately do
+		// not cancel it because IdleStop normally arrives after the clip ends.
+		auto armIt = s_idleStopArmedClips.find(a_clip);
+		if (armIt != s_idleStopArmedClips.end() && armIt->second.owner == subMod) {
+			auto pendingIt = s_pendingIdleStopByActor.find(armIt->second.actorFormID);
+			if (pendingIt != s_pendingIdleStopByActor.end() && pendingIt->second.first == a_clip) {
+				s_pendingIdleStopByActor.erase(pendingIt);
+			}
+			s_idleStopArmedClips.erase(armIt);
+		}
+		return;
+	}
+
+	const auto actorFormID = a_refr->GetFormID();
+	auto existing = s_idleStopArmedClips.find(a_clip);
+	if (existing != s_idleStopArmedClips.end() &&
+		existing->second.actorFormID == actorFormID &&
+		existing->second.owner == subMod &&
+		existing->second.originalPath == a_info->originalPath) {
+		return;  // Same play; do not re-arm every Update after consumption.
+	}
+
+	IdleStopSuppressionArm arm;
+	arm.actorFormID = actorFormID;
+	arm.owner = subMod;
+	arm.subModName = subMod->GetName();
+	arm.originalPath = a_info->originalPath;
+	s_idleStopArmedClips[a_clip] = arm;
+	s_pendingIdleStopByActor[actorFormID] = { a_clip, arm };
+	logger::info("[OAR-IdleStop] Armed actor {:X} from submod '{}' path='{}'",
+		actorFormID, arm.subModName, arm.originalPath);
+}
+
+static void RearmIdleStopSuppressionForEcho(RE::hkbClipGenerator* a_clip, SubMod* a_activeSubMod)
+{
+	if (!a_clip || !a_activeSubMod) return;
+	std::lock_guard lock(s_idleStopSuppressionMutex);
+	auto it = s_idleStopArmedClips.find(a_clip);
+	if (it == s_idleStopArmedClips.end() || it->second.owner != a_activeSubMod) return;
+	s_pendingIdleStopByActor[it->second.actorFormID] = { a_clip, it->second };
+	logger::info("[OAR-IdleStop] Re-armed echo for actor {:X} submod '{}'",
+		it->second.actorFormID, it->second.subModName);
+}
+
+static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return false;
+
+	IdleStopSuppressionArm consumed;
+	{
+		std::lock_guard lock(s_idleStopSuppressionMutex);
+		auto it = s_pendingIdleStopByActor.find(a_refr->GetFormID());
+		if (it == s_pendingIdleStopByActor.end()) return false;
+		consumed = it->second.second;
+		s_pendingIdleStopByActor.erase(it);
+	}
+
+	logger::info("[OAR-IdleStop] Consumed fix arm for actor {:X} submod '{}' path='{}'",
+		consumed.actorFormID, consumed.subModName, consumed.originalPath);
+	return true;
+}
+
+static void ReleaseIdleStopSuppressionClip(RE::hkbClipGenerator* a_clip)
+{
+	if (!a_clip) return;
+	std::lock_guard lock(s_idleStopSuppressionMutex);
+	// Keep the actor-level pending entry: IdleStop is commonly delivered only
+	// after the idle clip has deactivated. Its copied metadata is pointer-safe.
+	s_idleStopArmedClips.erase(a_clip);
+}
+
+static void ClearIdleStopSuppressionState()
+{
+	std::lock_guard lock(s_idleStopSuppressionMutex);
+	s_idleStopArmedClips.clear();
+	s_pendingIdleStopByActor.clear();
+}
+
 void SetGameFullyLoaded(bool a_loaded) { s_gameFullyLoaded.store(a_loaded); }
 void SetHasActiveReplacements(bool a_has) { s_hasActiveReplacements.store(a_has); }
 bool HasActiveReplacements() { return s_hasActiveReplacements.load(); }
@@ -142,11 +247,24 @@ struct CharTrackFilterState {
 	RE::hkbClipGenerator* sourceClip = nullptr;
 	std::unordered_set<RE::hkbClipGenerator*> sourceClips;
 	std::string suffix;
+	// Filter-only special idles have no native source clip. Their donor is
+	// advanced from this wall-clock origin and sampled into one ordinary,
+	// non-additive graph output per actor update.
+	bool standaloneSpecialIdle = false;
+	float standaloneStartSec = 0.0f;
+	uint64_t lastStandaloneSampleFrame = UINT64_MAX;
 
 	// Cache rep/base pose by bone NAME so it's portable across 1p/3p skeletons.
 	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedRepByName;
 	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedBaseByName;
 	bool cacheValid = false;
+
+	// Track-filtered Camera motion is transferred as a delta from the donor's
+	// frame-zero Camera pose, never as an absolute local transform.  Keeping the
+	// reference in the per-filter state avoids an extra full donor sample every
+	// frame while still resetting cleanly when the served donor changes.
+	std::unordered_map<int32_t, RE::hkQsTransformRaw> cameraDonorReferenceByTrack;
+	std::unordered_set<int32_t> invalidCameraReferenceTracks;
 
 	// Frozen-bone locals, captured from the SOURCE clip's own pose on the
 	// first sample of each play (so the freeze starts exactly where the
@@ -542,6 +660,23 @@ static RE::hkQsTransformRaw MakeIdentityQs()
 	t.rotation[3] = 1.0f;
 	t.scale[0] = t.scale[1] = t.scale[2] = 1.0f;
 	return t;
+}
+
+static bool IsTrackFilterCameraBone(std::string_view a_name)
+{
+	return a_name.size() == 6 && _strnicmp(a_name.data(), "Camera", 6) == 0;
+}
+
+static bool IsFiniteQs(const RE::hkQsTransformRaw& a_transform)
+{
+	for (int i = 0; i < 4; ++i) {
+		if (!std::isfinite(a_transform.translation[i]) ||
+			!std::isfinite(a_transform.rotation[i]) ||
+			!std::isfinite(a_transform.scale[i])) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static void QuatMul(const float a[4], const float b[4], float out[4])
@@ -2283,8 +2418,40 @@ namespace
 
 	static OARAnnotationSuppressionSink s_suppressionSink;
 
+	// Match the reference plugin's stale-state safeguard. Opening either menu
+	// interrupts special-idle playback; a pending flag must not leak forward and
+	// consume an unrelated IdleStop later in the session.
+	class IdleStopMenuWatcher : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
+	{
+	public:
+		RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event,
+			RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+		{
+			if (a_event.opening &&
+				(a_event.menuName == "LoadingMenu" || a_event.menuName == "PipboyMenu")) {
+				ClearIdleStopSuppressionState();
+				logger::info("[OAR-IdleStop] Cleared pending suppression on '{}' open", a_event.menuName.c_str());
+			}
+			return RE::BSEventNotifyControl::kContinue;
+		}
+
+		bool registered{ false };
+	};
+
+	static IdleStopMenuWatcher s_idleStopMenuWatcher;
+
 	void RegisterSuppressionSink()
 	{
+		if (!s_idleStopMenuWatcher.registered) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				if (auto* source = ui->GetEventSource<RE::MenuOpenCloseEvent>()) {
+					source->RegisterSink(&s_idleStopMenuWatcher);
+					s_idleStopMenuWatcher.registered = true;
+					logger::info("[OAR-IdleStop] Registered menu reset watcher");
+				}
+			}
+		}
+
 		if (s_suppressionSink.registered) return;
 
 		// OG-only: GetEventSourcePointersFromGraph (897074) has no NG/AE ID.
@@ -2489,6 +2656,7 @@ void RestoreAllActiveReplacements()
 
 void ClearClipRuntimeState()
 {
+	ClearIdleStopSuppressionState();
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		s_originalAnimMap.clear();
@@ -2617,6 +2785,7 @@ static std::atomic<bool> s_pendingLookupResort{ false };
 // update without waiting for paths to re-resolve.
 static void PerformGlobalDisableRestore()
 {
+	ClearIdleStopSuppressionState();
 	// 1) Write game originals back into every clip slot that still holds our
 	//    clone, and re-install original trigger arrays (validated — same code
 	//    path as the save-load restore).
@@ -2881,6 +3050,15 @@ namespace
 			sv = sv.substr(lastSlash + 1);
 		}
 		return sv;
+	}
+
+	static bool LeafEndsWithAdd(std::string_view a_leaf)
+	{
+		if (a_leaf.size() < 3) return false;
+		const auto tail = a_leaf.substr(a_leaf.size() - 3);
+		return std::tolower(static_cast<unsigned char>(tail[0])) == 'a' &&
+			std::tolower(static_cast<unsigned char>(tail[1])) == 'd' &&
+			std::tolower(static_cast<unsigned char>(tail[2])) == 'd';
 	}
 
 	static std::string ExtractAnimSuffix(const std::string& a_path)
@@ -4407,6 +4585,155 @@ namespace
 		return ClassifyPerspectiveFromPath(a_path);
 	}
 
+	OARClipPerspective GetPlayingClipPerspectiveImpl(RE::hkbClipGenerator* a_clip)
+	{
+		if (!a_clip) return OARClipPerspective::kUnknown;
+
+		// The player runs both perspective graphs at the same time. Membership
+		// learned by the graph poll is authoritative and avoids treating every
+		// player clip as whichever camera happens to be visible this frame.
+		{
+			std::shared_lock lock(s_playerClipMutex);
+			auto it = s_playerClipGraph.find(a_clip);
+			if (it != s_playerClipGraph.end()) {
+				const auto firstPersonIndex = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+				if (firstPersonIndex >= 0) {
+					return it->second == static_cast<uint8_t>(firstPersonIndex) ?
+						OARClipPerspective::kFirstPerson : OARClipPerspective::kThirdPerson;
+				}
+			}
+		}
+
+		// Non-player clips and early player clips can still be classified from
+		// the authoritative resolved path. Do not label an empty/unknown player
+		// path as third person merely because it lacks the _1stPerson marker.
+		std::string resolvedPath;
+		{
+			std::shared_lock lock(s_clipRealPathMutex);
+			auto it = s_clipRealPathCache.find(a_clip);
+			if (it != s_clipRealPathCache.end()) resolvedPath = it->second;
+		}
+		if (resolvedPath.empty()) return OARClipPerspective::kUnknown;
+
+		return ClassifyPerspectiveFromPath(resolvedPath) == AnimationLog::Perspective::kFirstPerson ?
+			OARClipPerspective::kFirstPerson : OARClipPerspective::kThirdPerson;
+	}
+
+	// Track filters deliberately paste their cached pose into other clips that
+	// the same graph blends alongside the source. Named additive support clips
+	// are different: they carry sway, pitch, turn, jiggle, and stance deltas.
+	// Pasting the absolute cached pose into them, or zeroing their filtered
+	// tracks, can corrupt the composed camera/weapon hierarchy. The two config
+	// switches are perspective-specific because the player's graphs run at the
+	// same time. Unknown perspective retains the historical behavior.
+	static bool ShouldSkipAddNonSourceClip(
+		RE::hkbClipGenerator* a_clip, const SubMod::TrackFilter* a_filter)
+	{
+		if (!a_clip || !a_filter) return false;
+
+		std::string suffix;
+		{
+			std::shared_lock lock(s_clipSuffixMutex);
+			auto it = s_clipSuffixCache.find(a_clip);
+			if (it != s_clipSuffixCache.end()) suffix = it->second;
+		}
+		if (suffix.empty()) {
+			const char* clipName = a_clip->animationName.data();
+			if (clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0] != '\0') {
+				suffix = ExtractAnimSuffix(std::string(clipName));
+			}
+		}
+		if (suffix.empty() || !LeafEndsWithAdd(GetSuffixLeaf(suffix))) return false;
+
+		const auto perspective = GetPlayingClipPerspectiveImpl(a_clip);
+		const bool skip =
+			(perspective == OARClipPerspective::kFirstPerson &&
+				a_filter->skipAdditiveNonSourceFirstPerson) ||
+			(perspective == OARClipPerspective::kThirdPerson &&
+				a_filter->skipAdditiveNonSourceThirdPerson);
+		if (skip) {
+			static std::atomic<int> s_skipAddLog{ 0 };
+			if (s_skipAddLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+				logger::info(
+					"[OAR-TrackFilter] Skipped non-source *add clip '{}' ({}, clip={:X})",
+					suffix,
+					perspective == OARClipPerspective::kFirstPerson ? "1st person" : "3rd person",
+					reinterpret_cast<uintptr_t>(a_clip));
+			}
+		}
+		return skip;
+	}
+
+	// Skeleton-root signature of an animation path: the lowercased segment
+	// between 'actors\' and '\animations\', e.g. 'character\_1stperson',
+	// 'character', 'powerarmor\_1stperson', 'powerarmor', a creature race.
+	// This is the discriminator suffix matching throws away: suffixes are
+	// computed after 'Animations\', so a power-armor clip's suffix collides
+	// with the normal-skeleton registration even though the skeletons differ.
+	// Empty = unknown (path unresolved or not under an actors tree).
+	static std::string AnimRootSignature(const std::string& a_path)
+	{
+		if (a_path.empty()) return {};
+		std::string lower = a_path;
+		std::ranges::transform(lower, lower.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		std::ranges::replace(lower, '/', '\\');
+		const auto actorsPos = lower.find("actors\\");
+		if (actorsPos == std::string::npos) return {};
+		const auto animPos = lower.find("\\animations\\", actorsPos);
+		if (animPos == std::string::npos || animPos <= actorsPos + 7) return {};
+		return lower.substr(actorsPos + 7, animPos - (actorsPos + 7));
+	}
+
+	// Skeleton gate for ALL candidate selection: a replacement authored for
+	// one skeleton must never install on a clip playing on another — the
+	// donor's track->bone indices are meaningless there and the result is a
+	// corrupted pose. Two field cases define the class: the 3rd-person
+	// F4Parkour 'rifle\wpnmelee' claiming 1st-person melee clips via leaf
+	// matching (Cryolator, 2026-08-19), and a tactical-reload submod firing
+	// on the POWER ARMOR reload clip (different skeleton, same suffix — the
+	// root segment is what suffix matching discards). Compare root
+	// signatures when both sides resolve; fall back to the 1st/3rd-person
+	// classifier (player graph index works even before the clip's path
+	// resolves); allow when genuinely unknown (NPC/unresolved paths keep
+	// today's behavior).
+	static bool ClaimSkeletonAllowed(RE::hkbClipGenerator* a_clip, const ReplacementAnimFileInfo* a_info)
+	{
+		if (!a_info) return false;
+		// This protection is deliberately opt-in. A special idle may use a
+		// third-person-authored animation while hosted by the player's first-person
+		// behavior graph, so graph perspective alone can otherwise reject a valid
+		// exact-path replacement (F4Parkour Ledge/Mantle High).
+		if (!Settings::GetSingleton()->bSkeletonCompatibilityGate) return true;
+		const std::string& filePath =
+			!a_info->absoluteDiskPath.empty() ? a_info->absoluteDiskPath : a_info->replacementPath;
+		const std::string fileSig = AnimRootSignature(filePath);
+		std::string clipPath;
+		{
+			std::shared_lock lock(s_clipRealPathMutex);
+			auto it = s_clipRealPathCache.find(a_clip);
+			if (it != s_clipRealPathCache.end()) clipPath = it->second;
+		}
+		const std::string clipSig = AnimRootSignature(clipPath);
+		if (!fileSig.empty() && !clipSig.empty()) {
+			if (fileSig == clipSig) return true;
+			static std::atomic<int> s_skelGateLog{ 0 };
+			if (s_skelGateLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+				logger::info("[OAR-SkelGate] blocked candidate: file root='{}' clip root='{}' (clipGen={:X}, file='{}')",
+					fileSig, clipSig, reinterpret_cast<uintptr_t>(a_clip), a_info->replacementPath);
+			}
+			return false;
+		}
+		// Root unknown on one side: the perspective classifier still separates
+		// 1st from 3rd person via the player graph index.
+		using Perspective = AnimationLog::Perspective;
+		const auto filePersp = ClassifyPerspectiveFromPath(filePath);
+		if (filePersp == Perspective::kUnknown) return true;
+		const auto clipPersp = ClassifyClipPerspective(a_clip, clipPath);
+		if (clipPersp == Perspective::kUnknown) return true;
+		return clipPersp == filePersp;
+	}
+
 	// Direct path matching: the exact suffix from a clip's previously resolved
 	// (authoritative) real path. Leaf-validated against the clip's current
 	// authored animation name — a recycled clip-generator address can carry a
@@ -4905,6 +5232,7 @@ namespace
 		for (auto* info : a_candidates) {
 			if (!info || !info->parentSubMod) continue;
 			if (info->parentSubMod->IsDisabled()) continue;
+			if (!ClaimSkeletonAllowed(a_clipGen, info)) continue;
 			auto* cs = info->parentSubMod->GetConditionSet();
 			if (!cs || cs->IsEmpty()) return info;
 			if (!a_refr) continue;
@@ -4913,6 +5241,158 @@ namespace
 			} catch (...) { continue; }
 		}
 		return nullptr;
+	}
+
+	struct StandaloneSpecialIdleMatch
+	{
+		ReplacementAnimFileInfo* info = nullptr;
+		std::string suffix;
+		RE::hkaAnimation* animation = nullptr;
+		std::vector<int16_t> donorTrackToBone;
+		bool donorIdentity = false;
+	};
+
+	// SetupSpecialIdle has no hkbClipGenerator yet, so resolve its IDLE filename
+	// through the same leaf tables used by clip replacement. Only explicitly
+	// opted-in track filters participate; clip-dependent conditions naturally
+	// fail when evaluated with a null clip.
+	static bool FindStandaloneSpecialIdleMatch(
+		RE::Actor* a_actor, RE::TESIdleForm* a_idle, StandaloneSpecialIdleMatch& a_out)
+	{
+		if (!a_actor || !a_idle) return false;
+		const char* fileName = a_idle->animFileName.c_str();
+		if (!fileName || !fileName[0]) return false;
+
+		const auto rawSuffix = ExtractAnimSuffix(fileName);
+		if (rawSuffix.empty()) return false;
+		const std::string leaf(GetSuffixLeaf(rawSuffix));
+
+		std::vector<std::pair<std::string, ReplacementAnimFileInfo*>> candidates;
+		{
+			std::shared_lock lock(s_nameLookupMutex);
+			auto leafIt = s_leafToFullSuffixes.find(leaf);
+			if (leafIt == s_leafToFullSuffixes.end()) return false;
+			for (const auto& suffix : leafIt->second) {
+				auto infoIt = s_suffixToInfos.find(suffix);
+				if (infoIt == s_suffixToInfos.end()) continue;
+				for (auto* info : infoIt->second) {
+					candidates.emplace_back(suffix, info);
+				}
+			}
+		}
+
+		std::ranges::stable_sort(candidates, [](const auto& a, const auto& b) {
+			const int ap = a.second && a.second->parentSubMod ? a.second->parentSubMod->GetPriority() : INT_MIN;
+			const int bp = b.second && b.second->parentSubMod ? b.second->parentSubMod->GetPriority() : INT_MIN;
+			return ap > bp;
+		});
+
+		auto* cache = AnimationCache::GetSingleton();
+		if (!cache->GetGameAnimVtable()) return false;
+		for (auto& [suffix, info] : candidates) {
+			if (!info || !info->parentSubMod) continue;
+			auto* subMod = info->parentSubMod;
+			auto& filter = subMod->trackFilter;
+			if (subMod->IsDisabled() || !filter.enabled || !filter.triggerOnlySpecialIdle) continue;
+			// Preserve ordinary path semantics: a foreign folder is eligible only
+			// when this submod explicitly claims filenames through Leaf Matching.
+			if (suffix != rawSuffix && !subMod->GetLeafMatching()) continue;
+
+			auto* conditions = subMod->GetConditionSet();
+			if (conditions && !conditions->IsEmpty()) {
+				try {
+					if (!subMod->EvaluateConditions(a_actor, nullptr)) continue;
+				} catch (...) {
+					continue;
+				}
+			}
+
+			auto* animation = cache->GetCachedAnimation(suffix, subMod);
+			if (!animation || reinterpret_cast<uintptr_t>(animation) < 0x10000 ||
+				IsBadReadPtr(animation, sizeof(RE::hkaAnimation))) {
+				continue;
+			}
+			std::vector<int16_t> donorMap;
+			bool donorIdentity = false;
+			if (!cache->GetDonorTrackMap(suffix, subMod, donorMap, donorIdentity) ||
+				(donorMap.empty() && !donorIdentity)) {
+				logger::warn(
+					"[OAR-TrackFilter-Standalone] '{}' matched '{}' but its donor binding has no track map; using vanilla SetupSpecialIdle",
+					subMod->GetName(), fileName);
+				continue;
+			}
+
+			a_out.info = info;
+			a_out.suffix = suffix;
+			a_out.animation = animation;
+			a_out.donorTrackToBone = std::move(donorMap);
+			a_out.donorIdentity = donorIdentity;
+			return true;
+		}
+		return false;
+	}
+
+	static bool StartStandaloneSpecialIdle(RE::Actor* a_actor, RE::TESIdleForm* a_idle)
+	{
+		StandaloneSpecialIdleMatch match;
+		if (!FindStandaloneSpecialIdleMatch(a_actor, a_idle, match)) return false;
+
+		auto* subMod = match.info->parentSubMod;
+		auto* filter = &subMod->trackFilter;
+		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
+		bool isNew = false;
+		{
+			std::unique_lock lock(s_trackFilterMutex);
+			auto* state = FindTrackFilterState(a_actor, filter);
+			isNew = state == nullptr;
+			if (isNew) {
+				state = &s_charTrackFilterMap[a_actor].emplace_back();
+				state->filter = filter;
+				s_trackFilterActiveCount.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			state->replacement = match.animation;
+			state->sourceAnimation = nullptr;
+			state->parentSubMod = subMod;
+			state->sourceClip = nullptr;
+			state->sourceClips.clear();
+			state->suffix = match.suffix;
+			state->standaloneSpecialIdle = true;
+			state->standaloneStartSec = nowSec;
+			state->lastStandaloneSampleFrame = UINT64_MAX;
+			state->donorTrackToBone = std::move(match.donorTrackToBone);
+			state->donorMapIdentity = match.donorIdentity;
+			state->donorMapQueried = true;
+			state->cachedRepByName.clear();
+			state->cachedBaseByName.clear();
+			state->cacheValid = false;
+			state->cameraDonorReferenceByTrack.clear();
+			state->invalidCameraReferenceTracks.clear();
+			state->frozenByName.clear();
+			state->lastSourceTimeSec = nowSec;
+			state->lastSampleSec = 0.0f;
+			state->lastSampledLocalTime = -1.0f;
+			state->lastAdvanceSec = nowSec;
+			state->selfAdvanceStartSec = -1.0f;
+			state->selfAdvanceBaseTime = 0.0f;
+			state->earlyBlendOutArmed = false;
+			state->oneShotDone = false;
+			state->dormant = false;
+			state->sampleStarved = false;
+			state->onEndFired = false;
+			state->blendingOut = false;
+			state->deactivationDelayActive = false;
+			state->blendElapsed = 0.0f;
+			state->blendDuration = filter->blendInTime;
+			state->blendAlpha = filter->blendInTime <= 0.0f ? 1.0f : 0.0f;
+		}
+
+		QueueCustomEvents(a_actor, subMod->eventsOnStart, "onStart/trackFilter-specialIdle");
+		logger::info(
+			"[OAR-TrackFilter-Standalone] Started '{}' for actor {:X}: idle='{}' donor='{}' duration={:.3f}s{}",
+			subMod->GetName(), a_actor->GetFormID(), a_idle->animFileName.c_str(), match.suffix,
+			match.animation->duration, isNew ? "" : " (restarted)");
+		return true;
 	}
 
 	// Pre-_Activate binding-set scrub. A FRESH clip generator has no animation
@@ -5122,6 +5602,7 @@ namespace
 												if (!info || !info->parentSubMod) continue;
 												if (!info->parentSubMod->GetLeafMatching()) continue;
 												if (info->parentSubMod->IsDisabled()) continue;
+												if (!ClaimSkeletonAllowed(a_this, info)) continue;
 												auto* cs = info->parentSubMod->GetConditionSet();
 												bool pass = (!cs || cs->IsEmpty());
 												if (!pass && refrPre) {
@@ -6347,6 +6828,7 @@ namespace
 							if (!info || !info->parentSubMod) continue;
 							if (!info->parentSubMod->GetLeafMatching()) continue;
 							if (info->parentSubMod->IsDisabled()) continue;
+							if (!ClaimSkeletonAllowed(a_this, info)) continue;
 							bool pass = false;
 							if (lockedActive) {
 								// Locked leaf-matching submod stays selected without
@@ -6388,10 +6870,25 @@ namespace
 						}
 					}
 					if (candidatesPtr) {
-						static std::atomic<int> s_leafOvLog{ 0 };
-						if (s_leafOvLog.fetch_add(1, std::memory_order_relaxed) < 40) {
-							logger::info("[OAR-LeafMatch] leaf='{}' claimed by leaf-matching suffix='{}' (exact='{}', foreign={})",
-								leafName, resolvedSuffix, exactSuffix, leafForcedSubMod != nullptr);
+						// Log once per (clip, claimed suffix) — the per-frame
+						// repeat of an unchanged claim burned the old absolute
+						// cap in one play and blinded later diagnosis
+						// (Cryolator 2026-08-19).
+						static std::mutex s_leafOvLogMutex;
+						static std::unordered_map<RE::hkbClipGenerator*, std::string> s_leafOvLastClaim;
+						bool logClaim = false;
+						{
+							std::lock_guard lgLock(s_leafOvLogMutex);
+							auto [it, inserted] = s_leafOvLastClaim.try_emplace(a_this, resolvedSuffix);
+							if (inserted || it->second != resolvedSuffix) {
+								it->second = resolvedSuffix;
+								logClaim = true;
+							}
+						}
+						if (logClaim) {
+							logger::info("[OAR-LeafMatch] leaf='{}' claimed by leaf-matching suffix='{}' (exact='{}', foreign={}, clipGen={:X})",
+								leafName, resolvedSuffix, exactSuffix, leafForcedSubMod != nullptr,
+								reinterpret_cast<uintptr_t>(a_this));
 						}
 					}
 				}
@@ -6864,6 +7361,7 @@ namespace
 				if (!info || !info->parentSubMod) continue;
 				++totalCands;
 				if (info->parentSubMod->IsDisabled()) { ++disabledCands; continue; }
+				if (!ClaimSkeletonAllowed(a_this, info)) { ++disabledCands; continue; }
 				auto* cs = info->parentSubMod->GetConditionSet();
 				if (!cs || cs->IsEmpty()) { shouldReplace = true; winningInfo = info; ++noCondCands; break; }
 				if (!refr) continue;
@@ -7055,6 +7553,13 @@ namespace
 					s_buildFailLog++;
 				}
 			}
+
+			// Arm only after the replacement clone exists (or orphan recovery
+			// proves it is already installed). Any original animation path is
+			// eligible when the winning submod has the option enabled.
+			if ((replacement || orphanAnnotOnly) && winningInfo && refr) {
+				UpdateIdleStopSuppressionArm(a_this, refr, winningInfo);
+			}
 			bool bReplaceAnnot = winningInfo && winningInfo->parentSubMod ?
 				winningInfo->parentSubMod->GetReplaceAnnotations() : true;
 
@@ -7134,12 +7639,15 @@ namespace
 						state.donorTrackToBone.clear();
 						state.donorMapIdentity = false;
 						state.donorMapQueried = true;
+						state.cameraDonorReferenceByTrack.clear();
+						state.invalidCameraReferenceTracks.clear();
 						AnimationCache::GetSingleton()->GetDonorTrackMap(
 							cacheSuffix, winningInfo->parentSubMod,
 							state.donorTrackToBone, state.donorMapIdentity);
 					}
 					state.replacement = replacement;
 					state.parentSubMod = winningInfo->parentSubMod;
+					state.standaloneSpecialIdle = false;
 					state.sourceClip = a_this;
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
@@ -8047,6 +8555,7 @@ namespace
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		if (a_this) {
+			ReleaseIdleStopSuppressionClip(a_this);
 			// Flush a still-pending kActivate log entry BEFORE dropping the
 			// per-clip state below. Short-lived clips (fire animations,
 			// transition clips) often deactivate before the Update-hook grace
@@ -8447,6 +8956,10 @@ namespace
 			if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
 			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+			const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
+			const bool standaloneNeedsSample = state.standaloneSpecialIdle &&
+				state.lastStandaloneSampleFrame != currentFrame &&
+				(poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f;
 
 			// Non-source clips with valid cache and already-resolved bones:
 			// handle entirely under shared_lock (no writes to shared state).
@@ -8457,7 +8970,9 @@ namespace
 				charIt->second.version == filterPtr->version.load(std::memory_order_relaxed) &&
 				!charIt->second.nameAndIndex.empty());
 
-			if (!isSourceClip && state.cacheValid && alreadyResolved) {
+			if (!isSourceClip && !standaloneNeedsSample && state.cacheValid && alreadyResolved) {
+				if (ShouldSkipAddNonSourceClip(a_this, filterPtr)) return;
+
 				// Skip clips with onFraction=0 — their pose buffer is uninitialized.
 				if (poseHeader.onFraction <= 0.f) return;
 
@@ -8508,6 +9023,11 @@ namespace
 				}
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
+					// Camera motion belongs only to the source clip. Pasting one
+					// absolute cached Camera local into every concurrently generating
+					// clip can duplicate it and can leave a foreign weapon's camera
+					// placement alive after the source has ended.
+					if (IsTrackFilterCameraBone(name)) continue;
 					if (idx < 0 || idx >= numOutputBones) continue;
 
 					if (isAdditiveClip) {
@@ -8540,6 +9060,7 @@ namespace
 				// identity so sway cannot wiggle a frozen bone). Skipped until
 				// the source clip's first sample captures the value.
 				for (auto& [name, idx] : cr.freezeNameAndIndex) {
+					if (IsTrackFilterCameraBone(name)) continue;
 					if (idx < 0 || idx >= numOutputBones) continue;
 					if (isAdditiveClip) {
 						RE::hkQsTransformRaw identity{};
@@ -8597,7 +9118,11 @@ namespace
 		float weight = filterPtr->weight * state.blendAlpha;
 		auto mode = filterPtr->mode;
 		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
-		bool isSourceClip = (state.sourceClips.count(a_this) > 0);
+		const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
+		const bool standaloneSampler = state.standaloneSpecialIdle &&
+			state.lastStandaloneSampleFrame != currentFrame &&
+			(poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f;
+		bool isSourceClip = (state.sourceClips.count(a_this) > 0) || standaloneSampler;
 
 		// End Clip If Shorter + end-driven fade: the fading alpha must only
 		// apply to NON-source clips. On the incoming state's clips, fading the
@@ -8692,9 +9217,11 @@ namespace
 					? std::min(animNumTracks, bindingNumTracks) : animNumTracks;
 				if (numTracksToSample <= 0) return;
 
-				float localTime = a_this->GetLocalTime();
+				float localTime = state.standaloneSpecialIdle ?
+					std::max(0.0f, nowSec - state.standaloneStartSec) : a_this->GetLocalTime();
 				float repDuration = repAnim->duration;
-				const bool loopingSource = (a_this->mode == RE::MODE_LOOPING);
+				const bool loopingSource = !state.standaloneSpecialIdle &&
+					(a_this->mode == RE::MODE_LOOPING);
 
 				if (filterPtr->sampleFrame >= 0.0f) {
 					// Fixed-frame sampling: hold the override pose at one authored
@@ -8706,6 +9233,15 @@ namespace
 					if (repDuration > 0.001f && localTime > repDuration) {
 						localTime = repDuration;
 					}
+					if (state.standaloneSpecialIdle && repDuration > 0.001f) {
+						const float elapsed = std::max(0.0f, nowSec - state.standaloneStartSec);
+						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
+							!state.earlyBlendOutArmed &&
+							elapsed >= repDuration - filterPtr->blendOutTime) {
+							state.earlyBlendOutArmed = true;
+						}
+						if (elapsed >= repDuration) state.oneShotDone = true;
+					}
 				} else if (repDuration > 0.001f) {
 					if (loopingSource) {
 						// Looping source (sprint, walk overlays): wrap the clip's
@@ -8713,6 +9249,20 @@ namespace
 						// replacements cycle correctly.
 						localTime = std::fmod(localTime, repDuration);
 						if (localTime < 0.f) localTime += repDuration;
+					} else if (state.standaloneSpecialIdle) {
+						// No graph clip owns this playback. The intercepted PlayIdle
+						// request supplied the start time and the donor runs once.
+						state.lastAdvanceSec = nowSec;
+						state.lastSampledLocalTime = localTime;
+						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
+							!state.earlyBlendOutArmed &&
+							localTime >= repDuration - filterPtr->blendOutTime) {
+							state.earlyBlendOutArmed = true;
+						}
+						if (localTime >= repDuration) {
+							localTime = repDuration;
+							state.oneShotDone = true;
+						}
 					} else {
 						// ---- One-shot source (SINGLE_PLAY clip) ----
 						// Restart detection first: localTime moving backward means the
@@ -8825,9 +9375,12 @@ namespace
 							QueueCustomEvents(actor, state.parentSubMod->eventsOnStart, "onStart/trackFilter-restart");
 						}
 					} else {
-						// Nothing to sample or apply, but stamp source liveness so
-						// staleness doesn't erase a state whose clip is still alive.
-						state.lastSourceTimeSec = nowSec;
+						// A native source clip can remain alive while dormant. A
+						// standalone special idle has no source to keep alive, so do
+						// not refresh it and let normal staleness cleanup retire it.
+						if (!state.standaloneSpecialIdle) {
+							state.lastSourceTimeSec = nowSec;
+						}
 						return;
 					}
 				} else if (state.sampleStarved) {
@@ -8952,6 +9505,7 @@ namespace
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
+					const bool isCameraBone = IsTrackFilterCameraBone(name);
 
 					// Same resolution order as donorTrackFor: donor's own map,
 					// donor identity, host mapping, host identity.
@@ -8966,6 +9520,61 @@ namespace
 
 					RE::hkQsTransformRaw repVal = tl_sampledTracks[trackIdx];
 					RE::hkQsTransformRaw baseVal = outputPose[idx];
+
+					// Camera is not a portable absolute local pose across weapon
+					// graphs. Preserve the donor's authored motion by transferring its
+					// delta from frame zero onto this frame's live native Camera pose.
+					// This remains source-only: non-source paths deliberately ignore
+					// Camera so the delta is neither duplicated nor left behind.
+					if (isCameraBone) {
+						auto cameraRefIt = state.cameraDonorReferenceByTrack.find(trackIdx);
+						if (cameraRefIt == state.cameraDonorReferenceByTrack.end() &&
+							!state.invalidCameraReferenceTracks.count(trackIdx)) {
+							thread_local std::vector<RE::hkQsTransformRaw> tl_cameraReferenceTracks;
+							thread_local std::vector<float> tl_cameraReferenceFloats;
+							tl_cameraReferenceTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
+							tl_cameraReferenceFloats.assign(
+								std::max(1, repAnim->numberOfFloatTracks), 0.0f);
+							repAnim->SampleTracks(
+								0.0f, tl_cameraReferenceTracks.data(), tl_cameraReferenceFloats.data());
+							const auto& reference = tl_cameraReferenceTracks[trackIdx];
+
+							if (IsFiniteQs(reference)) {
+								cameraRefIt = state.cameraDonorReferenceByTrack.emplace(trackIdx, reference).first;
+								logger::info(
+									"[OAR-TrackFilter-Camera] Relative camera active for '{}' "
+									"(bone={}, track={}, donor frame-zero reference captured)",
+									state.suffix, idx, trackIdx);
+							} else {
+								state.invalidCameraReferenceTracks.insert(trackIdx);
+								logger::warn(
+									"[OAR-TrackFilter-Camera] Invalid donor frame-zero Camera for '{}' - "
+									"leaving the native Camera untouched",
+									state.suffix);
+							}
+						}
+
+						// Remove values cached by an earlier activation/build. Camera is
+						// intentionally never eligible for non-source propagation.
+						state.cachedRepByName.erase(name);
+						state.cachedBaseByName.erase(name);
+
+						if (cameraRefIt != state.cameraDonorReferenceByTrack.end() &&
+							IsFiniteQs(repVal) && IsFiniteQs(baseVal)) {
+							if (weight > 0.001f) {
+								BlendAdditiveTransform(
+									outputPose[idx], cameraRefIt->second, repVal, weight);
+							}
+							// During blend-out, including the terminal alpha-zero frame,
+							// explicitly publish the live native Camera local. This closes
+							// the last-frame hole where the scalar fade reached zero without
+							// a final Camera mask update.
+							if (weight > 0.001f || state.blendingOut || state.dormant) {
+								SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+							}
+						}
+						continue;
+					}
 
 					// Chain roots get the anchored local (see setup above). The
 					// walk only touches ancestors OUTSIDE the filter set, which the
@@ -9009,6 +9618,7 @@ namespace
 				// freeze set is disjoint from the donor set), then hold it at the
 				// overlay's weight so blend-in/out release it smoothly.
 				for (auto& [name, idx] : cr.freezeNameAndIndex) {
+					if (IsTrackFilterCameraBone(name)) continue;
 					if (idx < 0 || idx >= numOutputBones) continue;
 					auto fIt = state.frozenByName.find(name);
 					if (fIt == state.frozenByName.end()) {
@@ -9025,6 +9635,9 @@ namespace
 				state.cacheValid = true;
 				state.lastSourceTimeSec = nowSec;
 				state.lastSampleSec = nowSec;
+				if (state.standaloneSpecialIdle) {
+					state.lastStandaloneSampleFrame = currentFrame;
+				}
 
 				static int s_finalLog = 0;
 				if (s_finalLog < 5) {
@@ -9096,17 +9709,36 @@ namespace
 
 			for (auto& [name, idx] : cr2.nameAndIndex) {
 				if (idx < 0 || idx >= numOutputBones) continue;
+				if (IsTrackFilterCameraBone(name)) {
+					static std::atomic<bool> s_cameraFallbackWarned{ false };
+					if (!s_cameraFallbackWarned.exchange(true)) {
+						logger::warn(
+							"[OAR-TrackFilter-Camera] '{}' has no reliable direct donor binding; "
+							"leaving Camera native instead of applying an absolute fallback pose",
+							state2.suffix);
+					}
+					continue;
+				}
 				state2.cachedRepByName[name] = outputPose[idx];
 				state2.cachedBaseByName[name] = tl_fullBasePose[idx];
 			}
 			state2.cacheValid = true;
 			state2.lastSourceTimeSec = nowSec;
 			state2.lastSampleSec = nowSec;
+			if (state2.standaloneSpecialIdle) {
+				state2.lastStandaloneSampleFrame = currentFrame;
+			}
 
 			memcpy(outputPose, tl_fullBasePose.data(), numOutputBones * sizeof(RE::hkQsTransformRaw));
 
 			for (auto& [name, idx] : cr2.nameAndIndex) {
 				if (idx < 0 || idx >= numOutputBones) continue;
+				if (IsTrackFilterCameraBone(name)) {
+					if (state2.blendingOut || state2.dormant) {
+						SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+					}
+					continue;
+				}
 				auto rIt = state2.cachedRepByName.find(name);
 				if (rIt == state2.cachedRepByName.end()) continue;
 				if (mode == SubMod::TrackFilter::Mode::Override) {
@@ -9122,6 +9754,7 @@ namespace
 			// Frozen bones (see the direct path): capture from the restored base
 			// pose (the clip's own native locals), then hold.
 			for (auto& [name, idx] : cr2.freezeNameAndIndex) {
+				if (IsTrackFilterCameraBone(name)) continue;
 				if (idx < 0 || idx >= numOutputBones) continue;
 				auto fIt = state2.frozenByName.find(name);
 				if (fIt == state2.frozenByName.end()) {
@@ -9160,6 +9793,7 @@ namespace
 		// when bones weren't yet resolved or cache wasn't valid above.
 		// =====================================================================
 		if (!state.cacheValid) return;
+		if (ShouldSkipAddNonSourceClip(a_this, filterPtr)) return;
 		// Skip inactive clips — their pose buffer is uninitialized
 		if (poseHeader.onFraction <= 0.f) return;
 
@@ -9181,6 +9815,7 @@ namespace
 		const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 
 		for (auto& [name, idx] : cr.nameAndIndex) {
+			if (IsTrackFilterCameraBone(name)) continue;
 			if (idx < 0 || idx >= numOutputBones) continue;
 
 			if (isAdditiveClip) {
@@ -9211,6 +9846,7 @@ namespace
 
 		// Frozen bones (see the fast path).
 		for (auto& [name, idx] : cr.freezeNameAndIndex) {
+			if (IsTrackFilterCameraBone(name)) continue;
 			if (idx < 0 || idx >= numOutputBones) continue;
 			if (isAdditiveClip) {
 				RE::hkQsTransformRaw identity{};
@@ -9295,6 +9931,7 @@ namespace
 				if (smIt != s_activeSubModMap.end()) echoActiveSub = smIt->second;
 				replacementActive = (echoActiveSub && echoActiveSub->GetReplaceAnnotations());
 			}
+			RearmIdleStopSuppressionForEcho(a_this, echoActiveSub);
 			if (replacementActive) {
 				bool wasRestored = false;
 				{
@@ -10009,6 +10646,11 @@ namespace
 	}
 }
 
+OARClipPerspective GetPlayingClipPerspective(RE::hkbClipGenerator* a_clip)
+{
+	return GetPlayingClipPerspectiveImpl(a_clip);
+}
+
 namespace Hooks
 {
 	// === NotifyAnimationGraphImpl hook via Actor + PlayerCharacter vtables ===
@@ -10084,6 +10726,89 @@ namespace Hooks
 		}
 	}
 
+	// === SetupSpecialIdle interception for filter-only special-idle layers ===
+	namespace SetupSpecialIdleHook
+	{
+		using SetupFn = bool(*)(RE::AIProcess*, RE::Actor&, RE::DEFAULT_OBJECT,
+			RE::TESIdleForm*, bool, RE::TESObjectREFR*);
+		static SetupFn _Original = nullptr;
+
+		static bool HookedSetupSpecialIdle(RE::AIProcess* a_process, RE::Actor& a_actor,
+			RE::DEFAULT_OBJECT a_defaultObject, RE::TESIdleForm* a_idle,
+			bool a_testConditions, RE::TESObjectREFR* a_targetOverride)
+		{
+			// The intercepted path must honor the IDLE record's own conditions;
+			// otherwise we could report success for an idle vanilla would reject.
+			const bool idleConditionsPass = a_idle && (!a_testConditions ||
+				a_idle->CheckConditions(&a_actor, a_targetOverride, true));
+			if (idleConditionsPass && StartStandaloneSpecialIdle(&a_actor, a_idle)) {
+				// Report success to the PlayIdle caller without creating the native
+				// special-idle state or its behavior-authored end trigger.
+				return true;
+			}
+			return _Original ? _Original(a_process, a_actor, a_defaultObject, a_idle,
+				a_testConditions, a_targetOverride) : false;
+		}
+
+		void Install(REL::Trampoline& a_trampoline)
+		{
+			REL::Relocation<std::uintptr_t> setupTarget{ RE::ID::AIProcess::SetupSpecialIdle };
+			const auto target = setupTarget.address();
+			const auto moduleBase = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+			if (!target || !moduleBase) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: runtime addresses are null");
+				return;
+			}
+
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: invalid DOS header");
+				return;
+			}
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE) {
+				logger::warn("[OAR-TrackFilter-Standalone] SetupSpecialIdle hook unavailable: invalid NT header");
+				return;
+			}
+
+			std::vector<std::uintptr_t> callSites;
+			const auto* section = IMAGE_FIRST_SECTION(nt);
+			for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+				if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+				const auto begin = moduleBase + section->VirtualAddress;
+				const auto size = static_cast<std::size_t>(section->Misc.VirtualSize);
+				const auto* code = reinterpret_cast<const std::uint8_t*>(begin);
+				for (std::size_t off = 0; off + 5 <= size; ++off) {
+					if (code[off] != 0xE8) continue;
+					const auto rel = *reinterpret_cast<const std::int32_t*>(code + off + 1);
+					const auto resolved = begin + off + 5 + static_cast<std::intptr_t>(rel);
+					if (resolved == target) callSites.push_back(begin + off);
+				}
+			}
+
+			if (callSites.empty()) {
+				logger::warn(
+					"[OAR-TrackFilter-Standalone] No validated direct calls to SetupSpecialIdle were found; filter-only special idles will fall back to vanilla behavior");
+				return;
+			}
+
+			for (const auto site : callSites) {
+				auto original = reinterpret_cast<SetupFn>(
+					a_trampoline.write_call<5>(site, &HookedSetupSpecialIdle));
+				if (!_Original) _Original = original;
+				if (original != _Original) {
+					logger::critical(
+						"[OAR-TrackFilter-Standalone] SetupSpecialIdle call at +0x{:X} resolved to an unexpected target; hook disabled for safety",
+						site - moduleBase);
+					return;
+				}
+			}
+			logger::info(
+				"[OAR-TrackFilter-Standalone] Hooked {} validated SetupSpecialIdle call site(s), target={:X}",
+				callSites.size(), target);
+		}
+	}
+
 	// === Animation event feed via BSTEventSink<BSAnimationGraphEvent> vfunc hook ===
 	// NG/AE replacement for the OG-only registered-sink path (RegisterSuppressionSink
 	// uses BGSAnimationSystemUtils::GetEventSourcePointersFromGraph, id 897074, which
@@ -10112,12 +10837,19 @@ namespace Hooks
 			ProcessEventFn a_original)
 		{
 			const char* evtStr = a_event.tag.c_str();
-			if (evtStr && evtStr[0] && AnimationLog::GetSingleton()->IsEnabled()) {
-				// The sink base lives at TESObjectREFR + 0x38 (fork header),
-				// so back-adjust the interface pointer to the refr base. More
-				// reliable than holderID, which the engine sometimes leaves 0.
-				auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
-					reinterpret_cast<uintptr_t>(a_sinkThis) - 0x38);
+			// The sink base lives at TESObjectREFR + 0x38 (fork header), so
+			// back-adjust the interface pointer to the refr base. This is needed
+			// even when event logging is disabled because IdleStop suppression is
+			// an actor-scoped gameplay action.
+			auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
+				reinterpret_cast<uintptr_t>(a_sinkThis) - 0x38);
+			const bool applyIdleStopFix = evtStr && _stricmp(evtStr, "IdleStop") == 0 &&
+				ConsumeIdleStopSuppression(refr);
+
+			// OG keeps its proven registered-sink event log. This vfunc hook is
+			// installed there only so it can bypass the actor's IdleStop handler.
+			if (!REX::FModule::IsRuntimeOG() && evtStr && evtStr[0] &&
+				AnimationLog::GetSingleton()->IsEnabled()) {
 				// Display tag.payload for dotted annotation events (see the
 				// registered-sink feed for rationale).
 				std::string display(evtStr);
@@ -10127,7 +10859,24 @@ namespace Hooks
 				}
 				AnimationLog::GetSingleton()->AddAnimEvent(refr, display);
 			}
-			return a_original(a_sinkThis, a_event, a_source);
+			if (applyIdleStopFix) {
+				// Match fallout4-idlestopfix: force the animation manager past the
+				// lingering idle, then still deliver IdleStop to the original actor
+				// sink. Consuming the event here left other graph state unfinished.
+				static thread_local bool applyingFix = false;
+				if (!applyingFix) {
+					if (auto* actor = refr ? refr->As<RE::Actor>() : nullptr) {
+						applyingFix = true;
+						actor->UpdateAnimation(1000.0f);
+						applyingFix = false;
+						logger::info(
+							"[OAR-IdleStop] Fast-forwarded actor {:X} by 1000s before delivering IdleStop",
+							actor->GetFormID());
+					}
+				}
+			}
+			return a_original ? a_original(a_sinkThis, a_event, a_source) :
+				RE::BSEventNotifyControl::kContinue;
 		}
 
 		static RE::BSEventNotifyControl HookedActorProcessEvent(
@@ -10146,10 +10895,6 @@ namespace Hooks
 
 		void Install()
 		{
-			// OG uses the registered-sink feed (RegisterSuppressionSink); do not
-			// double-feed the log there.
-			if (REX::FModule::IsRuntimeOG()) return;
-
 			REL::Relocation<uintptr_t> actorSinkVtbl{ REL::ID(720550) };
 			_OriginalActorProcess = reinterpret_cast<ProcessEventFn>(
 				actorSinkVtbl.write_vfunc(1, &HookedActorProcessEvent));
@@ -10158,7 +10903,8 @@ namespace Hooks
 			_OriginalPlayerProcess = reinterpret_cast<ProcessEventFn>(
 				playerSinkVtbl.write_vfunc(1, &HookedPlayerProcessEvent));
 
-			logger::info("[OAR] Animation event feed installed via BSTEventSink vfunc hooks (NG/AE path; Actor + PlayerCharacter)");
+			logger::info("[OAR] Animation event sink hooks installed (Actor + PlayerCharacter; IdleStop suppression{})",
+				REX::FModule::IsRuntimeOG() ? "; OG logging remains on registered sink" : "; event logging enabled");
 		}
 	}
 
@@ -10603,6 +11349,7 @@ namespace Hooks
 		UpdateHooks::Install();
 		FileRedirectHooks::Install();
 		ActionFireEmptyHook::Install();
+		SetupSpecialIdleHook::Install(REL::GetTrampoline());
 		AnimGraphEventFeedHook::Install();
 		PlayerFireEmptyHook::Install(REL::GetTrampoline());
 		AutoReloadSuppression::Install();

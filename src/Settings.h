@@ -29,6 +29,12 @@ public:
 	// When false, the legacy leaf-matching behavior is used everywhere.
 	bool  bDirectPathMatching{ true };
 
+	// Optional cross-skeleton safety gate. When enabled, replacement candidates
+	// whose authored skeleton root/perspective differs from the playing clip are
+	// rejected. Disabled by default because special idles can legitimately play
+	// a third-person-authored animation through the first-person behavior graph.
+	bool  bSkeletonCompatibilityGate{ false };
+
 	// Auto-reload mode. The engine's own automatic reloads (fire-on-empty and
 	// last-round) are ALWAYS suppressed: they are attack-initiated, so the
 	// engine exits the reload state the moment the reloadComplete annotation

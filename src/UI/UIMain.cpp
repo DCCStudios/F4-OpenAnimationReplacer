@@ -14,6 +14,8 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 
 // Havok skeleton bones — matches the actual animation skeleton definition.
@@ -755,6 +757,20 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"No original tail, no held frame. Applies to full-body and track-filtered\n"
 			"replacements; no effect when the replacement is equal length or longer.");
 
+		bool disableIdleStop = a_subMod->GetDisableIdleStop();
+		if (ImGui::Checkbox("Apply IdleStop Fix After Special Idle (?)", &disableIdleStop)) {
+			a_subMod->SetDisableIdleStop(disableIdleStop);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(
+				"After this submod's replacement plays, handle the actor's next IdleStop\n"
+				"using the fallout4-idlestopfix method: advance animation processing by\n"
+				"1000 seconds, then deliver IdleStop normally. Default: OFF.\n\n"
+				"This avoids leaving the actor in a lingering special-idle state without\n"
+				"swallowing the event or bypassing the graph's normal cleanup.");
+		}
+
 		bool leafMatch = a_subMod->GetLeafMatching();
 		if (ImGui::Checkbox("Match By Filename (Leaf Matching) (?)", &leafMatch)) {
 			a_subMod->SetLeafMatching(leafMatch);
@@ -1017,6 +1033,8 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->GetShareRandomResults() ? "Yes" : "No");
 		if (a_subMod->GetPlayOnceFullBody())
 			ImGui::Text("Lock Replacement Until Clip Ends: Yes");
+		if (a_subMod->GetDisableIdleStop())
+			ImGui::Text("Apply IdleStop Fix After Special Idle: Yes");
 		if (a_subMod->GetDeactivationDelay() > 0.0f)
 			ImGui::Text("Deactivation delay: %.2fs", a_subMod->GetDeactivationDelay());
 		if (!a_subMod->eventsOnStart.empty()) {
@@ -1113,6 +1131,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["playOnceFullBody"] = true;
 			if (a_subMod->GetEndClipIfShorter())
 				json["endClipIfShorter"] = true;
+			json["disableIdleStop"] = a_subMod->GetDisableIdleStop();
 			if (a_subMod->GetLeafMatching())
 				json["leafMatching"] = true;
 			if (!a_subMod->eventsOnStart.empty())
@@ -1131,6 +1150,9 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["blendOutAtEnd"] = tf.blendOutAtEnd;
 				tfJson["sampleFrame"] = tf.sampleFrame;
 				tfJson["modelSpaceAnchor"] = tf.modelSpaceAnchor;
+				tfJson["triggerOnlySpecialIdle"] = tf.triggerOnlySpecialIdle;
+				tfJson["skipAdditiveNonSourceFirstPerson"] = tf.skipAdditiveNonSourceFirstPerson;
+				tfJson["skipAdditiveNonSourceThirdPerson"] = tf.skipAdditiveNonSourceThirdPerson;
 				tfJson["includeChildren"] = tf.includeChildren;
 				tfJson["bones"] = tf.boneNames;
 				tfJson["excludeChildren"] = tf.excludeChildren;
@@ -1301,8 +1323,27 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 			ImGui::InputTextWithHint("##condSearch", "Search...", condFilter, sizeof(condFilter));
 
 			auto* factory = ConditionFactory::GetSingleton();
-			for (const auto& [name, fn] : factory->GetAllFactories()) {
+			const auto& factories = factory->GetAllFactories();
+			std::vector<std::string> conditionNames;
+			conditionNames.reserve(factories.size());
+			for (const auto& [name, fn] : factories) {
+				(void)fn;
+				conditionNames.push_back(name);
+			}
+			std::ranges::sort(conditionNames, [](const std::string& a_lhs, const std::string& a_rhs) {
+				const size_t commonLength = (std::min)(a_lhs.size(), a_rhs.size());
+				for (size_t i = 0; i < commonLength; ++i) {
+					const auto lhs = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a_lhs[i])));
+					const auto rhs = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a_rhs[i])));
+					if (lhs != rhs) return lhs < rhs;
+				}
+				if (a_lhs.size() != a_rhs.size()) return a_lhs.size() < a_rhs.size();
+				return a_lhs < a_rhs;
+			});
+
+			for (const auto& name : conditionNames) {
 				if (condFilter[0] != '\0' && !UICommon::FuzzyMatch(condFilter, name.c_str())) continue;
+				const auto& fn = factories.at(name);
 				auto tempCond = fn();
 				bool condIsStub = tempCond && tempCond->IsStub();
 				std::string displayName = condIsStub ? name + "  [N/A]" : name;
@@ -1312,11 +1353,18 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 					a_subMod->SetDirty(true);
 					condFilter[0] = '\0';
 				}
-				if (condIsStub) {
-					ImGui::PopStyleColor();
-					if (ImGui::IsItemHovered()) {
-						ImGui::SetTooltip("%s", tempCond->GetStubReason().c_str());
+				if (condIsStub) ImGui::PopStyleColor();
+				if (tempCond && ImGui::IsItemHovered()) {
+					ImGui::BeginTooltip();
+					ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+					const auto description = tempCond->GetDescription();
+					if (!description.empty()) ImGui::TextUnformatted(description.c_str());
+					if (condIsStub) {
+						if (!description.empty()) ImGui::Separator();
+						ImGui::TextDisabled("Unavailable: %s", tempCond->GetStubReason().c_str());
 					}
+					ImGui::PopTextWrapPos();
+					ImGui::EndTooltip();
 				}
 			}
 			ImGui::EndPopup();
@@ -1688,6 +1736,44 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 						"animation's (different) torso pose and the motion looks off.\n"
 						"Override mode only. Recommended ON for partial-body action overlays.");
 				}
+			}
+
+			ImGui::Spacing();
+			if (ImGui::Checkbox("Play Special Idle as Filter-Only Layer (?)##trackFilter", &tf.triggerOnlySpecialIdle)) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"For matching PlayIdle / SetupSpecialIdle requests, prevent the native full-body\n"
+					"idle from entering the behavior graph. OAR advances this replacement on an\n"
+					"independent clock and applies only the filtered bones over the normal graph.\n\n"
+					"This also prevents the source idle's behavior triggers (such as EquipFast)\n"
+					"from firing. Native and donor annotations are not replayed in this mode; use\n"
+					"the submod's custom start/end events when an event is required.\n\n"
+					"If OAR cannot validate the runtime hook or cached donor, it safely falls back\n"
+					"to the normal full-body special idle. Default: Off.");
+			}
+
+			ImGui::Spacing();
+			if (ImGui::Checkbox("Skip *Add Non-Source Clips (1st Person)##trackFilter", &tf.skipAdditiveNonSourceFirstPerson)) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Leave first-person non-source animation leaves ending in 'add' untouched.\n"
+					"The track-filtered pose is still applied when the *add animation is the source clip.\n\n"
+					"WARNING: Turning this off may corrupt the current game session if the\n"
+					"track filter includes the camera node.");
+			}
+			if (ImGui::Checkbox("Skip *Add Non-Source Clips (3rd Person)##trackFilter", &tf.skipAdditiveNonSourceThirdPerson)) {
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip(
+					"Leave third-person non-source animation leaves ending in 'add' untouched.\n"
+					"The track-filtered pose is still applied when the *add animation is the source clip.\n\n"
+					"WARNING: Turning this off may corrupt the current game session if the\n"
+					"track filter includes the camera node.");
 			}
 
 			if (ImGui::Checkbox("Include Children##trackFilter", &tf.includeChildren)) {
@@ -2065,6 +2151,9 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 				tf.mode == SubMod::TrackFilter::Mode::Override ? "Override" : "Additive",
 				tf.weight,
 				tf.includeChildren ? "Yes" : "No");
+			ImGui::Text("Skip non-source *add: 1st Person %s  |  3rd Person %s",
+				tf.skipAdditiveNonSourceFirstPerson ? "Yes" : "No",
+				tf.skipAdditiveNonSourceThirdPerson ? "Yes" : "No");
 			std::vector<std::string> displayBones;
 			std::vector<std::string> displayExclude;
 			{
@@ -2362,6 +2451,17 @@ void UIMain::DrawSettingsPanel()
 			"Leaf-name matching is only used as a fallback for clips whose real\n"
 			"path cannot be resolved. Disable to restore the legacy leaf-matching\n"
 			"behavior everywhere.");
+	}
+	dirty |= ImGui::Checkbox("Skeleton Compatibility Gate", &settings->bSkeletonCompatibilityGate);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip(
+			"Reject replacement candidates whose authored skeleton root or perspective\n"
+			"differs from the playing clip. Default: OFF.\n\n"
+			"Enabling this can prevent corrupted poses from cross-skeleton or foreign\n"
+			"leaf-matching claims, but it can also reject valid special idles that play\n"
+			"a third-person asset through the first-person behavior graph.\n\n"
+			"WARNING: With this disabled, a wrongly matched animation from another\n"
+			"skeleton may corrupt the current game session.");
 	}
 	{
 		// The engine's own auto-reloads are always suppressed (they are

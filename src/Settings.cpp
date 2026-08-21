@@ -24,6 +24,7 @@ void Settings::Load()
 	bFilterOutDuplicateAnimations = getB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	bShowWelcomeBanner            = getB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	bDirectPathMatching           = getB("General", "bDirectPathMatching", bDirectPathMatching);
+	bSkeletonCompatibilityGate    = getB("General", "bSkeletonCompatibilityGate", bSkeletonCompatibilityGate);
 	iAutoReloadMode               = std::clamp(getI("General", "iAutoReloadMode", iAutoReloadMode), 0, 2);
 	bPlayDryFireSound             = getB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
@@ -56,8 +57,9 @@ void Settings::Load()
 		iLoadClipsAddressRVA = std::strtoull(rvaStr, nullptr, 16);
 	}
 
-	logger::info("[OAR] Settings loaded: enabled={}, UI={}, async={}, animLimit={}, verbose={}, directPathMatching={}, loadClipsRVA=0x{:X}",
-		bEnabled, bEnableUI, bAsyncParsing, iAnimationLimit, bVerboseLogging, bDirectPathMatching, iLoadClipsAddressRVA);
+	logger::info("[OAR] Settings loaded: enabled={}, UI={}, async={}, animLimit={}, verbose={}, directPathMatching={}, skeletonGate={}, loadClipsRVA=0x{:X}",
+		bEnabled, bEnableUI, bAsyncParsing, iAnimationLimit, bVerboseLogging,
+		bDirectPathMatching, bSkeletonCompatibilityGate, iLoadClipsAddressRVA);
 }
 
 void Settings::Save()
@@ -80,6 +82,7 @@ void Settings::Save()
 	setB("General", "bFilterOutDuplicateAnimations", bFilterOutDuplicateAnimations);
 	setB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	setB("General", "bDirectPathMatching", bDirectPathMatching);
+	setB("General", "bSkeletonCompatibilityGate", bSkeletonCompatibilityGate);
 	setI("General", "iAutoReloadMode", iAutoReloadMode);
 	setB("General", "bPlayDryFireSound", bPlayDryFireSound);
 

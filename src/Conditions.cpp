@@ -220,6 +220,16 @@ bool IsSprintingCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGe
 	return (actor->moveMode & 0x100) != 0;
 }
 
+bool IsFirstPersonCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const
+{
+	return GetPlayingClipPerspective(a_clipGen) == OARClipPerspective::kFirstPerson;
+}
+
+bool IsThirdPersonCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const
+{
+	return GetPlayingClipPerspective(a_clipGen) == OARClipPerspective::kThirdPerson;
+}
+
 bool IsInAirCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr) return false;
@@ -419,6 +429,84 @@ void ANDCondition::SerializeImpl(nlohmann::json& a_json) const
 
 // ===== Expanded conditions =====
 
+namespace
+{
+	struct VanillaWeaponType
+	{
+		std::uint32_t formID;
+		std::string_view editorID;
+	};
+
+	constexpr VanillaWeaponType kVanillaWeaponTypes[] = {
+		{ 0x0016968B, "WeaponTypeAlienBlaster" },
+		{ 0x00226455, "WeaponTypeAssaultRifle" },
+		{ 0x0004A0A2, "WeaponTypeAutomatic" },
+		{ 0x00092A86, "WeaponTypeBallistic" },
+		{ 0x0021968A, "WeaponTypeBottlecapMine" },
+		{ 0x00225766, "WeaponTypeBroadsider" },
+		{ 0x0021968B, "WeaponTypeCryoGrenade" },
+		{ 0x0022575F, "WeaponTypeCryolater" },
+		{ 0x00219686, "WeaponTypeCryoMine" },
+		{ 0x0004C922, "WeaponTypeExplosive" },
+		{ 0x0022575C, "WeaponTypeFatman" },
+		{ 0x00225760, "WeaponTypeFlamer" },
+		{ 0x00225761, "WeaponTypeFlareGun" },
+		{ 0x00225762, "WeaponTypeGammaGun" },
+		{ 0x0022575E, "WeaponTypeGatlingLaser" },
+		{ 0x00226456, "WeaponTypeGaussRifle" },
+		{ 0x0010C415, "WeaponTypeGrenade" },
+		{ 0x00226453, "WeaponTypeHandToHand" },
+		{ 0x0004A0A3, "WeaponTypeHeavyGun" },
+		{ 0x00225763, "WeaponTypeJunkJet" },
+		{ 0x00092A84, "WeaponTypeLaser" },
+		{ 0x00226452, "WeaponTypeLaserMusket" },
+		{ 0x0004A0A4, "WeaponTypeMelee1H" },
+		{ 0x0004A0A5, "WeaponTypeMelee2H" },
+		{ 0x0010C414, "WeaponTypeMine" },
+		{ 0x0022575D, "WeaponTypeMinigun" },
+		{ 0x0022575B, "WeaponTypeMissileLauncher" },
+		{ 0x0021A29F, "WeaponTypeMolotov" },
+		{ 0x0021968C, "WeaponTypeNukaGrenade" },
+		{ 0x00219688, "WeaponTypeNukaMine" },
+		{ 0x0004A0A0, "WeaponTypePistol" },
+		{ 0x00092A85, "WeaponTypePlasma" },
+		{ 0x0021968D, "WeaponTypePlasmaGrenade" },
+		{ 0x00219689, "WeaponTypePlasmaMine" },
+		{ 0x00249FD5, "WeaponTypePossiblyVerySmallClipSize" },
+		{ 0x0021968E, "WeaponTypePulseGrenade" },
+		{ 0x00219687, "WeaponTypePulseMine" },
+		{ 0x00225764, "WeaponTypeRailwayRifle" },
+		{ 0x0004A0A1, "WeaponTypeRifle" },
+		{ 0x00225767, "WeaponTypeRipper" },
+		{ 0x00225768, "WeaponTypeShishkebab" },
+		{ 0x00226454, "WeaponTypeShotgun" },
+		{ 0x001E325D, "WeaponTypeSniper" },
+		{ 0x00225765, "WeaponTypeSyringer" },
+		{ 0x0004A0A6, "WeaponTypeThrown" },
+		{ 0x0005240E, "WeaponTypeUnarmed" }
+	};
+
+	std::int32_t FindVanillaWeaponType(std::string_view a_editorID)
+	{
+		for (std::size_t i = 0; i < std::size(kVanillaWeaponTypes); ++i) {
+			if (kVanillaWeaponTypes[i].editorID == a_editorID) {
+				return static_cast<std::int32_t>(i);
+			}
+		}
+		return -1;
+	}
+
+	std::int32_t FindVanillaWeaponType(std::uint32_t a_formID)
+	{
+		for (std::size_t i = 0; i < std::size(kVanillaWeaponTypes); ++i) {
+			if (kVanillaWeaponTypes[i].formID == a_formID) {
+				return static_cast<std::int32_t>(i);
+			}
+		}
+		return -1;
+	}
+}
+
 bool IsEquippedTypeCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr || !cachedKeyword) return false;
@@ -450,6 +538,98 @@ void IsEquippedTypeCondition::InitializeImpl(const nlohmann::json& a_json)
 void IsEquippedTypeCondition::SerializeImpl(nlohmann::json& a_json) const
 {
 	weaponKeywordForm.Serialize(a_json);
+}
+
+std::string IsWeaponTypeCondition::GetParameterString() const
+{
+	if (selectedWeaponType >= 0 && static_cast<std::size_t>(selectedWeaponType) < std::size(kVanillaWeaponTypes)) {
+		return std::string(kVanillaWeaponTypes[selectedWeaponType].editorID);
+	}
+	return "(none)";
+}
+
+void IsWeaponTypeCondition::DrawEditWidgets(bool& a_dirty)
+{
+	const auto validSelection = selectedWeaponType >= 0 && static_cast<std::size_t>(selectedWeaponType) < std::size(kVanillaWeaponTypes);
+	const char* preview = validSelection ? kVanillaWeaponTypes[selectedWeaponType].editorID.data() : "Select weapon type...";
+	if (ImGui::BeginCombo("Weapon Type", preview)) {
+		for (std::size_t i = 0; i < std::size(kVanillaWeaponTypes); ++i) {
+			const auto selected = selectedWeaponType == static_cast<std::int32_t>(i);
+			const auto label = std::format("{} [0x{:08X}]", kVanillaWeaponTypes[i].editorID, kVanillaWeaponTypes[i].formID);
+			if (ImGui::Selectable(label.c_str(), selected)) {
+				selectedWeaponType = static_cast<std::int32_t>(i);
+				ResolveKeyword();
+				a_dirty = true;
+			}
+			if (selected) {
+				ImGui::SetItemDefaultFocus();
+			}
+		}
+		ImGui::EndCombo();
+	}
+}
+
+bool IsWeaponTypeCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
+{
+	if (!a_refr || !cachedKeyword) return false;
+	auto* actor = a_refr->As<RE::Actor>();
+	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
+	auto* mh = actor->currentProcess->middleHigh;
+	RE::BSAutoLock lock{ mh->equippedItemsLock };
+	for (auto& eq : mh->equippedItems) {
+		auto* obj = eq.item.object;
+		if (!obj || obj->GetFormType() != RE::ENUM_FORM_ID::kWEAP) continue;
+		auto* weap = static_cast<RE::TESObjectWEAP*>(obj);
+		auto* idata = eq.item.instanceData ? eq.item.instanceData.get() : nullptr;
+		if (weap->HasKeyword(cachedKeyword, idata)) return true;
+		if (idata) {
+			auto* kwForm = idata->GetKeywordData();
+			if (kwForm && kwForm->HasKeyword(cachedKeyword, nullptr)) return true;
+		}
+	}
+	return false;
+}
+
+void IsWeaponTypeCondition::InitializeImpl(const nlohmann::json& a_json)
+{
+	selectedWeaponType = -1;
+	if (a_json.contains("weaponType") && a_json["weaponType"].is_string()) {
+		selectedWeaponType = FindVanillaWeaponType(a_json["weaponType"].get<std::string>());
+	}
+
+	if (selectedWeaponType < 0 && a_json.contains("formID")) {
+		try {
+			const auto& formID = a_json["formID"];
+			const auto value = formID.is_string() ?
+				static_cast<std::uint32_t>(std::stoul(formID.get<std::string>(), nullptr, 0)) :
+				formID.get<std::uint32_t>();
+			selectedWeaponType = FindVanillaWeaponType(value);
+		} catch (const std::exception&) {
+			logger::warn("[OAR] IsWeaponType has an invalid formID value");
+		}
+	}
+
+	ResolveKeyword();
+}
+
+void IsWeaponTypeCondition::SerializeImpl(nlohmann::json& a_json) const
+{
+	if (selectedWeaponType < 0 || static_cast<std::size_t>(selectedWeaponType) >= std::size(kVanillaWeaponTypes)) return;
+	const auto& weaponType = kVanillaWeaponTypes[selectedWeaponType];
+	a_json["weaponType"] = weaponType.editorID;
+	a_json["formID"] = std::format("0x{:08X}", weaponType.formID);
+}
+
+void IsWeaponTypeCondition::ResolveKeyword()
+{
+	cachedKeyword = nullptr;
+	if (selectedWeaponType < 0 || static_cast<std::size_t>(selectedWeaponType) >= std::size(kVanillaWeaponTypes)) return;
+	const auto& weaponType = kVanillaWeaponTypes[selectedWeaponType];
+	auto* form = Utils::LookupForm(weaponType.formID, "Fallout4.esm");
+	cachedKeyword = form ? form->As<RE::BGSKeyword>() : nullptr;
+	if (!cachedKeyword) {
+		logger::warn("[OAR] IsWeaponType failed to resolve {} [Fallout4.esm:0x{:08X}]", weaponType.editorID, weaponType.formID);
+	}
 }
 
 bool IsInPowerArmorCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
@@ -3551,6 +3731,8 @@ void RegisterAllConditions()
 	factory->Register("IsWeaponDrawn", [] { return std::make_unique<IsWeaponDrawnCondition>(); });
 	factory->Register("IsInCombat", [] { return std::make_unique<IsInCombatCondition>(); });
 	factory->Register("IsSprinting", [] { return std::make_unique<IsSprintingCondition>(); });
+	factory->Register("IsFirstPerson", [] { return std::make_unique<IsFirstPersonCondition>(); });
+	factory->Register("IsThirdPerson", [] { return std::make_unique<IsThirdPersonCondition>(); });
 	factory->Register("IsInAir", [] { return std::make_unique<IsInAirCondition>(); });
 	factory->Register("HasKeyword", [] { return std::make_unique<HasKeywordCondition>(); });
 	factory->Register("IsInFaction", [] { return std::make_unique<IsInFactionCondition>(); });
@@ -3559,6 +3741,7 @@ void RegisterAllConditions()
 	factory->Register("OR", [] { return std::make_unique<ORCondition>(); });
 	factory->Register("AND", [] { return std::make_unique<ANDCondition>(); });
 	factory->Register("IsEquippedType", [] { return std::make_unique<IsEquippedTypeCondition>(); });
+	factory->Register("IsWeaponType", [] { return std::make_unique<IsWeaponTypeCondition>(); });
 	factory->Register("IsInPowerArmor", [] { return std::make_unique<IsInPowerArmorCondition>(); });
 	factory->Register("IsSneaking", [] { return std::make_unique<IsSneakingCondition>(); });
 	factory->Register("CurrentWeather", [] { return std::make_unique<CurrentWeatherCondition>(); });

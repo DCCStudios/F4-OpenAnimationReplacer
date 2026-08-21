@@ -94,7 +94,8 @@ public:
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
 		const void* a_owner = nullptr, int32_t a_priority = 0);
-	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix) const;
+	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix,
+		const void* a_owner = nullptr) const;
 	// a_owner: the winning SubMod (from condition evaluation). Selects that
 	// SubMod's file under the suffix; falls back to the highest-priority file
 	// when null or not found (pre-swap and legacy callers).

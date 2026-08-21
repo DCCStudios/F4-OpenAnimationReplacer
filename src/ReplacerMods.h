@@ -73,6 +73,8 @@ public:
 	void SetPlayOnceFullBody(bool a_val) { playOnceFullBody = a_val; }
 	bool GetEndClipIfShorter() const { return endClipIfShorter; }
 	void SetEndClipIfShorter(bool a_val) { endClipIfShorter = a_val; }
+	bool GetDisableIdleStop() const { return disableIdleStop; }
+	void SetDisableIdleStop(bool a_val) { disableIdleStop = a_val; }
 	bool GetLeafMatching() const { return leafMatching; }
 	void SetLeafMatching(bool a_val) { leafMatching = a_val; }
 	const std::string& GetRequiredProjectName() const { return requiredProjectName; }
@@ -135,6 +137,9 @@ public:
 	// clip ends when the replacement ends — as if the original were that length.
 	// No original tail, no held frame.
 	bool endClipIfShorter{ false };
+	// Apply the IdleStopFix fast-forward before delivering the actor's next
+	// IdleStop after an opted-in replacement. Disabled by default.
+	bool disableIdleStop{ false };
 	// Leaf matching: this submod's animations match by FILENAME alone. A
 	// wpnmelee.hkx here replaces ANY clip whose animation file is named
 	// wpnmelee.hkx, whatever folder it lives in — and it outranks exact-path
@@ -196,6 +201,20 @@ public:
 		// (different) torso pose. This is what makes "the left arm looks
 		// exactly like the donor" true when only part of the body is filtered.
 		bool modelSpaceAnchor = false;
+		// Special-idle isolation: when SetupSpecialIdle/PlayIdle requests a
+		// matching animation, do not start the engine's full-body idle. Advance
+		// this donor on OAR's clock and stamp only the filtered tracks over the
+		// normal graph. Default-off because callers may rely on native idle state.
+		bool triggerOnlySpecialIdle = false;
+		// Non-source clips normally receive the cached filtered pose so an
+		// overlay remains stable across the other clips blended by the graph.
+		// Additive support clips (typically names ending in "add") are unsafe
+		// recipients for broad pose stamping: they carry native sway, pitch,
+		// turn, and stance deltas. These perspective-specific defaults leave
+		// those clips untouched while preserving direct replacement when an
+		// *add clip is itself the source animation.
+		bool skipAdditiveNonSourceFirstPerson = true;
+		bool skipAdditiveNonSourceThirdPerson = true;
 		bool includeChildren = true;
 		std::vector<std::string> boneNames;
 		// Exclude list: bones matching here are removed from the final resolved set

@@ -120,6 +120,28 @@ protected:
 	void SerializeImpl(nlohmann::json&) const override {}
 };
 
+class IsFirstPersonCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsFirstPerson"; }
+	std::string GetDescription() const override { return "True when the condition is evaluating a clip currently playing in the first-person animation graph."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
+class IsThirdPersonCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsThirdPerson"; }
+	std::string GetDescription() const override { return "True when the condition is evaluating a clip currently playing in the third-person animation graph."; }
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator* a_clipGen, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json&) override {}
+	void SerializeImpl(nlohmann::json&) const override {}
+};
+
 class IsInAirCondition : public ConditionBase
 {
 public:
@@ -235,6 +257,24 @@ protected:
 	void SerializeImpl(nlohmann::json& a_json) const override;
 private:
 	FormComponent weaponKeywordForm;
+	RE::BGSKeyword* cachedKeyword{ nullptr };
+};
+
+class IsWeaponTypeCondition : public ConditionBase
+{
+public:
+	std::string GetName() const override { return "IsWeaponType"; }
+	std::string GetDescription() const override { return "Checks whether the equipped weapon has the selected vanilla Fallout4.esm WeaponType keyword."; }
+	std::string GetParameterString() const override;
+	void DrawEditWidgets(bool& a_dirty) override;
+protected:
+	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
+	void InitializeImpl(const nlohmann::json& a_json) override;
+	void SerializeImpl(nlohmann::json& a_json) const override;
+private:
+	void ResolveKeyword();
+
+	std::int32_t selectedWeaponType{ -1 };
 	RE::BGSKeyword* cachedKeyword{ nullptr };
 };
 

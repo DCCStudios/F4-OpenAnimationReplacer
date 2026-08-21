@@ -242,10 +242,10 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 	}
 }
 
-RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix) const
+RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix, const void* a_owner) const
 {
 	std::shared_lock lock(m_mutex);
-	if (auto* entry = SelectEntry(a_suffix, nullptr)) {
+	if (auto* entry = SelectEntry(a_suffix, a_owner)) {
 		return entry->animation;
 	}
 	return nullptr;

@@ -151,24 +151,12 @@ namespace Parsing
 				{
 					if (!raceDir.is_directory()) continue;
 
-					// 3P: actors/<race>/animations/
-					auto animsDir = raceDir.path() / "animations";
-					if (std::filesystem::exists(animsDir)) {
-						ScanDirectoryForOAR(animsDir, meshesPath, modCount, subModCount, animCount);
-					}
-
-					// 1P: actors/<race>/_1stperson/
-					auto firstPersonDir = raceDir.path() / "_1stperson";
-					if (std::filesystem::exists(firstPersonDir)) {
-						ScanDirectoryForOAR(firstPersonDir, meshesPath, modCount, subModCount, animCount);
-					}
-
-					// Fallback paths some mods use
-					auto charsDir = raceDir.path() / "character" / "animations";
-					if (std::filesystem::exists(charsDir)) {
-						ScanDirectoryForOAR(charsDir, meshesPath, modCount, subModCount, animCount);
-					}
-
+					// Search the complete race root once. This discovers conventional
+					// Actors/<race>/Animations and _1stPerson layouts, plus packages that
+					// intentionally place OpenAnimationReplacer directly beneath the race.
+					// A single recursive pass also avoids discovering deeper layouts twice.
+					ScanDirectoryForOAR(
+						raceDir.path(), meshesPath, modCount, subModCount, animCount);
 				}
 			} catch (const std::filesystem::filesystem_error& e) {
 				logger::error("[OAR] Filesystem error scanning actors: {}", e.what());
@@ -539,6 +527,8 @@ namespace Parsing
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
 		if (json.contains("endClipIfShorter"))
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
+		if (json.contains("disableIdleStop"))
+			a_subMod->disableIdleStop = json["disableIdleStop"].get<bool>();
 		if (json.contains("leafMatching"))
 			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
@@ -604,6 +594,11 @@ namespace Parsing
 			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", false);
+			a_subMod->trackFilter.triggerOnlySpecialIdle = tf.value("triggerOnlySpecialIdle", false);
+			a_subMod->trackFilter.skipAdditiveNonSourceFirstPerson =
+				tf.value("skipAdditiveNonSourceFirstPerson", true);
+			a_subMod->trackFilter.skipAdditiveNonSourceThirdPerson =
+				tf.value("skipAdditiveNonSourceThirdPerson", true);
 			a_subMod->trackFilter.includeChildren = tf.value("includeChildren", true);
 			if (tf.contains("bones") && tf["bones"].is_array()) {
 				for (const auto& b : tf["bones"]) {
@@ -662,6 +657,8 @@ namespace Parsing
 			a_subMod->playOnceFullBody = json["playOnceFullBody"].get<bool>();
 		if (json.contains("endClipIfShorter"))
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
+		if (json.contains("disableIdleStop"))
+			a_subMod->disableIdleStop = json["disableIdleStop"].get<bool>();
 		if (json.contains("leafMatching"))
 			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("blendCurve"))
