@@ -94,6 +94,21 @@ public:
 		bool pendingRebind{ false };
 	};
 
+	// Reverse identity for runtime clones. Replacement queries run from clip
+	// update and lifecycle hooks; scanning every cached file/clone for each
+	// query scales with the number of preloaded animations. Keep the lookup
+	// value independent of CachedAnimation storage so it remains valid while a
+	// clone is moved to the retired keep-alive list.
+	struct CloneLookup
+	{
+		RE::hkaAnimation* gameOriginal{ nullptr };
+		float originalDuration{ 0.f };
+		int32_t originalNumTracks{ 0 };
+		std::string suffix;
+		const void* owner{ nullptr };
+		bool retired{ false };
+	};
+
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
 		const void* a_owner = nullptr, int32_t a_priority = 0);
 	bool LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
@@ -223,6 +238,8 @@ private:
 		const void* owner{ nullptr };
 	};
 	std::vector<RetiredClone> m_retiredClones;
+	// One entry per live or retired runtime clone. Protected by m_mutex.
+	std::unordered_map<RE::hkaAnimation*, CloneLookup> m_cloneLookup;
 	// One suffix -> all files registered for it (one per SubMod replacing the
 	// same original path; variants get their own suffixes but can still
 	// collide across SubMods). Sorted by priority, highest first.

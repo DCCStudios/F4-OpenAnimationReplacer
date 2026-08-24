@@ -170,6 +170,16 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 					existing->owner = a_owner;
 					existing->priority = a_priority;
 					existing->pendingRebind = false;
+					// Existing live clones keep playing after a config reload. Their
+					// reverse identities must follow the rebound entry just like the
+					// old cache scan followed entry->owner.
+					for (const auto& clone : existing->clones) {
+						if (const auto lookup = m_cloneLookup.find(clone.clone); lookup != m_cloneLookup.end()) {
+							lookup->second.suffix = a_suffix;
+							lookup->second.owner = existing->owner;
+							lookup->second.retired = false;
+						}
+					}
 					// Priority may have changed; keep index 0 = highest.
 					std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
 						return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
@@ -490,6 +500,15 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		newClone.originalNumTracks = *reinterpret_cast<const int32_t*>(origBytes + 0x18);
 	}
 	entry.clones.push_back(std::move(newClone));
+	const auto& registeredClone = entry.clones.back();
+	m_cloneLookup[registeredClone.clone] = CloneLookup{
+		.gameOriginal = registeredClone.gameOriginal,
+		.originalDuration = registeredClone.originalDuration,
+		.originalNumTracks = registeredClone.originalNumTracks,
+		.suffix = a_suffix,
+		.owner = entry.owner,
+		.retired = false
+	};
 
 	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}' ({} clone(s) live)",
 		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim),
@@ -544,22 +563,7 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 {
 	if (!a_anim) return false;
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				if (rc.clone == a_anim) return true;
-			}
-		}
-	}
-	// Retired clones are still "ours": a clip that held a clone across an
-	// invalidation must not mistake it for a game animation (see RetiredClone
-	// comment in the header). Their original reverse link is retained so a
-	// later activation can scrub a shared binding safely.
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_anim) return true;
-	}
-	return false;
+	return m_cloneLookup.contains(a_anim);
 }
 
 bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::string& a_outSuffix,
@@ -567,30 +571,12 @@ bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::strin
 {
 	if (!a_anim) return false;
 	std::shared_lock lock(m_mutex);
-	// Live entries first: the clip is still playing a current clone.
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				if (rc.clone == a_anim) {
-					a_outSuffix = key;
-					a_outOwner = entry->owner;
-					return true;
-				}
-			}
-		}
-	}
-	// Retired clones: the clip carried a kept-alive buffer across an
-	// invalidation (mid-session save load, weapon switch). The identity was
-	// stamped onto the record at retire time.
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_anim && !retired.suffix.empty()) {
-			a_outSuffix = retired.suffix;
-			a_outOwner = retired.owner;
-			return true;
-		}
-	}
-	return false;
+	const auto it = m_cloneLookup.find(a_anim);
+	if (it == m_cloneLookup.end()) return false;
+	if (it->second.retired && it->second.suffix.empty()) return false;
+	a_outSuffix = it->second.suffix;
+	a_outOwner = it->second.owner;
+	return true;
 }
 
 RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_suffix) const
@@ -615,27 +601,13 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 			*reinterpret_cast<const int32_t*>(bytes + 0x18) == a_numTracks;
 	};
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				// The recorded original may be stale (freed on weapon switch
-				// while the clone stays live for other originals) — callers
-				// already validate the returned pointer before use.
-				if (rc.clone == a_replacement &&
-					originalStillMatches(rc.gameOriginal, rc.originalDuration, rc.originalNumTracks)) {
-					return rc.gameOriginal;
-				}
-			}
-		}
-	}
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_replacement &&
-			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
-			return retired.gameOriginal;
-		}
-	}
-	return nullptr;
+	const auto it = m_cloneLookup.find(a_replacement);
+	if (it == m_cloneLookup.end()) return nullptr;
+	// The recorded original may be stale (freed on weapon switch while the
+	// clone stays live for other originals). Callers validate the returned
+	// pointer before use, and this preserves the old duration/track guard.
+	return originalStillMatches(it->second.gameOriginal, it->second.originalDuration,
+		it->second.originalNumTracks) ? it->second.gameOriginal : nullptr;
 }
 
 RE::hkaAnimation* AnimationCache::GetOriginalFromRetiredReplacement(RE::hkaAnimation* a_replacement) const
@@ -649,13 +621,10 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromRetiredReplacement(RE::hkaAnima
 	};
 
 	std::shared_lock lock(m_mutex);
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_replacement &&
-			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
-			return retired.gameOriginal;
-		}
-	}
-	return nullptr;
+	const auto it = m_cloneLookup.find(a_replacement);
+	if (it == m_cloneLookup.end() || !it->second.retired) return nullptr;
+	return originalStillMatches(it->second.gameOriginal, it->second.originalDuration,
+		it->second.originalNumTracks) ? it->second.gameOriginal : nullptr;
 }
 
 void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_index,
@@ -663,9 +632,14 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 {
 	if (a_index >= a_entry.clones.size()) return;
 	auto& rc = a_entry.clones[a_index];
+	const auto clonePtr = rc.clone;
+	m_cloneLookup.erase(clonePtr);
 	if (!rc.structBuffer.empty()) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
+				m_cloneLookup.erase(retiredPtr);
+			}
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
 		RetiredClone rec;
@@ -677,6 +651,14 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 		rec.suffix = a_suffix;
 		rec.owner = a_entry.owner;
 		m_retiredClones.push_back(std::move(rec));
+		m_cloneLookup[clonePtr] = CloneLookup{
+			.gameOriginal = rc.gameOriginal,
+			.originalDuration = rc.originalDuration,
+			.originalNumTracks = rc.originalNumTracks,
+			.suffix = a_suffix,
+			.owner = a_entry.owner,
+			.retired = true
+		};
 	}
 	a_entry.clones.erase(a_entry.clones.begin() + a_index);
 }
@@ -697,6 +679,9 @@ void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBa
 	if (retireData) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
+				m_cloneLookup.erase(retiredPtr);
+			}
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
 		RetiredClone rec;
@@ -759,6 +744,16 @@ void AnimationCache::InvalidateRuntimeClones()
 void AnimationCache::Clear()
 {
 	std::unique_lock lock(m_mutex);
+	// Retired clones remain in their keep-alive list, so only remove live-clone
+	// identities before dropping the cached file entries.
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (!entry) continue;
+			for (const auto& clone : entry->clones) {
+				m_cloneLookup.erase(clone.clone);
+			}
+		}
+	}
 	m_cache.clear();
 }
 

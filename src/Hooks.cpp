@@ -204,6 +204,10 @@ static std::shared_mutex s_graphAnimPathMutex;
 static std::unordered_map<uint32_t, std::string> s_graphAnimPathByIndex;  // graph index -> folder prefix
 static std::string s_weaponAnimFolder;  // latest weapon graph's folder (e.g. "scar")
 static std::atomic<bool> s_weaponAnimFolderValid{ false };
+// A graph can be temporarily unavailable while the player graph is being
+// built. Do not repeat the full graph walk for every clip activation while it
+// remains unavailable; retry on a wall-clock cadence instead.
+static std::atomic<int64_t> s_lastWeaponAnimFolderRetryMs{ 0 };
 
 // ============ Option 2: CreateFileW animation path capture ============
 // Maps leaf animation name -> set of folder prefixes seen in actual file opens.
@@ -1613,6 +1617,25 @@ namespace
 	// deferred log flush needs it. Deactivate-erase keeps it from going stale.
 	static std::shared_mutex s_playerClipMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, uint8_t> s_playerClipGraph;
+
+	// PollPlayerGraphClips() runs after every actor update so direct-path
+	// matching can observe newly active clips.  The active-node arrays are
+	// normally stable for many frames, however, and walking every clip again
+	// in that steady state only repeats pointer validation, path-cache locks,
+	// and suffix maintenance.  Keep a game-thread fingerprint for each player
+	// root and rescan only when the graph reports a change or a clip hook marks
+	// the graph state dirty.  The hash includes the active-node entries and
+	// their nested graph pointers, so in-place array updates are still seen.
+	struct PlayerGraphPollState
+	{
+		uintptr_t hkGraph{ 0 };
+		uintptr_t activeNodes{ 0 };
+		uintptr_t data{ 0 };
+		int32_t size{ 0 };
+		uint64_t entriesHash{ 0 };
+	};
+	static std::array<PlayerGraphPollState, 4> s_playerGraphPollState{};
+	static std::atomic_bool s_playerGraphPollDirty{ true };
 	// Learned index of the player's 1st-person root graph: set when a clip from
 	// that graph resolves to a "..._1stperson..." path. Lets us classify player
 	// clips whose own paths lack the marker (authored relative names).
@@ -1652,18 +1675,9 @@ namespace
 	static std::shared_mutex s_annotStateMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, ClipAnnotationState> s_annotStateMap;
 
-	// Track which suffixes currently have active replacements globally
-	static std::shared_mutex s_activeReplacementSuffixMutex;
-	static std::unordered_set<std::string> s_activeReplacementSuffixes;
-
 	// Per-actor set of original-animation annotation strings to suppress while replacement active
 	static std::shared_mutex s_origAnnotSetMutex;
 	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_origAnnotByActor; // actorFormID -> set of annotation text
-
-	// Per-actor active replacement set: actorFormID -> set of (clipGen, suffix) keys.
-	// Suppression sink consults this to decide whether to suppress engine annotations.
-	static std::shared_mutex s_activeReplacementActorMutex;
-	static std::unordered_map<uint32_t, std::unordered_set<std::string>> s_activeReplacementByActor;
 
 	// Backup of hkbClipGenerator::triggers/originalTriggers we replaced during swap, so we can
 	// restore them when conditions stop matching. Without this, the engine's native annotation
@@ -2074,8 +2088,12 @@ namespace
 
 	// Per-play integrity-check bookkeeping: last localTime seen per clip; a
 	// regression = new play on the same generator = re-run the check.
-	static std::mutex s_annotIntegrityMutex;
-	static std::unordered_map<RE::hkbClipGenerator*, float> s_annotIntegrityLastT;
+	struct AnnotIntegrityStamp
+	{
+		std::atomic<float> lastT{ 0.0f };
+	};
+	static std::shared_mutex s_annotIntegrityMutex;
+	static std::unordered_map<RE::hkbClipGenerator*, std::unique_ptr<AnnotIntegrityStamp>> s_annotIntegrityLastT;
 
 	// Enumerate (time, text) annotation pairs from a game hkaAnimation's raw
 	// annotation tracks — same guarded offsets as CollectAnimAnnotationTexts.
@@ -2914,6 +2932,8 @@ void RestoreAllActiveReplacements()
 void ClearClipRuntimeState()
 {
 	ClearIdleStopSuppressionState();
+	s_playerGraphPollDirty.store(true, std::memory_order_release);
+	s_playerGraphPollState = {};
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		s_originalAnimMap.clear();
@@ -2967,16 +2987,8 @@ void ClearClipRuntimeState()
 		s_annotStateMap.clear();
 	}
 	{
-		std::unique_lock lock(s_activeReplacementSuffixMutex);
-		s_activeReplacementSuffixes.clear();
-	}
-	{
 		std::unique_lock lock(s_origAnnotSetMutex);
 		s_origAnnotByActor.clear();
-	}
-	{
-		std::unique_lock lock(s_activeReplacementActorMutex);
-		s_activeReplacementByActor.clear();
 	}
 	{
 		std::unique_lock lock(s_triggersBackupMutex);
@@ -3015,6 +3027,7 @@ void ClearClipRuntimeState()
 		s_weaponAnimFolder.clear();
 		s_weaponAnimFolderValid.store(false);
 	}
+	s_lastWeaponAnimFolderRetryMs.store(0, std::memory_order_release);
 	// Don't clear s_createFile* maps - they persist across save loads
 	// (CreateFileW captures are valid globally)
 	// Don't clear s_subGraphIDToFolder - accumulated mapping persists
@@ -3086,14 +3099,6 @@ static void PerformGlobalDisableRestore()
 	{
 		std::unique_lock lock(s_annotStateMutex);
 		s_annotStateMap.clear();
-	}
-	{
-		std::unique_lock lock(s_activeReplacementSuffixMutex);
-		s_activeReplacementSuffixes.clear();
-	}
-	{
-		std::unique_lock lock(s_activeReplacementActorMutex);
-		s_activeReplacementByActor.clear();
 	}
 	ActiveReplacementTracker::GetSingleton()->Clear();
 
@@ -4515,6 +4520,31 @@ namespace
 		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
 		constexpr uintptr_t kBG_ActiveNodes = 0xE0;
 
+		// This is deliberately a cheap pointer fingerprint rather than a deep
+		// graph walk.  It detects both array replacement and in-place active-node
+		// changes while leaving the authoritative path resolver as the only code
+		// that decides which animation path is valid.
+		const auto fingerprintEntries = [](uintptr_t a_data, int32_t a_size) {
+			constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+			constexpr uint64_t kFnvPrime = 1099511628211ull;
+			uint64_t hash = kFnvOffset;
+			for (int32_t i = 0; i < a_size; ++i) {
+				const auto entry = *reinterpret_cast<uintptr_t*>(a_data +
+					static_cast<uintptr_t>(i) * sizeof(void*));
+				hash ^= static_cast<uint64_t>(entry);
+				hash *= kFnvPrime;
+				if (entry && !IsBadReadPtr(reinterpret_cast<void*>(entry), 0x18)) {
+					const auto node = *reinterpret_cast<uintptr_t*>(entry + 0x08);
+					const auto nested = *reinterpret_cast<uintptr_t*>(entry + 0x10);
+					hash ^= static_cast<uint64_t>(node);
+					hash *= kFnvPrime;
+					hash ^= static_cast<uint64_t>(nested);
+					hash *= kFnvPrime;
+				}
+			}
+			return hash;
+		};
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) return;
 		RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
@@ -4525,16 +4555,21 @@ namespace
 
 		static std::atomic<int> s_pollDiagCount{ 0 };
 
+		bool graphWasUnstable = false;
+		const bool forcePoll = s_playerGraphPollDirty.load(std::memory_order_acquire);
+
 		for (uint32_t gi = 0; gi < manager->graph.size() && gi < 4; ++gi) {
 			const auto root = reinterpret_cast<uintptr_t>(manager->graph[gi].get());
 			if (!root || root < 0x10000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(root), kBShkb_HkRootGraph + 8) ||
 				*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
+				s_playerGraphPollState[gi] = {};
 				continue;
 			}
 			const auto hkGraph = *reinterpret_cast<uintptr_t*>(root + kBShkb_HkRootGraph);
 			if (!hkGraph || hkGraph < 0x10000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+				s_playerGraphPollState[gi] = {};
 				continue;
 			}
 
@@ -4564,21 +4599,40 @@ namespace
 				}
 			}
 
-			// GunMover: skip while the graph rebuilds its node list
+			// GunMover: skip while the graph rebuilds its node list.  Do not
+			// consume the dirty flag in this state; the next stable frame must
+			// perform the scan.
 			if (*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
 				*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0) {
+				graphWasUnstable = true;
 				continue;
 			}
 			const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kBG_ActiveNodes);
 			if (!activeNodes || IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
+				s_playerGraphPollState[gi] = { hkGraph, activeNodes, 0, 0, 0 };
 				continue;
 			}
 			const auto data = *reinterpret_cast<uintptr_t*>(activeNodes);
 			const auto size = *reinterpret_cast<int32_t*>(activeNodes + 8);
 			if (!data || size <= 0 || size > 0x1000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(data), static_cast<size_t>(size) * sizeof(void*))) {
+				s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, 0 };
 				continue;
 			}
+
+			const auto entriesHash = fingerprintEntries(data, size);
+			const auto& previous = s_playerGraphPollState[gi];
+			const bool unchanged = !forcePoll &&
+				previous.hkGraph == hkGraph &&
+				previous.activeNodes == activeNodes &&
+				previous.data == data &&
+				previous.size == size &&
+				previous.entriesHash == entriesHash;
+			if (unchanged) {
+				continue;
+			}
+
+			s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, entriesHash };
 
 			for (int32_t i = 0; i < size; ++i) {
 				const auto entry = *reinterpret_cast<uintptr_t*>(data + static_cast<uintptr_t>(i) * sizeof(void*));
@@ -4762,6 +4816,10 @@ namespace
 					}
 				}
 			}
+		}
+
+		if (!graphWasUnstable) {
+			s_playerGraphPollDirty.store(false, std::memory_order_release);
 		}
 
 	}
@@ -5891,6 +5949,10 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		// A clip activation can reuse an active-node entry in place, so force the
+		// next stable player-graph poll even when the pointer fingerprint happens
+		// to remain unchanged.
+		s_playerGraphPollDirty.store(true, std::memory_order_release);
 		const int32_t playerGraphIndex = PlayerGraphIndexForClip(a_this, a_context);
 		if (playerGraphIndex >= 0) {
 			std::unique_lock lock(s_playerClipMutex);
@@ -6236,13 +6298,25 @@ namespace
 		if (!s_lookupBuilt) BuildNameLookup();
 		if (!s_idleAnimReverseBuilt.load()) BuildIdleAnimReverseMap();
 
-		{
-			static std::atomic<int> s_refreshCounter{ 0 };
-			int count = s_refreshCounter.fetch_add(1);
-			if (!s_weaponAnimFolderValid.load() || (count % 2000 == 0)) {
-				RefreshWeaponAnimFolder();
+	{
+		static std::atomic<int> s_refreshCounter{ 0 };
+		int count = s_refreshCounter.fetch_add(1);
+		const bool folderValid = s_weaponAnimFolderValid.load(std::memory_order_acquire);
+		bool shouldRefresh = folderValid && (count % 2000 == 0);
+		if (!folderValid) {
+			const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+			auto lastRetryMs = s_lastWeaponAnimFolderRetryMs.load(std::memory_order_relaxed);
+			if (nowMs - lastRetryMs >= 1000 &&
+				s_lastWeaponAnimFolderRetryMs.compare_exchange_strong(
+					lastRetryMs, nowMs, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+				shouldRefresh = true;
 			}
 		}
+		if (shouldRefresh) {
+			RefreshWeaponAnimFolder();
+		}
+	}
 
 		auto* cache = AnimationCache::GetSingleton();
 
@@ -6976,14 +7050,37 @@ namespace
 			{
 				// Once per PLAY, not per generator: a localTime regression on
 				// the same generator is a re-entered play and re-runs the check.
+				// The common path only takes a shared map lock and updates an
+				// atomic timestamp; exclusive insertion is limited to first sighting
+				// and actual play restarts.
 				const float icT = a_this->GetLocalTime();
-				std::unique_lock lock(s_annotIntegrityMutex);
-				auto [it, inserted] = s_annotIntegrityLastT.try_emplace(a_this, icT);
-				if (inserted) {
-					needCheck = true;
-				} else {
-					if (icT < it->second - 0.05f) needCheck = true;
-					it->second = icT;
+				bool missing = false;
+				{
+					std::shared_lock lock(s_annotIntegrityMutex);
+					auto it = s_annotIntegrityLastT.find(a_this);
+					if (it == s_annotIntegrityLastT.end() || !it->second) {
+						missing = true;
+					} else {
+						const float previousT = it->second->lastT.load(std::memory_order_relaxed);
+						needCheck = icT < previousT - 0.05f;
+						if (!needCheck) {
+							it->second->lastT.store(icT, std::memory_order_relaxed);
+						}
+					}
+				}
+				if (missing || needCheck) {
+					std::unique_lock lock(s_annotIntegrityMutex);
+					auto it = s_annotIntegrityLastT.find(a_this);
+					if (it == s_annotIntegrityLastT.end()) {
+						auto stamp = std::make_unique<AnnotIntegrityStamp>();
+						stamp->lastT.store(icT, std::memory_order_relaxed);
+						s_annotIntegrityLastT.emplace(a_this, std::move(stamp));
+						needCheck = true;
+					} else if (it->second) {
+						const float previousT = it->second->lastT.load(std::memory_order_relaxed);
+						needCheck = icT < previousT - 0.05f;
+						it->second->lastT.store(icT, std::memory_order_relaxed);
+					}
 				}
 			}
 			if (needCheck) {
@@ -7155,8 +7252,10 @@ namespace
 			}
 		}
 
-		// Diagnostic: log unique suffixes
-		{
+		// Diagnostic: log unique suffixes only when verbose logging is enabled.
+		// This is not part of replacement selection and must not add a shared
+		// lock/hash lookup to every steady-state clip update.
+		if (Settings::GetSingleton()->bVerboseLogging) {
 			static std::unordered_set<std::string> s_loggedSuffixes;
 			static std::shared_mutex s_loggedSuffixMutex;
 			std::shared_lock slock(s_loggedSuffixMutex);
@@ -7463,17 +7562,6 @@ namespace
 				if (!cleanRefr) cleanRefr = RE::PlayerCharacter::GetSingleton();
 				uint32_t cleanActorID = cleanRefr ? cleanRefr->GetFormID() : 0;
 				ActiveReplacementTracker::GetSingleton()->Remove(cleanActorID, leafName);
-				{
-					std::unique_lock slock(s_activeReplacementSuffixMutex);
-					s_activeReplacementSuffixes.erase(leafName);
-				}
-				{
-					std::unique_lock alock(s_activeReplacementActorMutex);
-					auto it = s_activeReplacementByActor.find(cleanActorID);
-					if (it != s_activeReplacementByActor.end()) {
-						it->second.erase(leafName);
-					}
-				}
 				return;
 			}
 
@@ -7486,9 +7574,13 @@ namespace
 		} else {
 			auto infoIt = s_suffixToInfos.find(suffix);
 			if (infoIt == s_suffixToInfos.end()) {
-				static std::atomic<int> s_noMatchLogCount{ 0 };
-				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
-					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
+				if (Settings::GetSingleton()->bVerboseLogging) {
+					static std::atomic<int> s_noMatchLogCount{ 0 };
+					const int logCount = s_noMatchLogCount.load(std::memory_order_relaxed);
+					if (logCount < 30 &&
+						s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
+						logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
+					}
 				}
 				return;
 			}
@@ -7884,7 +7976,7 @@ namespace
 			}
 		}
 
-		{
+		if (Settings::GetSingleton()->bVerboseLogging) {
 			static std::atomic<int> s_updateDiagCounter{ 0 };
 			int count = s_updateDiagCounter.fetch_add(1);
 			if (count < 5 || count % 3000 == 0) {
@@ -8472,17 +8564,6 @@ namespace
 		}
 		ActiveReplacementTracker::GetSingleton()->Update(actorID, resolvedSuffix, entry);
 
-		// Register this suffix as having an active replacement (for event suppression)
-		{
-			std::unique_lock slock(s_activeReplacementSuffixMutex);
-			s_activeReplacementSuffixes.insert(resolvedSuffix);
-		}
-		// Track per-actor active replacements
-		{
-			std::unique_lock alock(s_activeReplacementActorMutex);
-			s_activeReplacementByActor[actorID].insert(resolvedSuffix);
-		}
-
 		// Fire replacement annotations manually with dual-path emission.
 		// Phase 1: NotifyAnimationGraphImpl (behavior graph state transitions, bone cull)
 		// Phase 2: BSTEventSource::Notify (audio SoundPlay.*, plugin sinks)
@@ -9013,26 +9094,13 @@ namespace
 			std::unique_lock alock(s_annotStateMutex);
 			s_annotStateMap.erase(a_this);
 		}
-		{
-			std::unique_lock slock(s_activeReplacementSuffixMutex);
-			s_activeReplacementSuffixes.erase(resolvedSuffix);
-		}
-		{
-			std::unique_lock alock(s_activeReplacementActorMutex);
-			auto it = s_activeReplacementByActor.find(actorID);
-			if (it != s_activeReplacementByActor.end()) {
-				it->second.erase(resolvedSuffix);
-				if (it->second.empty()) {
-					s_activeReplacementByActor.erase(it);
-				}
-			}
-		}
 	}
 	}
 
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		if (a_this) {
+			s_playerGraphPollDirty.store(true, std::memory_order_release);
 			ReleaseIdleStopSuppressionClip(a_this);
 			// Flush a still-pending kActivate log entry BEFORE dropping the
 			// per-clip state below. Short-lived clips (fire animations,
@@ -10782,24 +10850,25 @@ namespace
 				RE::TESObjectREFR* actor;
 				const SubMod::TrackFilter* filter;  // identifies the state within the actor
 				SubMod* subMod;
-				std::string suffix;
 				RE::hkbClipGenerator* sourceClip;
 			};
-			std::vector<PendingEval> toEval;
+			thread_local std::vector<PendingEval> toEval;
+			thread_local std::vector<std::pair<RE::TESObjectREFR*, const SubMod::TrackFilter*>> conditionsFalse;
+			toEval.clear();
+			conditionsFalse.clear();
 			{
 				std::shared_lock tfShared(s_trackFilterMutex);
 				toEval.reserve(s_charTrackFilterMap.size());
 				for (auto& [actor, states] : s_charTrackFilterMap) {
 					for (auto& state : states) {
 						if (state.parentSubMod && actor)
-							toEval.push_back({ actor, state.filter, state.parentSubMod, state.suffix, state.sourceClip });
+							toEval.push_back({ actor, state.filter, state.parentSubMod, state.sourceClip });
 					}
 				}
 			}
 
 			// Conditions are evaluated per (actor, filter) pair — multiple filters
 			// can be active on one actor and each deactivates independently.
-			std::set<std::pair<RE::TESObjectREFR*, const SubMod::TrackFilter*>> conditionsFalse;
 			for (auto& pe : toEval) {
 				if (pe.subMod->GetPlayOnceFullBody()) continue;
 				// Non-interruptible PLAYBACK-FOLLOWING overlays honor the same
@@ -10816,7 +10885,7 @@ namespace
 				if (!pe.subMod->IsInterruptible() && pe.filter && pe.filter->sampleFrame < 0.0f)
 					continue;
 				if (!pe.subMod->EvaluateConditions(pe.actor, pe.sourceClip))
-					conditionsFalse.insert({ pe.actor, pe.filter });
+					conditionsFalse.push_back({ pe.actor, pe.filter });
 			}
 
 			{
@@ -10827,7 +10896,9 @@ namespace
 					for (auto stIt = states.begin(); stIt != states.end(); ) {
 						auto& state = *stIt;
 						auto* filterPtr = state.filter;
-						bool condFalse = conditionsFalse.count({ mapIt->first, filterPtr }) > 0;
+<<<<<<< HEAD
+						bool condFalse = std::ranges::find(
+							conditionsFalse, std::pair{ mapIt->first, filterPtr }) != conditionsFalse.end();
 						TrackFilterSourceState* currentSourceState = nullptr;
 						if (state.sourceClip) {
 							auto sourceIt = state.sourceStateByClip.find(state.sourceClip);
@@ -10844,7 +10915,7 @@ namespace
 						auto& currentSampleStarved = currentSourceState
 							? currentSourceState->sampleStarved : state.sampleStarved;
 						auto& currentLastSampleSec = currentSourceState
-							? currentSourceState->lastSampleSec : state.lastSampleSec;
+									? currentSourceState->lastSampleSec : state.lastSampleSec;
 
 						// Dormant: applies nothing (alpha 0), kept while its source clip
 						// is alive so revival never goes through erase-and-recreate
