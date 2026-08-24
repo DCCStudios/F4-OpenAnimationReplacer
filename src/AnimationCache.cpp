@@ -1,6 +1,7 @@
 #include "AnimationCache.h"
 #include "OpenAnimationReplacer.h"
 #include "Settings.h"
+#include "RE/B/BSResourceNiBinaryStream.h"
 
 // Per-file load logging is gated behind bVerboseLogging: at tens of thousands
 // of animations the ~15 info lines each file emits during preload dominate
@@ -85,24 +86,87 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		return false;
 	}
 	const auto diskMTime = std::filesystem::last_write_time(a_absolutePath, ec);
+	const bool hasDiskMTime = !ec;
 
-	// Fast path: this exact file is already cached. The cache's real identity
-	// is the on-disk file, not the owner tag — a config reload recreates every
+	const auto pathStr = a_absolutePath.string();
+	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
+	if (!file.is_open()) {
+		logger::warn("[OAR-Cache] Cannot open: '{}'", pathStr);
+		return false;
+	}
+
+	const auto fileSize = file.tellg();
+	if (fileSize < 64 || fileSize > 50 * 1024 * 1024) {
+		logger::warn("[OAR-Cache] Invalid file size ({}) for: '{}'", static_cast<int64_t>(fileSize), pathStr);
+		return false;
+	}
+
+	std::vector<uint8_t> bytes(static_cast<size_t>(fileSize));
+	file.seekg(0);
+	file.read(reinterpret_cast<char*>(bytes.data()), fileSize);
+	if (!file) {
+		logger::warn("[OAR-Cache] Failed to read: '{}'", pathStr);
+		return false;
+	}
+	return LoadAnimationBytes(a_suffix, pathStr, std::move(bytes), hasDiskMTime,
+		static_cast<uint64_t>(diskSize), diskMTime, a_owner, a_priority);
+}
+
+bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
+	const void* a_owner, int32_t a_priority)
+{
+	RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
+	if (!stream) {
+		logger::warn("[OAR-Cache] Resource not found: '{}'", a_resourcePath);
+		return false;
+	}
+
+	RE::NiBinaryStream::BufferInfo bufferInfo{};
+	stream.GetBufferInfo(bufferInfo);
+	if (bufferInfo.fileSize < 64 || bufferInfo.fileSize > 50 * 1024 * 1024) {
+		logger::warn("[OAR-Cache] Invalid resource size ({}) for: '{}'", bufferInfo.fileSize, a_resourcePath);
+		return false;
+	}
+
+	std::vector<uint8_t> bytes(bufferInfo.fileSize);
+	const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
+	if (bytesRead != bytes.size()) {
+		logger::warn("[OAR-Cache] Failed to read resource '{}' ({} / {} bytes)",
+			a_resourcePath, bytesRead, bytes.size());
+		return false;
+	}
+
+	return LoadAnimationBytes(a_suffix, a_resourcePath, std::move(bytes), false,
+		static_cast<uint64_t>(bufferInfo.fileSize), {}, a_owner, a_priority);
+}
+
+bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
+	std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
+	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority)
+{
+	const auto sourceSize = a_sourceSize != 0 ? a_sourceSize : static_cast<uint64_t>(a_bytes.size());
+	if (a_bytes.size() < 64 || a_bytes.size() > 50 * 1024 * 1024) {
+		logger::warn("[OAR-Cache] Invalid source size ({}) for: '{}'", a_bytes.size(), a_sourceIdentity);
+		return false;
+	}
+
+	// Fast path: this exact file/resource is already cached. The cache's identity
+	// is the source path, not the owner tag — a config reload recreates every
 	// SubMod, so matching on owner would miss ALL entries and re-read every
 	// animation file from disk (seconds of hitching with thousands of anims).
-	// Match by path instead and, when size+mtime are unchanged, just re-bind
-	// the entry to the new owner/priority: the parsed data, annotations, and
-	// runtime clone all stay valid because the bytes they were built from are
-	// the same. A changed file (author replaced the .hkx and hit reload) falls
-	// through to a full re-read that replaces the entry below.
-	const std::string pathStr = a_absolutePath.string();
+	// Match by source identity and size, plus mtime for loose files. BA2
+	// resources have no filesystem timestamp, so their identity is the
+	// Data-relative resource path and their cache entry is rebound by path+size.
 	{
 		std::unique_lock lock(m_mutex);
 		auto it = m_cache.find(a_suffix);
 		if (it != m_cache.end()) {
 			for (auto& existing : it->second) {
-				if (!existing || existing->filePath != pathStr) continue;
-				if (existing->fileSize == diskSize && existing->fileMTime == diskMTime) {
+				if (!existing || existing->filePath != a_sourceIdentity) continue;
+				const bool timestampMatches = a_hasFileMTime
+					? existing->hasFileMTime && existing->fileMTime == a_sourceMTime
+					: !existing->hasFileMTime;
+				if (existing->fileSize == sourceSize && timestampMatches) {
 					existing->owner = a_owner;
 					existing->priority = a_priority;
 					existing->pendingRebind = false;
@@ -120,28 +184,13 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	}
 
 	auto entry = std::make_unique<CachedAnimation>();
-	entry->filePath = pathStr;
+	entry->filePath = std::move(a_sourceIdentity);
 	entry->owner = a_owner;
 	entry->priority = a_priority;
-	entry->fileSize = diskSize;
-	entry->fileMTime = diskMTime;
-
-	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
-	if (!file.is_open()) {
-		logger::warn("[OAR-Cache] Cannot open: '{}'", a_absolutePath.string());
-		return false;
-	}
-
-	auto fileSize = file.tellg();
-	if (fileSize < 64 || fileSize > 50 * 1024 * 1024) {
-		logger::warn("[OAR-Cache] Invalid file size ({}) for: '{}'", (int64_t)fileSize, a_absolutePath.string());
-		return false;
-	}
-
-	entry->fileData.resize(static_cast<size_t>(fileSize));
-	file.seekg(0);
-	file.read(reinterpret_cast<char*>(entry->fileData.data()), fileSize);
-	file.close();
+	entry->fileSize = sourceSize;
+	entry->fileMTime = a_sourceMTime;
+	entry->hasFileMTime = a_hasFileMTime;
+	entry->fileData = std::move(a_bytes);
 
 	auto magic = *reinterpret_cast<uint32_t*>(entry->fileData.data());
 
@@ -151,19 +200,19 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	} else if (magic == kTagfileMagic) {
 		parsed = ParseTagfile(*entry);
 	} else {
-		logger::warn("[OAR-Cache] Unknown file format (magic=0x{:08X}) for: '{}'", magic, a_absolutePath.string());
+		logger::warn("[OAR-Cache] Unknown file format (magic=0x{:08X}) for: '{}'", magic, entry->filePath);
 		return false;
 	}
 
 	if (!parsed || !entry->animation) {
-		logger::warn("[OAR-Cache] Failed to parse animation from: '{}'", a_absolutePath.string());
+		logger::warn("[OAR-Cache] Failed to parse animation from: '{}'", entry->filePath);
 		return false;
 	}
 
 	if (VerboseCacheLog()) {
 		logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
 			a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
-			a_absolutePath.string());
+			entry->filePath);
 	}
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);

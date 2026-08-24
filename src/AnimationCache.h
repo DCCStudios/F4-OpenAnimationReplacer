@@ -79,12 +79,14 @@ public:
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
 
-		// Disk identity at load time. A config reload recreates every SubMod,
-		// so `owner` always misses — LoadAnimation matches by filePath instead
-		// and RE-BINDS the entry to the new owner when size+mtime still match,
-		// skipping the disk read/parse/clone rebuild entirely.
+		// Source identity at load time. A config reload recreates every SubMod,
+		// so `owner` always misses — the load functions match by filePath instead
+		// and rebind the entry to the new owner when source size and identity
+		// still match. Loose files also use their timestamp; BSResource sources
+		// have no filesystem timestamp and use the Data-relative resource path.
 		uint64_t fileSize{ 0 };
 		std::filesystem::file_time_type fileMTime{};
+		bool hasFileMTime{ false };
 		// Set by MarkAllForRebind (config reload); cleared when LoadAnimation
 		// re-binds or replaces the entry. Entries still flagged after the
 		// re-parse belong to SubMods that no longer exist — PruneUnrebound
@@ -93,6 +95,8 @@ public:
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
+		const void* a_owner = nullptr, int32_t a_priority = 0);
+	bool LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
 		const void* a_owner = nullptr, int32_t a_priority = 0);
 	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix,
 		const void* a_owner = nullptr) const;
@@ -148,6 +152,9 @@ private:
 
 	bool ParsePackfile(CachedAnimation& a_entry);
 	bool ParseTagfile(CachedAnimation& a_entry);
+	bool LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
+		std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
+		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority);
 	RE::hkaAnimation* FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable);
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 

@@ -3654,8 +3654,8 @@ namespace
 			if (suffix.empty()) continue;
 
 			for (auto& info : replacementInfos) {
-				if (info.absoluteDiskPath.empty()) {
-					logger::warn("[OAR-Preload] No absolute path for suffix '{}'", suffix);
+				if (info.absoluteDiskPath.empty() && (!info.archiveResource || info.resourcePath.empty())) {
+					logger::warn("[OAR-Preload] No disk or resource path for suffix '{}'", suffix);
 					failed.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
@@ -3680,8 +3680,11 @@ namespace
 				const size_t i = nextItem.fetch_add(1, std::memory_order_relaxed);
 				if (i >= work.size()) break;
 				const auto& item = work[i];
-				if (cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod,
-						item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0)) {
+				const auto priority = item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0;
+				const auto loadedFromSource = item.info->archiveResource
+					? cache->LoadAnimationResource(item.suffix, item.info->resourcePath, item.info->parentSubMod, priority)
+					: cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
+				if (loadedFromSource) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {
 					failed.fetch_add(1, std::memory_order_relaxed);
