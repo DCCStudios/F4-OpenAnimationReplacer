@@ -1157,6 +1157,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["blendOutTime"] = tf.blendOutTime;
 				tfJson["blendOutAtEnd"] = tf.blendOutAtEnd;
 				tfJson["sampleFrame"] = tf.sampleFrame;
+				tfJson["loopSourcePrefixes"] = tf.loopSourcePrefixes;
 				tfJson["modelSpaceAnchor"] = tf.modelSpaceAnchor;
 				tfJson["triggerOnlySpecialIdle"] = tf.triggerOnlySpecialIdle;
 				tfJson["skipAdditiveNonSourceFirstPerson"] = tf.skipAdditiveNonSourceFirstPerson;
