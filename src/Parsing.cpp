@@ -593,6 +593,12 @@ namespace Parsing
 			a_subMod->trackFilter.blendOutTime = tf.value("blendOutTime", 0.0f);
 			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
+			if (tf.contains("loopSourcePrefixes") && tf["loopSourcePrefixes"].is_array()) {
+				for (const auto& prefix : tf["loopSourcePrefixes"]) {
+					if (prefix.is_string())
+						a_subMod->trackFilter.loopSourcePrefixes.push_back(prefix.get<std::string>());
+				}
+			}
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", false);
 			a_subMod->trackFilter.triggerOnlySpecialIdle = tf.value("triggerOnlySpecialIdle", false);
 			a_subMod->trackFilter.skipAdditiveNonSourceFirstPerson =
@@ -639,6 +645,13 @@ namespace Parsing
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
+		if (json.contains("trackFilter") && json["trackFilter"].is_object()) {
+			const auto& tf = json["trackFilter"];
+			if (tf.contains("loopSourcePrefixes") && tf["loopSourcePrefixes"].is_array()) {
+				a_subMod->trackFilter.loopSourcePrefixes =
+					tf["loopSourcePrefixes"].get<std::vector<std::string>>();
+			}
+		}
 		if (json.contains("suppressAnnotations")) {
 			const auto& sa = json["suppressAnnotations"];
 			if (sa.is_boolean()) {

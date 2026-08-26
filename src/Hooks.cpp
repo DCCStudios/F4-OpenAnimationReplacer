@@ -26,6 +26,7 @@ namespace ConditionTracking
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 
 static std::atomic<bool> s_gameFullyLoaded{ false };
 static std::atomic<bool> s_hasActiveReplacements{ false };
@@ -241,6 +242,26 @@ struct CharResolved {
 	uint64_t version = 0; // matches TrackFilter::version when this was resolved
 };
 
+// A single actor-level TrackFilter can receive several source generators at
+// once (idle, locomotion, and a crossfade sibling). Keep the donor and its
+// loop clock per source clip so the last source registered by Update cannot
+// overwrite the donor or phase used by another source in Generate.
+struct TrackFilterSourceState {
+	RE::hkaAnimation* replacement = nullptr;
+	std::string suffix;
+	std::vector<int16_t> donorTrackToBone;
+	bool donorMapIdentity = false;
+	bool donorMapQueried = false;
+	// Fallout 4 can expose a repeating locomotion leaf as SINGLE_PLAY or
+	// USER_CONTROLLED. Its localTime may rewind while the generator remains
+	// alive, so configured loop sources use a clip-owned continuous clock.
+	float loopPlaybackTime = 0.0f;
+	float loopLastSourceTime = -1.0f;
+	float loopLastClockSec = -1.0f;
+	uint64_t loopLastFrame = UINT64_MAX;
+	float loopLastDiagSec = -1.0f;
+};
+
 struct CharTrackFilterState {
 	RE::hkaAnimation* replacement = nullptr;
 	RE::hkaAnimation* sourceAnimation = nullptr; // Original animation the source clip plays (for blend-sibling identification)
@@ -248,6 +269,11 @@ struct CharTrackFilterState {
 	SubMod* parentSubMod = nullptr;
 	RE::hkbClipGenerator* sourceClip = nullptr;
 	std::unordered_set<RE::hkbClipGenerator*> sourceClips;
+	std::unordered_map<RE::hkbClipGenerator*, TrackFilterSourceState> sourceStateByClip;
+	// Source clips matching TrackFilter::loopSourcePrefixes. This is separate
+	// from the shared one-shot flags because idle and locomotion can feed the
+	// same actor-level filter at the same time.
+	std::unordered_set<RE::hkbClipGenerator*> loopSourceClips;
 	std::string suffix;
 	// Filter-only special idles have no native source clip. Their donor is
 	// advanced from this wall-clock origin and sampled into one ordinary,
@@ -400,6 +426,28 @@ static CharTrackFilterState* FindTrackFilterState(RE::TESObjectREFR* a_actor, co
 		if (state.filter == a_filter) return &state;
 	}
 	return nullptr;
+}
+
+// Match a configured prefix against the source animation leaf only. This is
+// intentionally generic: no TAEF, posture, weapon, player, or archive names
+// participate in the rule. Action clips stay one-shot unless an author opts
+// them into the prefix list.
+static bool MatchesLoopSourcePrefix(std::string_view a_suffix,
+	const std::vector<std::string>& a_prefixes)
+{
+	const auto slash = a_suffix.find_last_of("\\/");
+	const auto leafStart = slash == std::string_view::npos ? 0 : slash + 1;
+	std::string leaf(a_suffix.substr(leafStart));
+	std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+		[](unsigned char a_char) { return static_cast<char>(std::tolower(a_char)); });
+
+	for (const auto& prefix : a_prefixes) {
+		std::string folded(prefix);
+		std::transform(folded.begin(), folded.end(), folded.begin(),
+			[](unsigned char a_char) { return static_cast<char>(std::tolower(a_char)); });
+		if (!folded.empty() && leaf.starts_with(folded)) return true;
+	}
+	return false;
 }
 
 // Play Once (Full Body): tracks the initial replacement decision per clip generator.
@@ -5663,6 +5711,8 @@ namespace
 			state->parentSubMod = subMod;
 			state->sourceClip = nullptr;
 			state->sourceClips.clear();
+			state->sourceStateByClip.clear();
+			state->loopSourceClips.clear();
 			state->suffix = match.suffix;
 			state->standaloneSpecialIdle = true;
 			state->standaloneStartSec = nowSec;
@@ -7970,17 +8020,33 @@ namespace
 					// both share a track layout — true for the donor's own weapon
 					// (path matching), false for Leaf Matching claims on other
 					// weapons' clips (the MCX glitch, 2026-08-16).
-					if (state.replacement != replacement || state.suffix != cacheSuffix ||
-						(!state.donorMapQueried)) {
-						state.donorTrackToBone.clear();
-						state.donorMapIdentity = false;
-						state.donorMapQueried = true;
-						state.cameraDonorFrameZeroTracks.clear();
-						state.invalidCameraReferenceTracks.clear();
+					auto& sourceState = state.sourceStateByClip[a_this];
+					const bool sourceChanged = sourceState.replacement != replacement ||
+						sourceState.suffix != cacheSuffix;
+					if (sourceChanged || !sourceState.donorMapQueried) {
+						// A new donor or source leaf starts a new loop phase. Keep
+						// continuity only while this exact source-generator/donor
+						// pairing remains active.
+						sourceState.loopPlaybackTime = 0.0f;
+						sourceState.loopLastSourceTime = -1.0f;
+						sourceState.loopLastClockSec = -1.0f;
+						sourceState.loopLastFrame = UINT64_MAX;
+						sourceState.loopLastDiagSec = -1.0f;
+						sourceState.donorTrackToBone.clear();
+						sourceState.donorMapIdentity = false;
+						sourceState.donorMapQueried = true;
 						AnimationCache::GetSingleton()->GetDonorTrackMap(
 							cacheSuffix, winningInfo->parentSubMod,
-							state.donorTrackToBone, state.donorMapIdentity);
+							sourceState.donorTrackToBone, sourceState.donorMapIdentity);
+					state.invalidCameraReferenceTracks.clear();
 					}
+					sourceState.replacement = replacement;
+					sourceState.suffix = cacheSuffix;
+					// Keep the last registered donor as the fallback for non-source
+					// clips. Source Generate selects its own entry below.
+					state.donorTrackToBone = sourceState.donorTrackToBone;
+					state.donorMapIdentity = sourceState.donorMapIdentity;
+					state.donorMapQueried = sourceState.donorMapQueried;
 					state.replacement = replacement;
 					state.parentSubMod = winningInfo->parentSubMod;
 					state.standaloneSpecialIdle = false;
@@ -7988,6 +8054,49 @@ namespace
 					state.sourceClips.insert(a_this);
 					state.suffix = cacheSuffix;
 					state.lastSourceTimeSec = s_tfNowSec.load(std::memory_order_relaxed);
+
+					// A configured loop source must not inherit completion state from
+					// a previous one-shot source that reused this TrackFilter state.
+					const bool hadConfiguredLoopingSource = !state.loopSourceClips.empty();
+					const bool configuredLoopingSource =
+						MatchesLoopSourcePrefix(cacheSuffix, filterKey->loopSourcePrefixes);
+					if (configuredLoopingSource) {
+						state.loopSourceClips.insert(a_this);
+					} else {
+						state.loopSourceClips.erase(a_this);
+					}
+					const bool staleOneShotState = configuredLoopingSource &&
+						!hadConfiguredLoopingSource &&
+						(state.blendingOut || state.dormant || state.oneShotDone ||
+							state.earlyBlendOutArmed || state.sampleStarved ||
+							state.selfAdvanceStartSec >= 0.0f);
+					if (staleOneShotState) {
+						const bool wasBlendingOut = state.blendingOut || state.dormant;
+						state.blendingOut = false;
+						state.dormant = false;
+						state.oneShotDone = false;
+						state.earlyBlendOutArmed = false;
+						state.sampleStarved = false;
+						state.selfAdvanceStartSec = -1.0f;
+						state.selfAdvanceBaseTime = 0.0f;
+						state.lastSampledLocalTime = -1.0f;
+						state.lastSampleSec = state.lastSourceTimeSec;
+						state.lastAdvanceSec = state.lastSourceTimeSec;
+						if (wasBlendingOut) {
+							const float blendIn = filterKey->blendInTime;
+							state.blendDuration = blendIn;
+							state.blendElapsed = blendIn > 0.0f
+								? InverseBlendCurve(CurveOf(state.parentSubMod), state.blendAlpha) * blendIn
+								: 0.0f;
+							if (blendIn <= 0.0f) state.blendAlpha = 1.0f;
+						}
+						state.onEndFired = false;
+						static std::atomic<int> s_loopStateResetLog{ 0 };
+						if (s_loopStateResetLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+							logger::info("[OAR-TrackFilter] Reset one-shot state for configured loop: suffix='{}'",
+								cacheSuffix);
+						}
+					}
 					// Store the original animation pointer for blend-sibling identification.
 					// Track filter doesn't swap the animation slot, so the source clip's
 					// current animation IS the original.
@@ -9071,6 +9180,8 @@ namespace
 				for (auto& [actor, states] : s_charTrackFilterMap) {
 					for (auto& state : states) {
 						state.sourceClips.erase(a_this);
+						state.sourceStateByClip.erase(a_this);
+						state.loopSourceClips.erase(a_this);
 						if (state.sourceClip == a_this) state.sourceClip = nullptr;
 					}
 				}
@@ -9288,10 +9399,15 @@ namespace
 
 			auto& state = *statePtr;
 			auto* filterPtr = state.filter;
-			auto* replacement = state.replacement;
+			bool isSourceClip = state.sourceClips.count(a_this) > 0;
+			const auto sourceStateIt = isSourceClip
+				? state.sourceStateByClip.find(a_this)
+				: state.sourceStateByClip.end();
+			auto* replacement = sourceStateIt != state.sourceStateByClip.end()
+				? sourceStateIt->second.replacement
+				: state.replacement;
 			if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
-			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
 			const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
 			const bool standaloneNeedsSample = state.standaloneSpecialIdle &&
 				state.lastStandaloneSampleFrame != currentFrame &&
@@ -9439,7 +9555,14 @@ namespace
 
 		auto& state = *statePtr;
 		auto* filterPtr = state.filter;
-		auto* replacement = state.replacement;
+		bool isSourceClip = state.sourceClips.count(a_this) > 0;
+		const auto sourceStateIt = isSourceClip
+			? state.sourceStateByClip.find(a_this)
+			: state.sourceStateByClip.end();
+		auto* sourceState = sourceStateIt != state.sourceStateByClip.end()
+			? &sourceStateIt->second
+			: nullptr;
+		auto* replacement = sourceState ? sourceState->replacement : state.replacement;
 		if (!filterPtr || !filterPtr->enabled || !replacement) return;
 
 
@@ -9458,7 +9581,7 @@ namespace
 		const bool standaloneSampler = state.standaloneSpecialIdle &&
 			state.lastStandaloneSampleFrame != currentFrame &&
 			(poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f;
-		bool isSourceClip = (state.sourceClips.count(a_this) > 0) || standaloneSampler;
+		isSourceClip = isSourceClip || standaloneSampler;
 
 		// End Clip If Shorter + end-driven fade: the fading alpha must only
 		// apply to NON-source clips. On the incoming state's clips, fading the
@@ -9530,10 +9653,15 @@ namespace
 			// this weapon's animation set. A Leaf Matching donor sampled under
 			// another weapon's clip through the host mapping put wrong tracks
 			// on wrong bones (the MCX glitch, 2026-08-16).
-			const int16_t* donorMap =
-				state.donorTrackToBone.empty() ? nullptr : state.donorTrackToBone.data();
-			const int32_t donorMapSize = static_cast<int32_t>(state.donorTrackToBone.size());
-			const bool donorIdentity = state.donorMapIdentity;
+			const auto& donorTrackToBone = sourceState
+				? sourceState->donorTrackToBone
+				: state.donorTrackToBone;
+			const int16_t* donorMap = donorTrackToBone.empty()
+				? nullptr : donorTrackToBone.data();
+			const int32_t donorMapSize = static_cast<int32_t>(donorTrackToBone.size());
+			const bool donorIdentity = sourceState
+				? sourceState->donorMapIdentity
+				: state.donorMapIdentity;
 
 			static int s_pathLog = 0;
 			if (s_pathLog < 6) {
@@ -9556,8 +9684,20 @@ namespace
 				float localTime = state.standaloneSpecialIdle ?
 					std::max(0.0f, nowSec - state.standaloneStartSec) : a_this->GetLocalTime();
 				float repDuration = repAnim->duration;
-				const bool loopingSource = !state.standaloneSpecialIdle &&
+				const float sourceDuration = (animSlot && *animSlot) ? (*animSlot)->duration : 0.0f;
+				const bool graphLoopingSource = !state.standaloneSpecialIdle &&
 					(a_this->mode == RE::MODE_LOOPING);
+				const auto sourceSuffix = sourceState ? sourceState->suffix : state.suffix;
+				const bool configuredLoopingSource = !state.standaloneSpecialIdle &&
+					MatchesLoopSourcePrefix(sourceSuffix, filterPtr->loopSourcePrefixes);
+				const bool loopingSource = graphLoopingSource || configuredLoopingSource;
+				if (configuredLoopingSource && !graphLoopingSource && sourceState) {
+					static std::atomic<int> s_configuredLoopLog{ 0 };
+					if (s_configuredLoopLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+						logger::info("[OAR-TrackFilter] Configured source loop: suffix='{}' sourceMode={} donorDuration={:.3f}s",
+							sourceSuffix, static_cast<int>(a_this->mode), repDuration);
+					}
+				}
 
 				if (filterPtr->sampleFrame >= 0.0f) {
 					// Fixed-frame sampling: hold the override pose at one authored
@@ -9580,11 +9720,53 @@ namespace
 					}
 				} else if (repDuration > 0.001f) {
 					if (loopingSource) {
-						// Looping source (sprint, walk overlays): wrap the clip's
-						// localTime to the replacement's duration so different-length
-						// replacements cycle correctly.
-						localTime = std::fmod(localTime, repDuration);
-						if (localTime < 0.f) localTime += repDuration;
+						if (graphLoopingSource && sourceDuration > 0.001f) {
+							// Preserve native source phase when source and donor durations
+							// differ. Raw seconds would shift the donor phase on every
+							// source wrap.
+							float sourcePhase = std::fmod(localTime, sourceDuration) / sourceDuration;
+							if (sourcePhase < 0.0f) sourcePhase += 1.0f;
+							localTime = sourcePhase * repDuration;
+						} else if (configuredLoopingSource && sourceState) {
+							// Explicit loopSourcePrefixes are an opt-in to continuous
+							// donor playback. Locomotion leaves can be SINGLE_PLAY or
+							// USER_CONTROLLED and rewind localTime without deactivating
+							// the generator. Advance once per graph frame so a rewind
+							// cannot restart the donor at frame zero.
+							if (sourceState->loopLastFrame != currentFrame) {
+								if (sourceState->loopLastFrame == UINT64_MAX) {
+									sourceState->loopPlaybackTime = std::max(0.0f, localTime);
+								} else {
+									float delta = localTime - sourceState->loopLastSourceTime;
+									const float wallDelta = sourceState->loopLastClockSec >= 0.0f
+										? std::clamp(nowSec - sourceState->loopLastClockSec, 0.0f, 0.1f)
+										: 0.0f;
+									// A rewind, stall, or large jump means the graph is not
+									// exposing a usable continuous clock. Keep the donor moving
+									// from the active generator's wall-clock elapsed time.
+									if (delta < 0.0f || delta > 0.1f || delta < 1.0e-5f) {
+										delta = wallDelta;
+									}
+									sourceState->loopPlaybackTime += std::max(0.0f, delta);
+								}
+								sourceState->loopLastSourceTime = localTime;
+								sourceState->loopLastClockSec = nowSec;
+								sourceState->loopLastFrame = currentFrame;
+							}
+							localTime = std::fmod(sourceState->loopPlaybackTime, repDuration);
+							if (localTime < 0.0f) localTime += repDuration;
+							if (sourceState->loopLastDiagSec < 0.0f ||
+								nowSec - sourceState->loopLastDiagSec >= 0.5f) {
+								logger::info("[OAR-TrackFilter] Loop clock: suffix='{}' mode={} sourceTime={:.3f} sourceDuration={:.3f} donorTime={:.3f} donorDuration={:.3f} frame={}",
+									sourceSuffix, static_cast<int>(a_this->mode),
+									sourceState->loopLastSourceTime, sourceDuration,
+									localTime, repDuration, currentFrame);
+								sourceState->loopLastDiagSec = nowSec;
+							}
+						} else {
+							localTime = std::fmod(localTime, repDuration);
+							if (localTime < 0.f) localTime += repDuration;
+						}
 					} else if (state.standaloneSpecialIdle) {
 						// No graph clip owns this playback. The intercepted PlayIdle
 						// request supplied the start time and the donor runs once.
@@ -10665,6 +10847,7 @@ namespace
 						// keep the persistent-overlay semantics and are untouched.
 						bool oneShotEnd = false;
 						if (filterPtr && filterPtr->sampleFrame < 0.0f &&
+							state.loopSourceClips.empty() &&
 							!state.blendingOut && !condFalse) {
 							if (state.oneShotDone || state.earlyBlendOutArmed) {
 								oneShotEnd = true;
