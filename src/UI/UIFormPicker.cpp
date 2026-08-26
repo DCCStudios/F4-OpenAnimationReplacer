@@ -48,6 +48,20 @@ namespace UIFormPicker
 		RE::ENUM_FORM_ID a_formType,
 		bool& a_dirty)
 	{
+		std::vector<RE::ENUM_FORM_ID> types;
+		if (static_cast<uint8_t>(a_formType) != static_cast<uint8_t>(RE::ENUM_FORM_ID::kNONE)) {
+			types.push_back(a_formType);
+		}
+		return DrawFormPicker(a_label, a_pluginName, a_localFormID, types, a_dirty);
+	}
+
+	bool DrawFormPicker(
+		const char* a_label,
+		std::string& a_pluginName,
+		uint32_t& a_localFormID,
+		const std::vector<RE::ENUM_FORM_ID>& a_formTypes,
+		bool& a_dirty)
+	{
 		bool changed = false;
 		auto* registry = FormRegistry::GetSingleton();
 		auto plugins = registry->GetLoadedPlugins();
@@ -74,9 +88,23 @@ namespace UIFormPicker
 			}
 		}
 
-		// Form dropdown (only if plugin is selected and form type is valid)
-		if (!a_pluginName.empty() && static_cast<uint8_t>(a_formType) != static_cast<uint8_t>(RE::ENUM_FORM_ID::kNONE)) {
-			auto& forms = registry->GetFormsForPlugin(a_pluginName, a_formType);
+		// Form dropdown (only if plugin is selected and form types are given)
+		if (!a_pluginName.empty() && !a_formTypes.empty()) {
+			auto& forms = registry->GetFormsForPluginMulti(a_pluginName, a_formTypes);
+
+			if (forms.empty()) {
+				// Never hide the dropdown silently — an empty list looked like
+				// the feature was missing (IsForm on a plugin with no
+				// enumerable references, 2026-08-25). Show why it is empty;
+				// the manual fields to the right still accept typed IDs.
+				ImGui::SameLine();
+				ImGui::SetNextItemWidth(300);
+				if (ImGui::BeginCombo("Form", "(no forms of this type in plugin)")) {
+					ImGui::TextDisabled("Nothing of the relevant type found here.");
+					ImGui::TextDisabled("Type the form ID manually on the right.");
+					ImGui::EndCombo();
+				}
+			}
 
 			if (!forms.empty()) {
 				std::vector<std::string> displayStrings;
