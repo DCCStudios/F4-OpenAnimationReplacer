@@ -66,6 +66,17 @@ void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty, RE::ENUM
 	}
 }
 
+void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty, const std::vector<RE::ENUM_FORM_ID>& a_formTypeHints)
+{
+	if (UIFormPicker::DrawFormPicker(a_label, pluginName, localFormID, a_formTypeHints, a_dirty)) {
+		ResolveForm();
+	}
+	ImGui::SameLine();
+	if (ImGui::SmallButton(std::format("Resolve##{}", a_label).c_str())) {
+		ResolveForm();
+	}
+}
+
 // ===== NumericComponent =====
 
 float NumericComponent::GetValue(RE::TESObjectREFR* a_refr) const
@@ -2273,7 +2284,7 @@ std::string InventoryCountCondition::GetParameterString() const
 
 void InventoryCountCondition::DrawEditWidgets(bool& a_dirty)
 {
-	itemForm.DrawEditWidgets("Item", a_dirty);
+	itemForm.DrawEditWidgets("Item", a_dirty, kItemFormTypes);
 	int compIdx = static_cast<int>(comparison);
 	const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
 	ImGui::SetNextItemWidth(60);

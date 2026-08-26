@@ -261,12 +261,21 @@ struct CharTrackFilterState {
 	std::unordered_map<std::string, RE::hkQsTransformRaw> cachedBaseByName;
 	bool cacheValid = false;
 
-	// Track-filtered Camera motion is transferred as a delta from the donor's
-	// frame-zero Camera pose, never as an absolute local transform.  Keeping the
-	// reference in the per-filter state avoids an extra full donor sample every
-	// frame while still resetting cleanly when the served donor changes.
-	std::unordered_map<int32_t, RE::hkQsTransformRaw> cameraDonorReferenceByTrack;
+	// Track-filtered Camera motion is transferred as a model-space delta from the
+	// donor's frame-zero pose, never as a portable absolute local transform. Keep
+	// the complete frame-zero sample because reconstructing the Camera model
+	// transform requires every animated ancestor in its skeleton chain.
+	std::vector<RE::hkQsTransformRaw> cameraDonorFrameZeroTracks;
 	std::unordered_set<int32_t> invalidCameraReferenceTracks;
+	// The Generate hook samples Camera with the rest of the donor, but it never
+	// writes Camera back into Havok's output pose. Instead it publishes the
+	// weighted local delta for the current PlayerCharacter::UpdateAnimation pass.
+	// The post-animation hook consumes that delta on the actual first-person
+	// Camera scene node, after the graph has finished evaluating.
+	float pendingCameraTranslationDelta[3]{ 0.0f, 0.0f, 0.0f };
+	float pendingCameraRotationDelta[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
+	uint64_t pendingCameraEvaluation = 0;
+	bool pendingCameraValid = false;
 
 	// Frozen-bone locals, captured from the SOURCE clip's own pose on the
 	// first sample of each play (so the freeze starts exactly where the
@@ -359,6 +368,27 @@ static std::shared_mutex s_trackFilterMutex;
 // was "not new", so blendAlpha stayed at the previous filter's value).
 static std::unordered_map<RE::TESObjectREFR*, std::vector<CharTrackFilterState>> s_charTrackFilterMap;
 static std::atomic<int> s_trackFilterActiveCount{ 0 };
+
+// A monotonically increasing token identifies one PlayerCharacter animation
+// evaluation. Generate hooks reached from that evaluation publish Camera
+// deltas with this token, so the post-animation scene-node hook cannot replay a
+// stale sample when a filter stops generating or a graph is rebuilt.
+static std::atomic<uint64_t> s_cameraEvaluationSerial{ 0 };
+static std::atomic<uint64_t> s_activeCameraEvaluation{ 0 };
+
+struct AppliedTrackFilterCamera
+{
+	RE::NiAVObject* root = nullptr;
+	RE::NiAVObject* node = nullptr;
+	RE::NiTransform base = RE::NiTransform::IDENTITY;
+	RE::NiTransform applied = RE::NiTransform::IDENTITY;
+	bool valid = false;
+};
+
+// PlayerCharacter::UpdateAnimation runs on the game thread. This state is only
+// touched immediately before and after that call, so it deliberately does not
+// need a second lock alongside s_trackFilterMutex.
+static AppliedTrackFilterCamera s_appliedTrackFilterCamera;
 
 // Find the state for a specific filter on an actor. Returns nullptr if absent.
 // Caller must hold s_trackFilterMutex (shared or unique).
@@ -672,6 +702,47 @@ static bool IsFiniteQs(const RE::hkQsTransformRaw& a_transform)
 		}
 	}
 	return true;
+}
+
+static bool HasUsableRotation(const RE::hkQsTransformRaw& a_transform)
+{
+	const float lengthSquared = QuatDot(a_transform.rotation, a_transform.rotation);
+	return std::isfinite(lengthSquared) && lengthSquared > 1e-8f;
+}
+
+static RE::NiMatrix3 CameraQuatToMatrix(const float a_quaternion[4])
+{
+	float q[4] = {
+		a_quaternion[0], a_quaternion[1], a_quaternion[2], a_quaternion[3]
+	};
+	NormalizeQuat(q);
+
+	const float x = q[0];
+	const float y = q[1];
+	const float z = q[2];
+	const float w = q[3];
+	return RE::NiMatrix3(
+		1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w), 0.0f,
+		2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w), 0.0f,
+		2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y), 0.0f);
+}
+
+static bool CameraTransformNear(const RE::NiTransform& a_left, const RE::NiTransform& a_right)
+{
+	constexpr float kTranslationEpsilon = 1e-4f;
+	constexpr float kRotationEpsilon = 1e-5f;
+	constexpr float kScaleEpsilon = 1e-5f;
+	for (std::size_t row = 0; row < 3; ++row) {
+		for (std::size_t column = 0; column < 3; ++column) {
+			if (std::abs(a_left.rotate[row][column] - a_right.rotate[row][column]) > kRotationEpsilon) {
+				return false;
+			}
+		}
+	}
+	return std::abs(a_left.translate.x - a_right.translate.x) <= kTranslationEpsilon &&
+		std::abs(a_left.translate.y - a_right.translate.y) <= kTranslationEpsilon &&
+		std::abs(a_left.translate.z - a_right.translate.z) <= kTranslationEpsilon &&
+		std::abs(a_left.scale - a_right.scale) <= kScaleEpsilon;
 }
 
 static void QuatMul(const float a[4], const float b[4], float out[4])
@@ -3049,6 +3120,41 @@ namespace
 	};
 	static_assert(sizeof(BSTArrayHeaderRaw) == 16);
 
+	// SEH-guarded bounded C-string copy. Returns the copied length, or -1 if
+	// the source memory faulted mid-read. Its own function because __try
+	// cannot share a frame with objects that need C++ unwinding.
+	static int SafeCopyCString(const char* a_src, char* a_dst, size_t a_cap) noexcept
+	{
+		__try {
+			size_t i = 0;
+			for (; i + 1 < a_cap; i++) {
+				const char c = a_src[i];
+				a_dst[i] = c;
+				if (c == '\0') return static_cast<int>(i);
+			}
+			a_dst[a_cap - 1] = '\0';
+			return static_cast<int>(a_cap - 1);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return -1;
+		}
+	}
+
+	// Only path-shaped strings are useful to the reverse map: its one consumer
+	// extracts an animation suffix from a real .hkx path. The engine array
+	// holds stale entries whose animFile points at freed or reused memory --
+	// the 2026-08-23 16:52 session captured binary junk and a stray hkb
+	// expression string ("Decel = cond(...)") in this map -- so anything that
+	// does not read as printable ASCII ending in .hkx is dropped, not trusted.
+	static bool LooksLikeAnimPath(const char* a_str, int a_len)
+	{
+		if (a_len < 5 || a_len >= 260) return false;
+		for (int i = 0; i < a_len; i++) {
+			const auto c = static_cast<unsigned char>(a_str[i]);
+			if (c < 0x20 || c > 0x7E) return false;
+		}
+		return _stricmp(a_str + a_len - 4, ".hkx") == 0;
+	}
+
 	static void BuildIdleAnimReverseMap()
 	{
 		if (s_idleAnimReverseBuilt.load()) return;
@@ -3085,35 +3191,68 @@ namespace
 			return;
 		}
 
+		// One builder at a time; losers skip rather than queue. The map is a
+		// best-effort resolution source with three fallbacks, so "not this
+		// frame" is fine -- and skipping means no thread ever waits here.
+		static std::atomic<bool> s_building{ false };
+		bool buildExpected = false;
+		if (!s_building.compare_exchange_strong(buildExpected, true)) return;
+
+		// Every engine-memory read below runs with NO lock held, behind an
+		// SEH-guarded bounded copy. The 2026-08-23 16:52 hang: a stale
+		// animFile string AV'd while this loop held the unique_lock; the
+		// outer SEH wrapper (SafeCallOriginalUpdate) swallowed the fault
+		// WITHOUT running the lock's destructor -- that is how __except
+		// unwinds under /EHsc -- so s_idleAnimReverseMutex stayed locked
+		// forever and the next BuildIdleAnimReverseMap call deadlocked the
+		// main thread against the abandoned lock. The lock now guards only
+		// the swap-in of a fully built list; nothing inside it can fault.
 		auto* entries = reinterpret_cast<LoadedIdleAnimDataRaw*>(arrHeader->data);
+		std::vector<std::pair<RE::hkbClipGenerator*, std::string>> collected;
+		collected.reserve(arrHeader->size);
 		int captured = 0;
 		int skipped = 0;
+		char fileNameBuffer[512];
+		for (uint32_t i = 0; i < arrHeader->size; i++) {
+			auto& e = entries[i];
+			// The array carries stale rows (a clipGenerator of 0xFFFFFFFF was
+			// captured in the field), so the clip pointer gets the same
+			// plausibility test as the string pointer.
+			const auto rawClipPtr = reinterpret_cast<uintptr_t>(e.clipGenerator);
+			if (rawClipPtr < 0x10000 || rawClipPtr > 0x7FFFFFFFFFFFull) continue;
+
+			// BSFixedString stores a pointer at offset 0; validate before calling c_str()
+			auto rawStrPtr = *reinterpret_cast<const uintptr_t*>(&e.animFile);
+			if (rawStrPtr == 0 || rawStrPtr < 0x10000 || rawStrPtr > 0x7FFFFFFFFFFFull) {
+				skipped++;
+				continue;
+			}
+			if (IsBadReadPtr(reinterpret_cast<void*>(rawStrPtr), 8)) {
+				skipped++;
+				continue;
+			}
+
+			const char* fileName = e.animFile.c_str();
+			if (!fileName || reinterpret_cast<uintptr_t>(fileName) < 0x10000) continue;
+			const int len = SafeCopyCString(fileName, fileNameBuffer, sizeof(fileNameBuffer));
+			if (len <= 0 || !LooksLikeAnimPath(fileNameBuffer, len)) {
+				skipped++;
+				continue;
+			}
+			collected.emplace_back(
+				reinterpret_cast<RE::hkbClipGenerator*>(e.clipGenerator),
+				std::string(fileNameBuffer, static_cast<size_t>(len)));
+			captured++;
+		}
 		{
 			std::unique_lock lock(s_idleAnimReverseMutex);
-			for (uint32_t i = 0; i < arrHeader->size; i++) {
-				auto& e = entries[i];
-				if (!e.clipGenerator) continue;
-
-				// BSFixedString stores a pointer at offset 0; validate before calling c_str()
-				auto rawStrPtr = *reinterpret_cast<const uintptr_t*>(&e.animFile);
-				if (rawStrPtr == 0 || rawStrPtr < 0x10000 || rawStrPtr > 0x7FFFFFFFFFFFull) {
-					skipped++;
-					continue;
-				}
-				if (IsBadReadPtr(reinterpret_cast<void*>(rawStrPtr), 8)) {
-					skipped++;
-					continue;
-				}
-
-				const char* fileName = e.animFile.c_str();
-				if (!fileName || reinterpret_cast<uintptr_t>(fileName) < 0x10000 || !fileName[0]) continue;
-				auto* clipGen = reinterpret_cast<RE::hkbClipGenerator*>(e.clipGenerator);
-				s_idleAnimReverseMap[clipGen] = std::string(fileName);
-				captured++;
+			for (auto& [clipGen, name] : collected) {
+				s_idleAnimReverseMap[clipGen] = std::move(name);
 			}
 		}
 
 		s_idleAnimReverseBuilt.store(true);
+		s_building.store(false);
 		logger::info("[OAR-IdleAnim] Built reverse map: {} entries ({} skipped) from {} total",
 			captured, skipped, arrHeader->size);
 
@@ -5534,7 +5673,7 @@ namespace
 			state->cachedRepByName.clear();
 			state->cachedBaseByName.clear();
 			state->cacheValid = false;
-			state->cameraDonorReferenceByTrack.clear();
+			state->cameraDonorFrameZeroTracks.clear();
 			state->invalidCameraReferenceTracks.clear();
 			state->frozenByName.clear();
 			state->lastSourceTimeSec = nowSec;
@@ -7836,7 +7975,7 @@ namespace
 						state.donorTrackToBone.clear();
 						state.donorMapIdentity = false;
 						state.donorMapQueried = true;
-						state.cameraDonorReferenceByTrack.clear();
+						state.cameraDonorFrameZeroTracks.clear();
 						state.invalidCameraReferenceTracks.clear();
 						AnimationCache::GetSingleton()->GetDonorTrackMap(
 							cacheSuffix, winningInfo->parentSubMod,
@@ -9517,8 +9656,36 @@ namespace
 						const bool stalled = state.lastAdvanceSec > 0.0f &&
 							nowSec - state.lastAdvanceSec > kOneShotStallSeconds;
 
+						// OVERRIDE CONTRACT: the donor must look IDENTICAL no
+						// matter which weapon's clip hosts the play. Host clips
+						// differ per weapon in playback speed, start offset, and
+						// park point, and every one of those used to shape the
+						// donor through the host's localTime. In Override mode
+						// the donor therefore runs on OAR's own clock from the
+						// play's first sample — the same self-advance clock that
+						// already takes over when a source parks — and the host
+						// clip only starts, restarts (localTime regression
+						// above), and ends the state (starvation/deactivation).
+						// The restart paths reset selfAdvanceStartSec to -1,
+						// which lands here as "restart the override clock".
+						// Additive mode keeps host time (its deltas belong to
+						// the host animation); looping sources keep loop sync
+						// (cycle-authored overlays must track the host cycle);
+						// fixed-frame sampling never reaches this branch.
+						if (mode == SubMod::TrackFilter::Mode::Override &&
+							state.selfAdvanceStartSec < 0.0f) {
+							state.selfAdvanceStartSec = nowSec;
+							state.selfAdvanceBaseTime = 0.0f;
+							static std::atomic<int> s_ovClockLog{ 0 };
+							if (s_ovClockLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+								logger::info("[OAR-TrackFilter] Override clock started for '{}' (host t={:.3f} ignored from here on)",
+									state.suffix, localTime);
+							}
+						}
+
 						if (state.selfAdvanceStartSec >= 0.0f) {
-							// Source is parked; donor continues on its own clock.
+							// Donor on its own clock (Override contract, or a
+							// parked source in Additive mode).
 							localTime = state.selfAdvanceBaseTime + (nowSec - state.selfAdvanceStartSec);
 						}
 
@@ -9638,9 +9805,13 @@ namespace
 				bool doAnchor = filterPtr->modelSpaceAnchor &&
 					mode == SubMod::TrackFilter::Mode::Override &&
 					filterPtr->sampleFrame < 0.0f;
+				const bool needsCameraModelSpace = std::ranges::any_of(
+					cr.nameAndIndex, [](const auto& a_entry) {
+						return IsTrackFilterCameraBone(a_entry.first);
+					});
 				const int16_t* skelParents = nullptr;
 				int32_t skelBoneCount = 0;
-				if (doAnchor) {
+				if (doAnchor || needsCameraModelSpace) {
 					if (auto* setup = character->setup._ptr) {
 						if (auto* skel = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr)) {
 							auto* parentArr = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_parentIndices);
@@ -9677,27 +9848,36 @@ namespace
 					return (boneIdx < numTracksToSample) ? static_cast<int32_t>(boneIdx) : -1;
 				};
 
-				// Model transform = compose locals root→bone. Donor version uses the
-				// sampled donor tracks (falling back to the current pose for bones
-				// the donor doesn't track — arm chains are fully covered in practice);
-				// current version uses this generator's output pose.
-				auto modelTransform = [&](int16_t boneIdx, bool a_useDonor, RE::hkQsTransformRaw& outXf) {
+				// Model transform = compose locals root to bone. Donor versions use the
+				// supplied sample and fall back to the same live native locals for
+				// untracked ancestors. Using that identical fallback for frame zero and
+				// the current donor frame keeps native ancestor motion out of the donor
+				// delta while retaining a complete chain.
+				auto modelTransform = [&](int16_t boneIdx,
+					const std::vector<RE::hkQsTransformRaw>* a_donorTracks,
+					RE::hkQsTransformRaw& outXf) -> bool {
+					if (!skelParents || boneIdx < 0 || boneIdx >= skelBoneCount) return false;
 					int16_t chain[64];
 					int n = 0;
 					for (int16_t b = boneIdx; b >= 0 && b < skelBoneCount && n < 64; b = skelParents[b])
 						chain[n++] = b;
+					if (n == 0 || (n == 64 && skelParents[chain[n - 1]] >= 0)) return false;
 					RE::hkQsTransformRaw acc = MakeIdentityQs();
 					for (int i = n - 1; i >= 0; --i) {
 						const int16_t b = chain[i];
 						const RE::hkQsTransformRaw* l = nullptr;
-						if (a_useDonor) {
+						if (a_donorTracks) {
 							const int32_t trk = donorTrackFor(b);
-							if (trk >= 0) l = &tl_sampledTracks[trk];
+							if (trk >= 0 && trk < static_cast<int32_t>(a_donorTracks->size())) {
+								l = &(*a_donorTracks)[trk];
+							}
 						}
 						if (!l && b < numOutputBones) l = &outputPose[b];
-						if (l) ComposeQs(acc, *l, acc);
+						if (!l || !IsFiniteQs(*l)) return false;
+						ComposeQs(acc, *l, acc);
 					}
 					outXf = acc;
+					return IsFiniteQs(outXf);
 				};
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
@@ -9718,31 +9898,31 @@ namespace
 					RE::hkQsTransformRaw repVal = tl_sampledTracks[trackIdx];
 					RE::hkQsTransformRaw baseVal = outputPose[idx];
 
-					// Camera is not a portable absolute local pose across weapon
-					// graphs. Preserve the donor's authored motion by transferring its
-					// delta from frame zero onto this frame's live native Camera pose.
-					// This remains source-only: non-source paths deliberately ignore
-					// Camera so the delta is neither duplicated nor left behind.
+					// Camera locals are not portable across weapon graphs because the
+					// live and donor parent bases can differ. Reconstruct the donor motion
+					// in character model space, convert it into a weighted delta relative
+					// to this frame's native Camera local, and publish that delta for the
+					// post-animation scene-node hook. Never write Camera into outputPose:
+					// doing so lets a malformed Camera track enter Havok's blend tree,
+					// which is the path associated with the white-screen session failure.
 					if (isCameraBone) {
-						auto cameraRefIt = state.cameraDonorReferenceByTrack.find(trackIdx);
-						if (cameraRefIt == state.cameraDonorReferenceByTrack.end() &&
+						if (state.cameraDonorFrameZeroTracks.empty() &&
 							!state.invalidCameraReferenceTracks.count(trackIdx)) {
-							thread_local std::vector<RE::hkQsTransformRaw> tl_cameraReferenceTracks;
 							thread_local std::vector<float> tl_cameraReferenceFloats;
-							tl_cameraReferenceTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
+							state.cameraDonorFrameZeroTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
 							tl_cameraReferenceFloats.assign(
 								std::max(1, repAnim->numberOfFloatTracks), 0.0f);
 							repAnim->SampleTracks(
-								0.0f, tl_cameraReferenceTracks.data(), tl_cameraReferenceFloats.data());
-							const auto& reference = tl_cameraReferenceTracks[trackIdx];
+								0.0f, state.cameraDonorFrameZeroTracks.data(), tl_cameraReferenceFloats.data());
+							const auto& reference = state.cameraDonorFrameZeroTracks[trackIdx];
 
 							if (IsFiniteQs(reference)) {
-								cameraRefIt = state.cameraDonorReferenceByTrack.emplace(trackIdx, reference).first;
 								logger::info(
-									"[OAR-TrackFilter-Camera] Relative camera active for '{}' "
-									"(bone={}, track={}, donor frame-zero reference captured)",
+									"[OAR-TrackFilter-Camera] Model-space camera active for '{}' "
+									"(bone={}, track={}, donor frame-zero tracks captured)",
 									state.suffix, idx, trackIdx);
 							} else {
+								state.cameraDonorFrameZeroTracks.clear();
 								state.invalidCameraReferenceTracks.insert(trackIdx);
 								logger::warn(
 									"[OAR-TrackFilter-Camera] Invalid donor frame-zero Camera for '{}' - "
@@ -9756,18 +9936,111 @@ namespace
 						state.cachedRepByName.erase(name);
 						state.cachedBaseByName.erase(name);
 
-						if (cameraRefIt != state.cameraDonorReferenceByTrack.end() &&
-							IsFiniteQs(repVal) && IsFiniteQs(baseVal)) {
-							if (weight > 0.001f) {
-								BlendAdditiveTransform(
-									outputPose[idx], cameraRefIt->second, repVal, weight);
-							}
-							// During blend-out, including the terminal alpha-zero frame,
-							// explicitly publish the live native Camera local. This closes
-							// the last-frame hole where the scalar fade reached zero without
-							// a final Camera mask update.
-							if (weight > 0.001f || state.blendingOut || state.dormant) {
-								SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+						const uint64_t cameraEvaluation =
+							s_activeCameraEvaluation.load(std::memory_order_acquire);
+						const bool firstPersonPlayerSample =
+							cameraEvaluation != 0 &&
+							actor == RE::PlayerCharacter::GetSingleton() &&
+							GetPlayingClipPerspective(a_this) == OARClipPerspective::kFirstPerson;
+
+						if (firstPersonPlayerSample && !state.cameraDonorFrameZeroTracks.empty() &&
+							IsFiniteQs(repVal) && IsFiniteQs(baseVal) && skelParents && idx < skelBoneCount) {
+							RE::hkQsTransformRaw donorReferenceModel;
+							RE::hkQsTransformRaw donorCurrentModel;
+							RE::hkQsTransformRaw nativeCameraModel;
+							const int16_t parentIdx = skelParents[idx];
+							RE::hkQsTransformRaw nativeParentModel = MakeIdentityQs();
+							const bool haveModels =
+								modelTransform(idx, &state.cameraDonorFrameZeroTracks, donorReferenceModel) &&
+								modelTransform(idx, &tl_sampledTracks, donorCurrentModel) &&
+								modelTransform(idx, nullptr, nativeCameraModel) &&
+								(parentIdx < 0 || modelTransform(parentIdx, nullptr, nativeParentModel)) &&
+								HasUsableRotation(donorReferenceModel) &&
+								HasUsableRotation(donorCurrentModel) &&
+								HasUsableRotation(nativeCameraModel) &&
+								HasUsableRotation(nativeParentModel);
+
+							if (haveModels && weight > 0.001f) {
+								// InverseQuat and InverseQs use conjugates, so normalize the
+								// composed rotations before calculating either inverse. A
+								// degenerate sampled quaternion becomes identity instead of
+								// propagating non-finite values into the render pose.
+								NormalizeQuat(donorReferenceModel.rotation);
+								NormalizeQuat(donorCurrentModel.rotation);
+								NormalizeQuat(nativeCameraModel.rotation);
+								NormalizeQuat(nativeParentModel.rotation);
+								RE::hkQsTransformRaw targetModel = nativeCameraModel;
+								for (int axis = 0; axis < 3; ++axis) {
+									targetModel.translation[axis] +=
+										(donorCurrentModel.translation[axis] - donorReferenceModel.translation[axis]) * weight;
+								}
+
+								float inverseReference[4];
+								InverseQuat(donorReferenceModel.rotation, inverseReference);
+								float donorModelDelta[4];
+								MultiplyQuat(donorCurrentModel.rotation, inverseReference, donorModelDelta);
+								NormalizeQuat(donorModelDelta);
+								static constexpr float kIdentityQuat[4] = { 0.f, 0.f, 0.f, 1.f };
+								float weightedModelDelta[4];
+								SlerpQuat(kIdentityQuat, donorModelDelta, weight, weightedModelDelta);
+								MultiplyQuat(weightedModelDelta, nativeCameraModel.rotation, targetModel.rotation);
+								NormalizeQuat(targetModel.rotation);
+
+								RE::hkQsTransformRaw inverseNativeParent;
+								RE::hkQsTransformRaw targetLocal;
+								InverseQs(nativeParentModel, inverseNativeParent);
+								ComposeQs(inverseNativeParent, targetModel, targetLocal);
+								// Camera animation should not introduce scale. Retain the
+								// live graph's local scale exactly.
+								for (int axis = 0; axis < 4; ++axis) {
+									targetLocal.scale[axis] = baseVal.scale[axis];
+								}
+								if (IsFiniteQs(targetLocal) && HasUsableRotation(baseVal) &&
+									HasUsableRotation(targetLocal)) {
+									float inverseBaseRotation[4];
+									InverseQuat(baseVal.rotation, inverseBaseRotation);
+									MultiplyQuat(targetLocal.rotation, inverseBaseRotation,
+										state.pendingCameraRotationDelta);
+									NormalizeQuat(state.pendingCameraRotationDelta);
+									for (int axis = 0; axis < 3; ++axis) {
+										state.pendingCameraTranslationDelta[axis] =
+											targetLocal.translation[axis] - baseVal.translation[axis];
+									}
+									state.pendingCameraEvaluation = cameraEvaluation;
+									state.pendingCameraValid = true;
+									static std::atomic<uint32_t> s_cameraModelDiagCount{ 0 };
+									const uint32_t diagIndex = s_cameraModelDiagCount.fetch_add(1);
+									if (diagIndex < 12) {
+										logger::info(
+											"[OAR-TrackFilter-Camera] Published post-eval delta '{}' "
+											"modelDT=({:.3f},{:.3f},{:.3f}) localDT=({:.3f},{:.3f},{:.3f}) "
+											"evaluation={} weight={:.3f}",
+											state.suffix,
+											donorCurrentModel.translation[0] - donorReferenceModel.translation[0],
+											donorCurrentModel.translation[1] - donorReferenceModel.translation[1],
+											donorCurrentModel.translation[2] - donorReferenceModel.translation[2],
+											state.pendingCameraTranslationDelta[0],
+											state.pendingCameraTranslationDelta[1],
+											state.pendingCameraTranslationDelta[2],
+											cameraEvaluation, weight);
+									}
+								} else {
+									static std::atomic<bool> s_invalidCameraModelWarned{ false };
+									if (!s_invalidCameraModelWarned.exchange(true)) {
+										logger::warn(
+											"[OAR-TrackFilter-Camera] Model-space result for '{}' was invalid; "
+											"leaving Camera native",
+											state.suffix);
+									}
+								}
+							} else if (!haveModels) {
+								static std::atomic<bool> s_cameraChainWarned{ false };
+								if (!s_cameraChainWarned.exchange(true)) {
+									logger::warn(
+										"[OAR-TrackFilter-Camera] Could not reconstruct the Camera model-space chain "
+										"for '{}'; leaving Camera native",
+										state.suffix);
+								}
 							}
 						}
 						continue;
@@ -9780,13 +10053,13 @@ namespace
 						const int16_t par = skelParents[idx];
 						if (par < 0 || !tl_filteredSet.count(par)) {
 							RE::hkQsTransformRaw donorM, parentM;
-							modelTransform(idx, /*useDonor=*/true, donorM);
-							if (par >= 0) {
-								modelTransform(par, /*useDonor=*/false, parentM);
-								InverseQs(parentM, parentM);
-								ComposeQs(parentM, donorM, repVal);
-							} else {
-								repVal = donorM;
+							if (modelTransform(idx, &tl_sampledTracks, donorM)) {
+								if (par >= 0 && modelTransform(par, nullptr, parentM)) {
+									InverseQs(parentM, parentM);
+									ComposeQs(parentM, donorM, repVal);
+								} else if (par < 0) {
+									repVal = donorM;
+								}
 							}
 						}
 					}
@@ -11567,6 +11840,138 @@ namespace Hooks
 		}
 	}
 
+	namespace TrackFilterCameraHooks
+	{
+		static bool IsFirstPersonCamera()
+		{
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			if (!camera || !camera->currentState) return false;
+			const auto id = camera->currentState->id;
+			return id == RE::CameraStates::kFirstPerson || id == RE::CameraStates::kIronSights;
+		}
+
+		static RE::NiAVObject* FindCameraNode(RE::PlayerCharacter* a_player, RE::NiAVObject*& a_root)
+		{
+			a_root = a_player ? a_player->Get3D(true) : nullptr;
+			if (!a_root) return nullptr;
+			return a_root->GetObjectByName(RE::BSFixedString("Camera"));
+		}
+
+		static void RestorePreviousContribution(RE::PlayerCharacter* a_player)
+		{
+			if (!s_appliedTrackFilterCamera.valid) return;
+
+			RE::NiAVObject* root = nullptr;
+			auto* node = FindCameraNode(a_player, root);
+			if (root == s_appliedTrackFilterCamera.root &&
+				node == s_appliedTrackFilterCamera.node &&
+				CameraTransformNear(node->local, s_appliedTrackFilterCamera.applied)) {
+				node->local = s_appliedTrackFilterCamera.base;
+			} else {
+				// Another camera plugin or a skeleton rebuild changed the node after
+				// OAR. Do not overwrite that newer state. The engine's animation update
+				// that follows normally regenerates the Camera local from the graph.
+				static std::atomic<uint32_t> s_restoreSkippedLogCount{ 0 };
+				if (s_restoreSkippedLogCount.fetch_add(1, std::memory_order_relaxed) < 8) {
+					logger::info(
+						"[OAR-TrackFilter-Camera] Previous scene-node contribution was already "
+						"changed; skipping restoration before animation evaluation");
+				}
+			}
+			s_appliedTrackFilterCamera = {};
+		}
+
+		static void ApplyCurrentContribution(RE::PlayerCharacter* a_player, uint64_t a_evaluation)
+		{
+			if (!a_player || !IsFirstPersonCamera()) return;
+
+			struct CameraDelta
+			{
+				float translation[3];
+				float rotation[4];
+			};
+			std::vector<CameraDelta> deltas;
+			{
+				std::shared_lock lock(s_trackFilterMutex);
+				auto statesIt = s_charTrackFilterMap.find(a_player);
+				if (statesIt == s_charTrackFilterMap.end()) return;
+				for (const auto& state : statesIt->second) {
+					if (!state.pendingCameraValid ||
+						state.pendingCameraEvaluation != a_evaluation) {
+						continue;
+					}
+					CameraDelta delta{};
+					std::copy_n(state.pendingCameraTranslationDelta, 3, delta.translation);
+					std::copy_n(state.pendingCameraRotationDelta, 4, delta.rotation);
+					deltas.push_back(delta);
+				}
+			}
+			if (deltas.empty()) return;
+
+			RE::NiAVObject* root = nullptr;
+			auto* node = FindCameraNode(a_player, root);
+			if (!node || !root) {
+				static std::atomic<bool> s_missingCameraWarned{ false };
+				if (!s_missingCameraWarned.exchange(true)) {
+					logger::warn(
+						"[OAR-TrackFilter-Camera] First-person Camera scene node was not found; "
+						"sampled Camera motion was not applied");
+				}
+				return;
+			}
+
+			s_appliedTrackFilterCamera.root = root;
+			s_appliedTrackFilterCamera.node = node;
+			s_appliedTrackFilterCamera.base = node->local;
+			for (const auto& delta : deltas) {
+				node->local.translate.x += delta.translation[0];
+				node->local.translate.y += delta.translation[1];
+				node->local.translate.z += delta.translation[2];
+				node->local.rotate = CameraQuatToMatrix(delta.rotation) * node->local.rotate;
+			}
+			s_appliedTrackFilterCamera.applied = node->local;
+			s_appliedTrackFilterCamera.valid = true;
+
+			static std::atomic<uint32_t> s_sceneApplyLogCount{ 0 };
+			if (s_sceneApplyLogCount.fetch_add(1, std::memory_order_relaxed) < 12) {
+				logger::info(
+					"[OAR-TrackFilter-Camera] Applied {} sampled delta(s) to the post-eval "
+					"first-person Camera scene node (evaluation={})",
+					deltas.size(), a_evaluation);
+			}
+		}
+
+		struct PlayerUpdateAnimationHook
+		{
+			static void Thunk(RE::PlayerCharacter* a_player, float a_delta)
+			{
+				RestorePreviousContribution(a_player);
+				const uint64_t evaluation =
+					s_cameraEvaluationSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+				s_activeCameraEvaluation.store(evaluation, std::memory_order_release);
+				Original(a_player, a_delta);
+				s_activeCameraEvaluation.store(0, std::memory_order_release);
+				ApplyCurrentContribution(a_player, evaluation);
+			}
+
+			static void Install()
+			{
+				REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE::PlayerCharacter[0] };
+				Original = vtable.write_vfunc(0x9F, Thunk);
+				logger::info(
+					"[OAR-TrackFilter-Camera] PlayerCharacter::UpdateAnimation vfunc 0x9F "
+					"hook installed (post-evaluation scene-node mode)");
+			}
+
+			inline static REL::Relocation<decltype(Thunk)> Original;
+		};
+
+		void Install()
+		{
+			PlayerUpdateAnimationHook::Install();
+		}
+	}
+
 	void Install()
 	{
 		ClipGeneratorHooks::Install();
@@ -11580,6 +11985,7 @@ namespace Hooks
 		AnimGraphEventFeedHook::Install();
 		PlayerFireEmptyHook::Install(REL::GetTrampoline());
 		AutoReloadSuppression::Install();
+		TrackFilterCameraHooks::Install();
 		logger::info("[OAR] All hooks installed");
 	}
 

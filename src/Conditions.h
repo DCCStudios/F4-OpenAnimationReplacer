@@ -13,6 +13,16 @@ struct FormComponent
 	void ResolveForm();
 	std::string GetDisplayString() const;
 	void DrawEditWidgets(const char* a_label, bool& a_dirty, RE::ENUM_FORM_ID a_formTypeHint = RE::ENUM_FORM_ID::kNONE);
+	// Multi-type hint: dropdown lists the union of the given form types.
+	void DrawEditWidgets(const char* a_label, bool& a_dirty, const std::vector<RE::ENUM_FORM_ID>& a_formTypeHints);
+};
+
+// The "an item" type set for inventory/worn-style conditions: anything an
+// actor commonly carries or wears.
+inline const std::vector<RE::ENUM_FORM_ID> kItemFormTypes{
+	RE::ENUM_FORM_ID::kWEAP, RE::ENUM_FORM_ID::kARMO, RE::ENUM_FORM_ID::kAMMO,
+	RE::ENUM_FORM_ID::kALCH, RE::ENUM_FORM_ID::kMISC, RE::ENUM_FORM_ID::kBOOK,
+	RE::ENUM_FORM_ID::kNOTE, RE::ENUM_FORM_ID::kKEYM
 };
 
 struct NumericComponent
@@ -37,7 +47,9 @@ public:
 	std::string GetName() const override { return "IsForm"; }
 	std::string GetDescription() const override { return "Checks if the reference matches a specific form. Use plugin name + local form ID."; }
 	std::string GetParameterString() const override { return form.GetDisplayString(); }
-	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Form", a_dirty); }
+	// kACHR: this condition matches REFERENCE FormIDs; the registry serves the
+	// Player entry (the overwhelmingly common target) plus any enumerable refs.
+	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Form", a_dirty, RE::ENUM_FORM_ID::kACHR); }
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
 	void InitializeImpl(const nlohmann::json& a_json) override;
@@ -1239,7 +1251,7 @@ public:
 	std::string GetName() const override { return "IsWorn"; }
 	std::string GetDescription() const override { return "True if a specific item form is currently equipped/worn by the actor. Checks all equipped slots."; }
 	std::string GetParameterString() const override { return form.GetDisplayString(); }
-	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Item", a_dirty); }
+	void DrawEditWidgets(bool& a_dirty) override { form.DrawEditWidgets("Item", a_dirty, kItemFormTypes); }
 protected:
 	bool EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const override;
 	void InitializeImpl(const nlohmann::json& a_json) override;

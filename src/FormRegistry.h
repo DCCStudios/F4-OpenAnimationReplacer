@@ -23,6 +23,11 @@ public:
 
 	std::vector<std::string> GetLoadedPlugins();
 	const std::vector<FormEntry>& GetFormsForPlugin(const std::string& a_pluginName, RE::ENUM_FORM_ID a_formType);
+	// Merged, sorted union of several form types from one plugin (item-style
+	// conditions where the "relevant type" is a set: weapons, armor, ammo...).
+	// Cached per (plugin, type set) like the single-type variant.
+	const std::vector<FormEntry>& GetFormsForPluginMulti(const std::string& a_pluginName,
+		const std::vector<RE::ENUM_FORM_ID>& a_formTypes);
 	void InvalidateCache();
 
 private:
@@ -41,6 +46,8 @@ private:
 
 	mutable std::shared_mutex cacheMutex;
 	std::unordered_map<CacheKey, std::vector<FormEntry>, CacheKeyHash> formCache;
+	// Multi-type cache: key = plugin + '\x01' + one byte per type (sorted).
+	std::unordered_map<std::string, std::vector<FormEntry>> multiFormCache;
 
 	mutable std::shared_mutex pluginMutex;
 	std::vector<std::string> cachedPlugins;
