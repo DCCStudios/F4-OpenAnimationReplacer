@@ -645,13 +645,6 @@ namespace Parsing
 		if (json.contains("replaceOnLoop")) a_subMod->SetReplaceOnLoop(json["replaceOnLoop"].get<bool>());
 		if (json.contains("replaceOnEcho")) a_subMod->SetReplaceOnEcho(json["replaceOnEcho"].get<bool>());
 		if (json.contains("replaceAnnotations")) a_subMod->SetReplaceAnnotations(json["replaceAnnotations"].get<bool>());
-		if (json.contains("trackFilter") && json["trackFilter"].is_object()) {
-			const auto& tf = json["trackFilter"];
-			if (tf.contains("loopSourcePrefixes") && tf["loopSourcePrefixes"].is_array()) {
-				a_subMod->trackFilter.loopSourcePrefixes =
-					tf["loopSourcePrefixes"].get<std::vector<std::string>>();
-			}
-		}
 		if (json.contains("suppressAnnotations")) {
 			const auto& sa = json["suppressAnnotations"];
 			if (sa.is_boolean()) {

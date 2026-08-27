@@ -260,6 +260,22 @@ struct TrackFilterSourceState {
 	float loopLastClockSec = -1.0f;
 	uint64_t loopLastFrame = UINT64_MAX;
 	float loopLastDiagSec = -1.0f;
+	// Playback lifecycle belongs to this source generator as well. Keeping
+	// these fields in the actor-level filter lets an idle/locomotion sibling
+	// reset or finish the other source's donor.
+	float lastSampleSec = 0.0f;
+	float lastSampledLocalTime = -1.0f;
+	float lastAdvanceSec = 0.0f;
+	float selfAdvanceStartSec = -1.0f;
+	float selfAdvanceBaseTime = 0.0f;
+	bool earlyBlendOutArmed = false;
+	bool oneShotDone = false;
+	bool sampleStarved = false;
+	// Camera reference samples are donor-specific for the same reason as the
+	// track map. A shared frame-zero buffer lets a concurrent source reuse the
+	// previous donor's camera basis.
+	std::vector<RE::hkQsTransformRaw> cameraDonorFrameZeroTracks;
+	std::unordered_set<int32_t> invalidCameraReferenceTracks;
 };
 
 struct CharTrackFilterState {
@@ -435,17 +451,30 @@ static CharTrackFilterState* FindTrackFilterState(RE::TESObjectREFR* a_actor, co
 static bool MatchesLoopSourcePrefix(std::string_view a_suffix,
 	const std::vector<std::string>& a_prefixes)
 {
+	// A multi-match suffix is represented as "multi:<leaf>" by the normal
+	// replacement resolver. The loop rule is defined on the same leaf for both
+	// single and multi-match sources.
+	if (a_suffix.size() >= 6 &&
+		std::equal(a_suffix.begin(), a_suffix.begin() + 6, "multi:",
+			[](char a_lhs, char a_rhs) {
+				return std::tolower(static_cast<unsigned char>(a_lhs)) ==
+					std::tolower(static_cast<unsigned char>(a_rhs));
+			})) {
+		a_suffix.remove_prefix(6);
+	}
 	const auto slash = a_suffix.find_last_of("\\/");
 	const auto leafStart = slash == std::string_view::npos ? 0 : slash + 1;
-	std::string leaf(a_suffix.substr(leafStart));
-	std::transform(leaf.begin(), leaf.end(), leaf.begin(),
-		[](unsigned char a_char) { return static_cast<char>(std::tolower(a_char)); });
+	const auto leaf = a_suffix.substr(leafStart);
 
 	for (const auto& prefix : a_prefixes) {
-		std::string folded(prefix);
-		std::transform(folded.begin(), folded.end(), folded.begin(),
-			[](unsigned char a_char) { return static_cast<char>(std::tolower(a_char)); });
-		if (!folded.empty() && leaf.starts_with(folded)) return true;
+		if (prefix.empty() || prefix.size() > leaf.size()) continue;
+		if (std::equal(prefix.begin(), prefix.end(), leaf.begin(),
+			[](char a_lhs, char a_rhs) {
+				return std::tolower(static_cast<unsigned char>(a_lhs)) ==
+					std::tolower(static_cast<unsigned char>(a_rhs));
+			})) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -8032,13 +8061,24 @@ namespace
 						sourceState.loopLastClockSec = -1.0f;
 						sourceState.loopLastFrame = UINT64_MAX;
 						sourceState.loopLastDiagSec = -1.0f;
+						sourceState.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
+						sourceState.lastSampledLocalTime = -1.0f;
+						sourceState.lastAdvanceSec = sourceState.lastSampleSec;
+						sourceState.selfAdvanceStartSec = -1.0f;
+						sourceState.selfAdvanceBaseTime = 0.0f;
+						sourceState.earlyBlendOutArmed = false;
+						sourceState.oneShotDone = false;
+						sourceState.sampleStarved = false;
+						sourceState.cameraDonorFrameZeroTracks.clear();
+						sourceState.invalidCameraReferenceTracks.clear();
 						sourceState.donorTrackToBone.clear();
 						sourceState.donorMapIdentity = false;
 						sourceState.donorMapQueried = true;
 						AnimationCache::GetSingleton()->GetDonorTrackMap(
 							cacheSuffix, winningInfo->parentSubMod,
 							sourceState.donorTrackToBone, sourceState.donorMapIdentity);
-					state.invalidCameraReferenceTracks.clear();
+						state.cameraDonorFrameZeroTracks.clear();
+						state.invalidCameraReferenceTracks.clear();
 					}
 					sourceState.replacement = replacement;
 					sourceState.suffix = cacheSuffix;
@@ -8055,9 +8095,9 @@ namespace
 					state.suffix = cacheSuffix;
 					state.lastSourceTimeSec = s_tfNowSec.load(std::memory_order_relaxed);
 
-					// A configured loop source must not inherit completion state from
-					// a previous one-shot source that reused this TrackFilter state.
-					const bool hadConfiguredLoopingSource = !state.loopSourceClips.empty();
+					// A configured loop source must not inherit a filter-level fade from
+					// a previous one-shot source. Per-source completion flags are reset
+					// above, while blendAlpha remains filter-level by design.
 					const bool configuredLoopingSource =
 						MatchesLoopSourcePrefix(cacheSuffix, filterKey->loopSourcePrefixes);
 					if (configuredLoopingSource) {
@@ -8066,22 +8106,11 @@ namespace
 						state.loopSourceClips.erase(a_this);
 					}
 					const bool staleOneShotState = configuredLoopingSource &&
-						!hadConfiguredLoopingSource &&
-						(state.blendingOut || state.dormant || state.oneShotDone ||
-							state.earlyBlendOutArmed || state.sampleStarved ||
-							state.selfAdvanceStartSec >= 0.0f);
+						(state.blendingOut || state.dormant);
 					if (staleOneShotState) {
 						const bool wasBlendingOut = state.blendingOut || state.dormant;
 						state.blendingOut = false;
 						state.dormant = false;
-						state.oneShotDone = false;
-						state.earlyBlendOutArmed = false;
-						state.sampleStarved = false;
-						state.selfAdvanceStartSec = -1.0f;
-						state.selfAdvanceBaseTime = 0.0f;
-						state.lastSampledLocalTime = -1.0f;
-						state.lastSampleSec = state.lastSourceTimeSec;
-						state.lastAdvanceSec = state.lastSourceTimeSec;
 						if (wasBlendingOut) {
 							const float blendIn = filterKey->blendInTime;
 							state.blendDuration = blendIn;
@@ -8139,18 +8168,19 @@ namespace
 							// An armed end-anchored fade counts as ended even before it
 							// reaches dormancy: re-throwing during the fade is a new
 							// play and must re-fire eventsOnStart.
-							const bool wasEnded = state.dormant || state.oneShotDone || state.earlyBlendOutArmed;
+							const bool wasEnded = state.dormant || sourceState.oneShotDone ||
+								sourceState.earlyBlendOutArmed;
 							state.blendingOut = false;
 							state.dormant = false;
-							state.oneShotDone = false;
-							state.sampleStarved = false;
+							sourceState.oneShotDone = false;
+							sourceState.sampleStarved = false;
 							state.frozenByName.clear();
-							state.lastSampledLocalTime = -1.0f;
-							state.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
-							state.lastAdvanceSec = state.lastSampleSec;
-							state.selfAdvanceStartSec = -1.0f;
-							state.selfAdvanceBaseTime = 0.0f;
-							state.earlyBlendOutArmed = false;
+							sourceState.lastSampledLocalTime = -1.0f;
+							sourceState.lastSampleSec = s_tfNowSec.load(std::memory_order_relaxed);
+							sourceState.lastAdvanceSec = sourceState.lastSampleSec;
+							sourceState.selfAdvanceStartSec = -1.0f;
+							sourceState.selfAdvanceBaseTime = 0.0f;
+							sourceState.earlyBlendOutArmed = false;
 							// Blend in from the CURRENT alpha (0 if dormant) rather than
 							// snapping, so cancelling a half-done blend-out doesn't pop.
 							float blendIn = winningInfo->parentSubMod->trackFilter.blendInTime;
@@ -9593,7 +9623,8 @@ namespace
 		// Condition-driven fades (conditions failed mid-play, clip continues)
 		// keep fading the source too — there the original is the right target.
 		if (isSourceClip && state.parentSubMod && state.parentSubMod->GetEndClipIfShorter() &&
-			(state.earlyBlendOutArmed || state.oneShotDone)) {
+			(sourceState ? (sourceState->earlyBlendOutArmed || sourceState->oneShotDone) :
+				(state.earlyBlendOutArmed || state.oneShotDone))) {
 			weight = filterPtr->weight;
 		}
 		// Source clips must proceed even at zero weight: dormant one-shot states
@@ -9632,6 +9663,21 @@ namespace
 
 			RE::hkaAnimation* repAnim = replacement;
 			if (!repAnim) return;
+			// Source timing is owned by the source generator. The fallback state
+			// remains for standalone special-idle playback, which has no generator
+			// entry of its own.
+			auto& lastSampleSec = sourceState ? sourceState->lastSampleSec : state.lastSampleSec;
+			auto& lastSampledLocalTime = sourceState ? sourceState->lastSampledLocalTime : state.lastSampledLocalTime;
+			auto& lastAdvanceSec = sourceState ? sourceState->lastAdvanceSec : state.lastAdvanceSec;
+			auto& selfAdvanceStartSec = sourceState ? sourceState->selfAdvanceStartSec : state.selfAdvanceStartSec;
+			auto& selfAdvanceBaseTime = sourceState ? sourceState->selfAdvanceBaseTime : state.selfAdvanceBaseTime;
+			auto& earlyBlendOutArmed = sourceState ? sourceState->earlyBlendOutArmed : state.earlyBlendOutArmed;
+			auto& oneShotDone = sourceState ? sourceState->oneShotDone : state.oneShotDone;
+			auto& sampleStarved = sourceState ? sourceState->sampleStarved : state.sampleStarved;
+			auto& cameraDonorFrameZeroTracks = sourceState
+				? sourceState->cameraDonorFrameZeroTracks : state.cameraDonorFrameZeroTracks;
+			auto& invalidCameraReferenceTracks = sourceState
+				? sourceState->invalidCameraReferenceTracks : state.invalidCameraReferenceTracks;
 
 			const auto* trackToBoneArr = GetTrackToBoneIndices(a_this);
 			const bool haveMapping =
@@ -9712,11 +9758,11 @@ namespace
 					if (state.standaloneSpecialIdle && repDuration > 0.001f) {
 						const float elapsed = std::max(0.0f, nowSec - state.standaloneStartSec);
 						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
-							!state.earlyBlendOutArmed &&
+							!earlyBlendOutArmed &&
 							elapsed >= repDuration - filterPtr->blendOutTime) {
-							state.earlyBlendOutArmed = true;
+							earlyBlendOutArmed = true;
 						}
-						if (elapsed >= repDuration) state.oneShotDone = true;
+						if (elapsed >= repDuration) oneShotDone = true;
 					}
 				} else if (repDuration > 0.001f) {
 					if (loopingSource) {
@@ -9755,8 +9801,9 @@ namespace
 							}
 							localTime = std::fmod(sourceState->loopPlaybackTime, repDuration);
 							if (localTime < 0.0f) localTime += repDuration;
-							if (sourceState->loopLastDiagSec < 0.0f ||
-								nowSec - sourceState->loopLastDiagSec >= 0.5f) {
+							if (Settings::GetSingleton()->bVerboseLogging &&
+								(sourceState->loopLastDiagSec < 0.0f ||
+								nowSec - sourceState->loopLastDiagSec >= 0.5f)) {
 								logger::info("[OAR-TrackFilter] Loop clock: suffix='{}' mode={} sourceTime={:.3f} sourceDuration={:.3f} donorTime={:.3f} donorDuration={:.3f} frame={}",
 									sourceSuffix, static_cast<int>(a_this->mode),
 									sourceState->loopLastSourceTime, sourceDuration,
@@ -9770,35 +9817,35 @@ namespace
 					} else if (state.standaloneSpecialIdle) {
 						// No graph clip owns this playback. The intercepted PlayIdle
 						// request supplied the start time and the donor runs once.
-						state.lastAdvanceSec = nowSec;
-						state.lastSampledLocalTime = localTime;
+						lastAdvanceSec = nowSec;
+						lastSampledLocalTime = localTime;
 						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
-							!state.earlyBlendOutArmed &&
+							!earlyBlendOutArmed &&
 							localTime >= repDuration - filterPtr->blendOutTime) {
-							state.earlyBlendOutArmed = true;
+							earlyBlendOutArmed = true;
 						}
 						if (localTime >= repDuration) {
 							localTime = repDuration;
-							state.oneShotDone = true;
+							oneShotDone = true;
 						}
 					} else {
 						// ---- One-shot source (SINGLE_PLAY clip) ----
 						// Restart detection first: localTime moving backward means the
 						// engine restarted this generator for a new play. Re-arm a
 						// finished/dormant overlay and blend back in.
-						if (state.lastSampledLocalTime >= 0.0f &&
-							localTime + 0.05f < state.lastSampledLocalTime) {
+						if (lastSampledLocalTime >= 0.0f &&
+							localTime + 0.05f < lastSampledLocalTime) {
 							// An armed end-anchored fade counts as ended even before it
 							// reaches dormancy: re-throwing during the fade is a new
 							// play and must re-fire eventsOnStart.
-							const bool wasEnded = state.dormant || state.oneShotDone || state.earlyBlendOutArmed;
-							state.oneShotDone = false;
-							state.sampleStarved = false;
+							const bool wasEnded = state.dormant || oneShotDone || earlyBlendOutArmed;
+							oneShotDone = false;
+							sampleStarved = false;
 							state.frozenByName.clear();
-							state.lastAdvanceSec = nowSec;
-							state.selfAdvanceStartSec = -1.0f;
-							state.selfAdvanceBaseTime = 0.0f;
-							state.earlyBlendOutArmed = false;
+							lastAdvanceSec = nowSec;
+							selfAdvanceStartSec = -1.0f;
+							selfAdvanceBaseTime = 0.0f;
+							earlyBlendOutArmed = false;
 							if (state.dormant || state.blendingOut) {
 								state.dormant = false;
 								state.blendingOut = false;
@@ -9815,10 +9862,10 @@ namespace
 								}
 							}
 						}
-						if (std::fabs(localTime - state.lastSampledLocalTime) > 1e-5f) {
-							state.lastAdvanceSec = nowSec;
+						if (std::fabs(localTime - lastSampledLocalTime) > 1e-5f) {
+							lastAdvanceSec = nowSec;
 						}
-						state.lastSampledLocalTime = localTime;
+						lastSampledLocalTime = localTime;
 
 						// One-shot end handling. The one-shot ends ONLY when the
 						// DONOR has played through (clamp, never wrap: a donor
@@ -9835,8 +9882,8 @@ namespace
 						// that, doing nothing froze the overlay on the parked frame.
 						const float srcDuration = (animSlot && *animSlot) ? (*animSlot)->duration : 0.0f;
 						const bool sourceDone = srcDuration > 0.02f && localTime >= srcDuration - 0.02f;
-						const bool stalled = state.lastAdvanceSec > 0.0f &&
-							nowSec - state.lastAdvanceSec > kOneShotStallSeconds;
+						const bool stalled = lastAdvanceSec > 0.0f &&
+							nowSec - lastAdvanceSec > kOneShotStallSeconds;
 
 						// OVERRIDE CONTRACT: the donor must look IDENTICAL no
 						// matter which weapon's clip hosts the play. Host clips
@@ -9855,9 +9902,9 @@ namespace
 						// (cycle-authored overlays must track the host cycle);
 						// fixed-frame sampling never reaches this branch.
 						if (mode == SubMod::TrackFilter::Mode::Override &&
-							state.selfAdvanceStartSec < 0.0f) {
-							state.selfAdvanceStartSec = nowSec;
-							state.selfAdvanceBaseTime = 0.0f;
+							selfAdvanceStartSec < 0.0f) {
+							selfAdvanceStartSec = nowSec;
+							selfAdvanceBaseTime = 0.0f;
 							static std::atomic<int> s_ovClockLog{ 0 };
 							if (s_ovClockLog.fetch_add(1, std::memory_order_relaxed) < 20) {
 								logger::info("[OAR-TrackFilter] Override clock started for '{}' (host t={:.3f} ignored from here on)",
@@ -9865,10 +9912,10 @@ namespace
 							}
 						}
 
-						if (state.selfAdvanceStartSec >= 0.0f) {
+						if (selfAdvanceStartSec >= 0.0f) {
 							// Donor on its own clock (Override contract, or a
 							// parked source in Additive mode).
-							localTime = state.selfAdvanceBaseTime + (nowSec - state.selfAdvanceStartSec);
+							localTime = selfAdvanceBaseTime + (nowSec - selfAdvanceStartSec);
 						}
 
 						// End-anchored blend-out (default): start the fade
@@ -9885,20 +9932,22 @@ namespace
 						// End instead keeps the donor at full weight to its end and
 						// fades during the engine's crossfade to the next state.
 						if (!filterPtr->blendOutAtEnd && filterPtr->blendOutTime > 0.0f &&
-							!state.earlyBlendOutArmed &&
+							!earlyBlendOutArmed &&
 							localTime >= repDuration - filterPtr->blendOutTime) {
-							state.earlyBlendOutArmed = true;
+							earlyBlendOutArmed = true;
 						}
 
 						const bool donorDone = localTime >= repDuration;
 						if (donorDone) {
 							localTime = repDuration;
-							state.oneShotDone = true;
-						} else if ((sourceDone || stalled) && state.selfAdvanceStartSec < 0.0f) {
-							state.selfAdvanceStartSec = nowSec;
-							state.selfAdvanceBaseTime = localTime;
-							logger::info("[OAR-TrackFilter] Source {} at t={:.3f} before donor end ({:.3f}s) for '{}' — donor self-advancing to completion",
-								sourceDone ? "finished" : "stalled", localTime, repDuration, state.suffix);
+							oneShotDone = true;
+						} else if ((sourceDone || stalled) && selfAdvanceStartSec < 0.0f) {
+							selfAdvanceStartSec = nowSec;
+							selfAdvanceBaseTime = localTime;
+							if (Settings::GetSingleton()->bVerboseLogging) {
+								logger::info("[OAR-TrackFilter] Source {} at t={:.3f} before donor end ({:.3f}s) for '{}' — donor self-advancing to completion",
+									sourceDone ? "finished" : "stalled", localTime, repDuration, state.suffix);
+							}
 						}
 					}
 				}
@@ -9908,9 +9957,9 @@ namespace
 				// (oneShotDone) stays dormant until the restart detection above
 				// sees the clip's localTime jump backward.
 				if (state.dormant) {
-					if (state.sampleStarved && !state.oneShotDone && !state.earlyBlendOutArmed) {
+					if (sampleStarved && !oneShotDone && !earlyBlendOutArmed) {
 						state.dormant = false;
-						state.sampleStarved = false;
+						sampleStarved = false;
 						state.blendingOut = false;
 						float blendIn = filterPtr->blendInTime;
 						state.blendDuration = blendIn;
@@ -9929,10 +9978,10 @@ namespace
 						}
 						return;
 					}
-				} else if (state.sampleStarved) {
+				} else if (sampleStarved) {
 					// Samples resumed during a starvation blend-out: cancel it and
 					// blend back in from the current alpha (no pop).
-					state.sampleStarved = false;
+					sampleStarved = false;
 					if (state.blendingOut) {
 						state.blendingOut = false;
 						float blendIn = filterPtr->blendInTime;
@@ -10088,15 +10137,15 @@ namespace
 					// doing so lets a malformed Camera track enter Havok's blend tree,
 					// which is the path associated with the white-screen session failure.
 					if (isCameraBone) {
-						if (state.cameraDonorFrameZeroTracks.empty() &&
-							!state.invalidCameraReferenceTracks.count(trackIdx)) {
+						if (cameraDonorFrameZeroTracks.empty() &&
+							!invalidCameraReferenceTracks.count(trackIdx)) {
 							thread_local std::vector<float> tl_cameraReferenceFloats;
-							state.cameraDonorFrameZeroTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
+							cameraDonorFrameZeroTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
 							tl_cameraReferenceFloats.assign(
 								std::max(1, repAnim->numberOfFloatTracks), 0.0f);
 							repAnim->SampleTracks(
-								0.0f, state.cameraDonorFrameZeroTracks.data(), tl_cameraReferenceFloats.data());
-							const auto& reference = state.cameraDonorFrameZeroTracks[trackIdx];
+								0.0f, cameraDonorFrameZeroTracks.data(), tl_cameraReferenceFloats.data());
+							const auto& reference = cameraDonorFrameZeroTracks[trackIdx];
 
 							if (IsFiniteQs(reference)) {
 								logger::info(
@@ -10104,8 +10153,8 @@ namespace
 									"(bone={}, track={}, donor frame-zero tracks captured)",
 									state.suffix, idx, trackIdx);
 							} else {
-								state.cameraDonorFrameZeroTracks.clear();
-								state.invalidCameraReferenceTracks.insert(trackIdx);
+								cameraDonorFrameZeroTracks.clear();
+								invalidCameraReferenceTracks.insert(trackIdx);
 								logger::warn(
 									"[OAR-TrackFilter-Camera] Invalid donor frame-zero Camera for '{}' - "
 									"leaving the native Camera untouched",
@@ -10125,7 +10174,7 @@ namespace
 							actor == RE::PlayerCharacter::GetSingleton() &&
 							GetPlayingClipPerspective(a_this) == OARClipPerspective::kFirstPerson;
 
-						if (firstPersonPlayerSample && !state.cameraDonorFrameZeroTracks.empty() &&
+						if (firstPersonPlayerSample && !cameraDonorFrameZeroTracks.empty() &&
 							IsFiniteQs(repVal) && IsFiniteQs(baseVal) && skelParents && idx < skelBoneCount) {
 							RE::hkQsTransformRaw donorReferenceModel;
 							RE::hkQsTransformRaw donorCurrentModel;
@@ -10133,7 +10182,7 @@ namespace
 							const int16_t parentIdx = skelParents[idx];
 							RE::hkQsTransformRaw nativeParentModel = MakeIdentityQs();
 							const bool haveModels =
-								modelTransform(idx, &state.cameraDonorFrameZeroTracks, donorReferenceModel) &&
+								modelTransform(idx, &cameraDonorFrameZeroTracks, donorReferenceModel) &&
 								modelTransform(idx, &tl_sampledTracks, donorCurrentModel) &&
 								modelTransform(idx, nullptr, nativeCameraModel) &&
 								(parentIdx < 0 || modelTransform(parentIdx, nullptr, nativeParentModel)) &&
@@ -10286,7 +10335,7 @@ namespace
 
 				state.cacheValid = true;
 				state.lastSourceTimeSec = nowSec;
-				state.lastSampleSec = nowSec;
+				lastSampleSec = nowSec;
 				if (state.standaloneSpecialIdle) {
 					state.lastStandaloneSampleFrame = currentFrame;
 				}
@@ -10776,6 +10825,23 @@ namespace
 						auto& state = *stIt;
 						auto* filterPtr = state.filter;
 						bool condFalse = conditionsFalse.count({ mapIt->first, filterPtr }) > 0;
+						TrackFilterSourceState* currentSourceState = nullptr;
+						if (state.sourceClip) {
+							auto sourceIt = state.sourceStateByClip.find(state.sourceClip);
+							if (sourceIt != state.sourceStateByClip.end()) {
+								currentSourceState = &sourceIt->second;
+							}
+						}
+						const bool currentSourceIsLoop = currentSourceState &&
+							state.loopSourceClips.count(state.sourceClip) > 0;
+						auto& currentOneShotDone = currentSourceState
+							? currentSourceState->oneShotDone : state.oneShotDone;
+						auto& currentEarlyBlendOutArmed = currentSourceState
+							? currentSourceState->earlyBlendOutArmed : state.earlyBlendOutArmed;
+						auto& currentSampleStarved = currentSourceState
+							? currentSourceState->sampleStarved : state.sampleStarved;
+						auto& currentLastSampleSec = currentSourceState
+							? currentSourceState->lastSampleSec : state.lastSampleSec;
 
 						// Dormant: applies nothing (alpha 0), kept while its source clip
 						// is alive so revival never goes through erase-and-recreate
@@ -10799,8 +10865,8 @@ namespace
 							//    the sampling path.
 							//  - condition-ended: conditions turning true again wake
 							//    it here (persistent-overlay semantics).
-							if (!condFalse && !state.oneShotDone && !state.earlyBlendOutArmed &&
-								!state.sampleStarved) {
+							if (!condFalse && !currentOneShotDone && !currentEarlyBlendOutArmed &&
+								!currentSampleStarved) {
 								state.dormant = false;
 								state.blendingOut = false;
 								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
@@ -10847,18 +10913,18 @@ namespace
 						// keep the persistent-overlay semantics and are untouched.
 						bool oneShotEnd = false;
 						if (filterPtr && filterPtr->sampleFrame < 0.0f &&
-							state.loopSourceClips.empty() &&
+							!currentSourceIsLoop &&
 							!state.blendingOut && !condFalse) {
-							if (state.oneShotDone || state.earlyBlendOutArmed) {
+							if (currentOneShotDone || currentEarlyBlendOutArmed) {
 								oneShotEnd = true;
-							} else if (state.lastSampleSec > 0.0f &&
-								nowSec - state.lastSampleSec > kOneShotSampleGraceSeconds) {
-								state.sampleStarved = true;
+							} else if (currentLastSampleSec > 0.0f &&
+								nowSec - currentLastSampleSec > kOneShotSampleGraceSeconds) {
+								currentSampleStarved = true;
 								oneShotEnd = true;
 							}
 						}
 
-						if (oneShotEnd) {
+						if (oneShotEnd && state.loopSourceClips.empty()) {
 							// No deactivation delay here — that setting is for
 							// condition-driven ends; a finished one-shot goes now.
 							state.deactivationDelayActive = false;
@@ -10875,8 +10941,8 @@ namespace
 							if (s_osLog < 10) {
 								logger::info("[OAR-TrackFilter] One-shot end for '{}' ({}) — blending out ({:.2f}s)",
 									state.suffix,
-									state.oneShotDone ? "donor completed"
-										: state.earlyBlendOutArmed ? "approaching donor end"
+									currentOneShotDone ? "donor completed"
+										: currentEarlyBlendOutArmed ? "approaching donor end"
 										: "source stopped sampling",
 									state.blendDuration);
 								s_osLog++;
@@ -10926,8 +10992,8 @@ namespace
 							// its end, clamped, and held that final pose through a fade
 							// that only started AFTER the animation was over. Exactly
 							// the symptom the feature was meant to remove.
-							if (state.blendingOut && !state.oneShotDone && !state.earlyBlendOutArmed &&
-								!state.sampleStarved) {
+							if (state.blendingOut && !currentOneShotDone && !currentEarlyBlendOutArmed &&
+								!currentSampleStarved) {
 								state.blendingOut = false;
 								float blendIn = filterPtr ? filterPtr->blendInTime : 0.0f;
 								state.blendDuration = blendIn;
