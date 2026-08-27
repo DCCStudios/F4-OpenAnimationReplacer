@@ -26,4 +26,3 @@ namespace OAR::BA2
 		std::unordered_set<std::string> seenPaths;
 	};
 }
-
