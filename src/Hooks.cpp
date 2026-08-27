@@ -309,6 +309,17 @@ struct CharTrackFilterState {
 	// fresh play/restart so a weapon switch re-captures the new grip.
 	std::unordered_map<std::string, RE::hkQsTransformRaw> frozenByName;
 
+	// nativeIdlePlayback entry/exit anchor: the 1P graph's FINAL composited
+	// pose (hkbCharacter::generatorOutput) snapshotted at idle start, i.e.
+	// the last pre-idle frame. This is the only correct blend-from/-to pose:
+	// no single clip's raw output equals the on-screen arm (the composite of
+	// base idle + aim additives), which is why every capture-and-convert
+	// attempt failed (forensic audit 2026-08-27). Same 123-bone
+	// hkQsTransformRaw local layout as every clip's output pose — no
+	// conversion of any kind.
+	std::vector<RE::hkQsTransformRaw> nativeAnchorPose;
+	bool nativeAnchorValid = false;
+
 	// Per-character bone-name → index resolution (rebuilt when filter version changes).
 	std::unordered_map<RE::hkbCharacter*, CharResolved> resolvedByChar;
 
@@ -5815,6 +5826,8 @@ namespace
 			state->cameraDonorFrameZeroTracks.clear();
 			state->invalidCameraReferenceTracks.clear();
 			state->frozenByName.clear();
+			state->nativeAnchorPose.clear();
+			state->nativeAnchorValid = false;
 			state->lastSourceTimeSec = nowSec;
 			state->lastSampleSec = 0.0f;
 			state->lastSampledLocalTime = -1.0f;
@@ -5907,13 +5920,96 @@ namespace
 						captured.size());
 				}
 			}
+
+			// Entry/exit ANCHOR (audit 2026-08-27): snapshot the 1P graph's
+			// FINAL composited pose — hkbCharacter::generatorOutput, which at
+			// this moment still holds the last pre-idle frame. This is the
+			// only correct blend-from/-to pose: the on-screen arm is a
+			// COMPOSITE of several clips (base idle + aim additives), so no
+			// single clip's raw output equals it — the defect behind every
+			// prior capture-and-convert attempt. Same hkQsTransformRaw local
+			// layout as every clip's output pose; zero conversion.
+			{
+				RE::hkbCharacter* anchorChar = nullptr;
+				RE::BSTSmartPointer<RE::BSAnimationGraphManager> anchorMgr;
+				if (a_actor->GetAnimationGraphManagerImpl(anchorMgr) && anchorMgr) {
+					const int32_t fpIdx = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+					const uint32_t gi =
+						(fpIdx >= 0 && static_cast<uint32_t>(fpIdx) < anchorMgr->graph.size())
+							? static_cast<uint32_t>(fpIdx)
+							: 0u;
+					if (gi < anchorMgr->graph.size() && anchorMgr->graph[gi]) {
+						anchorChar = &anchorMgr->graph[gi]->character;
+					}
+				}
+				std::vector<RE::hkQsTransformRaw> anchor;
+				bool anchorOk = false;
+				if (anchorChar && anchorChar->generatorOutput &&
+					!IsBadReadPtr(anchorChar->generatorOutput, sizeof(void*))) {
+					auto* goTracks = *reinterpret_cast<uint8_t**>(anchorChar->generatorOutput);
+					if (goTracks && !IsBadReadPtr(goTracks, sizeof(RE::TrackMasterHeaderRaw) + sizeof(RE::TrackHeaderRaw) * 2)) {
+						auto* goHeaders = reinterpret_cast<RE::TrackHeaderRaw*>(
+							goTracks + sizeof(RE::TrackMasterHeaderRaw));
+						auto& goPoseHdr = goHeaders[RE::kTrackIndex_Pose];
+						if (goPoseHdr.numData > 0 && goPoseHdr.numData <= 512 &&
+							goPoseHdr.dataOffset > 0) {
+							auto* goPose = reinterpret_cast<RE::hkQsTransformRaw*>(
+								goTracks + goPoseHdr.dataOffset);
+							anchor.assign(goPose, goPose + goPoseHdr.numData);
+							anchorOk = true;
+							for (auto& av : anchor) {
+								if (!IsFiniteQs(av)) {
+									anchorOk = false;
+									break;
+								}
+							}
+						}
+					}
+				}
+				if (anchorOk) {
+					{
+						std::unique_lock aLock(s_trackFilterMutex);
+						if (auto* aState = FindTrackFilterState(a_actor, filter)) {
+							aState->nativeAnchorPose = std::move(anchor);
+							aState->nativeAnchorValid = true;
+						}
+					}
+					// Probe (first gate before judging visuals): bone 26 =
+					// RArm_Hand must read the COMPOSITED ready value
+					// (~R(0.718,0.012,0.021,0.695) in the field logs), NOT a
+					// single clip's raw output (~R(0.630,-0.481,...)) and NOT
+					// a conjugate.
+					static std::atomic<int> s_anchorCapLog{ 0 };
+					if (s_anchorCapLog.fetch_add(1, std::memory_order_relaxed) < 12) {
+						std::shared_lock aReadLock(s_trackFilterMutex);
+						if (auto* aState = FindTrackFilterState(a_actor, filter);
+							aState && aState->nativeAnchorPose.size() > 28) {
+							const auto& ah = aState->nativeAnchorPose[26];
+							const auto& aw = aState->nativeAnchorPose[28];
+							logger::info("[OAR-TF-Anchor] Captured {}-bone final-pose anchor: RArm_Hand T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) | Weapon T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+								aState->nativeAnchorPose.size(),
+								ah.translation[0], ah.translation[1], ah.translation[2],
+								ah.rotation[0], ah.rotation[1], ah.rotation[2], ah.rotation[3],
+								aw.translation[0], aw.translation[1], aw.translation[2],
+								aw.rotation[0], aw.rotation[1], aw.rotation[2], aw.rotation[3]);
+						}
+					}
+				} else {
+					static std::atomic<int> s_anchorFailLog{ 0 };
+					if (s_anchorFailLog.fetch_add(1, std::memory_order_relaxed) < 8) {
+						logger::warn("[OAR-TF-Anchor] generatorOutput anchor unavailable (char={:X}) — entry/exit will not blend this play",
+							reinterpret_cast<uintptr_t>(anchorChar));
+					}
+				}
+			}
 		}
 
 		QueueCustomEvents(a_actor, subMod->eventsOnStart, "onStart/trackFilter-specialIdle");
 		logger::info(
-			"[OAR-TrackFilter-Standalone] Started '{}' for actor {:X}: idle='{}' donor='{}' duration={:.3f}s{}",
+			"[OAR-TrackFilter-Standalone] Started '{}' for actor {:X}: idle='{}' donor='{}' duration={:.3f}s blendIn={:.2f} blendOut={:.2f}{}",
 			subMod->GetName(), a_actor->GetFormID(), a_idle->animFileName.c_str(), match.suffix,
-			match.animation->duration, isNew ? "" : " (restarted)");
+			match.animation->duration, filter->blendInTime, filter->blendOutTime,
+			isNew ? "" : " (restarted)");
 		return true;
 	}
 
@@ -10787,6 +10883,27 @@ namespace
 					}
 				}
 
+				// Entry/exit crossfade against the ANCHOR (the last pre-idle
+				// FINAL composited pose — see nativeAnchorPose): blend the
+				// whole output toward it at (1 - blendAlpha). At alpha 1 this
+				// is a pure skip (raw donor plays); entry ramps 0->1 over
+				// blendInTime (ready -> donor, no snap); the end-anchored
+				// blend-out ramps 1->0 completing at the donor's end (donor ->
+				// ready), so the engine's exit departs from the ready pose.
+				// Runs BEFORE the frozen holds so the weapon set is re-pinned
+				// afterwards (anchor's weapon ~= held value anyway). Bones the
+				// donor doesn't move sit near the anchor already — near-no-op.
+				if (nativeIdleMode && state.nativeAnchorValid && applyToThisClip &&
+					static_cast<int16_t>(state.nativeAnchorPose.size()) == numOutputBones) {
+					const float backW = (1.0f - state.blendAlpha) * filterPtr->weight;
+					if (backW > 0.001f) {
+						for (int16_t abi = 0; abi < numOutputBones; ++abi) {
+							LerpTransform(outputPose[abi], state.nativeAnchorPose[abi], backW);
+							SetPoseBoneMaskBit(tracksPtr, poseHeader, abi);
+						}
+					}
+				}
+
 				// Frozen bones: neither the donor nor the native animation drives
 				// them. Capture the native local on the first sample of this play
 				// (outputPose still holds the source clip's own value here - the
@@ -11001,6 +11118,21 @@ namespace
 						BlendAdditiveTransform(outputPose[idx], bIt->second, rIt->second, weight);
 				}
 				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+			}
+
+			// Entry/exit anchor crossfade — swap-fallback twin of the direct
+			// source path's block (see nativeAnchorPose).
+			if (state2.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+				state2.nativeAnchorValid &&
+				static_cast<int16_t>(state2.nativeAnchorPose.size()) == numOutputBones &&
+				GetPlayingClipPerspectiveImpl(a_this) == OARClipPerspective::kFirstPerson) {
+				const float fbBackW = (1.0f - state2.blendAlpha) * filterPtr->weight;
+				if (fbBackW > 0.001f) {
+					for (int16_t fbi = 0; fbi < numOutputBones; ++fbi) {
+						LerpTransform(outputPose[fbi], state2.nativeAnchorPose[fbi], fbBackW);
+						SetPoseBoneMaskBit(tracksPtr, poseHeader, fbi);
+					}
+				}
 			}
 
 			// Frozen bones (see the direct path): capture from the restored base
