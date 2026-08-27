@@ -7289,10 +7289,8 @@ namespace
 			}
 		}
 
-		// Diagnostic: log unique suffixes only when verbose logging is enabled.
-		// This is not part of replacement selection and must not add a shared
-		// lock/hash lookup to every steady-state clip update.
-		if (Settings::GetSingleton()->bVerboseLogging) {
+		// Diagnostic: log unique suffixes
+		{
 			static std::unordered_set<std::string> s_loggedSuffixes;
 			static std::shared_mutex s_loggedSuffixMutex;
 			std::shared_lock slock(s_loggedSuffixMutex);
@@ -7611,13 +7609,9 @@ namespace
 		} else {
 			auto infoIt = s_suffixToInfos.find(suffix);
 			if (infoIt == s_suffixToInfos.end()) {
-				if (Settings::GetSingleton()->bVerboseLogging) {
-					static std::atomic<int> s_noMatchLogCount{ 0 };
-					const int logCount = s_noMatchLogCount.load(std::memory_order_relaxed);
-					if (logCount < 30 &&
-						s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
-						logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
-					}
+				static std::atomic<int> s_noMatchLogCount{ 0 };
+				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
+					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
 				return;
 			}
@@ -8013,7 +8007,7 @@ namespace
 			}
 		}
 
-		if (Settings::GetSingleton()->bVerboseLogging) {
+		{
 			static std::atomic<int> s_updateDiagCounter{ 0 };
 			int count = s_updateDiagCounter.fetch_add(1);
 			if (count < 5 || count % 3000 == 0) {
