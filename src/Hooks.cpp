@@ -10933,7 +10933,6 @@ namespace
 					for (auto stIt = states.begin(); stIt != states.end(); ) {
 						auto& state = *stIt;
 						auto* filterPtr = state.filter;
-<<<<<<< HEAD
 						bool condFalse = std::ranges::find(
 							conditionsFalse, std::pair{ mapIt->first, filterPtr }) != conditionsFalse.end();
 						TrackFilterSourceState* currentSourceState = nullptr;
