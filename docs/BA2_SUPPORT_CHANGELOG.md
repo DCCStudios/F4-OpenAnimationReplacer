@@ -4,7 +4,7 @@ This file records the review-cleanup scope for the generic BA2 support change. I
 
 ## 2026-08-27 review cleanup
 
-- `src/BA2Archive.cpp`: validate indexed HKX paths through Fallout's active resource manager, so disabled or unregistered plugin archives do not create dead entries. Sort the resulting index and expose prefix ranges for bounded submod scans.
+- `src/BA2Archive.cpp`: scan and index HKX names without calling Fallout's resource manager from OAR's background parser. Resource resolution is deferred until an indexed path is loaded as an actual replacement, avoiding a startup heap race while still honoring the game's active archive resolution. Sort the resulting index and expose prefix ranges for bounded submod scans.
 - `src/Parsing.cpp`: consume the sorted prefix range instead of scanning the full archive index for every submod.
 - `src/OpenAnimationReplacer.h` and `src/AnimationCache.*`: keep the Data-relative `resourcePath` as the archive identity used by resource loading and skeleton/perspective checks. Rebind unchanged loose or archive entries from metadata before reading the animation payload.
 - `src/Hooks.cpp`: make player-graph polling generation-safe and use the resource identity when deciding whether a replacement is valid for first- or third-person skeletons.

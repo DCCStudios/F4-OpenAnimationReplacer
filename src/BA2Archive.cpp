@@ -1,7 +1,5 @@
 #include "BA2Archive.h"
 
-#include "RE/B/BSResourceNiBinaryStream.h"
-
 #include <cctype>
 #include <cstring>
 
@@ -132,17 +130,12 @@ namespace OAR::BA2
 			if (!path.starts_with("meshes\\") || !path.ends_with(".hkx")) continue;
 			if (!seenPaths.insert(path).second) continue;
 
-			// The Data directory may contain archives belonging to disabled
-			// plugins. The running resource manager is the authoritative source
-			// for registration and precedence, so retain only paths that it can
-			// currently resolve. This also makes duplicate paths follow the game
-			// resource order rather than filesystem enumeration order.
-			RE::BSResourceNiBinaryStream resource(path.c_str(), false, nullptr, false);
-			if (!resource) {
-				seenPaths.erase(path);
-				continue;
-			}
-
+			// ParseAllMods runs on OAR's background loader. Do not call the game's
+			// resource manager here: during startup it is still registering BA2
+			// locations, and probing every indexed HKX from this worker can race
+			// that process and corrupt the game's heap. Resource resolution is
+			// deferred to AnimationCache::LoadAnimationResource, which only opens
+			// paths referenced by an actual OAR replacement.
 			entries.push_back({ std::move(path) });
 			++added;
 		}
