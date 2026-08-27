@@ -697,6 +697,10 @@ namespace RE
 
 	static constexpr uintptr_t kSkeletonOffset_parentIndices = 0x18;
 	static constexpr uintptr_t kSkeletonOffset_bones = 0x28;
+	// hkaSkeleton::m_referencePose (hkArray<hkQsTransform>) — the bind pose.
+	// Follows m_bones in the 2014 layout; consumers validate size ==
+	// parentIndices.size before trusting it.
+	static constexpr uintptr_t kSkeletonOffset_referencePose = 0x38;
 	static constexpr size_t kHkaBoneStride = 16;  // hkStringPtr(8) + lockTranslation(1) + pad(7)
 
 	// hkaAnimationBinding layout (verified from CommonLibSSE NG / Havok 2014):

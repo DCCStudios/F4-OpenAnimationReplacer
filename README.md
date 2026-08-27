@@ -564,6 +564,8 @@ flowchart TB
 | `override` | Replace bone transform with replacement |
 | `additive` | Add replacement on top of base pose |
 
+`trackFilter.nativeIdlePlayback` (with `triggerOnlySpecialIdle`): the engine's full-body idle plays natively, so the 3rd-person body performs the animation with its annotations, and the overlay applies only to first-person clips as raw replacement locals so the 1st-person arms mirror the motion. Use for 3rd-person-authored idles that must also read correctly in first person. Default off.
+
 Override timing guarantee: on one-shot plays the replacement runs on OAR's own clock from the moment the play starts, so it looks identical on the selected bones no matter which weapon's clip hosts it, how fast that clip plays, or where it parks. The host clip only starts, restarts, and ends the overlay. Additive mode follows the host animation's time (its deltas belong to that animation), and looping sources stay loop-synced in both modes so cycle-authored overlays track the host cycle. Fixed-frame sampling (`sampleFrame`) is time-independent already.
 
 ---
