@@ -136,6 +136,8 @@ namespace Parsing
 		if (!std::filesystem::exists(meshesPath)) {
 			logger::warn("[OAR] Meshes directory not found at '{}'", meshesPath.string());
 			oar->isLoading.store(false);
+			oar->loadingComplete.store(true);
+			oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kIdle);
 			return;
 		}
 

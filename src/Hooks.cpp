@@ -3750,6 +3750,27 @@ namespace
 	// reuse made it look like it worked.
 	static void PerformConfigReload()
 	{
+		auto* oar = OpenAnimationReplacer::GetSingleton();
+
+		// The reload is drained on the game thread, but the progress overlay is
+		// rendered independently. Always close the loading state, including when
+		// a reload step throws, so the progress window cannot retain stale input
+		// or cursor state after the main editor closes.
+		struct LoadingStateGuard
+		{
+			OpenAnimationReplacer* oar;
+			~LoadingStateGuard()
+			{
+				oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kIdle);
+				oar->isLoading.store(false);
+				oar->loadingComplete.store(true);
+			}
+		} loadingStateGuard{ oar };
+
+		oar->isLoading.store(true);
+		oar->loadingComplete.store(false);
+		oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kParsing);
+
 		// The startup load may still be running on its background thread (the
 		// reload job can be queued from the UI at the main menu). Re-parsing
 		// concurrently with it would race ClearAllMods against the parser —
@@ -3781,7 +3802,6 @@ namespace
 		}
 
 		// 3) Tear down and re-parse all mod configurations.
-		auto* oar = OpenAnimationReplacer::GetSingleton();
 		oar->ClearAllMods();
 		Parsing::ParseAllMods();
 

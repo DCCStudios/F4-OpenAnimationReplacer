@@ -404,6 +404,12 @@ Players can override author settings without editing `config.json`. The in-game 
 
 ### Plugin INI -- `Data/F4SE/Plugins/OpenAnimationReplacer.ini`
 
+This file is the mod-provided defaults layer. Settings changed from the OAR
+Settings page are saved to the separate
+`Data/F4SE/Plugins/OpenAnimationReplacer.user.ini` file and take precedence
+over these defaults. The user file is created at runtime and should not be
+included in a mod release package.
+
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | **General** | `bEnabled` | `1` | Master enable |
@@ -582,6 +588,28 @@ SubMod conditions use **AND** logic at the root. Use `OR` / `AND` / `XOR` nodes 
 | **Comparison** | `Level`, `CompareActorValue`, `Scale`, `FactionRank`, etc. |
 
 Full parameter reference: **[docs/QuickStart.md](docs/QuickStart.md)**.
+
+### Condition localization
+
+The built-in condition names, descriptions, stub reasons, and editor labels
+are translated through the selected locale without changing the condition IDs
+stored in JSON. The `condition` value remains the exact runtime registration
+name, so existing configs and third-party APIs remain compatible.
+
+Third-party conditions use the same string-key fallback: OAR displays the
+original name or description when no translation is present. A plugin author
+or translation add-on can provide an optional language extension pack at:
+
+```text
+Data/F4SE/Plugins/OpenAnimationReplacer/locales/<language>.d/<unique-name>.json
+```
+
+The file is a flat JSON object whose keys are the exact strings returned by
+`GetName()` and `GetDescription()`. OAR loads the base `<language>.json` first,
+then extension files in filename order; later entries override earlier ones.
+Use a unique filename per add-on and keep runtime IDs, JSON field names, and
+condition evaluation code untranslated. Missing or invalid extension entries
+fall back to the original source text.
 
 ### Example: reload when magazine not empty
 

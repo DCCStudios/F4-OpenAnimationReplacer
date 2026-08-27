@@ -24,6 +24,7 @@ private:
 	JobQueue() = default;
 	mutable std::mutex mutex;
 	std::queue<std::unique_ptr<IJob>> jobs;
+	std::atomic_bool pending{ false };
 };
 
 class SaveConfigJob : public IJob

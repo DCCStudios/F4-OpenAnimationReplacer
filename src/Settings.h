@@ -91,7 +91,11 @@ public:
 
 	bool  bVerboseLogging{ false };
 
+	// OpenAnimationReplacer.ini is the mod-provided default configuration. The
+	// settings page writes only the separate user overlay so a mod update or a
+	// mod-manager deployment does not overwrite the author's defaults.
 	static constexpr const char* kSettingsPath = "Data\\F4SE\\Plugins\\OpenAnimationReplacer.ini";
+	static constexpr const char* kUserSettingsPath = "Data\\F4SE\\Plugins\\OpenAnimationReplacer.user.ini";
 
 private:
 	Settings() = default;

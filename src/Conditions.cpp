@@ -4,6 +4,7 @@
 #include "OpenAnimationReplacer.h"
 #include <imgui.h>
 #include <numbers>
+#include "UI/Localization.h"
 #include "UI/UIFormPicker.h"
 #include "RE_Additions.h"
 
@@ -61,7 +62,8 @@ void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty, RE::ENUM
 		ResolveForm();
 	}
 	ImGui::SameLine();
-	if (ImGui::SmallButton(std::format("Resolve##{}", a_label).c_str())) {
+	const auto resolveLabel = std::format("Resolve##{}", a_label);
+	if (ImGui::SmallButton(UICommon::T(resolveLabel.c_str()))) {
 		ResolveForm();
 	}
 }
@@ -72,7 +74,8 @@ void FormComponent::DrawEditWidgets(const char* a_label, bool& a_dirty, const st
 		ResolveForm();
 	}
 	ImGui::SameLine();
-	if (ImGui::SmallButton(std::format("Resolve##{}", a_label).c_str())) {
+	const auto resolveLabel = std::format("Resolve##{}", a_label);
+	if (ImGui::SmallButton(UICommon::T(resolveLabel.c_str()))) {
 		ResolveForm();
 	}
 }
@@ -263,14 +266,14 @@ void HasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 		}
 	}
 	ImGui::SameLine();
-	if (ImGui::SmallButton("Resolve##kw")) {
+	if (ImGui::SmallButton(UICommon::T("Resolve##kw"))) {
 		if (!editorID.empty()) {
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
 	}
 	if (cachedKeyword) {
 		ImGui::SameLine();
-		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OK (0x%X)", cachedKeyword->GetFormID());
+		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), UICommon::T("OK (0x%X)"), cachedKeyword->GetFormID());
 	}
 }
 
@@ -326,7 +329,7 @@ bool RandomCondition::EvaluateImpl(RE::TESObjectREFR*, RE::hkbClipGenerator*, co
 void RandomCondition::DrawEditWidgets(bool& a_dirty)
 {
 	ImGui::SetNextItemWidth(150);
-	if (ImGui::SliderFloat("Threshold##rand", &threshold, 0.0f, 1.0f, "%.2f")) {
+	if (ImGui::SliderFloat(UICommon::T("Threshold##rand"), &threshold, 0.0f, 1.0f, "%.2f")) {
 		a_dirty = true;
 	}
 }
@@ -563,7 +566,7 @@ void IsWeaponTypeCondition::DrawEditWidgets(bool& a_dirty)
 {
 	const auto validSelection = selectedWeaponType >= 0 && static_cast<std::size_t>(selectedWeaponType) < std::size(kVanillaWeaponTypes);
 	const char* preview = validSelection ? kVanillaWeaponTypes[selectedWeaponType].editorID.data() : "Select weapon type...";
-	if (ImGui::BeginCombo("Weapon Type", preview)) {
+	if (ImGui::BeginCombo(UICommon::T("Weapon Type"), UICommon::T(preview))) {
 		for (std::size_t i = 0; i < std::size(kVanillaWeaponTypes); ++i) {
 			const auto selected = selectedWeaponType == static_cast<std::int32_t>(i);
 			const auto label = std::format("{} [0x{:08X}]", kVanillaWeaponTypes[i].editorID, kVanillaWeaponTypes[i].formID);
@@ -739,15 +742,15 @@ std::string IsADSCondition::GetParameterString() const
 void IsADSCondition::DrawEditWidgets(bool& a_dirty)
 {
 	int grace = graceMs;
-	if (ImGui::SliderInt("Grace window (ms)", &grace, 0, 2000)) {
+	if (ImGui::SliderInt(UICommon::T("Grace window (ms)"), &grace, 0, 2000)) {
 		graceMs = grace;
 		a_dirty = true;
 	}
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip(
+		ImGui::SetTooltip(UICommon::T(
 			"Keeps the condition true this long after leaving sights (player only).\n"
 			"Reloads drop sighted state the moment they start, so use ~300-500ms\n"
-			"to catch aim-initiated reloads. 0 = current aim state only.");
+			"to catch aim-initiated reloads. 0 = current aim state only."));
 }
 
 void IsADSCondition::InitializeImpl(const nlohmann::json& a_json)
@@ -783,7 +786,7 @@ void CompareActorValueCondition::DrawEditWidgets(bool& a_dirty)
 	char buf[128]{};
 	strncpy_s(buf, actorValueName.c_str(), sizeof(buf) - 1);
 	ImGui::SetNextItemWidth(150);
-	if (ImGui::InputText("Actor Value##cav", buf, sizeof(buf))) {
+	if (ImGui::InputText(UICommon::T("Actor Value##cav"), buf, sizeof(buf))) {
 		actorValueName = buf;
 		a_dirty = true;
 	}
@@ -938,7 +941,7 @@ void IsEquippedHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 		}
 	}
 	ImGui::SameLine();
-	if (ImGui::SmallButton("Resolve##eqkw")) {
+	if (ImGui::SmallButton(UICommon::T("Resolve##eqkw"))) {
 		if (!editorID.empty()) {
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
@@ -1162,18 +1165,18 @@ std::string IsDryFiringCondition::GetParameterString() const
 void IsDryFiringCondition::DrawEditWidgets(bool& a_dirty)
 {
 	int dur = durationMs;
-	if (ImGui::SliderInt("Duration (ms)", &dur, 50, 5000)) {
+	if (ImGui::SliderInt(UICommon::T("Duration (ms)"), &dur, 50, 5000)) {
 		durationMs = dur;
 		a_dirty = true;
 	}
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("How long the condition stays true after pressing fire with no ammo.");
+		ImGui::SetTooltip(UICommon::T("How long the condition stays true after pressing fire with no ammo."));
 
-	if (ImGui::Checkbox("Retriggerable", &retriggerable)) {
+	if (ImGui::Checkbox(UICommon::T("Retriggerable"), &retriggerable)) {
 		a_dirty = true;
 	}
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("If checked, pressing fire again before the animation finishes will restart it from the beginning.");
+		ImGui::SetTooltip(UICommon::T("If checked, pressing fire again before the animation finishes will restart it from the beginning."));
 }
 
 void IsDryFiringCondition::InitializeImpl(const nlohmann::json& a_json)
@@ -1244,9 +1247,9 @@ void IsButtonHeldCondition::DrawEditWidgets(bool& a_dirty)
 		}
 	}
 
-	const char* preview = currentIdx >= 0 ? eventNames[currentIdx].c_str() : "(select event)";
+	const char* preview = currentIdx >= 0 ? eventNames[currentIdx].c_str() : UICommon::T("(select event)");
 	ImGui::SetNextItemWidth(180);
-	if (ImGui::BeginCombo("User Event##btnheld", preview)) {
+	if (ImGui::BeginCombo(UICommon::T("User Event##btnheld"), preview)) {
 		for (int i = 0; i < static_cast<int>(eventNames.size()); ++i) {
 			bool isSelected = (i == currentIdx);
 			if (ImGui::Selectable(eventNames[i].c_str(), isSelected)) {
@@ -1731,15 +1734,15 @@ void CurrentTargetDistanceCondition::SerializeImpl(nlohmann::json& a_json) const
 // IsMovementDirection
 std::string IsMovementDirectionCondition::GetParameterString() const
 {
-	const char* dirs[] = { "Forward", "Right", "Back", "Left" };
+	const char* dirs[] = { UICommon::T("Forward"), UICommon::T("Right"), UICommon::T("Back"), UICommon::T("Left") };
 	return (direction >= 0 && direction <= 3) ? dirs[direction] : "Unknown";
 }
 
 void IsMovementDirectionCondition::DrawEditWidgets(bool& a_dirty)
 {
-	const char* dirs[] = { "Forward", "Right", "Back", "Left" };
+	const char* dirs[] = { UICommon::T("Forward"), UICommon::T("Right"), UICommon::T("Back"), UICommon::T("Left") };
 	ImGui::SetNextItemWidth(120);
-	if (ImGui::Combo("Direction##md", &direction, dirs, 4)) { a_dirty = true; }
+	if (ImGui::Combo(UICommon::T("Direction##md"), &direction, dirs, 4)) { a_dirty = true; }
 }
 
 bool IsMovementDirectionCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
@@ -3234,7 +3237,7 @@ void DetectionRelationshipCondition::DrawEditWidgets(bool& a_dirty)
 	ImGui::SetNextItemWidth(80);
 	if (ImGui::InputFloat("##drVal", &numericValue.staticValue, 0, 0, "%.0f")) { a_dirty = true; }
 	ImGui::SameLine();
-	ImGui::TextDisabled("(-4=Archnemesis .. +4=Lover)");
+	ImGui::TextDisabled(UICommon::T("(-4=Archnemesis .. +4=Lover)"));
 }
 
 // --- DetectionAngle ---
@@ -3307,7 +3310,7 @@ std::string DetectionAngleCondition::GetParameterString() const
 
 void DetectionAngleCondition::DrawEditWidgets(bool& a_dirty)
 {
-	if (ImGui::Checkbox("Swap perspective##da", &swapActors)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Swap perspective##da"), &swapActors)) a_dirty = true;
 	ImGui::SameLine();
 	static const char* ops[] = { "==", "!=", ">", ">=", "<", "<=" };
 	int compIdx = static_cast<int>(comparison);
@@ -3316,9 +3319,9 @@ void DetectionAngleCondition::DrawEditWidgets(bool& a_dirty)
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(80);
 	if (ImGui::InputFloat("##daVal", &numericValue.staticValue, 0, 0, "%.1f")) { a_dirty = true; }
-	if (ImGui::Checkbox("Right only##da", &limitRight)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Right only##da"), &limitRight)) a_dirty = true;
 	ImGui::SameLine();
-	if (ImGui::Checkbox("Left only##da", &limitLeft)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Left only##da"), &limitLeft)) a_dirty = true;
 }
 
 // =============================================================================
@@ -3401,11 +3404,11 @@ std::string DialogueCondition::GetParameterString() const
 
 void DialogueCondition::DrawEditWidgets(bool& a_dirty)
 {
-	if (ImGui::Checkbox("Dialogue Active", &checkDialogueActive)) a_dirty = true;
-	if (ImGui::Checkbox("Dialogue Started (edge)", &checkDialogueStarted)) a_dirty = true;
-	if (ImGui::Checkbox("Player Choosing", &checkPlayerChoosing)) a_dirty = true;
-	if (ImGui::Checkbox("Player Chose (edge)", &checkPlayerChose)) a_dirty = true;
-	if (ImGui::Checkbox("Dialogue Ended (edge)", &checkDialogueEnded)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Dialogue Active"), &checkDialogueActive)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Dialogue Started (edge)"), &checkDialogueStarted)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Player Choosing"), &checkPlayerChoosing)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Player Chose (edge)"), &checkPlayerChose)) a_dirty = true;
+	if (ImGui::Checkbox(UICommon::T("Dialogue Ended (edge)"), &checkDialogueEnded)) a_dirty = true;
 }
 
 // =============================================================================
@@ -3681,7 +3684,7 @@ void MathStatementCondition::DrawEditWidgets(bool& a_dirty)
 	// Expression input
 	static char exprBuf[512];
 	strncpy_s(exprBuf, expression.c_str(), sizeof(exprBuf) - 1);
-	ImGui::Text("Expression:");
+	ImGui::Text(UICommon::T("Expression:"));
 	ImGui::SetNextItemWidth(-1);
 	if (ImGui::InputText("##mathExpr", exprBuf, sizeof(exprBuf))) {
 		expression = exprBuf;
@@ -3689,7 +3692,7 @@ void MathStatementCondition::DrawEditWidgets(bool& a_dirty)
 	}
 
 	ImGui::Separator();
-	ImGui::Text("Variables:");
+	ImGui::Text(UICommon::T("Variables:"));
 
 	// Existing variables
 	int removeIdx = -1;
@@ -3722,7 +3725,7 @@ void MathStatementCondition::DrawEditWidgets(bool& a_dirty)
 	}
 
 	// Add variable button
-	if (ImGui::SmallButton("+ Add Variable")) {
+	if (ImGui::SmallButton(UICommon::T("+ Add Variable"))) {
 		MathVariable mv;
 		mv.name = std::format("v{}", variables.size());
 		variables.push_back(std::move(mv));
