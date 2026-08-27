@@ -594,6 +594,7 @@ namespace Parsing
 			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", false);
+			a_subMod->trackFilter.nativeIdlePlayback = tf.value("nativeIdlePlayback", false);
 			a_subMod->trackFilter.triggerOnlySpecialIdle = tf.value("triggerOnlySpecialIdle", false);
 			a_subMod->trackFilter.skipAdditiveNonSourceFirstPerson =
 				tf.value("skipAdditiveNonSourceFirstPerson", true);

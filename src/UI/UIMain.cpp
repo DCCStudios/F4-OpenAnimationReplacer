@@ -1158,6 +1158,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				tfJson["blendOutAtEnd"] = tf.blendOutAtEnd;
 				tfJson["sampleFrame"] = tf.sampleFrame;
 				tfJson["modelSpaceAnchor"] = tf.modelSpaceAnchor;
+				tfJson["nativeIdlePlayback"] = tf.nativeIdlePlayback;
 				tfJson["triggerOnlySpecialIdle"] = tf.triggerOnlySpecialIdle;
 				tfJson["skipAdditiveNonSourceFirstPerson"] = tf.skipAdditiveNonSourceFirstPerson;
 				tfJson["skipAdditiveNonSourceThirdPerson"] = tf.skipAdditiveNonSourceThirdPerson;
@@ -1762,6 +1763,20 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 					"the submod's custom start/end events when an event is required.\n\n"
 					"If OAR cannot validate the runtime hook or cached donor, it safely falls back\n"
 					"to the normal full-body special idle. Default: Off."));
+			}
+
+			if (tf.triggerOnlySpecialIdle) {
+				if (ImGui::Checkbox(UICommon::T("Let Native Idle Play (1st-Person Overlay Only) (?)##trackFilter"), &tf.nativeIdlePlayback)) {
+					a_subMod->SetDirty(true);
+				}
+				if (ImGui::IsItemHovered()) {
+					ImGui::SetTooltip("%s", UICommon::T(
+						"The engine's full-body idle plays natively (the 3rd-person body performs the\n"
+						"animation with its annotations), and the overlay applies ONLY to first-person\n"
+						"clips, as raw replacement locals — so the 1st-person arms mirror the motion.\n"
+						"For 3rd-person-authored idles that must also read correctly in first person.\n"
+						"Default: Off."));
+				}
 			}
 
 			ImGui::Spacing();

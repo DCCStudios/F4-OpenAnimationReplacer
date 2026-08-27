@@ -201,6 +201,15 @@ public:
 		// (different) torso pose. This is what makes "the left arm looks
 		// exactly like the donor" true when only part of the body is filtered.
 		bool modelSpaceAnchor = false;
+		// Special-idle interception normally SUPPRESSES the engine's native
+		// full-body idle and drives only the filtered tracks. With this set,
+		// the native idle plays through (the 3rd-person body performs the
+		// animation natively) and the overlay applies ONLY to first-person
+		// clips, as raw donor locals (cross-skeleton model anchoring is
+		// ill-defined: the donor's root frame belongs to its authoring
+		// skeleton). Built for 3P-authored full-body idles that must read
+		// correctly in first person too (F4Parkour vault, 2026-08-26).
+		bool nativeIdlePlayback = false;
 		// Special-idle isolation: when SetupSpecialIdle/PlayIdle requests a
 		// matching animation, do not start the engine's full-body idle. Advance
 		// this donor on OAR's clock and stamp only the filtered tracks over the

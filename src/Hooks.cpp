@@ -277,6 +277,31 @@ struct CharTrackFilterState {
 	uint64_t pendingCameraEvaluation = 0;
 	bool pendingCameraValid = false;
 
+	// Post-eval bone targets (model-space anchor, corrected pipeline): the
+	// in-graph anchor can only cancel the parent chain of ONE clip, but the
+	// arm the player sees sits under the FINAL blended chain (aim twist and
+	// additive layers included) — so the anchored look varied with facing and
+	// with whichever clip happened to sample (audit 2026-08-26, findings 1-2).
+	// The sampling path now ALSO publishes each filtered bone's donor target
+	// per evaluation: chain roots as the donor's MODEL-space transform,
+	// children as raw donor locals. The PlayerCharacter::UpdateAnimation
+	// post-eval hook (TrackFilterCameraHooks) rewrites the scene-node locals
+	// against the real final pose — deterministic and facing-independent by
+	// construction. Player-only (the hook is on PlayerCharacter); NPCs keep
+	// the in-graph path.
+	struct PendingBoneTarget
+	{
+		std::string name;
+		bool chainRoot = false;
+		// chainRoot: donor MODEL transform. child: donor LOCAL transform.
+		float translation[3]{ 0.0f, 0.0f, 0.0f };
+		float rotation[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
+	};
+	std::vector<PendingBoneTarget> pendingBoneTargets;
+	uint64_t pendingBoneEvaluation = 0;
+	float pendingBoneWeight = 0.0f;
+	bool pendingBoneFirstPerson = false;
+
 	// Frozen-bone locals, captured from the SOURCE clip's own pose on the
 	// first sample of each play (so the freeze starts exactly where the
 	// underlying animation left the bone - no pop) and stamped into every
@@ -315,6 +340,9 @@ struct CharTrackFilterState {
 	// Source-clip localTime at the last sample. A backward jump means the engine
 	// restarted the clip for a new play — the overlay re-arms and blends back in.
 	float lastSampledLocalTime = -1.0f;
+	// Play-consistency diagnostic bookkeeping (temporary, 2026-08-26): donor
+	// time at the last diagnostic check, so each play logs exactly one sample.
+	float diagLastDonorT = -1.0f;
 	// Wall-clock time localTime last ADVANCED. The graph can park a finished
 	// clip at a fixed localTime while keeping it active and sampling — the
 	// stall detector ends the one-shot instead of freezing on that pose.
@@ -389,6 +417,18 @@ struct AppliedTrackFilterCamera
 // touched immediately before and after that call, so it deliberately does not
 // need a second lock alongside s_trackFilterMutex.
 static AppliedTrackFilterCamera s_appliedTrackFilterCamera;
+
+// Post-eval bone writes (see PendingBoneTarget): one entry per scene node the
+// hook rewrote last evaluation, restored before the next one exactly like the
+// camera contribution above. Same single-threaded discipline.
+struct AppliedTrackFilterBone
+{
+	RE::NiAVObject* node = nullptr;
+	RE::NiTransform base = RE::NiTransform::IDENTITY;
+	RE::NiTransform applied = RE::NiTransform::IDENTITY;
+};
+static std::vector<AppliedTrackFilterBone> s_appliedTrackFilterBones;
+static RE::NiAVObject* s_appliedTrackFilterBonesRoot = nullptr;
 
 // Find the state for a specific filter on an actor. Returns nullptr if absent.
 // Caller must hold s_trackFilterMutex (shared or unique).
@@ -727,6 +767,64 @@ static RE::NiMatrix3 CameraQuatToMatrix(const float a_quaternion[4])
 		2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y), 0.0f);
 }
 
+// NiMatrix3 -> quaternion (Shepperd's method). Rotation matrices from the
+// engine are orthonormal, so no degenerate handling beyond the branch choice.
+static void MatrixToQuat(const RE::NiMatrix3& a_m, float a_outQuat[4])
+{
+	const float m00 = a_m[0][0], m01 = a_m[0][1], m02 = a_m[0][2];
+	const float m10 = a_m[1][0], m11 = a_m[1][1], m12 = a_m[1][2];
+	const float m20 = a_m[2][0], m21 = a_m[2][1], m22 = a_m[2][2];
+	const float trace = m00 + m11 + m22;
+	if (trace > 0.0f) {
+		const float s = std::sqrt(trace + 1.0f) * 2.0f;
+		a_outQuat[3] = 0.25f * s;
+		a_outQuat[0] = (m21 - m12) / s;
+		a_outQuat[1] = (m02 - m20) / s;
+		a_outQuat[2] = (m10 - m01) / s;
+	} else if (m00 > m11 && m00 > m22) {
+		const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+		a_outQuat[3] = (m21 - m12) / s;
+		a_outQuat[0] = 0.25f * s;
+		a_outQuat[1] = (m01 + m10) / s;
+		a_outQuat[2] = (m02 + m20) / s;
+	} else if (m11 > m22) {
+		const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+		a_outQuat[3] = (m02 - m20) / s;
+		a_outQuat[0] = (m01 + m10) / s;
+		a_outQuat[1] = 0.25f * s;
+		a_outQuat[2] = (m12 + m21) / s;
+	} else {
+		const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+		a_outQuat[3] = (m10 - m01) / s;
+		a_outQuat[0] = (m02 + m20) / s;
+		a_outQuat[1] = (m12 + m21) / s;
+		a_outQuat[2] = 0.25f * s;
+	}
+	NormalizeQuat(a_outQuat);
+}
+
+// Rigid NiTransform composition/inverse for skeleton chain math. Scale is
+// treated as rigid (skeleton bones carry ~1.0); the caller preserves each
+// node's live scale on write.
+static RE::NiTransform ComposeNi(const RE::NiTransform& a_parent, const RE::NiTransform& a_child)
+{
+	RE::NiTransform out;
+	out.rotate = a_parent.rotate * a_child.rotate;
+	out.translate = a_parent.translate + (a_parent.rotate * a_child.translate) * a_parent.scale;
+	out.scale = a_parent.scale * a_child.scale;
+	return out;
+}
+
+static RE::NiTransform InvertNi(const RE::NiTransform& a_xf)
+{
+	RE::NiTransform out;
+	out.rotate = a_xf.rotate.Transpose();
+	const float invScale = (std::abs(a_xf.scale) > 1e-6f) ? 1.0f / a_xf.scale : 1.0f;
+	out.translate = (out.rotate * a_xf.translate) * -invScale;
+	out.scale = invScale;
+	return out;
+}
+
 static bool CameraTransformNear(const RE::NiTransform& a_left, const RE::NiTransform& a_right)
 {
 	constexpr float kTranslationEpsilon = 1e-4f;
@@ -856,6 +954,31 @@ static void SetPoseBoneMaskBit(uint8_t* a_tracksPtr,
 	mask[a_boneIdx >> 5] |= (1u << (a_boneIdx & 0x1F));
 }
 
+// Inverse of SetPoseBoneMaskBit: mark a bone's pose track as NOT provided by
+// this clip so downstream blending ignores its written value (sparse tracks
+// only — dense tracks have no mask and cannot be unset this way; returns
+// whether the bit was actually cleared).
+static bool ClearPoseBoneMaskBit(uint8_t* a_tracksPtr,
+	const RE::TrackHeaderRaw& a_poseHeader, int16_t a_boneIdx)
+{
+	if (!a_tracksPtr || a_boneIdx < 0) return false;
+	if (a_poseHeader.elementSizeBytes <= 0 || a_poseHeader.capacity <= 0) return false;
+	if (a_boneIdx >= a_poseHeader.capacity) return false;
+	if ((a_poseHeader.flags & 0x02) == 0) return false;
+
+	auto maskOffset = static_cast<uintptr_t>(a_poseHeader.dataOffset)
+		+ static_cast<uintptr_t>(a_poseHeader.elementSizeBytes) * a_poseHeader.capacity;
+	auto maskWordOffset = maskOffset + static_cast<uintptr_t>(a_boneIdx >> 5) * 4;
+
+	auto* master = reinterpret_cast<RE::TrackMasterHeaderRaw*>(a_tracksPtr);
+	if (static_cast<int32_t>(maskWordOffset + 4) > master->numBytes) return false;
+
+	auto* maskBytes = a_tracksPtr + maskOffset;
+	auto* mask = reinterpret_cast<uint32_t*>(maskBytes);
+	mask[a_boneIdx >> 5] &= ~(1u << (a_boneIdx & 0x1F));
+	return true;
+}
+
 // Additive: given the base pose from the original animation (origBase) and the
 // replacement pose (rep), compute delta = rep - origBase, then apply delta*weight
 // on top of whatever current output is. This lets additive work with full-pose
@@ -973,8 +1096,8 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 	}
 
 	// Step 2: build the exclude set and subtract from matched
-	if (!excludeNames.empty() && !matched.empty()) {
-		std::unordered_set<int16_t> excluded;
+	std::unordered_set<int16_t> excluded;
+	if (!excludeNames.empty()) {
 		for (int16_t i = 0; i < numBones; ++i) {
 			auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
 			namePtr &= ~uintptr_t(1);
@@ -1042,6 +1165,18 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		}
 		for (int16_t idx : frozen) {
 			matched.erase(idx);
+		}
+	}
+
+	// nativeIdlePlayback: the native idle clip renders EVERY donor track, so
+	// an excluded bone is never "left alone" — the donor's own track drives it
+	// (field 2026-08-26: the weapon bones showed the donor's 3P carry pose,
+	// rotated ~90°, while "excluded"; other excluded bones moved out of place
+	// too). Exclusion in native mode therefore means HOLD: the excluded set
+	// joins the freeze set and gets stamped with its pre-play locals.
+	if (a_filter->nativeIdlePlayback && !excluded.empty()) {
+		for (int16_t idx : excluded) {
+			frozen.insert(idx);
 		}
 	}
 
@@ -5639,12 +5774,16 @@ namespace
 	}
 
 	static bool StartStandaloneSpecialIdle(
-		RE::Actor* a_actor, RE::TESIdleForm* a_idle, std::string* a_rejectionReason)
+		RE::Actor* a_actor, RE::TESIdleForm* a_idle, std::string* a_rejectionReason,
+		bool* a_outNativePlayback = nullptr)
 	{
 		StandaloneSpecialIdleMatch match;
 		if (!FindStandaloneSpecialIdleMatch(a_actor, a_idle, match, a_rejectionReason)) return false;
 
 		auto* subMod = match.info->parentSubMod;
+		if (a_outNativePlayback) {
+			*a_outNativePlayback = subMod->trackFilter.nativeIdlePlayback;
+		}
 		auto* filter = &subMod->trackFilter;
 		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 		bool isNew = false;
@@ -5692,6 +5831,82 @@ namespace
 			state->blendElapsed = 0.0f;
 			state->blendDuration = filter->blendInTime;
 			state->blendAlpha = filter->blendInTime <= 0.0f ? 1.0f : 0.0f;
+		}
+
+		// nativeIdlePlayback: freeze + EXCLUDED bones must hold their PRE-PLAY
+		// locals over the native render (the native clip drives every donor
+		// track, so nothing is "left alone"; and the skeleton bind pose proved
+		// a wrong substitute for runtime grips — field 2026-08-26, weapon
+		// rotated ~90° during the vault). Capture them from the actor's scene
+		// nodes HERE: SetupSpecialIdle runs before the idle enters the graphs,
+		// so the nodes still hold the true pre-idle pose. Children are walked
+		// through the scene hierarchy itself (freeze subtrees always; exclude
+		// subtrees when Exclude Children is on).
+		if (filter->nativeIdlePlayback) {
+			std::vector<std::string> capFreeze;
+			std::vector<std::string> capExclude;
+			bool capExcludeChildren = false;
+			{
+				std::lock_guard bLock(filter->boneMutex);
+				capFreeze = filter->freezeBoneNames;
+				capExclude = filter->excludeBoneNames;
+				capExcludeChildren = filter->excludeChildren;
+			}
+			std::unordered_map<std::string, RE::hkQsTransformRaw> captured;
+			auto captureNode = [&captured](RE::NiAVObject* a_obj, bool a_children,
+									auto&& a_self) -> void {
+				if (!a_obj) return;
+				const char* nodeName = a_obj->name.c_str();
+				if (nodeName && nodeName[0] != '\0') {
+					RE::hkQsTransformRaw t{};
+					t.translation[0] = a_obj->local.translate.x;
+					t.translation[1] = a_obj->local.translate.y;
+					t.translation[2] = a_obj->local.translate.z;
+					t.translation[3] = 0.0f;
+					MatrixToQuat(a_obj->local.rotate, t.rotation);
+					t.scale[0] = a_obj->local.scale;
+					t.scale[1] = a_obj->local.scale;
+					t.scale[2] = a_obj->local.scale;
+					t.scale[3] = 0.0f;
+					if (IsFiniteQs(t) && HasUsableRotation(t)) {
+						captured[nodeName] = t;
+					}
+				}
+				if (a_children) {
+					if (auto* node = a_obj->IsNode()) {
+						for (std::uint32_t i = 0; i < node->children.size(); ++i) {
+							if (auto* child = node->children[i].get()) {
+								a_self(child, true, a_self);
+							}
+						}
+					}
+				}
+			};
+			RE::NiAVObject* capRoot = a_actor->Get3D(true);
+			if (!capRoot) capRoot = a_actor->Get3D(false);
+			if (capRoot) {
+				for (const auto& fzName : capFreeze) {
+					captureNode(capRoot->GetObjectByName(RE::BSFixedString(fzName.c_str())),
+						/*a_children=*/true, captureNode);
+				}
+				for (const auto& exName : capExclude) {
+					captureNode(capRoot->GetObjectByName(RE::BSFixedString(exName.c_str())),
+						capExcludeChildren, captureNode);
+				}
+			}
+			if (!captured.empty()) {
+				std::unique_lock capLock(s_trackFilterMutex);
+				if (auto* capState = FindTrackFilterState(a_actor, filter)) {
+					for (auto& [capName, capVal] : captured) {
+						capState->frozenByName.insert_or_assign(capName, capVal);
+					}
+				}
+				static std::atomic<int> s_prePlayCapLog{ 0 };
+				if (s_prePlayCapLog.fetch_add(1, std::memory_order_relaxed) < 12) {
+					logger::info("[OAR-TrackFilter] Captured {} pre-play local(s) from the scene nodes (nativeIdlePlayback hold set)",
+						captured.size());
+				}
+			}
 		}
 
 		QueueCustomEvents(a_actor, subMod->eventsOnStart, "onStart/trackFilter-specialIdle");
@@ -7951,6 +8166,23 @@ namespace
 					auto* filterKey = &winningInfo->parentSubMod->trackFilter;
 					auto* statePtr = FindTrackFilterState(tfActor, filterKey);
 					const bool isNew = (statePtr == nullptr);
+					// A live standalone native-idle state must NOT be converted
+					// into a playback-following state: with nativeIdlePlayback
+					// the intercepted idle's clip legitimately EXISTS in the
+					// graphs and its leaf claim routed it here, where the old
+					// path reset standaloneSpecialIdle mid-play — killing the
+					// independent clock, the 1P-only stamping, and the 1P
+					// suppression all at once (2026-08-26 field log:
+					// 'Registered filtered replacement' during a native vault).
+					// The standalone state already owns this play; skip.
+					if (!isNew && statePtr->standaloneSpecialIdle &&
+						filterKey->nativeIdlePlayback) {
+						static std::atomic<int> s_nativeConvertSkipLog{ 0 };
+						if (s_nativeConvertSkipLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+							logger::info("[OAR-TrackFilter] Skipped source registration onto live native-idle state ('{}' stays standalone)",
+								statePtr->suffix);
+						}
+					} else {
 					if (isNew) {
 						statePtr = &s_charTrackFilterMap[tfActor].emplace_back();
 						statePtr->filter = filterKey;
@@ -8057,6 +8289,7 @@ namespace
 							}
 						}
 					}
+					}  // native-idle conversion guard (see above)
 				}
 			}
 			if (*animSlot != originalAnim && originalAnim) {
@@ -9256,6 +9489,163 @@ namespace
 			s_poseHdrLog++;
 		}
 
+		// nativeIdlePlayback: the engine ALSO enters the intercepted idle on the
+		// FIRST-person graph, where the 3P-authored file's identity binding
+		// lands on the wrong bones of the different 1P skeleton and garbles
+		// everything it maps (field 2026-08-26: right arm destroyed regardless
+		// of filter config). Suppress that clip's pose contribution outright —
+		// the 1P view is the normal weapon pose plus the overlay's stamps.
+		{
+			std::string nativeIdleSuffix;
+			float nativeIdleStartSec = 0.0f;
+			{
+				std::shared_lock tfShared(s_trackFilterMutex);
+				auto mapIt = s_charTrackFilterMap.find(actor);
+				if (mapIt != s_charTrackFilterMap.end()) {
+					for (auto& st : mapIt->second) {
+						if (st.standaloneSpecialIdle && st.filter &&
+							st.filter->nativeIdlePlayback && !st.suffix.empty()) {
+							nativeIdleSuffix = st.suffix;
+							nativeIdleStartSec = st.standaloneStartSec;
+							break;
+						}
+					}
+				}
+			}
+			if (!nativeIdleSuffix.empty()) {
+				std::string suppressClipSuffix;
+				{
+					std::shared_lock csLock(s_clipSuffixMutex);
+					auto csIt = s_clipSuffixCache.find(a_this);
+					if (csIt != s_clipSuffixCache.end()) suppressClipSuffix = csIt->second;
+				}
+				// Suffix-cache identity ALONE misses these clips (field 2026-08-26):
+				// the engine enters the idle on a RECYCLED clip generator whose
+				// cache entry still names its previous animation, and the path
+				// poll finds nothing under the graph's roots to re-key it with
+				// (the idle file lives under the 3P tree). The clip's AUTHORED
+				// name is still the idle file's leaf, so match on that too —
+				// scoped to this actor while its native-idle state is live.
+				bool isNativeIdleClip = (suppressClipSuffix == nativeIdleSuffix);
+				std::string censusLeaf;
+				{
+					const char* clipAnimName = a_this->animationName.data();
+					if (clipAnimName && reinterpret_cast<uintptr_t>(clipAnimName) > 0x10000 &&
+						clipAnimName[0] != '\0') {
+						censusLeaf = SubgraphGetLeaf(clipAnimName);
+						if (!isNativeIdleClip) {
+							isNativeIdleClip = (censusLeaf == GetSuffixLeaf(nativeIdleSuffix));
+						}
+					}
+				}
+				// Census (field 2026-08-26): the suppression and camera-clear
+				// markers stayed silent across TWO builds whose static logic
+				// checks out, so measure instead — one line per clip per
+				// native-idle play, showing exactly the identity facts the
+				// match decisions read. If the vault clips never appear here,
+				// Generate is not running for them at all.
+				{
+					static std::mutex s_censusMutex;
+					static std::unordered_map<RE::hkbClipGenerator*, float> s_censusSeen;
+					bool logCensus = false;
+					{
+						std::lock_guard cLock(s_censusMutex);
+						auto [cit, cIns] = s_censusSeen.try_emplace(a_this, nativeIdleStartSec);
+						if (cIns || cit->second != nativeIdleStartSec) {
+							cit->second = nativeIdleStartSec;
+							logCensus = true;
+						}
+					}
+					static std::atomic<int> s_censusCount{ 0 };
+					if (logCensus && s_censusCount.fetch_add(1, std::memory_order_relaxed) < 300) {
+						logger::info("[OAR-TF-NativeCensus] clip={:X} leaf='{}' cachedSuffix='{}' persp={} onFrac={:.2f} nBones={} match={}",
+							reinterpret_cast<uintptr_t>(a_this), censusLeaf, suppressClipSuffix,
+							static_cast<int>(GetPlayingClipPerspectiveImpl(a_this)),
+							poseHeader.onFraction, poseHeader.numData, isNativeIdleClip);
+					}
+				}
+				if (isNativeIdleClip) {
+					if (GetPlayingClipPerspectiveImpl(a_this) == OARClipPerspective::kFirstPerson) {
+						// FORMER onFraction=0 suppression is GONE (2026-08-26
+						// night). During a first-person special idle this clip
+						// is the ONLY generating player clip — the weapon clips
+						// deactivate until the exit transition — so suppressing
+						// it left the 1P rig with no pose source for the whole
+						// play AND starved the overlay's sampler (first sample
+						// landed at donor END, slamming the end pose on in one
+						// frame and fading: the arms-whip field report). Its
+						// pose is also NOT garbled: both player graphs output
+						// the same 123-bone layout (NativeCensus), so the
+						// identity binding is as valid here as on the 3P graph.
+						// Let it render and fall through: it becomes the
+						// standalone SAMPLER and the stamp target — filtered
+						// bones re-stamp their own donor values (no-op), the
+						// frozen Weapon set overrides the donor's 3P carry
+						// pose, and the camera branch pins the pose camera to
+						// donor frame zero so the post-eval delta stays the
+						// single, blendable camera driver.
+						static std::atomic<int> s_nativeIdleAdoptLog{ 0 };
+						if (s_nativeIdleAdoptLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+							logger::info("[OAR-TrackFilter] Native idle 1P clip adopted as overlay source '{}' (clipGen={:X}, onFrac={:.2f})",
+								nativeIdleSuffix, reinterpret_cast<uintptr_t>(a_this), poseHeader.onFraction);
+						}
+					} else {
+
+					// 3P instance: the body plays natively, but the idle's CAMERA
+					// track must not take the first-person view (the big swoop
+					// near the animation's end, field 2026-08-26). Clear the
+					// Camera bone's pose-mask bit so this clip contributes no
+					// camera; the player keeps look control.
+					if (character) {
+						static std::mutex s_camIdxMutex;
+						static std::unordered_map<const RE::hkbCharacter*, int16_t> s_camIdxByChar;
+						int16_t camIdx = -1;
+						{
+							std::lock_guard cg(s_camIdxMutex);
+							auto cit = s_camIdxByChar.find(character);
+							if (cit != s_camIdxByChar.end()) {
+								camIdx = cit->second;
+							} else {
+								if (auto* camSetup = character->setup._ptr) {
+									if (auto* camSkel = reinterpret_cast<uint8_t*>(camSetup->animationSkeleton._ptr)) {
+										auto* camBones = reinterpret_cast<RE::hkArrayRawLayout*>(camSkel + RE::kSkeletonOffset_bones);
+										if (camBones->data && camBones->size > 0) {
+											auto* camBoneData = reinterpret_cast<uint8_t*>(camBones->data);
+											for (int16_t i = 0; i < static_cast<int16_t>(camBones->size); ++i) {
+												auto namePtr = *reinterpret_cast<uintptr_t*>(camBoneData + i * RE::kHkaBoneStride);
+												namePtr &= ~uintptr_t(1);
+												const char* bn = reinterpret_cast<const char*>(namePtr);
+												if (bn && reinterpret_cast<uintptr_t>(bn) > 0x10000 &&
+													IsTrackFilterCameraBone(bn)) {
+													camIdx = i;
+													break;
+												}
+											}
+										}
+									}
+								}
+								s_camIdxByChar[character] = camIdx;
+							}
+						}
+						if (camIdx >= 0 && ClearPoseBoneMaskBit(tracksPtr, poseHeader, camIdx)) {
+							static std::atomic<int> s_camClearLog{ 0 };
+							if (s_camClearLog.fetch_add(1, std::memory_order_relaxed) < 12) {
+								logger::info("[OAR-TrackFilter] Cleared Camera track (bone {}) on the native idle's 3P clip '{}' (clipGen={:X}) — player keeps look control",
+									camIdx, nativeIdleSuffix, reinterpret_cast<uintptr_t>(a_this));
+							}
+						}
+					}
+					// Do NOT return: this clip proceeds into the state processing
+					// as the standalone SAMPLER (often the only active
+					// non-additive 3P clip during the play). It samples the
+					// donor but never stamps (applyToThisClip is false for
+					// non-1P clips) and the registration guard keeps it from
+					// converting the standalone state.
+					}  // else (non-1P instance)
+				}
+			}
+		}
+
 		// Snapshot which filters are registered for this actor, and bail out
 		// entirely if this clip's slot currently holds ANY registered replacement
 		// — that means we're inside a swap-fallback's recursive _Generate and
@@ -9293,6 +9683,18 @@ namespace
 
 			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
 			const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
+			// The former 1P-sampler exclusion for nativeIdlePlayback is GONE
+			// (2026-08-26 late): during a first-person special idle the ONLY
+			// generating player clips are 1P-graph clips, so excluding them
+			// starved the sampler for the entire play — the overlay's first
+			// sample landed at donor END (exit transition reactivating other
+			// clips), slamming the end pose on at full weight and fading,
+			// i.e. the arms-whip-then-blend-in field report. The exclusion's
+			// premise was wrong anyway: both player graphs output the SAME
+			// 123-bone pose layout (NativeCensus), and sampling resolves donor
+			// tracks through the STATE's donor map, not the host clip binding.
+			// The suppressed native-idle clip can never become the sampler —
+			// its Generate returns at the suppression gate before this path.
 			const bool standaloneNeedsSample = state.standaloneSpecialIdle &&
 				state.lastStandaloneSampleFrame != currentFrame &&
 				(poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f;
@@ -9306,8 +9708,30 @@ namespace
 				charIt->second.version == filterPtr->version.load(std::memory_order_relaxed) &&
 				!charIt->second.nameAndIndex.empty());
 
-			if (!isSourceClip && !standaloneNeedsSample && state.cacheValid && alreadyResolved) {
+			// nativeIdleMode: while any frozen bone still lacks its 1P-captured
+			// value, force the slow path (unique lock) so the capture there can
+			// run — the fast path cannot write state (see the slow-path capture
+			// block).
+			bool nativeFreezePending = false;
+			if (state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback && alreadyResolved) {
+				for (auto& [fzn, fzi] : charIt->second.freezeNameAndIndex) {
+					if (!IsTrackFilterCameraBone(fzn) && !state.frozenByName.count(fzn)) {
+						nativeFreezePending = true;
+						break;
+					}
+				}
+			}
+
+			if (!isSourceClip && !standaloneNeedsSample && state.cacheValid && alreadyResolved &&
+				!nativeFreezePending) {
 				if (ShouldSkipAddNonSourceClip(a_this, filterPtr)) return;
+
+				// nativeIdlePlayback: the native idle owns the 3P pose; the
+				// overlay only stamps first-person clips.
+				if (state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+					GetPlayingClipPerspectiveImpl(a_this) != OARClipPerspective::kFirstPerson) {
+					return;
+				}
 
 				// Skip clips with onFraction=0 — their pose buffer is uninitialized.
 				if (poseHeader.onFraction <= 0.f) return;
@@ -9378,6 +9802,28 @@ namespace
 					} else {
 						auto rIt = state.cachedRepByName.find(name);
 						if (rIt == state.cachedRepByName.end()) continue;
+						// Right-hand stamp tracking (field 2026-08-26: blend-out
+						// reportedly not applying to the right hand). The logged
+						// weight IS the blend alpha in action; live shows what the
+						// stamp is blending against.
+						if (name == "RArm_Hand") {
+							static std::atomic<int> s_rhStampLog{ 0 };
+							static std::atomic<uint64_t> s_rhStampLastFrame{ 0 };
+							const auto rhFrame = s_currentFrame.load(std::memory_order_relaxed);
+							auto rhLast = s_rhStampLastFrame.load(std::memory_order_relaxed);
+							if (rhFrame - rhLast > 30 &&
+								s_rhStampLastFrame.compare_exchange_strong(rhLast, rhFrame) &&
+								s_rhStampLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+								const auto& lv = outputPose[idx];
+								const auto& rv = rIt->second;
+								logger::info("[OAR-TF-WeaponDiag] RArm_Hand stamp(fast) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+									reinterpret_cast<uintptr_t>(a_this), idx, weight, state.blendingOut,
+									lv.translation[0], lv.translation[1], lv.translation[2],
+									lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
+									rv.translation[0], rv.translation[1], rv.translation[2],
+									rv.rotation[0], rv.rotation[1], rv.rotation[2], rv.rotation[3]);
+							}
+						}
 						if (mode == SubMod::TrackFilter::Mode::Override) {
 							LerpTransform(outputPose[idx], rIt->second, weight);
 						} else {
@@ -9395,6 +9841,12 @@ namespace
 				// Frozen bones: hold the captured local (additive clips get the
 				// identity so sway cannot wiggle a frozen bone). Skipped until
 				// the source clip's first sample captures the value.
+				// nativeIdleMode holds ignore the blend envelope (see the source
+				// path): underneath the hold is the donor's own track.
+				const float fastHoldW =
+					(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback)
+						? filterPtr->weight
+						: weight;
 				for (auto& [name, idx] : cr.freezeNameAndIndex) {
 					if (IsTrackFilterCameraBone(name)) continue;
 					if (idx < 0 || idx >= numOutputBones) continue;
@@ -9410,7 +9862,28 @@ namespace
 					} else {
 						auto fIt = state.frozenByName.find(name);
 						if (fIt == state.frozenByName.end()) continue;
-						LerpTransform(outputPose[idx], fIt->second, weight);
+						// Weapon-freeze tracking (field 2026-08-26: weapon jumps out
+						// of place / disappears while frozen). One line per ~second
+						// showing the live value being overwritten and the held one.
+						if (name == "Weapon") {
+							static std::atomic<int> s_wpnFreezeLog{ 0 };
+							static std::atomic<uint64_t> s_wpnFreezeLastFrame{ 0 };
+							const auto wfFrame = s_currentFrame.load(std::memory_order_relaxed);
+							auto wfLast = s_wpnFreezeLastFrame.load(std::memory_order_relaxed);
+							if (wfFrame - wfLast > 30 &&
+								s_wpnFreezeLastFrame.compare_exchange_strong(wfLast, wfFrame) &&
+								s_wpnFreezeLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+								const auto& lv = outputPose[idx];
+								const auto& fv = fIt->second;
+								logger::info("[OAR-TF-WeaponDiag] freeze-apply(fast) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+									reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
+									lv.translation[0], lv.translation[1], lv.translation[2],
+									lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
+									fv.translation[0], fv.translation[1], fv.translation[2],
+									fv.rotation[0], fv.rotation[1], fv.rotation[2], fv.rotation[3]);
+							}
+						}
+						LerpTransform(outputPose[idx], fIt->second, fastHoldW);
 					}
 					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
@@ -9457,6 +9930,8 @@ namespace
 		const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
 		const bool standaloneSampler = state.standaloneSpecialIdle &&
 			state.lastStandaloneSampleFrame != currentFrame &&
+			// See standaloneNeedsSample: the 1P-sampler exclusion is gone —
+			// it starved the sampler for the whole play in first person.
 			(poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f;
 		bool isSourceClip = (state.sourceClips.count(a_this) > 0) || standaloneSampler;
 
@@ -9470,7 +9945,16 @@ namespace
 		// Condition-driven fades (conditions failed mid-play, clip continues)
 		// keep fading the source too — there the original is the right target.
 		if (isSourceClip && state.parentSubMod && state.parentSubMod->GetEndClipIfShorter() &&
-			(state.earlyBlendOutArmed || state.oneShotDone)) {
+			(state.earlyBlendOutArmed || state.oneShotDone) &&
+			// nativeIdlePlayback: the pin's premise does not hold. The "source"
+			// is the standalone SAMPLER — a long-lived movement clip the engine
+			// never crossfades out — and the CAMERA delta is computed in this
+			// path at this weight. Pinning held the donor camera at full
+			// strength through the whole blend-out and then dropped it in one
+			// frame at dormancy: the view snapped by the donor's end-camera
+			// delta and the arms visibly whipped offscreen before re-aligning
+			// (field 2026-08-26 evening). Let the sampler fade with blendAlpha.
+			!(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback)) {
 			weight = filterPtr->weight;
 		}
 		// Source clips must proceed even at zero weight: dormant one-shot states
@@ -9802,22 +10286,43 @@ namespace
 				// so the whole chain lands exactly where the donor puts it relative
 				// to the character root. Children keep raw donor locals — composed
 				// under the anchored root they reproduce the donor in model space.
+				// nativeIdlePlayback: the engine's idle drives the 3P body, the
+				// overlay drives ONLY first-person clips, and everything applies
+				// as raw donor locals — the donor's model-space root frame
+				// belongs to its authoring (3P) skeleton and means nothing on
+				// the 1P skeleton, so the anchor is disabled outright.
+				const bool nativeIdleMode = state.standaloneSpecialIdle &&
+					filterPtr->nativeIdlePlayback;
+				const bool applyToThisClip = !nativeIdleMode ||
+					GetPlayingClipPerspectiveImpl(a_this) == OARClipPerspective::kFirstPerson;
 				bool doAnchor = filterPtr->modelSpaceAnchor &&
 					mode == SubMod::TrackFilter::Mode::Override &&
-					filterPtr->sampleFrame < 0.0f;
+					filterPtr->sampleFrame < 0.0f &&
+					!nativeIdleMode;
 				const bool needsCameraModelSpace = std::ranges::any_of(
 					cr.nameAndIndex, [](const auto& a_entry) {
 						return IsTrackFilterCameraBone(a_entry.first);
 					});
 				const int16_t* skelParents = nullptr;
 				int32_t skelBoneCount = 0;
-				if (doAnchor || needsCameraModelSpace) {
+				// Bind pose (audit finding 3): donor model chains fall back to
+				// this for ancestors the donor does not track, instead of the
+				// LIVE pose — a partial-skeleton donor otherwise mixes the
+				// current animation into its own model-space target. Validated
+				// by element count; absent/odd skeletons keep the live fallback.
+				const RE::hkQsTransformRaw* skelRefPose = nullptr;
+				if (doAnchor || needsCameraModelSpace || nativeIdleMode) {
 					if (auto* setup = character->setup._ptr) {
 						if (auto* skel = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr)) {
 							auto* parentArr = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_parentIndices);
 							if (parentArr->data && parentArr->size > 0) {
 								skelParents = reinterpret_cast<int16_t*>(parentArr->data);
 								skelBoneCount = parentArr->size;
+								auto* refArr = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_referencePose);
+								if (refArr->data && refArr->size == parentArr->size &&
+									!IsBadReadPtr(refArr->data, static_cast<size_t>(refArr->size) * sizeof(RE::hkQsTransformRaw))) {
+									skelRefPose = reinterpret_cast<const RE::hkQsTransformRaw*>(refArr->data);
+								}
 							}
 						}
 					}
@@ -9830,20 +10335,60 @@ namespace
 					for (auto& [n2, i2] : cr.nameAndIndex) tl_filteredSet.insert(i2);
 				}
 
+				// Post-eval publish gate (see PendingBoneTarget): only inside a
+				// PlayerCharacter::UpdateAnimation evaluation, for the player's
+				// own graphs, and only in the anchored Override configuration.
+				const uint64_t boneEvaluation =
+					s_activeCameraEvaluation.load(std::memory_order_acquire);
+				// Post-eval bone publication is fully DISABLED (2026-08-26 night).
+				// It existed to reach the 1P view while the native idle clip was
+				// suppressed; with that clip now ADOPTED as the rendering source,
+				// the graph already carries the donor arms, and the raw-local
+				// node writes ran a SECOND, differently-composed writer over the
+				// final pose at full weight — the "both arms messed up during the
+				// vault" field report. In-graph stamps are the only bone writer.
+				const bool publishPostEval = false;
+				static_cast<void>(boneEvaluation);
+				if (!state.pendingBoneTargets.empty()) {
+					state.pendingBoneTargets.clear();
+					state.pendingBoneEvaluation = 0;
+				}
+
+				// Bone -> track reverse map, built once per sample (audit
+				// finding 4): the previous per-query linear scans ran once per
+				// chain bone per frame inside the write lock. First matching
+				// track wins, preserving the old scan's tie-break.
+				thread_local std::vector<int32_t> tl_boneToTrack;
+				const int32_t revMapSize = std::max<int32_t>(
+					std::max<int32_t>(numOutputBones, skelBoneCount), 1);
+				tl_boneToTrack.assign(static_cast<size_t>(revMapSize), -1);
+				if (donorMap) {
+					const int32_t n = std::min(donorMapSize, animNumTracks);
+					for (int32_t t = 0; t < n; ++t) {
+						const int16_t b = donorMap[t];
+						if (b >= 0 && b < revMapSize && tl_boneToTrack[b] < 0) {
+							tl_boneToTrack[b] = t;
+						}
+					}
+				} else if (!donorIdentity && haveMapping) {
+					for (int32_t t = 0; t < numTracksToSample; ++t) {
+						const int16_t b = trackToBoneData[t];
+						if (b >= 0 && b < revMapSize && tl_boneToTrack[b] < 0) {
+							tl_boneToTrack[b] = t;
+						}
+					}
+				}
+
 				auto donorTrackFor = [&](int16_t boneIdx) -> int32_t {
+					if (boneIdx < 0) return -1;
 					if (donorMap) {
-						const int32_t n = std::min(donorMapSize, animNumTracks);
-						for (int32_t t = 0; t < n; ++t)
-							if (donorMap[t] == boneIdx) return t;
-						return -1;
+						return (boneIdx < revMapSize) ? tl_boneToTrack[boneIdx] : -1;
 					}
 					if (donorIdentity) {
 						return (boneIdx < animNumTracks) ? static_cast<int32_t>(boneIdx) : -1;
 					}
 					if (haveMapping) {
-						for (int32_t t = 0; t < numTracksToSample; ++t)
-							if (trackToBoneData[t] == boneIdx) return t;
-						return -1;
+						return (boneIdx < revMapSize) ? tl_boneToTrack[boneIdx] : -1;
 					}
 					return (boneIdx < numTracksToSample) ? static_cast<int32_t>(boneIdx) : -1;
 				};
@@ -9871,14 +10416,65 @@ namespace
 							if (trk >= 0 && trk < static_cast<int32_t>(a_donorTracks->size())) {
 								l = &(*a_donorTracks)[trk];
 							}
+							// Untracked ancestor of a DONOR chain: prefer the
+							// skeleton's bind pose (deterministic) over the live
+							// pose — a partial donor otherwise mixes the current
+							// animation into its own model-space target (audit
+							// finding 3). Live chains (a_donorTracks == null)
+							// keep reading the live pose below.
+							if (!l && skelRefPose && b < skelBoneCount) {
+								l = &skelRefPose[b];
+							}
 						}
 						if (!l && b < numOutputBones) l = &outputPose[b];
-						if (!l || !IsFiniteQs(*l)) return false;
+						// A clip's pose buffer is only meaningful for the bones
+						// that clip animates — everything else can be zeros
+						// (rotation (0,0,0,0), not a valid quaternion). The 3P
+						// vault sampled through a weapon-subgraph add clip whose
+						// buffer held zeros for the entire spine, and the anchor
+						// composed garbage from them (2026-08-26 PlayDiag).
+						// Substitute the bind pose for unusable chain locals.
+						if (l && !HasUsableRotation(*l) && skelRefPose && b < skelBoneCount) {
+							l = &skelRefPose[b];
+						}
+						if (!l || !IsFiniteQs(*l) || !HasUsableRotation(*l)) return false;
 						ComposeQs(acc, *l, acc);
 					}
 					outXf = acc;
 					return IsFiniteQs(outXf);
 				};
+
+				// ===== Play-consistency diagnostic (temporary, 2026-08-26) =====
+				// Once per play, at the first sample past donor t=0.25s, log the
+				// RAW donor local and the POST-ANCHOR cached local for the
+				// left-arm chain so consecutive plays can be diffed numerically
+				// (field report: the overlay looks different depending on
+				// facing). The raw value comes straight from the donor file and
+				// must be bit-identical every play; the post-anchor value folds
+				// in the LIVE parent chain (aim twist), which is where facing
+				// can legally enter under modelSpaceAnchor. Divergence between
+				// plays in the raw value = sampling/clock bug; divergence only
+				// in the anchored value = parent-chain (aim/spine) influence.
+				bool diagLogThisSample = false;
+				{
+					if (localTime + 0.01f < state.diagLastDonorT) {
+						state.diagLastDonorT = -1.0f;  // new play (time wrapped)
+					}
+					const bool crossing = state.diagLastDonorT >= 0.0f &&
+						state.diagLastDonorT < 0.25f && localTime >= 0.25f;
+					if (crossing) {
+						static std::atomic<int> s_tfPlayDiagCount{ 0 };
+						if (s_tfPlayDiagCount.fetch_add(1, std::memory_order_relaxed) < 60) {
+							diagLogThisSample = true;
+							const char* diagClipName = a_this->animationName.data();
+							logger::info("[OAR-TF-PlayDiag] ---- play sample for '{}' (donor t={:.3f}, weight={:.3f}, alpha={:.3f}, sampler clipGen={:X} clip='{}') ----",
+								state.suffix, localTime, weight, state.blendAlpha,
+								reinterpret_cast<uintptr_t>(a_this),
+								(diagClipName && reinterpret_cast<uintptr_t>(diagClipName) > 0x10000) ? diagClipName : "(unknown)");
+						}
+					}
+					state.diagLastDonorT = localTime;
+				}
 
 				for (auto& [name, idx] : cr.nameAndIndex) {
 					if (idx < 0 || idx >= numOutputBones) continue;
@@ -9938,7 +10534,11 @@ namespace
 
 						const uint64_t cameraEvaluation =
 							s_activeCameraEvaluation.load(std::memory_order_acquire);
+						// nativeIdleMode: the adopted native clip's own Camera track
+						// is the sole camera driver; the post-eval delta would apply
+						// the same donor motion a second time on top of it.
 						const bool firstPersonPlayerSample =
+							!nativeIdleMode &&
 							cameraEvaluation != 0 &&
 							actor == RE::PlayerCharacter::GetSingleton() &&
 							GetPlayingClipPerspective(a_this) == OARClipPerspective::kFirstPerson;
@@ -10043,8 +10643,17 @@ namespace
 								}
 							}
 						}
+
+						// The round-10 frame-zero camera PIN is gone: in the 1P rig
+						// the arm chain composes against the Camera bone, so pinning
+						// it while the donor's arm locals expect the authored camera
+						// motion garbled BOTH arms (field 2026-08-26). With the
+						// native clip rendering, its own Camera track plays as
+						// authored and the filter leaves the camera alone entirely.
 						continue;
 					}
+
+					const RE::hkQsTransformRaw diagRawVal = repVal;
 
 					// Chain roots get the anchored local (see setup above). The
 					// walk only touches ancestors OUTSIDE the filter set, which the
@@ -10064,12 +10673,59 @@ namespace
 						}
 					}
 
+					// Post-eval target publish: chain roots carry the donor's
+					// model transform, children the raw donor local. Bones whose
+					// donor model chain cannot be composed publish nothing (the
+					// in-graph stamp remains their only driver this frame).
+					if (publishPostEval && !isCameraBone) {
+						// nativeIdleMode: everything is a raw donor LOCAL — the
+						// donor's model space belongs to its authoring skeleton.
+						bool pbChainRoot = false;
+						if (!nativeIdleMode && skelParents && idx < skelBoneCount) {
+							const int16_t pbPar = skelParents[idx];
+							pbChainRoot = (pbPar < 0 || !tl_filteredSet.count(pbPar));
+						}
+						RE::hkQsTransformRaw pbValue = diagRawVal;
+						bool pbOk = true;
+						if (pbChainRoot) {
+							pbOk = modelTransform(idx, &tl_sampledTracks, pbValue);
+						}
+						if (pbOk && IsFiniteQs(pbValue)) {
+							auto& tgt = state.pendingBoneTargets.emplace_back();
+							tgt.name = name;
+							tgt.chainRoot = pbChainRoot;
+							tgt.translation[0] = pbValue.translation[0];
+							tgt.translation[1] = pbValue.translation[1];
+							tgt.translation[2] = pbValue.translation[2];
+							tgt.rotation[0] = pbValue.rotation[0];
+							tgt.rotation[1] = pbValue.rotation[1];
+							tgt.rotation[2] = pbValue.rotation[2];
+							tgt.rotation[3] = pbValue.rotation[3];
+						}
+					}
+
+					if (diagLogThisSample &&
+						(name == "LArm_Collarbone" || name == "LArm_UpperArm" || name == "LArm_Hand")) {
+						const bool anchored =
+							std::memcmp(&diagRawVal, &repVal, sizeof(RE::hkQsTransformRaw)) != 0;
+						logger::info("[OAR-TF-PlayDiag] '{}' raw T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | {} T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | base T=({:.4f},{:.4f},{:.4f})",
+							name,
+							diagRawVal.translation[0], diagRawVal.translation[1], diagRawVal.translation[2],
+							diagRawVal.rotation[0], diagRawVal.rotation[1], diagRawVal.rotation[2], diagRawVal.rotation[3],
+							anchored ? "anchored" : "unanchored",
+							repVal.translation[0], repVal.translation[1], repVal.translation[2],
+							repVal.rotation[0], repVal.rotation[1], repVal.rotation[2], repVal.rotation[3],
+							baseVal.translation[0], baseVal.translation[1], baseVal.translation[2]);
+					}
+
 					state.cachedRepByName[name] = repVal;
 					state.cachedBaseByName[name] = baseVal;
 
 					// At ~zero weight this pass only primes the cache (blend-in's
-					// first frame): don't touch the pose or set mask bits.
-					if (weight > 0.001f) {
+					// first frame): don't touch the pose or set mask bits. In
+					// nativeIdleMode, non-1P clips sample and publish but never
+					// stamp — the native idle owns the 3P pose.
+					if (weight > 0.001f && applyToThisClip) {
 						if (mode == SubMod::TrackFilter::Mode::Override) {
 							LerpTransform(outputPose[idx], repVal, weight);
 						} else {
@@ -10082,6 +10738,55 @@ namespace
 				}
 				if (wantBindingDiag) s_bindingDiagLog++;
 
+				// Right-arm reference tracking (bones NOT in the filter set): the
+				// field report says the right arm sometimes visibly plays the
+				// donor even though it is excluded. Log the sampling clip's OWN
+				// local and its composed model-space transform for the right-arm
+				// chain at the same per-play sample point. The filter never
+				// writes these bones, so play-to-play variance here proves the
+				// motion arrives from the graph/aim side, not from a stamp.
+				// Requires the skeleton tables the anchor setup fetched; silently
+				// skipped when modelSpaceAnchor is off.
+				if (diagLogThisSample && skelParents && skelBoneCount > 0) {
+					if (auto* diagSetup = character->setup._ptr) {
+						if (auto* diagSkel = reinterpret_cast<uint8_t*>(diagSetup->animationSkeleton._ptr)) {
+							auto* diagBonesArr = reinterpret_cast<RE::hkArrayRawLayout*>(diagSkel + RE::kSkeletonOffset_bones);
+							if (diagBonesArr->data && diagBonesArr->size > 0) {
+								auto* diagBoneData = reinterpret_cast<uint8_t*>(diagBonesArr->data);
+								static constexpr const char* kDiagRArmBones[] = {
+									"RArm_Collarbone", "RArm_UpperArm", "RArm_Hand"
+								};
+								const int16_t diagBoneCount = static_cast<int16_t>(
+									std::min<int32_t>(diagBonesArr->size, skelBoneCount));
+								for (const char* want : kDiagRArmBones) {
+									for (int16_t i = 0; i < diagBoneCount; ++i) {
+										auto namePtr = *reinterpret_cast<uintptr_t*>(diagBoneData + i * RE::kHkaBoneStride);
+										namePtr &= ~uintptr_t(1);
+										const char* bn = reinterpret_cast<const char*>(namePtr);
+										if (!bn || reinterpret_cast<uintptr_t>(bn) < 0x10000 ||
+											_stricmp(bn, want) != 0) {
+											continue;
+										}
+										if (i < numOutputBones) {
+											RE::hkQsTransformRaw diagModel{};
+											const bool haveModel = modelTransform(i, nullptr, diagModel);
+											const auto& lp = outputPose[i];
+											logger::info("[OAR-TF-PlayDiag] '{}' (unfiltered) local T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | model T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}){}",
+												want,
+												lp.translation[0], lp.translation[1], lp.translation[2],
+												lp.rotation[0], lp.rotation[1], lp.rotation[2], lp.rotation[3],
+												diagModel.translation[0], diagModel.translation[1], diagModel.translation[2],
+												diagModel.rotation[0], diagModel.rotation[1], diagModel.rotation[2], diagModel.rotation[3],
+												haveModel ? "" : " (model chain incomplete)");
+										}
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+
 				// Frozen bones: neither the donor nor the native animation drives
 				// them. Capture the native local on the first sample of this play
 				// (outputPose still holds the source clip's own value here - the
@@ -10092,15 +10797,92 @@ namespace
 					if (idx < 0 || idx >= numOutputBones) continue;
 					auto fIt = state.frozenByName.find(name);
 					if (fIt == state.frozenByName.end()) {
-						fIt = state.frozenByName.emplace(name, outputPose[idx]).first;
+						// nativeIdleMode: the source clip IS the native idle, so
+						// outputPose holds the DONOR's weapon values here — the
+						// exact 3P carry pose the freeze exists to override. And
+						// no other player clip generates until the exit window,
+						// so waiting for the slow-path 1P capture left the weapon
+						// on donor values for the whole play. The bind pose is
+						// the correct hold value (field telemetry: every weapon
+						// bone's live local matched the bind local bit-for-bit
+						// across all clips all session).
+						if (nativeIdleMode) {
+							if (skelRefPose && idx < skelBoneCount &&
+								HasUsableRotation(skelRefPose[idx])) {
+								fIt = state.frozenByName.emplace(name, skelRefPose[idx]).first;
+								static std::atomic<int> s_fzBindLog{ 0 };
+								if (s_fzBindLog.fetch_add(1, std::memory_order_relaxed) < 24) {
+									logger::info("[OAR-TrackFilter] Captured frozen '{}' from the BIND pose (nativeIdlePlayback source)",
+										name);
+								}
+							} else {
+								continue;
+							}
+						} else {
+						// Only capture a USABLE local: the sampling clip's buffer
+						// holds zeros for bones it does not animate, and freezing
+						// the Weapon bone to a degenerate zero transform crushed
+						// the weapon in the actor's hand (2026-08-26, right-hand
+						// corruption with 'Weapon' in freezeBones). Fall back to
+						// the bind pose; if neither is usable, wait for a sampler
+						// that actually animates the bone.
+						RE::hkQsTransformRaw freezeVal = outputPose[idx];
+						if (!HasUsableRotation(freezeVal)) {
+							if (skelRefPose && idx < skelBoneCount) {
+								freezeVal = skelRefPose[idx];
+							}
+							if (!HasUsableRotation(freezeVal)) continue;
+						}
+						fIt = state.frozenByName.emplace(name, freezeVal).first;
+						}  // else (non-native capture)
 					}
-					if (weight > 0.001f) {
-						LerpTransform(outputPose[idx], fIt->second, weight);
-						SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+					// Post-eval publish for frozen bones too: the post-eval writer
+					// drives the ARM chain's node locals, and a frozen child (the
+					// Weapon riding RArm_Hand) left out of that pass can end up
+					// placed against a different parent result than the one on
+					// screen — the weapon visibly detached from the hand while
+					// its pose-level local was provably constant (field
+					// 2026-08-26 evening). Publishing the held local as a raw
+					// (non-chain-root) target keeps parent and child in the SAME
+					// write pass.
+					if (publishPostEval && fIt != state.frozenByName.end() &&
+						IsFiniteQs(fIt->second)) {
+						auto& tgt = state.pendingBoneTargets.emplace_back();
+						tgt.name = name;
+						tgt.chainRoot = false;
+						tgt.translation[0] = fIt->second.translation[0];
+						tgt.translation[1] = fIt->second.translation[1];
+						tgt.translation[2] = fIt->second.translation[2];
+						tgt.rotation[0] = fIt->second.rotation[0];
+						tgt.rotation[1] = fIt->second.rotation[1];
+						tgt.rotation[2] = fIt->second.rotation[2];
+						tgt.rotation[3] = fIt->second.rotation[3];
+					}
+					// nativeIdleMode holds ignore the blend envelope: underneath
+					// the hold is the donor's own (wrong) track, not the base
+					// pose, so blending the hold in/out flashed the donor carry
+					// pose at play start and re-revealed it through the fade
+					// (field 2026-08-26). The held local IS the pre-play base
+					// local, so the engine's idle entry/exit crossfade already
+					// blends it seamlessly — apply at full filter weight for the
+					// clip's entire life.
+					{
+						const float holdW = nativeIdleMode ? filterPtr->weight : weight;
+						if (holdW > 0.001f && applyToThisClip) {
+							LerpTransform(outputPose[idx], fIt->second, holdW);
+							SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
+						}
 					}
 				}
 
 				// onFraction is > 0 here (source path has an early-out at the top).
+
+				// Finalize the post-eval publication: stamping the evaluation
+				// serial makes the targets consumable by exactly this frame's
+				// post-eval hook and no other.
+				if (publishPostEval && !state.pendingBoneTargets.empty()) {
+					state.pendingBoneEvaluation = boneEvaluation;
+				}
 
 				state.cacheValid = true;
 				state.lastSourceTimeSec = nowSec;
@@ -10222,16 +11004,23 @@ namespace
 			}
 
 			// Frozen bones (see the direct path): capture from the restored base
-			// pose (the clip's own native locals), then hold.
-			for (auto& [name, idx] : cr2.freezeNameAndIndex) {
-				if (IsTrackFilterCameraBone(name)) continue;
-				if (idx < 0 || idx >= numOutputBones) continue;
-				auto fIt = state2.frozenByName.find(name);
-				if (fIt == state2.frozenByName.end()) {
-					fIt = state2.frozenByName.emplace(name, outputPose[idx]).first;
+			// pose (the clip's own native locals), then hold. nativeIdleMode
+			// holds ignore the blend envelope (see the direct source path).
+			{
+				const float fbHoldW =
+					(state2.standaloneSpecialIdle && filterPtr->nativeIdlePlayback)
+						? filterPtr->weight
+						: weight;
+				for (auto& [name, idx] : cr2.freezeNameAndIndex) {
+					if (IsTrackFilterCameraBone(name)) continue;
+					if (idx < 0 || idx >= numOutputBones) continue;
+					auto fIt = state2.frozenByName.find(name);
+					if (fIt == state2.frozenByName.end()) {
+						fIt = state2.frozenByName.emplace(name, outputPose[idx]).first;
+					}
+					LerpTransform(outputPose[idx], fIt->second, fbHoldW);
+					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
-				LerpTransform(outputPose[idx], fIt->second, weight);
-				SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 			}
 			// onFraction is > 0 here (source path has an early-out at the top).
 
@@ -10264,6 +11053,12 @@ namespace
 		// =====================================================================
 		if (!state.cacheValid) return;
 		if (ShouldSkipAddNonSourceClip(a_this, filterPtr)) return;
+		// nativeIdlePlayback: overlay stamps first-person clips only (fast-path
+		// gate mirrored here).
+		if (state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+			GetPlayingClipPerspectiveImpl(a_this) != OARClipPerspective::kFirstPerson) {
+			return;
+		}
 		// Skip inactive clips — their pose buffer is uninitialized
 		if (poseHeader.onFraction <= 0.f) return;
 
@@ -10284,6 +11079,33 @@ namespace
 
 		const bool isAdditiveClip = (poseHeader.flags & 0x01) != 0;
 
+		// nativeIdleMode freeze capture: frozen locals must come from a
+		// FIRST-person clip's own pose — the stamp targets live on the 1P
+		// skeleton whose bone frames differ from the 3P sampler's (a
+		// 3P-captured Weapon local parked the weapon at a 3P attachment
+		// offset instead of riding the 1P hand, field 2026-08-26). This slow
+		// path holds the unique lock and 1P clips pass its perspective gate,
+		// so the first usable 1P pose seen here becomes the frozen value.
+		if (state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+			!isAdditiveClip && poseHeader.onFraction > 0.0f) {
+			for (auto& [fzName, fzIdx] : cr.freezeNameAndIndex) {
+				if (IsTrackFilterCameraBone(fzName)) continue;
+				if (fzIdx < 0 || fzIdx >= numOutputBones) continue;
+				if (state.frozenByName.count(fzName)) continue;
+				const RE::hkQsTransformRaw fzVal = outputPose[fzIdx];
+				if (HasUsableRotation(fzVal)) {
+					state.frozenByName.emplace(fzName, fzVal);
+					static std::atomic<int> s_fz1pLog{ 0 };
+					if (s_fz1pLog.fetch_add(1, std::memory_order_relaxed) < 24) {
+						logger::info("[OAR-TrackFilter] Captured frozen '{}' from 1P clip {:X} idx={} T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) (nativeIdlePlayback)",
+							fzName, reinterpret_cast<uintptr_t>(a_this), fzIdx,
+							fzVal.translation[0], fzVal.translation[1], fzVal.translation[2],
+							fzVal.rotation[0], fzVal.rotation[1], fzVal.rotation[2], fzVal.rotation[3]);
+					}
+				}
+			}
+		}
+
 		for (auto& [name, idx] : cr.nameAndIndex) {
 			if (IsTrackFilterCameraBone(name)) continue;
 			if (idx < 0 || idx >= numOutputBones) continue;
@@ -10300,6 +11122,27 @@ namespace
 			} else {
 				auto rIt = state.cachedRepByName.find(name);
 				if (rIt == state.cachedRepByName.end()) continue;
+				// Slow-path twin of the fast-path RArm_Hand tracking: native
+				// mode runs THIS path every frame while any freeze bone stays
+				// uncaptured, so the fast-path diag alone records nothing.
+				if (name == "RArm_Hand") {
+					static std::atomic<int> s_rhStampSlowLog{ 0 };
+					static std::atomic<uint64_t> s_rhStampSlowLastFrame{ 0 };
+					const auto rhFrame = s_currentFrame.load(std::memory_order_relaxed);
+					auto rhLast = s_rhStampSlowLastFrame.load(std::memory_order_relaxed);
+					if (rhFrame - rhLast > 30 &&
+						s_rhStampSlowLastFrame.compare_exchange_strong(rhLast, rhFrame) &&
+						s_rhStampSlowLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+						const auto& lv = outputPose[idx];
+						const auto& rv = rIt->second;
+						logger::info("[OAR-TF-WeaponDiag] RArm_Hand stamp(slow) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+							reinterpret_cast<uintptr_t>(a_this), idx, weight, state.blendingOut,
+							lv.translation[0], lv.translation[1], lv.translation[2],
+							lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
+							rv.translation[0], rv.translation[1], rv.translation[2],
+							rv.rotation[0], rv.rotation[1], rv.rotation[2], rv.rotation[3]);
+					}
+				}
 				if (mode == SubMod::TrackFilter::Mode::Override) {
 					LerpTransform(outputPose[idx], rIt->second, weight);
 				} else {
@@ -10314,7 +11157,12 @@ namespace
 			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}
 
-		// Frozen bones (see the fast path).
+		// Frozen bones (see the fast path). nativeIdleMode holds ignore the
+		// blend envelope (see the source path).
+		const float slowHoldW =
+			(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback)
+				? filterPtr->weight
+				: weight;
 		for (auto& [name, idx] : cr.freezeNameAndIndex) {
 			if (IsTrackFilterCameraBone(name)) continue;
 			if (idx < 0 || idx >= numOutputBones) continue;
@@ -10330,7 +11178,26 @@ namespace
 			} else {
 				auto fIt = state.frozenByName.find(name);
 				if (fIt == state.frozenByName.end()) continue;
-				LerpTransform(outputPose[idx], fIt->second, weight);
+				// Slow-path twin of the fast-path Weapon-freeze tracking.
+				if (name == "Weapon") {
+					static std::atomic<int> s_wpnFreezeSlowLog{ 0 };
+					static std::atomic<uint64_t> s_wpnFreezeSlowLastFrame{ 0 };
+					const auto wfFrame = s_currentFrame.load(std::memory_order_relaxed);
+					auto wfLast = s_wpnFreezeSlowLastFrame.load(std::memory_order_relaxed);
+					if (wfFrame - wfLast > 30 &&
+						s_wpnFreezeSlowLastFrame.compare_exchange_strong(wfLast, wfFrame) &&
+						s_wpnFreezeSlowLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+						const auto& lv = outputPose[idx];
+						const auto& fv = fIt->second;
+						logger::info("[OAR-TF-WeaponDiag] freeze-apply(slow) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+							reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
+							lv.translation[0], lv.translation[1], lv.translation[2],
+							lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
+							fv.translation[0], fv.translation[1], fv.translation[2],
+							fv.rotation[0], fv.rotation[1], fv.rotation[2], fv.rotation[3]);
+					}
+				}
+				LerpTransform(outputPose[idx], fIt->second, slowHoldW);
 			}
 			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}
@@ -11235,7 +12102,19 @@ namespace Hooks
 			const bool idleConditionsPass = a_idle && (!a_testConditions ||
 				a_idle->CheckConditions(&a_actor, a_targetOverride, true));
 			std::string rejectionReason;
-			if (idleConditionsPass && StartStandaloneSpecialIdle(&a_actor, a_idle, &rejectionReason)) {
+			bool nativePlayback = false;
+			if (idleConditionsPass &&
+				StartStandaloneSpecialIdle(&a_actor, a_idle, &rejectionReason, &nativePlayback)) {
+				if (nativePlayback) {
+					// nativeIdlePlayback: the engine plays the full-body idle
+					// natively (3rd-person body performs it with annotations)
+					// while the overlay drives ONLY first-person clips — for
+					// 3P-authored idles that must read correctly in 1st person.
+					logger::info(
+						"[OAR-TrackFilter-Standalone] Native idle playback enabled — engine idle proceeds alongside the 1st-person overlay");
+					return _Original ? _Original(a_process, a_actor, a_defaultObject, a_idle,
+						a_testConditions, a_targetOverride) : true;
+				}
 				// Report success to the PlayIdle caller without creating the native
 				// special-idle state or its behavior-authored end trigger.
 				return true;
@@ -11941,17 +12820,162 @@ namespace Hooks
 			}
 		}
 
+		// Post-eval BONE writes (model-space anchor, corrected pipeline; see
+		// PendingBoneTarget). Restore mirrors the camera policy: nodes changed
+		// by someone else since our write keep the newer state, and a rebuilt
+		// 3D tree (root no longer matches) is never touched.
+		static void RestorePreviousBoneContribution(RE::PlayerCharacter* a_player)
+		{
+			if (s_appliedTrackFilterBones.empty()) return;
+			RE::NiAVObject* firstRoot = a_player ? a_player->Get3D(true) : nullptr;
+			RE::NiAVObject* thirdRoot = a_player ? a_player->Get3D(false) : nullptr;
+			const bool rootAlive = s_appliedTrackFilterBonesRoot &&
+				(s_appliedTrackFilterBonesRoot == firstRoot ||
+					s_appliedTrackFilterBonesRoot == thirdRoot);
+			if (rootAlive) {
+				for (auto& entry : s_appliedTrackFilterBones) {
+					if (entry.node && CameraTransformNear(entry.node->local, entry.applied)) {
+						entry.node->local = entry.base;
+					}
+				}
+			}
+			s_appliedTrackFilterBones.clear();
+			s_appliedTrackFilterBonesRoot = nullptr;
+		}
+
+		static void ApplyCurrentBoneContribution(RE::PlayerCharacter* a_player, uint64_t a_evaluation)
+		{
+			if (!a_player) return;
+
+			struct BoneTargetCopy
+			{
+				std::string name;
+				bool chainRoot;
+				float t[3];
+				float r[4];
+			};
+			std::vector<BoneTargetCopy> targets;
+			float weight = 0.0f;
+			bool firstPerson = false;
+			{
+				std::shared_lock lock(s_trackFilterMutex);
+				auto statesIt = s_charTrackFilterMap.find(a_player);
+				if (statesIt == s_charTrackFilterMap.end()) return;
+				for (const auto& state : statesIt->second) {
+					if (state.pendingBoneEvaluation != a_evaluation ||
+						state.pendingBoneTargets.empty()) {
+						continue;
+					}
+					if (!targets.empty()) {
+						// Two anchored Override overlays on the player in one
+						// evaluation: apply the first, note the collision.
+						static std::atomic<int> s_multiOverlayLog{ 0 };
+						if (s_multiOverlayLog.fetch_add(1, std::memory_order_relaxed) < 8) {
+							logger::info("[OAR-TrackFilter-PostEval] additional anchored overlay pending this evaluation was skipped");
+						}
+						break;
+					}
+					weight = state.pendingBoneWeight;
+					firstPerson = state.pendingBoneFirstPerson;
+					targets.reserve(state.pendingBoneTargets.size());
+					for (const auto& t : state.pendingBoneTargets) {
+						BoneTargetCopy copy;
+						copy.name = t.name;
+						copy.chainRoot = t.chainRoot;
+						std::copy_n(t.translation, 3, copy.t);
+						std::copy_n(t.rotation, 4, copy.r);
+						targets.push_back(std::move(copy));
+					}
+				}
+			}
+			if (targets.empty() || weight <= 0.001f) return;
+
+			auto* root = a_player->Get3D(firstPerson);
+			if (!root) return;
+
+			// Model-space reference frame = the composition of scene-node
+			// LOCALS from just under the actor root down to the bone's parent.
+			// Post-evaluation these locals hold the FINAL blended pose (aim
+			// twist and additives included), which is exactly the chain the
+			// in-graph anchor could never see.
+			auto parentModel = [&](RE::NiAVObject* a_node, RE::NiTransform& a_out) -> bool {
+				RE::NiAVObject* chain[64];
+				int n = 0;
+				RE::NiAVObject* walker = a_node->parent;
+				for (; walker && walker != root && n < 64; walker = walker->parent) {
+					chain[n++] = walker;
+				}
+				if (walker != root) return false;  // detached or implausibly deep
+				RE::NiTransform acc = RE::NiTransform::IDENTITY;
+				for (int i = n - 1; i >= 0; --i) {
+					acc = ComposeNi(acc, chain[i]->local);
+				}
+				a_out = acc;
+				return true;
+			};
+
+			s_appliedTrackFilterBones.clear();
+			s_appliedTrackFilterBonesRoot = root;
+			const float w = std::min(weight, 1.0f);
+			int written = 0;
+			for (const auto& tgt : targets) {
+				auto* node = root->GetObjectByName(RE::BSFixedString(tgt.name.c_str()));
+				if (!node) continue;
+
+				RE::NiTransform targetLocal;
+				const RE::NiPoint3 tp{ tgt.t[0], tgt.t[1], tgt.t[2] };
+				if (tgt.chainRoot) {
+					RE::NiTransform pm;
+					if (!parentModel(node, pm)) continue;
+					const RE::NiTransform donorModel(CameraQuatToMatrix(tgt.r), tp, 1.0f);
+					targetLocal = ComposeNi(InvertNi(pm), donorModel);
+				} else {
+					targetLocal = RE::NiTransform(CameraQuatToMatrix(tgt.r), tp, 1.0f);
+				}
+				targetLocal.scale = node->local.scale;
+
+				AppliedTrackFilterBone entry;
+				entry.node = node;
+				entry.base = node->local;
+				if (w >= 0.999f) {
+					node->local = targetLocal;
+				} else {
+					float qa[4];
+					float qb[4];
+					float qo[4];
+					MatrixToQuat(node->local.rotate, qa);
+					MatrixToQuat(targetLocal.rotate, qb);
+					SlerpQuat(qa, qb, w, qo);
+					node->local.rotate = CameraQuatToMatrix(qo);
+					node->local.translate.x += (targetLocal.translate.x - node->local.translate.x) * w;
+					node->local.translate.y += (targetLocal.translate.y - node->local.translate.y) * w;
+					node->local.translate.z += (targetLocal.translate.z - node->local.translate.z) * w;
+				}
+				entry.applied = node->local;
+				s_appliedTrackFilterBones.push_back(entry);
+				++written;
+			}
+
+			static std::atomic<uint32_t> s_boneApplyLogCount{ 0 };
+			if (written > 0 && s_boneApplyLogCount.fetch_add(1, std::memory_order_relaxed) < 12) {
+				logger::info("[OAR-TrackFilter-PostEval] wrote {} bone local(s) against the final pose (firstPerson={}, weight={:.3f}, evaluation={})",
+					written, firstPerson, w, a_evaluation);
+			}
+		}
+
 		struct PlayerUpdateAnimationHook
 		{
 			static void Thunk(RE::PlayerCharacter* a_player, float a_delta)
 			{
 				RestorePreviousContribution(a_player);
+				RestorePreviousBoneContribution(a_player);
 				const uint64_t evaluation =
 					s_cameraEvaluationSerial.fetch_add(1, std::memory_order_relaxed) + 1;
 				s_activeCameraEvaluation.store(evaluation, std::memory_order_release);
 				Original(a_player, a_delta);
 				s_activeCameraEvaluation.store(0, std::memory_order_release);
 				ApplyCurrentContribution(a_player, evaluation);
+				ApplyCurrentBoneContribution(a_player, evaluation);
 			}
 
 			static void Install()
