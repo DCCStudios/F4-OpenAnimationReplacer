@@ -330,8 +330,7 @@ namespace Parsing
 				std::filesystem::path("meshes") / ExtractPathAfterMeshes(a_subModPath));
 			if (!subModPrefix.ends_with('\\')) subModPrefix.push_back('\\');
 
-			for (const auto& archiveEntry : a_archiveIndex->GetEntries()) {
-				if (!archiveEntry.path.starts_with(subModPrefix)) continue;
+			for (const auto& archiveEntry : a_archiveIndex->GetEntriesUnderPrefix(subModPrefix)) {
 				auto relativeString = archiveEntry.path.substr(subModPrefix.size());
 				if (relativeString.empty()) continue;
 				addFile(std::filesystem::path(relativeString), {}, archiveEntry.path, true);

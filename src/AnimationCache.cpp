@@ -89,6 +89,11 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	const bool hasDiskMTime = !ec;
 
 	const auto pathStr = a_absolutePath.string();
+	if (TryRebindCached(a_suffix, pathStr, hasDiskMTime, static_cast<uint64_t>(diskSize),
+		diskMTime, a_owner, a_priority)) {
+		return true;
+	}
+
 	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
 	if (!file.is_open()) {
 		logger::warn("[OAR-Cache] Cannot open: '{}'", pathStr);
@@ -127,6 +132,10 @@ bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const st
 		logger::warn("[OAR-Cache] Invalid resource size ({}) for: '{}'", bufferInfo.fileSize, a_resourcePath);
 		return false;
 	}
+	if (TryRebindCached(a_suffix, a_resourcePath, false,
+		static_cast<uint64_t>(bufferInfo.fileSize), {}, a_owner, a_priority)) {
+		return true;
+	}
 
 	std::vector<uint8_t> bytes(bufferInfo.fileSize);
 	const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
@@ -150,47 +159,9 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 		return false;
 	}
 
-	// Fast path: this exact file/resource is already cached. The cache's identity
-	// is the source path, not the owner tag — a config reload recreates every
-	// SubMod, so matching on owner would miss ALL entries and re-read every
-	// animation file from disk (seconds of hitching with thousands of anims).
-	// Match by source identity and size, plus mtime for loose files. BA2
-	// resources have no filesystem timestamp, so their identity is the
-	// Data-relative resource path and their cache entry is rebound by path+size.
-	{
-		std::unique_lock lock(m_mutex);
-		auto it = m_cache.find(a_suffix);
-		if (it != m_cache.end()) {
-			for (auto& existing : it->second) {
-				if (!existing || existing->filePath != a_sourceIdentity) continue;
-				const bool timestampMatches = a_hasFileMTime
-					? existing->hasFileMTime && existing->fileMTime == a_sourceMTime
-					: !existing->hasFileMTime;
-				if (existing->fileSize == sourceSize && timestampMatches) {
-					existing->owner = a_owner;
-					existing->priority = a_priority;
-					existing->pendingRebind = false;
-					// Existing live clones keep playing after a config reload. Their
-					// reverse identities must follow the rebound entry just like the
-					// old cache scan followed entry->owner.
-					for (const auto& clone : existing->clones) {
-						if (const auto lookup = m_cloneLookup.find(clone.clone); lookup != m_cloneLookup.end()) {
-							lookup->second.suffix = a_suffix;
-							lookup->second.owner = existing->owner;
-							lookup->second.retired = false;
-						}
-					}
-					// Priority may have changed; keep index 0 = highest.
-					std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
-						return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
-					});
-					// Count toward the loading progress bar like a real load.
-					OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
-					return true;
-				}
-				break;
-			}
-		}
+	if (TryRebindCached(a_suffix, a_sourceIdentity, a_hasFileMTime, sourceSize,
+		a_sourceMTime, a_owner, a_priority)) {
+		return true;
 	}
 
 	auto entry = std::make_unique<CachedAnimation>();
@@ -252,6 +223,40 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 	});
 	files.insert(insertAt, std::move(entry));
 	return true;
+}
+
+bool AnimationCache::TryRebindCached(const std::string& a_suffix,
+	std::string_view a_sourceIdentity, bool a_hasFileMTime, std::uint64_t a_sourceSize,
+	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority)
+{
+	std::unique_lock lock(m_mutex);
+	auto it = m_cache.find(a_suffix);
+	if (it == m_cache.end()) return false;
+
+	for (auto& existing : it->second) {
+		if (!existing || existing->filePath != a_sourceIdentity) continue;
+		const bool timestampMatches = a_hasFileMTime
+			? existing->hasFileMTime && existing->fileMTime == a_sourceMTime
+			: !existing->hasFileMTime;
+		if (existing->fileSize != a_sourceSize || !timestampMatches) continue;
+
+		existing->owner = a_owner;
+		existing->priority = a_priority;
+		existing->pendingRebind = false;
+		for (const auto& clone : existing->clones) {
+			if (const auto lookup = m_cloneLookup.find(clone.clone); lookup != m_cloneLookup.end()) {
+				lookup->second.suffix = a_suffix;
+				lookup->second.owner = existing->owner;
+				lookup->second.retired = false;
+			}
+		}
+		std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
+			return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
+		});
+		OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
+		return true;
+	}
+	return false;
 }
 
 // Select the cached file for a suffix: the given owner's file when present,

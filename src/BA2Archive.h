@@ -1,11 +1,13 @@
 #pragma once
 
+#include <span>
+#include <string_view>
+
 namespace OAR::BA2
 {
 	struct Entry
 	{
 		std::string path;
-		std::uint32_t uncompressedSize{ 0 };
 	};
 
 	class Index
@@ -15,6 +17,7 @@ namespace OAR::BA2
 
 		const std::vector<Entry>& GetEntries() const { return entries; }
 		std::size_t GetEntryCount() const { return entries.size(); }
+		std::span<const Entry> GetEntriesUnderPrefix(std::string_view a_prefix) const;
 
 	private:
 		void ScanArchive(const std::filesystem::path& a_archivePath);

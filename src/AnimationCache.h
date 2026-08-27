@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string_view>
+
 #include "HavokTypes.h"
 #include <shared_mutex>
 #include <unordered_map>
@@ -167,6 +169,10 @@ private:
 
 	bool ParsePackfile(CachedAnimation& a_entry);
 	bool ParseTagfile(CachedAnimation& a_entry);
+	bool TryRebindCached(const std::string& a_suffix, std::string_view a_sourceIdentity,
+		bool a_hasFileMTime, std::uint64_t a_sourceSize,
+		std::filesystem::file_time_type a_sourceMTime, const void* a_owner,
+		int32_t a_priority);
 	bool LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
 		std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
 		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority);

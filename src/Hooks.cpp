@@ -1634,8 +1634,13 @@ namespace
 		int32_t size{ 0 };
 		uint64_t entriesHash{ 0 };
 	};
+	static std::mutex s_playerGraphPollStateMutex;
 	static std::array<PlayerGraphPollState, 4> s_playerGraphPollState{};
-	static std::atomic_bool s_playerGraphPollDirty{ true };
+	// Generation numbers avoid losing an activation/deactivation request when
+	// it races the end of a graph poll. The poll acknowledges only the
+	// generation it observed at its start; a later request remains pending.
+	static std::atomic_uint64_t s_playerGraphPollGeneration{ 1 };
+	static std::atomic_uint64_t s_playerGraphPollApplied{ 0 };
 	// Learned index of the player's 1st-person root graph: set when a clip from
 	// that graph resolves to a "..._1stperson..." path. Lets us classify player
 	// clips whose own paths lack the marker (authored relative names).
@@ -2932,8 +2937,11 @@ void RestoreAllActiveReplacements()
 void ClearClipRuntimeState()
 {
 	ClearIdleStopSuppressionState();
-	s_playerGraphPollDirty.store(true, std::memory_order_release);
-	s_playerGraphPollState = {};
+	s_playerGraphPollGeneration.fetch_add(1, std::memory_order_release);
+	{
+		std::lock_guard lock(s_playerGraphPollStateMutex);
+		s_playerGraphPollState = {};
+	}
 	{
 		std::unique_lock lock(s_originalAnimMutex);
 		s_originalAnimMap.clear();
@@ -4556,20 +4564,27 @@ namespace
 		static std::atomic<int> s_pollDiagCount{ 0 };
 
 		bool graphWasUnstable = false;
-		const bool forcePoll = s_playerGraphPollDirty.load(std::memory_order_acquire);
+		const auto pollGeneration = s_playerGraphPollGeneration.load(std::memory_order_acquire);
+		const bool forcePoll = s_playerGraphPollApplied.load(std::memory_order_acquire) != pollGeneration;
 
 		for (uint32_t gi = 0; gi < manager->graph.size() && gi < 4; ++gi) {
 			const auto root = reinterpret_cast<uintptr_t>(manager->graph[gi].get());
 			if (!root || root < 0x10000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(root), kBShkb_HkRootGraph + 8) ||
 				*reinterpret_cast<uintptr_t*>(root) != bshkbVtbl.address()) {
-				s_playerGraphPollState[gi] = {};
+				{
+					std::lock_guard lock(s_playerGraphPollStateMutex);
+					s_playerGraphPollState[gi] = {};
+				}
 				continue;
 			}
 			const auto hkGraph = *reinterpret_cast<uintptr_t*>(root + kBShkb_HkRootGraph);
 			if (!hkGraph || hkGraph < 0x10000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
-				s_playerGraphPollState[gi] = {};
+				{
+					std::lock_guard lock(s_playerGraphPollStateMutex);
+					s_playerGraphPollState[gi] = {};
+				}
 				continue;
 			}
 
@@ -4609,19 +4624,29 @@ namespace
 			}
 			const auto activeNodes = *reinterpret_cast<uintptr_t*>(hkGraph + kBG_ActiveNodes);
 			if (!activeNodes || IsBadReadPtr(reinterpret_cast<void*>(activeNodes), 0x10)) {
-				s_playerGraphPollState[gi] = { hkGraph, activeNodes, 0, 0, 0 };
+				{
+					std::lock_guard lock(s_playerGraphPollStateMutex);
+					s_playerGraphPollState[gi] = { hkGraph, activeNodes, 0, 0, 0 };
+				}
 				continue;
 			}
 			const auto data = *reinterpret_cast<uintptr_t*>(activeNodes);
 			const auto size = *reinterpret_cast<int32_t*>(activeNodes + 8);
 			if (!data || size <= 0 || size > 0x1000 ||
 				IsBadReadPtr(reinterpret_cast<void*>(data), static_cast<size_t>(size) * sizeof(void*))) {
-				s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, 0 };
+				{
+					std::lock_guard lock(s_playerGraphPollStateMutex);
+					s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, 0 };
+				}
 				continue;
 			}
 
 			const auto entriesHash = fingerprintEntries(data, size);
-			const auto& previous = s_playerGraphPollState[gi];
+			PlayerGraphPollState previous;
+			{
+				std::lock_guard lock(s_playerGraphPollStateMutex);
+				previous = s_playerGraphPollState[gi];
+			}
 			const bool unchanged = !forcePoll &&
 				previous.hkGraph == hkGraph &&
 				previous.activeNodes == activeNodes &&
@@ -4632,7 +4657,10 @@ namespace
 				continue;
 			}
 
-			s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, entriesHash };
+			{
+				std::lock_guard lock(s_playerGraphPollStateMutex);
+				s_playerGraphPollState[gi] = { hkGraph, activeNodes, data, size, entriesHash };
+			}
 
 			for (int32_t i = 0; i < size; ++i) {
 				const auto entry = *reinterpret_cast<uintptr_t*>(data + static_cast<uintptr_t>(i) * sizeof(void*));
@@ -4819,7 +4847,7 @@ namespace
 		}
 
 		if (!graphWasUnstable) {
-			s_playerGraphPollDirty.store(false, std::memory_order_release);
+			s_playerGraphPollApplied.store(pollGeneration, std::memory_order_release);
 		}
 
 	}
@@ -5091,8 +5119,17 @@ namespace
 		// behavior graph, so graph perspective alone can otherwise reject a valid
 		// exact-path replacement (F4Parkour Ledge/Mantle High).
 		if (!Settings::GetSingleton()->bSkeletonCompatibilityGate) return true;
-		const std::string& filePath =
-			!a_info->absoluteDiskPath.empty() ? a_info->absoluteDiskPath : a_info->replacementPath;
+		// Archive-backed replacements have no absolute disk path. Their
+		// Data-relative resource path still contains the actor skeleton and
+		// perspective roots, so use it before the suffix-only replacement path.
+		std::string filePath;
+		if (a_info->archiveResource && !a_info->resourcePath.empty()) {
+			filePath = a_info->resourcePath;
+		} else if (!a_info->absoluteDiskPath.empty()) {
+			filePath = a_info->absoluteDiskPath;
+		} else {
+			filePath = a_info->replacementPath;
+		}
 		const std::string fileSig = AnimRootSignature(filePath);
 		std::string clipPath;
 		{
@@ -5952,7 +5989,7 @@ namespace
 		// A clip activation can reuse an active-node entry in place, so force the
 		// next stable player-graph poll even when the pointer fingerprint happens
 		// to remain unchanged.
-		s_playerGraphPollDirty.store(true, std::memory_order_release);
+		s_playerGraphPollGeneration.fetch_add(1, std::memory_order_release);
 		const int32_t playerGraphIndex = PlayerGraphIndexForClip(a_this, a_context);
 		if (playerGraphIndex >= 0) {
 			std::unique_lock lock(s_playerClipMutex);
@@ -9100,7 +9137,7 @@ namespace
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		if (a_this) {
-			s_playerGraphPollDirty.store(true, std::memory_order_release);
+			s_playerGraphPollGeneration.fetch_add(1, std::memory_order_release);
 			ReleaseIdleStopSuppressionClip(a_this);
 			// Flush a still-pending kActivate log entry BEFORE dropping the
 			// per-clip state below. Short-lived clips (fire animations,

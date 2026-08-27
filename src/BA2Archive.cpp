@@ -1,5 +1,7 @@
 #include "BA2Archive.h"
 
+#include "RE/B/BSResourceNiBinaryStream.h"
+
 #include <cctype>
 #include <cstring>
 
@@ -72,6 +74,8 @@ namespace OAR::BA2
 			logger::warn("[OAR-BA2] Failed to enumerate Data archives: {}", e.what());
 		}
 
+		std::ranges::sort(result.entries, {}, &Entry::path);
+
 		logger::info("[OAR-BA2] Indexed {} General BA2 resources from Data", result.entries.size());
 		return result;
 	}
@@ -96,15 +100,12 @@ namespace OAR::BA2
 			return;
 		}
 
-		std::vector<std::uint32_t> uncompressedSizes;
-		uncompressedSizes.reserve(fileCount);
 		for (std::uint32_t i = 0; i < fileCount; ++i) {
 			GeneralFileRecord record{};
 			if (!file.read(reinterpret_cast<char*>(&record), sizeof(record))) {
 				logger::warn("[OAR-BA2] Truncated file table in '{}'", a_archivePath.string());
 				return;
 			}
-			uncompressedSizes.push_back(record.uncompressedSize);
 		}
 
 		file.seekg(static_cast<std::streamoff>(nameTableOffset), std::ios::beg);
@@ -131,11 +132,42 @@ namespace OAR::BA2
 			if (!path.starts_with("meshes\\") || !path.ends_with(".hkx")) continue;
 			if (!seenPaths.insert(path).second) continue;
 
-			entries.push_back({ std::move(path), uncompressedSizes[i] });
+			// The Data directory may contain archives belonging to disabled
+			// plugins. The running resource manager is the authoritative source
+			// for registration and precedence, so retain only paths that it can
+			// currently resolve. This also makes duplicate paths follow the game
+			// resource order rather than filesystem enumeration order.
+			RE::BSResourceNiBinaryStream resource(path.c_str(), false, nullptr, false);
+			if (!resource) {
+				seenPaths.erase(path);
+				continue;
+			}
+
+			entries.push_back({ std::move(path) });
 			++added;
 		}
 
 		logger::info("[OAR-BA2] Archive '{}' version {} contributed {} HKX entries",
 			a_archivePath.filename().string(), version, added);
+	}
+
+	std::span<const Entry> Index::GetEntriesUnderPrefix(std::string_view a_prefix) const
+	{
+		if (entries.empty() || a_prefix.empty()) return {};
+
+		std::string prefix(a_prefix);
+		prefix = NormalizeArchivePath(std::move(prefix));
+		if (!prefix.ends_with('\\')) prefix.push_back('\\');
+
+		const auto first = std::ranges::lower_bound(entries, prefix, {}, &Entry::path);
+		if (first == entries.end() || !first->path.starts_with(prefix)) return {};
+
+		const auto last = std::find_if(first, entries.end(), [&](const Entry& a_entry) {
+			return !a_entry.path.starts_with(prefix);
+		});
+		return std::span<const Entry>{
+			std::to_address(first),
+			static_cast<std::size_t>(std::distance(first, last))
+		};
 	}
 }
