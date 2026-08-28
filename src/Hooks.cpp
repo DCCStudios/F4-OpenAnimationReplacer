@@ -132,6 +132,14 @@ static constexpr float kDeferredIdleStopTimeoutSec = 3.0f;
 static constexpr float kDeferredIdleStopSettleSec = 0.0f;
 // Duration of the post-exit anchor fade over the reactivated live clips.
 static constexpr float kPostExitAnchorFadeSec = 0.2f;
+// Settle step advanced through the graph right after
+// BGSAnimationSystemUtils::InitializeActorInstant rebuilds it at delivery.
+// SeamlessInspect's value; the committed-good (36e13ed) behavior. Tuning it
+// smaller (0.033/FLT_MIN) or larger (1.0) chasing the residual one-frame arm
+// spike did not help — that spike is the GAME's exit wpnequipfast playing on
+// the unfiltered arm bones during the blend-out TAIL (pre-delivery), which
+// this post-delivery step cannot touch. Left at the known-good value.
+static constexpr float kExitInitUpdateSec = 0.2f;
 
 // Sound-burst suppression window for the IdleStop fast-forward (submod
 // option suppressIdleStopSounds). File-scope thread_locals because delivery
@@ -816,7 +824,7 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 			s_inIdleStopFastForward = true;
 			s_suppressFastForwardSounds = suppressSounds;
 			RE::BGSAnimationSystemUtils::InitializeActorInstant(*actor, false);
-			actor->UpdateAnimation(0.2f);
+			actor->UpdateAnimation(kExitInitUpdateSec);
 			s_inIdleStopFastForward = false;
 			s_suppressFastForwardSounds = false;
 		}
@@ -12214,6 +12222,55 @@ namespace
 			processFilter(filterKey);
 		}
 
+			// BLEND-OUT arm hold (field 2026-08-28): the filter covers the whole
+			// arm (collarbones + includeChildren), so processFilter overrides it
+			// toward the donor at weight*blendAlpha, which DECAYS to 0 at the
+			// blend-out END, releasing the arm to the game's exit wpnequipfast
+			// (activates in the last ~70ms) for the final frames = the one-frame
+			// arm/weapon spike "at the end of the blend-out". The native clip is
+			// held by its own tail guard; wpnequipfast and the other ready clips
+			// are NOT. Give every 1P non-additive clip the same tail-guard ramp
+			// HERE, after processFilter (the final word): stamp all bones toward
+			// the ANCHOR at (1 - blendAlpha)*weight, so as the donor override
+			// fades out the anchor hold fades IN and the equip never surfaces.
+			// Overrides (does not delete) the equip, so no gap. Camera bone is
+			// owned by the camera pass; skip it.
+			if ((poseHeader.flags & 0x01) == 0 && poseHeader.onFraction > 0.0f &&
+				character == GetPlayer1PCharacter(actor)) {
+				std::shared_lock boShared(s_trackFilterMutex);
+				auto boIt = s_charTrackFilterMap.find(actor);
+				if (boIt != s_charTrackFilterMap.end()) {
+					for (auto& boState : boIt->second) {
+						if (!boState.standaloneSpecialIdle || !boState.blendingOut ||
+							boState.postExitAnchorFade || boState.dormant ||
+							!boState.filter || !boState.filter->nativeIdlePlayback ||
+							!boState.nativeAnchorValid) {
+							continue;
+						}
+						if (static_cast<int16_t>(boState.nativeAnchorPose.size()) !=
+							poseHeader.numData) {
+							break;
+						}
+						const float boW =
+							(1.0f - boState.blendAlpha) * boState.filter->weight;
+						if (boW <= 0.001f) break;
+						const int16_t boCamIdx = GetCharCameraBoneIndex(character);
+						for (int16_t pb = 0; pb < poseHeader.numData; ++pb) {
+							if (pb == boCamIdx) continue;
+							LerpTransform(outputPose[pb],
+								boState.nativeAnchorPose[pb], boW);
+							SetPoseBoneMaskBit(tracksPtr, poseHeader, pb);
+						}
+						static std::atomic<int> s_boHoldLog{ 0 };
+						if (s_boHoldLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+							logger::info("[OAR-IdleStop] Blend-out arm hold w={:.3f} (clip {:X}) overriding exit equip toward anchor",
+								boW, reinterpret_cast<uintptr_t>(a_this));
+						}
+						break;
+					}
+				}
+			}
+
 		// FINAL camera release (aim-rework 2026-08-28): runs AFTER every
 		// writer above — the source stamp re-sets the camera's pose-mask bit,
 		// so any earlier release would be undone. While a live carrier
@@ -12844,10 +12901,27 @@ namespace
 						}
 					}
 				}
+				// Keep tracing for a tail of frames AFTER the post-exit window
+				// ends (field 2026-08-28): the arm/weapon appear pinned at the
+				// anchor through the whole 1.5s hold, and the suspected one-frame
+				// snap to the live pose lands right as the window releases —
+				// which is exactly where the in-window trace used to stop. Run a
+				// short post-window tail so that release frame is captured.
+				static thread_local int s_traceTail = 0;
+				if (doTrace) {
+					s_traceTail = 40;
+				} else if (s_traceTail > 0) {
+					--s_traceTail;
+					doTrace = true;
+					tracePhase = "postWindow";
+				}
 			}
-			if (doTrace && s_camTraceLogUsed.fetch_add(1, std::memory_order_relaxed) < 240) {
+			if (doTrace && s_camTraceLogUsed.fetch_add(1, std::memory_order_relaxed) < 320) {
 				float poseR[4] = { 0, 0, 0, 0 };
 				bool havePose = false;
+				float hand26R[4] = { 0, 0, 0, 0 };
+				float wpn28R[4] = { 0, 0, 0, 0 };
+				bool haveArm = false;
 				RE::BSTSmartPointer<RE::BSAnimationGraphManager> trMgr;
 				if (tracePlayer->GetAnimationGraphManagerImpl(trMgr) && trMgr) {
 					const int32_t fpIdx = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
@@ -12868,6 +12942,20 @@ namespace
 									auto* trOut = reinterpret_cast<RE::hkQsTransformRaw*>(
 										trTracks + trPose.dataOffset);
 									for (int q = 0; q < 4; ++q) poseR[q] = trOut[78].rotation[q];
+									// Collarbone trace (field 2026-08-28: the arm/weapon
+									// spike is invisible on the HAND (bone 26, a child) —
+									// the FILTERED bones are the COLLARBONES, whose
+									// rotation swings the whole arm chain + attached
+									// weapon in world space while the hand's LOCAL
+									// rotation stays smooth. RArm_Collarbone=20,
+									// LArm_Collarbone=14.
+									if (trPose.numData > 20) {
+										for (int q = 0; q < 4; ++q) {
+											hand26R[q] = trOut[20].rotation[q];
+											wpn28R[q] = trOut[14].rotation[q];
+										}
+										haveArm = true;
+									}
 									havePose = true;
 								}
 							}
@@ -12882,10 +12970,12 @@ namespace
 						haveNode = true;
 					}
 				}
-				logger::info("[OAR-CamTrace] {} alpha={:.3f} pose78{} R=({:.3f},{:.3f},{:.3f},{:.3f}) node{} R=({:.3f},{:.3f},{:.3f},{:.3f})",
+				logger::info("[OAR-CamTrace] {} alpha={:.3f} pose78{} R=({:.3f},{:.3f},{:.3f},{:.3f}) node{} R=({:.3f},{:.3f},{:.3f},{:.3f}) | RColl{} R=({:.3f},{:.3f},{:.3f},{:.3f}) LColl R=({:.3f},{:.3f},{:.3f},{:.3f})",
 					tracePhase, traceAlpha,
 					havePose ? "" : "(x)", poseR[0], poseR[1], poseR[2], poseR[3],
-					haveNode ? "" : "(x)", nodeR[0], nodeR[1], nodeR[2], nodeR[3]);
+					haveNode ? "" : "(x)", nodeR[0], nodeR[1], nodeR[2], nodeR[3],
+					haveArm ? "" : "(x)", hand26R[0], hand26R[1], hand26R[2], hand26R[3],
+					wpn28R[0], wpn28R[1], wpn28R[2], wpn28R[3]);
 			}
 		}
 
