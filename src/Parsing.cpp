@@ -529,6 +529,8 @@ namespace Parsing
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
 		if (json.contains("disableIdleStop"))
 			a_subMod->disableIdleStop = json["disableIdleStop"].get<bool>();
+		if (json.contains("suppressIdleStopSounds"))
+			a_subMod->suppressIdleStopSounds = json["suppressIdleStopSounds"].get<bool>();
 		if (json.contains("leafMatching"))
 			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("eventsOnStart") && json["eventsOnStart"].is_array())
@@ -660,6 +662,8 @@ namespace Parsing
 			a_subMod->endClipIfShorter = json["endClipIfShorter"].get<bool>();
 		if (json.contains("disableIdleStop"))
 			a_subMod->disableIdleStop = json["disableIdleStop"].get<bool>();
+		if (json.contains("suppressIdleStopSounds"))
+			a_subMod->suppressIdleStopSounds = json["suppressIdleStopSounds"].get<bool>();
 		if (json.contains("leafMatching"))
 			a_subMod->leafMatching = json["leafMatching"].get<bool>();
 		if (json.contains("blendCurve"))

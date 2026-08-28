@@ -771,6 +771,22 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				"This avoids leaving the actor in a lingering special-idle state without\n"
 				"swallowing the event or bypassing the graph's normal cleanup."));
 		}
+		if (disableIdleStop) {
+			ImGui::Indent();
+			bool suppressIdleSounds = a_subMod->GetSuppressIdleStopSounds();
+			if (ImGui::Checkbox(UICommon::T("Suppress SoundPlay Annotations During IdleStop Fix (?)"), &suppressIdleSounds)) {
+				a_subMod->SetSuppressIdleStopSounds(suppressIdleSounds);
+				a_subMod->SetDirty(true);
+			}
+			if (ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("%s", UICommon::T(
+					"The IdleStop fix fast-forwards animation processing, which replays every\n"
+					"remaining SoundPlay annotation of the skipped span in one burst (an\n"
+					"audible glitch). While ticked, SoundPlay events are swallowed for the\n"
+					"duration of that fast-forward only. Default: ON."));
+			}
+			ImGui::Unindent();
+		}
 
 		bool leafMatch = a_subMod->GetLeafMatching();
 		if (ImGui::Checkbox(UICommon::T("Match By Filename (Leaf Matching) (?)"), &leafMatch)) {
@@ -1041,8 +1057,11 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			a_subMod->GetShareRandomResults() ? UICommon::T("Yes") : UICommon::T("No"));
 		if (a_subMod->GetPlayOnceFullBody())
 			ImGui::TextUnformatted(UICommon::T("Lock Replacement Until Clip Ends: Yes"));
-		if (a_subMod->GetDisableIdleStop())
+		if (a_subMod->GetDisableIdleStop()) {
 			ImGui::TextUnformatted(UICommon::T("Apply IdleStop Fix After Special Idle: Yes"));
+			if (a_subMod->GetSuppressIdleStopSounds())
+				ImGui::TextUnformatted(UICommon::T("Suppress SoundPlay During IdleStop Fix: Yes"));
+		}
 		if (a_subMod->GetDeactivationDelay() > 0.0f)
 			ImGui::Text(UICommon::T("Deactivation delay: %.2fs"), a_subMod->GetDeactivationDelay());
 		if (!a_subMod->eventsOnStart.empty()) {
@@ -1140,6 +1159,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			if (a_subMod->GetEndClipIfShorter())
 				json["endClipIfShorter"] = true;
 			json["disableIdleStop"] = a_subMod->GetDisableIdleStop();
+			json["suppressIdleStopSounds"] = a_subMod->GetSuppressIdleStopSounds();
 			if (a_subMod->GetLeafMatching())
 				json["leafMatching"] = true;
 			if (!a_subMod->eventsOnStart.empty())

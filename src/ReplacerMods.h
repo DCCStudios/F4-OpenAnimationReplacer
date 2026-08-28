@@ -75,6 +75,8 @@ public:
 	void SetEndClipIfShorter(bool a_val) { endClipIfShorter = a_val; }
 	bool GetDisableIdleStop() const { return disableIdleStop; }
 	void SetDisableIdleStop(bool a_val) { disableIdleStop = a_val; }
+	bool GetSuppressIdleStopSounds() const { return suppressIdleStopSounds; }
+	void SetSuppressIdleStopSounds(bool a_val) { suppressIdleStopSounds = a_val; }
 	bool GetLeafMatching() const { return leafMatching; }
 	void SetLeafMatching(bool a_val) { leafMatching = a_val; }
 	const std::string& GetRequiredProjectName() const { return requiredProjectName; }
@@ -140,6 +142,11 @@ public:
 	// Apply the IdleStopFix fast-forward before delivering the actor's next
 	// IdleStop after an opted-in replacement. Disabled by default.
 	bool disableIdleStop{ false };
+	// While the IdleStop fast-forward replays the skipped animation span, the
+	// clips' remaining SoundPlay annotations fire in one burst (an audible
+	// glitch). Suppress them during that window. Only meaningful when
+	// disableIdleStop is on; defaults ON.
+	bool suppressIdleStopSounds{ true };
 	// Leaf matching: this submod's animations match by FILENAME alone. A
 	// wpnmelee.hkx here replaces ANY clip whose animation file is named
 	// wpnmelee.hkx, whatever folder it lives in — and it outranks exact-path

@@ -79,11 +79,218 @@ struct IdleStopSuppressionArm
 	SubMod* owner{ nullptr };
 	std::string subModName;
 	std::string originalPath;
+	// Swallow SoundPlay annotation events during the fast-forward window (the
+	// skipped span's remaining sound annotations otherwise replay in one
+	// audible burst). Captured at arm time from the submod option.
+	bool suppressSounds{ true };
 };
 
 static std::mutex s_idleStopSuppressionMutex;
 static std::unordered_map<RE::hkbClipGenerator*, IdleStopSuppressionArm> s_idleStopArmedClips;
 static std::unordered_map<uint32_t, std::pair<RE::hkbClipGenerator*, IdleStopSuppressionArm>> s_pendingIdleStopByActor;
+
+// ---- Deferred IdleStop delivery (nativeIdlePlayback) ----
+// "Don't do the IdleStop until the blend-out is complete": when the graph
+// raises IdleStop while a native-idle overlay is still fading, park the
+// delivery (sink + original vfunc + event identity) and swallow the event.
+// The tick services it the moment the fade goes dormant (or on a safety
+// timeout), so the fast-forward and the engine exit fire from the parked
+// ready pose instead of mid-fade — the weapon/right-arm exit snap
+// (forensics 2026-08-27) happened because the exit landed at alpha 0.05-0.26.
+using AnimGraphProcessEventFn = RE::BSEventNotifyControl (*)(
+	void*, const RE::BSAnimationGraphEvent&, RE::BSTEventSource<RE::BSAnimationGraphEvent>*);
+struct DeferredIdleStop
+{
+	void* sinkThis{ nullptr };
+	AnimGraphProcessEventFn original{ nullptr };
+	uint64_t holderID{ 0 };
+	std::chrono::steady_clock::time_point deferredAt{};
+	// First tick on which the fade was observed inactive — delivery waits a
+	// short settle window past this so the pose visibly rests at base before
+	// the fast-forward jolts the graph.
+	std::chrono::steady_clock::time_point settleStart{};
+	bool settling{ false };
+};
+static std::mutex s_deferredIdleStopMutex;
+static std::unordered_map<RE::TESObjectREFR*, DeferredIdleStop> s_deferredIdleStops;
+
+// s_deferredIdleStopMutex is a LEAF lock: never taken while holding it does
+// any code take a track-filter lock (the sweep snapshots first), so callers
+// already inside the filter locks may peek safely.
+static bool HasDeferredIdleStop(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return false;
+	std::lock_guard dLock(s_deferredIdleStopMutex);
+	return s_deferredIdleStops.contains(a_refr);
+}
+// Safety: never hold an IdleStop hostage longer than this.
+static constexpr float kDeferredIdleStopTimeoutSec = 3.0f;
+// Rest-at-base time between fade completion and the deferred delivery.
+// Zero: deliver on the next sweep tick — the post-exit anchor fade now
+// provides the continuity the static settle window was approximating (and
+// the settle's held pose read as a frozen beat before locomotion resumed).
+static constexpr float kDeferredIdleStopSettleSec = 0.0f;
+// Duration of the post-exit anchor fade over the reactivated live clips.
+static constexpr float kPostExitAnchorFadeSec = 0.2f;
+
+// Sound-burst suppression window for the IdleStop fast-forward (submod
+// option suppressIdleStopSounds). File-scope thread_locals because delivery
+// can run from the tick as well as from the event hook.
+static thread_local bool s_inIdleStopFastForward = false;
+static thread_local bool s_suppressFastForwardSounds = false;
+// The synchronous window alone caught NOTHING in the field (2026-08-27):
+// events from the skipped span are queued and drained AFTER
+// UpdateAnimation(1000) returns. Per-actor TIMED window as the real filter.
+static constexpr float kPostFixSoundSuppressSec = 1.0f;
+static std::mutex s_soundSuppressMutex;
+static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+	s_soundSuppressUntilByActor;
+
+// Post-exit CAMERA hold window: the exit transition's own clips (wpnequipfast)
+// carry camera animation which the fast-forward lands mid-motion — the pose
+// camera stays pinned to the anchor for this long after the exit.
+static constexpr float kPostExitCameraHoldSec = 1.5f;
+static std::mutex s_cameraHoldMutex;
+// Exit-camera snapshot (field 2026-08-28): the fade's actual camera landing
+// value is NOT the anchor camera — the arms land bit-exact on the anchor but
+// the camera lands ~2-3deg away, varying per vault (donor camera end + look
+// drift). Pinning the post-exit hold/ease to the ANCHOR therefore snapped the
+// view one frame at delivery (the wpnequipfast hard strip wrote the anchor at
+// full weight — the user connected the snap to the equipfast directly). The
+// hold entry now carries the LAST COMPOSITED camera value, read from
+// generatorOutput at delivery before the fast-forward mutates it; the strip
+// and the ease pin to it, making continuity true by construction.
+struct PostExitCamHold
+{
+	std::chrono::steady_clock::time_point until{};
+	RE::hkQsTransformRaw camVal{};
+	bool camValid = false;
+};
+static std::unordered_map<uint32_t, PostExitCamHold> s_cameraHoldUntilByActor;
+
+// Per-vault diagnostic budgets (field 2026-08-28: the launch-lifetime caps
+// spent themselves on the first vault, leaving every later exit
+// uninstrumented). CamTrace re-arms at each anchor capture; the camera
+// strip/ease lines re-arm each time the post-exit window arms.
+static std::atomic<int> s_camTraceLogUsed{ 0 };
+static std::atomic<int> s_camStripLogUsed{ 0 };
+
+static void ArmPostExitCameraHold(RE::TESObjectREFR* a_refr,
+	const RE::hkQsTransformRaw* a_exitCam = nullptr)
+{
+	if (!a_refr) return;
+	{
+		std::lock_guard lock(s_cameraHoldMutex);
+		auto& hold = s_cameraHoldUntilByActor[a_refr->GetFormID()];
+		hold.until = std::chrono::steady_clock::now() +
+			std::chrono::milliseconds(static_cast<int>(kPostExitCameraHoldSec * 1000.0f));
+		if (a_exitCam) {
+			hold.camVal = *a_exitCam;
+			hold.camValid = true;
+		} else {
+			hold.camValid = false;
+		}
+	}
+	s_camStripLogUsed.store(0, std::memory_order_relaxed);
+}
+
+static bool InPostExitCameraHold(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return false;
+	std::lock_guard lock(s_cameraHoldMutex);
+	auto it = s_cameraHoldUntilByActor.find(a_refr->GetFormID());
+	if (it == s_cameraHoldUntilByActor.end()) return false;
+	if (std::chrono::steady_clock::now() >= it->second.until) {
+		s_cameraHoldUntilByActor.erase(it);
+		return false;
+	}
+	return true;
+}
+
+static bool GetPostExitCamSnapshot(RE::TESObjectREFR* a_refr, RE::hkQsTransformRaw& a_out)
+{
+	if (!a_refr) return false;
+	std::lock_guard lock(s_cameraHoldMutex);
+	auto it = s_cameraHoldUntilByActor.find(a_refr->GetFormID());
+	if (it == s_cameraHoldUntilByActor.end() || !it->second.camValid) return false;
+	a_out = it->second.camVal;
+	return true;
+}
+
+// Camera-specific ease clock (field 2026-08-28): the anchor->live camera
+// delta (~2.5deg — the view genuinely rests somewhere new after the vault)
+// was being traversed in the pose fade's 0.2s and read as a distinct extra
+// motion after the blend-out; worse, the ease died with the pose fade and
+// the engine's transition ramp finished the last third. Runs on the hold
+// window's own wall clock so it outlives the pose fade: 1 at delivery,
+// smoothstepped to 0 over kPostExitCamEaseSec.
+static constexpr float kPostExitCamEaseSec = 0.5f;
+
+static float PostExitCamEaseAlpha(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return 0.0f;
+	std::lock_guard lock(s_cameraHoldMutex);
+	auto it = s_cameraHoldUntilByActor.find(a_refr->GetFormID());
+	if (it == s_cameraHoldUntilByActor.end()) return 0.0f;
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= it->second.until) return 0.0f;
+	const float remainingSec =
+		std::chrono::duration<float>(it->second.until - now).count();
+	const float elapsedSec = kPostExitCameraHoldSec - remainingSec;
+	if (elapsedSec <= 0.0f) return 1.0f;
+	const float t = std::clamp(elapsedSec / kPostExitCamEaseSec, 0.0f, 1.0f);
+	return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+// Live camera carrier tracking (rework 2026-08-28): the pose camera bone is
+// AIM-DRIVEN — winding it back to the anchor during the blend-out re-applied
+// the vault-ENTRY aim pitch, and the look delta accumulated during the play
+// then played back as the visible post-exit lerp (field: the settle was pure
+// pitch, and each vault's fade landed exactly on the PREVIOUS vault's settle
+// value). The correct blend-out target is the LIVE carrier clip's camera,
+// which the filter's decaying donor stamp already blends donor->live on its
+// own. These helpers record that such a carrier generated recently so the
+// tail guard can RELEASE the native clip's camera track instead of steering
+// it.
+static std::mutex s_liveCamCarrierMutex;
+static std::unordered_map<RE::TESObjectREFR*, uint64_t> s_liveCamCarrierSeenFrame;
+
+static void MarkLiveCamCarrierSeen(RE::TESObjectREFR* a_refr, uint64_t a_frame)
+{
+	if (!a_refr) return;
+	std::lock_guard lock(s_liveCamCarrierMutex);
+	s_liveCamCarrierSeenFrame[a_refr] = a_frame;
+}
+
+static bool IsLiveCamCarrierFresh(RE::TESObjectREFR* a_refr, uint64_t a_frame)
+{
+	if (!a_refr) return false;
+	std::lock_guard lock(s_liveCamCarrierMutex);
+	auto it = s_liveCamCarrierSeenFrame.find(a_refr);
+	return it != s_liveCamCarrierSeenFrame.end() && a_frame - it->second <= 2;
+}
+
+static void ArmSoundSuppressWindow(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return;
+	std::lock_guard lock(s_soundSuppressMutex);
+	s_soundSuppressUntilByActor[a_refr->GetFormID()] =
+		std::chrono::steady_clock::now() +
+		std::chrono::milliseconds(static_cast<int>(kPostFixSoundSuppressSec * 1000.0f));
+}
+
+static bool InSoundSuppressWindow(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return false;
+	std::lock_guard lock(s_soundSuppressMutex);
+	auto it = s_soundSuppressUntilByActor.find(a_refr->GetFormID());
+	if (it == s_soundSuppressUntilByActor.end()) return false;
+	if (std::chrono::steady_clock::now() >= it->second) {
+		s_soundSuppressUntilByActor.erase(it);
+		return false;
+	}
+	return true;
+}
 
 static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr,
 	const ReplacementAnimFileInfo* a_info)
@@ -123,6 +330,7 @@ static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESOb
 	arm.owner = subMod;
 	arm.subModName = subMod->GetName();
 	arm.originalPath = a_info->originalPath;
+	arm.suppressSounds = subMod->GetSuppressIdleStopSounds();
 	s_idleStopArmedClips[a_clip] = arm;
 	s_pendingIdleStopByActor[actorFormID] = { a_clip, arm };
 	logger::info("[OAR-IdleStop] Armed actor {:X} from submod '{}' path='{}'",
@@ -140,7 +348,7 @@ static void RearmIdleStopSuppressionForEcho(RE::hkbClipGenerator* a_clip, SubMod
 		it->second.actorFormID, it->second.subModName);
 }
 
-static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr)
+static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSuppressSounds = nullptr)
 {
 	if (!a_refr) return false;
 
@@ -153,6 +361,7 @@ static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr)
 		s_pendingIdleStopByActor.erase(it);
 	}
 
+	if (a_outSuppressSounds) *a_outSuppressSounds = consumed.suppressSounds;
 	logger::info("[OAR-IdleStop] Consumed fix arm for actor {:X} submod '{}' path='{}'",
 		consumed.actorFormID, consumed.subModName, consumed.originalPath);
 	return true;
@@ -169,9 +378,15 @@ static void ReleaseIdleStopSuppressionClip(RE::hkbClipGenerator* a_clip)
 
 static void ClearIdleStopSuppressionState()
 {
-	std::lock_guard lock(s_idleStopSuppressionMutex);
-	s_idleStopArmedClips.clear();
-	s_pendingIdleStopByActor.clear();
+	{
+		std::lock_guard lock(s_idleStopSuppressionMutex);
+		s_idleStopArmedClips.clear();
+		s_pendingIdleStopByActor.clear();
+	}
+	// Parked deliveries reference sinks that may not survive the transition
+	// that triggered this clear (menu/load) — drop rather than deliver.
+	std::lock_guard dLock(s_deferredIdleStopMutex);
+	s_deferredIdleStops.clear();
 }
 
 void SetGameFullyLoaded(bool a_loaded) { s_gameFullyLoaded.store(a_loaded); }
@@ -319,6 +534,20 @@ struct CharTrackFilterState {
 	// conversion of any kind.
 	std::vector<RE::hkQsTransformRaw> nativeAnchorPose;
 	bool nativeAnchorValid = false;
+
+	// Post-exit anchor fade: after the deferred IdleStop is delivered, the
+	// reactivated LIVE clips are stamped toward the anchor at a weight
+	// ramping 1 -> 0 (blendAlpha reused), so the first post-exit frame is
+	// continuous with the fade's landing pose and then eases into the moving
+	// animation — instead of holding a static snapshot for a beat and
+	// snapping into locomotion (field 2026-08-27).
+	bool postExitAnchorFade = false;
+
+	// Camera NOT in the filter's bone list: the native clip's own Camera
+	// track must not animate the view — hold the pose camera bone at the
+	// anchor's value at full weight for the whole play. With Camera included,
+	// the native track plays (today's behavior).
+	bool nativeHoldCamera = false;
 
 	// Per-character bone-name → index resolution (rebuilt when filter version changes).
 	std::unordered_map<RE::hkbCharacter*, CharResolved> resolvedByChar;
@@ -489,6 +718,127 @@ static constexpr float kOneShotSampleGraceSeconds = 0.5f;
 // One-shot sources only: localTime not advancing for this long while samples
 // keep flowing means the graph parked the finished clip — end the play.
 static constexpr float kOneShotStallSeconds = 0.25f;
+
+// Fade-in-progress probe for the IdleStop deferral decision (data
+// structures live with the arm machinery near the top of the file).
+static bool HasActiveNativeIdleFade(RE::TESObjectREFR* a_refr, float* a_outAlpha)
+{
+	if (!a_refr) return false;
+	std::shared_lock lock(s_trackFilterMutex);
+	auto it = s_charTrackFilterMap.find(a_refr);
+	if (it == s_charTrackFilterMap.end()) return false;
+	for (auto& st : it->second) {
+		if (st.standaloneSpecialIdle && st.filter && st.filter->nativeIdlePlayback &&
+			!st.dormant &&
+			// A blend-out that has reached zero counts as COMPLETE even though
+			// dormancy is deliberately delayed while a deferred IdleStop pends
+			// (the state keeps pinning the base pose through the settle window).
+			!(st.blendingOut && st.blendAlpha <= 0.001f)) {
+			if (a_outAlpha) *a_outAlpha = st.blendAlpha;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool PeekIdleStopSuppression(RE::TESObjectREFR* a_refr)
+{
+	if (!a_refr) return false;
+	std::lock_guard lock(s_idleStopSuppressionMutex);
+	return s_pendingIdleStopByActor.contains(a_refr->GetFormID());
+}
+
+static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSuppressSounds);
+
+// Executes a parked IdleStop: fast-forward (with the sound window) when the
+// arm is still present, then replay the event into the ORIGINAL sink vfunc
+// (no hook re-entry). Runs on the game thread (event hook or actor tick).
+static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_reason,
+	const RE::hkQsTransformRaw* a_exitCam = nullptr)
+{
+	if (!a_refr) return;
+	DeferredIdleStop rec;
+	{
+		std::lock_guard dLock(s_deferredIdleStopMutex);
+		auto it = s_deferredIdleStops.find(a_refr);
+		if (it == s_deferredIdleStops.end()) return;
+		rec = it->second;
+		s_deferredIdleStops.erase(it);
+	}
+	bool suppressSounds = true;
+	const bool haveArm = ConsumeIdleStopSuppression(a_refr, &suppressSounds);
+	// Start the POST-EXIT anchor fade BEFORE the fast-forward: the
+	// fast-forward's own graph evaluation is the frame that used to render
+	// the ~3-degree camera jump (CamTrace 2026-08-28) — with the fade flag
+	// already set, that evaluation's Generate calls are stamped too, so the
+	// exit frame stays continuous with the fade's landing pose.
+	{
+		std::unique_lock pxLock(s_trackFilterMutex);
+		auto pxIt = s_charTrackFilterMap.find(a_refr);
+		if (pxIt != s_charTrackFilterMap.end()) {
+			for (auto& pxState : pxIt->second) {
+				if (!pxState.standaloneSpecialIdle || !pxState.filter ||
+					!pxState.filter->nativeIdlePlayback || !pxState.nativeAnchorValid) {
+					continue;
+				}
+				pxState.postExitAnchorFade = true;
+				pxState.dormant = false;
+				pxState.blendingOut = true;
+				pxState.oneShotDone = true;
+				pxState.blendDuration = kPostExitAnchorFadeSec;
+				pxState.blendElapsed = 0.0f;
+				pxState.blendAlpha = 1.0f;
+				break;
+			}
+		}
+	}
+	if (haveArm) {
+		if (auto* actor = a_refr->As<RE::Actor>()) {
+			if (suppressSounds) {
+				ArmSoundSuppressWindow(a_refr);
+			}
+			ArmPostExitCameraHold(a_refr, a_exitCam);
+			// SeamlessInspect route (user-directed 2026-08-28): instead of
+			// fast-forwarding THROUGH the idle remainder and then letting the
+			// IdleStop start a real-time exit transition (wpnequipfast — the
+			// camera/sound carrier every prior round fought), REBUILD the
+			// graph to the actor's current equip state in place, then a small
+			// settle update — the exit transition never exists at all. This
+			// is exactly SeamlessInspect's IdleStop recipe
+			// (BGSAnimationSystemUtils::InitializeActorInstant + a short
+			// update BEFORE the event is allowed through). The post-exit
+			// anchor fade and the exit-camera snapshot pin mask the one-frame
+			// graph rebuild; the sound window swallows its annotations.
+			s_inIdleStopFastForward = true;
+			s_suppressFastForwardSounds = suppressSounds;
+			RE::BGSAnimationSystemUtils::InitializeActorInstant(*actor, false);
+			actor->UpdateAnimation(0.2f);
+			s_inIdleStopFastForward = false;
+			s_suppressFastForwardSounds = false;
+		}
+	}
+	if (rec.original && rec.sinkThis) {
+		const RE::BSAnimationGraphEvent replay{ rec.holderID,
+			RE::BSFixedString("IdleStop"), RE::BSFixedString() };
+		rec.original(rec.sinkThis, replay, nullptr);
+	}
+	logger::info("[OAR-IdleStop] Delivered deferred IdleStop ({}, initInstant={}) for actor {:X}",
+		a_reason, haveArm, a_refr->GetFormID());
+}
+
+static void DropDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_reason)
+{
+	if (!a_refr) return;
+	bool dropped = false;
+	{
+		std::lock_guard dLock(s_deferredIdleStopMutex);
+		dropped = s_deferredIdleStops.erase(a_refr) > 0;
+	}
+	if (dropped) {
+		logger::info("[OAR-IdleStop] Dropped deferred IdleStop ({}) for actor {:X}",
+			a_reason, a_refr->GetFormID());
+	}
+}
 
 // --- Full-body replacement blend state ---
 // Uses a cached pose snapshot so we NEVER call _Generate twice per frame.
@@ -741,6 +1091,40 @@ static RE::hkQsTransformRaw MakeIdentityQs()
 static bool IsTrackFilterCameraBone(std::string_view a_name)
 {
 	return a_name.size() == 6 && _strnicmp(a_name.data(), "Camera", 6) == 0;
+}
+
+// Cached per-character "Camera" bone index on the animation skeleton
+// (shared by the tail guard, the post-exit camera pass, and the final
+// aim-release pass — previously three inline copies of this scan).
+static int16_t GetCharCameraBoneIndex(const RE::hkbCharacter* a_char)
+{
+	if (!a_char) return -1;
+	static std::mutex s_camIdxMutex;
+	static std::unordered_map<const RE::hkbCharacter*, int16_t> s_camIdxByChar;
+	std::lock_guard lock(s_camIdxMutex);
+	auto it = s_camIdxByChar.find(a_char);
+	if (it != s_camIdxByChar.end()) return it->second;
+	int16_t idx = -1;
+	if (auto* setup = a_char->setup._ptr) {
+		if (auto* skel = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr)) {
+			auto* bones = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_bones);
+			if (bones->data && bones->size > 0) {
+				auto* data = reinterpret_cast<uint8_t*>(bones->data);
+				for (int16_t b = 0; b < static_cast<int16_t>(bones->size); ++b) {
+					auto namePtr = *reinterpret_cast<uintptr_t*>(data + b * RE::kHkaBoneStride);
+					namePtr &= ~uintptr_t(1);
+					const char* n = reinterpret_cast<const char*>(namePtr);
+					if (n && reinterpret_cast<uintptr_t>(n) > 0x10000 &&
+						IsTrackFilterCameraBone(n)) {
+						idx = b;
+						break;
+					}
+				}
+			}
+		}
+	}
+	s_camIdxByChar[a_char] = idx;
+	return idx;
 }
 
 static bool IsFiniteQs(const RE::hkQsTransformRaw& a_transform)
@@ -5784,6 +6168,68 @@ namespace
 		return false;
 	}
 
+	// Deferred-exit probe (user hypothesis 2026-08-27): log the pose the
+	// IdleStop fast-forward LANDED on next to the anchor the fade parked at —
+	// any residual exit pop is exactly this delta on the aim-driven bones.
+	static void LogDeferredExitProbe(RE::TESObjectREFR* a_refr)
+	{
+		auto* actor = a_refr ? a_refr->As<RE::Actor>() : nullptr;
+		if (!actor) return;
+		RE::hkbCharacter* pChar = nullptr;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> pMgr;
+		if (actor->GetAnimationGraphManagerImpl(pMgr) && pMgr) {
+			const int32_t fpIdx = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+			const uint32_t gi =
+				(fpIdx >= 0 && static_cast<uint32_t>(fpIdx) < pMgr->graph.size())
+					? static_cast<uint32_t>(fpIdx)
+					: 0u;
+			if (gi < pMgr->graph.size() && pMgr->graph[gi]) {
+				pChar = &pMgr->graph[gi]->character;
+			}
+		}
+		if (!pChar || !pChar->generatorOutput ||
+			IsBadReadPtr(pChar->generatorOutput, sizeof(void*))) {
+			return;
+		}
+		auto* pTracks = *reinterpret_cast<uint8_t**>(pChar->generatorOutput);
+		if (!pTracks) return;
+		auto* pHeaders = reinterpret_cast<RE::TrackHeaderRaw*>(
+			pTracks + sizeof(RE::TrackMasterHeaderRaw));
+		auto& pPose = pHeaders[RE::kTrackIndex_Pose];
+		if (pPose.numData <= 28 || pPose.dataOffset <= 0) return;
+		auto* pOut = reinterpret_cast<RE::hkQsTransformRaw*>(pTracks + pPose.dataOffset);
+		RE::hkQsTransformRaw aHand{};
+		RE::hkQsTransformRaw aWpn{};
+		bool haveAnchor = false;
+		{
+			std::shared_lock lock(s_trackFilterMutex);
+			auto it = s_charTrackFilterMap.find(a_refr);
+			if (it != s_charTrackFilterMap.end()) {
+				for (auto& st : it->second) {
+					if (st.standaloneSpecialIdle && st.filter &&
+						st.filter->nativeIdlePlayback && st.nativeAnchorValid &&
+						st.nativeAnchorPose.size() > 28) {
+						aHand = st.nativeAnchorPose[26];
+						aWpn = st.nativeAnchorPose[28];
+						haveAnchor = true;
+						break;
+					}
+				}
+			}
+		}
+		static std::atomic<int> s_exitProbeLog{ 0 };
+		if (s_exitProbeLog.fetch_add(1, std::memory_order_relaxed) < 16) {
+			logger::info("[OAR-IdleStop-Probe] post-exit RArm_Hand T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) vs anchor{} T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) || post-exit Weapon R=({:.3f},{:.3f},{:.3f},{:.3f}) vs anchor R=({:.3f},{:.3f},{:.3f},{:.3f})",
+				pOut[26].translation[0], pOut[26].translation[1], pOut[26].translation[2],
+				pOut[26].rotation[0], pOut[26].rotation[1], pOut[26].rotation[2], pOut[26].rotation[3],
+				haveAnchor ? "" : " (missing)",
+				aHand.translation[0], aHand.translation[1], aHand.translation[2],
+				aHand.rotation[0], aHand.rotation[1], aHand.rotation[2], aHand.rotation[3],
+				pOut[28].rotation[0], pOut[28].rotation[1], pOut[28].rotation[2], pOut[28].rotation[3],
+				aWpn.rotation[0], aWpn.rotation[1], aWpn.rotation[2], aWpn.rotation[3]);
+		}
+	}
+
 	static bool StartStandaloneSpecialIdle(
 		RE::Actor* a_actor, RE::TESIdleForm* a_idle, std::string* a_rejectionReason,
 		bool* a_outNativePlayback = nullptr)
@@ -5796,6 +6242,10 @@ namespace
 			*a_outNativePlayback = subMod->trackFilter.nativeIdlePlayback;
 		}
 		auto* filter = &subMod->trackFilter;
+
+		// A NEW play supersedes any IdleStop still parked from the previous
+		// one: delivering it now would stop the idle that is just starting.
+		DropDeferredIdleStop(a_actor, "superseded by new play");
 		const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
 		bool isNew = false;
 		{
@@ -5828,6 +6278,20 @@ namespace
 			state->frozenByName.clear();
 			state->nativeAnchorPose.clear();
 			state->nativeAnchorValid = false;
+			state->postExitAnchorFade = false;
+			{
+				// Camera included in the filter? Live-edit safe: recomputed on
+				// every play start.
+				bool holdCam = true;
+				std::lock_guard camLock(filter->boneMutex);
+				for (auto& camName : filter->boneNames) {
+					if (IsTrackFilterCameraBone(camName)) {
+						holdCam = false;
+						break;
+					}
+				}
+				state->nativeHoldCamera = holdCam;
+			}
 			state->lastSourceTimeSec = nowSec;
 			state->lastSampleSec = 0.0f;
 			state->lastSampledLocalTime = -1.0f;
@@ -5974,6 +6438,12 @@ namespace
 							aState->nativeAnchorValid = true;
 						}
 					}
+					// Fresh diagnostic budgets for this play's full arc
+					// (play -> fade -> postExit); the strip budget is ALSO
+					// reset here because the camera pass now covers the
+					// blend-out phase, which precedes the delivery-time re-arm.
+					s_camTraceLogUsed.store(0, std::memory_order_relaxed);
+					s_camStripLogUsed.store(0, std::memory_order_relaxed);
 					// Probe (first gate before judging visuals): bone 26 =
 					// RArm_Hand must read the COMPOSITED ready value
 					// (~R(0.718,0.012,0.021,0.695) in the field logs), NOT a
@@ -9685,6 +10155,77 @@ namespace
 							logger::info("[OAR-TrackFilter] Native idle 1P clip adopted as overlay source '{}' (clipGen={:X}, onFrac={:.2f})",
 								nativeIdleSuffix, reinterpret_cast<uintptr_t>(a_this), poseHeader.onFraction);
 						}
+
+						// Sampler-race tail guard (field screenshot 2026-08-27):
+						// during the exit fade a reactivating ready clip can win
+						// the per-frame SAMPLER slot, sending THIS clip through
+						// the non-source paths whose weight≈0 early-outs leave
+						// it UNSTAMPED — the raw donor final frame (left arm
+						// forward, weapon vertical) then flashes through the
+						// engine's exit crossfade right before the fade
+						// completes. Pin this clip to the anchor HERE at
+						// (1 - alpha), independent of the sampler race.
+						// Mid-play (alpha 1) it is a no-op; a second anchor
+						// lerp from the source path just pulls closer to the
+						// same target — benign.
+						{
+							std::shared_lock tailLock(s_trackFilterMutex);
+							auto tailIt = s_charTrackFilterMap.find(actor);
+							if (tailIt != s_charTrackFilterMap.end()) {
+								for (auto& tailState : tailIt->second) {
+									if (!tailState.standaloneSpecialIdle || !tailState.filter ||
+										!tailState.filter->nativeIdlePlayback ||
+										!tailState.nativeAnchorValid) {
+										continue;
+									}
+									if (static_cast<int16_t>(tailState.nativeAnchorPose.size()) !=
+										poseHeader.numData) {
+										break;
+									}
+									auto* tailPose = reinterpret_cast<RE::hkQsTransformRaw*>(
+										tracksPtr + poseHeader.dataOffset);
+									const int16_t tailCamIdx = GetCharCameraBoneIndex(character);
+									// Aim release (rework 2026-08-28): the pose
+									// camera bone is AIM-DRIVEN — winding it to
+									// the anchor re-applied the vault-ENTRY aim
+									// pitch, and the look delta accumulated
+									// during the play then replayed as the
+									// post-exit lerp. While a live carrier
+									// generates during the blend-out, this
+									// clip's camera is skipped here and masked
+									// again at the end of the hook (the
+									// carrier's decaying donor stamp blends
+									// donor -> live aim on its own).
+									const bool tailCamLive = !tailState.nativeHoldCamera &&
+										tailState.blendingOut && tailCamIdx >= 0 &&
+										IsLiveCamCarrierFresh(actor,
+											s_currentFrame.load(std::memory_order_relaxed));
+									const float tailW =
+										(1.0f - tailState.blendAlpha) * tailState.filter->weight;
+									if (tailW > 0.001f) {
+										for (int16_t tb = 0; tb < poseHeader.numData; ++tb) {
+											if (tailCamLive && tb == tailCamIdx) continue;
+											LerpTransform(tailPose[tb],
+												tailState.nativeAnchorPose[tb], tailW);
+											SetPoseBoneMaskBit(tracksPtr, poseHeader, tb);
+										}
+									}
+									// Camera neutralization (field 2026-08-27):
+									// with no camera bone in the filter, the
+									// native clip's own Camera track still
+									// animated the view — nothing else stops it.
+									// Hold the pose camera at the ANCHOR's value
+									// at FULL weight for the whole play.
+									if (tailState.nativeHoldCamera && tailCamIdx >= 0 &&
+										tailCamIdx < poseHeader.numData &&
+										tailCamIdx < static_cast<int16_t>(tailState.nativeAnchorPose.size())) {
+										tailPose[tailCamIdx] = tailState.nativeAnchorPose[tailCamIdx];
+										SetPoseBoneMaskBit(tracksPtr, poseHeader, tailCamIdx);
+									}
+									break;
+								}
+							}
+						}
 					} else {
 
 					// 3P instance: the body plays natively, but the idle's CAMERA
@@ -9742,6 +10283,225 @@ namespace
 			}
 		}
 
+		// POST-EXIT anchor fade (see postExitAnchorFade): the idle is over and
+		// the live clips are back; stamp every 1P NON-additive clip toward the
+		// anchor at alpha (1 -> 0 over kPostExitAnchorFadeSec) so the pose
+		// eases from the fade's landing pose into the moving animation. The
+		// normal filter writers are suppressed for this state meanwhile —
+		// their donor-keyed stamps would reintroduce the donor pose.
+		{
+			bool pxApplied = false;
+			{
+				std::shared_lock pxShared(s_trackFilterMutex);
+				auto pxIt = s_charTrackFilterMap.find(actor);
+				if (pxIt != s_charTrackFilterMap.end()) {
+					for (auto& pxState : pxIt->second) {
+						if (!pxState.postExitAnchorFade || pxState.dormant ||
+							!pxState.nativeAnchorValid || !pxState.filter) {
+							continue;
+						}
+						if ((poseHeader.flags & 0x01) != 0) break;  // additive: skip
+						if (GetPlayingClipPerspectiveImpl(a_this) !=
+							OARClipPerspective::kFirstPerson) {
+							break;
+						}
+						if (static_cast<int16_t>(pxState.nativeAnchorPose.size()) !=
+							poseHeader.numData) {
+							break;
+						}
+						const float pxW = pxState.blendAlpha * pxState.filter->weight;
+						if (pxW > 0.001f) {
+							for (int16_t pb = 0; pb < poseHeader.numData; ++pb) {
+								LerpTransform(outputPose[pb],
+									pxState.nativeAnchorPose[pb], pxW);
+								SetPoseBoneMaskBit(tracksPtr, poseHeader, pb);
+							}
+							pxApplied = true;
+						}
+						break;
+					}
+				}
+			}
+			static_cast<void>(pxApplied);
+		}
+
+		// Post-exit CAMERA strip (field 2026-08-27): the exit transition's
+		// clips (wpnequipfast) carry camera animation the fast-forward lands
+		// mid-motion — and the pose-level pin on the PLAYER graph provably
+		// did not stop the view snap, so the camera rides other carriers
+		// (weapon-subgraph clips classify kUnknown and were skipped by the
+		// old perspective gate). Strip it EVERYWHERE: for the window, every
+		// non-additive clip on ANY of the player's characters gets its camera
+		// bone overwritten — with the ANCHOR's value when the skeleton
+		// matches the anchor, else with that skeleton's own BIND-pose camera
+		// local (neutral).
+		const bool camInPostExit = InPostExitCameraHold(actor);
+		bool camFadeOutActive = false;
+		bool camClipIsNativeSource = false;
+		if (!camInPostExit) {
+			// Blend-out phase (aim-rework 2026-08-28): the wpnequipfast
+			// already generates DURING the blend-out (the graph exits the
+			// idle state at the donor's natural end, before the deferred
+			// IdleStop delivers) — its camera track is masked out below. Live
+			// carriers are only OBSERVED here (their presence lets the tail
+			// guard release the native clip's camera to them).
+			std::shared_lock cfShared(s_trackFilterMutex);
+			auto cfIt = s_charTrackFilterMap.find(actor);
+			if (cfIt != s_charTrackFilterMap.end()) {
+				for (auto& cfState : cfIt->second) {
+					if (cfState.standaloneSpecialIdle && cfState.blendingOut &&
+						!cfState.dormant && cfState.filter &&
+						cfState.filter->nativeIdlePlayback && cfState.nativeAnchorValid) {
+						camFadeOutActive = true;
+						camClipIsNativeSource = cfState.sourceClips.count(a_this) > 0;
+						break;
+					}
+				}
+			}
+		}
+		if (camInPostExit || camFadeOutActive) {
+			// Camera handling by phase (aim-rework 2026-08-28):
+			//  BLEND-OUT: hands off — the live carrier's aim-driven camera is
+			//    the correct target and the filter's decaying donor stamp
+			//    already blends donor->live on its own; the equip clip's
+			//    camera track is masked out; carriers are recorded so the
+			//    tail guard can release the native clip's camera to them.
+			//  POST-EXIT window: the equip gets a HARD strip to the
+			//    exit-camera snapshot, other non-additive clips are eased
+			//    toward it at the decaying window alpha, and additive deltas
+			//    ease back in from identity.
+			const bool camPoseAdditive = (poseHeader.flags & 0x01) != 0;
+			const bool eqHardStrip = [&] {
+				const char* eqName = a_this->animationName.data();
+				return eqName && reinterpret_cast<uintptr_t>(eqName) > 0x10000 &&
+					eqName[0] != '\0' && SubgraphGetLeaf(eqName) == "wpnequipfast";
+			}();
+			const int16_t chCamIdx = GetCharCameraBoneIndex(character);
+			if (chCamIdx >= 0 && chCamIdx < poseHeader.numData && !camInPostExit) {
+				// BLEND-OUT phase (aim-rework 2026-08-28): no steering. The
+				// pose camera bone is AIM-DRIVEN — winding it toward the
+				// anchor here re-applied the vault-ENTRY aim pitch, and the
+				// look delta accumulated during the play then replayed as
+				// the visible post-exit lerp. The equip clip's camera track
+				// is simply MASKED OUT (contributes nothing, no hold value
+				// needed); live carriers are left untouched and recorded so
+				// the tail guard releases the native clip's camera to them;
+				// additive stays untouched (no anchor in the mix here means
+				// no double count).
+				if (!camPoseAdditive) {
+					if (eqHardStrip) {
+						ClearPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
+						if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+							logger::info("[OAR-IdleStop] Camera MASKED (bone {}) on clip {:X} (char {:X}) during the blend-out",
+								chCamIdx, reinterpret_cast<uintptr_t>(a_this),
+								reinterpret_cast<uintptr_t>(character));
+						}
+					} else if (!camClipIsNativeSource &&
+						GetPlayingClipPerspectiveImpl(a_this) ==
+							OARClipPerspective::kFirstPerson &&
+						poseHeader.onFraction > 0.0f) {
+						MarkLiveCamCarrierSeen(actor,
+							s_currentFrame.load(std::memory_order_relaxed));
+					}
+				}
+			} else if (chCamIdx >= 0 && chCamIdx < poseHeader.numData) {
+				// Resolve the hold value — the EXIT-camera snapshot (the value
+				// the viewer was looking at when the IdleStop delivered) when
+				// available, else the anchor on the matching skeleton, else the
+				// bind-pose local on foreign skeletons. The fade provably does
+				// NOT land the camera on the anchor (the arms do; the camera
+				// lands ~2-3deg away varying per vault), so pinning to the
+				// anchor was itself the one-frame snap at delivery. The ease
+				// alpha runs on the hold window's OWN clock
+				// (PostExitCamEaseAlpha), outliving the 0.2s pose fade.
+				RE::hkQsTransformRaw exitCamVal{};
+				const bool haveExitCam = GetPostExitCamSnapshot(actor, exitCamVal);
+				const RE::hkQsTransformRaw* holdVal = nullptr;
+				{
+					std::shared_lock chShared(s_trackFilterMutex);
+					auto chIt = s_charTrackFilterMap.find(actor);
+					if (chIt != s_charTrackFilterMap.end()) {
+						for (auto& chState : chIt->second) {
+							if (!chState.filter || !chState.filter->nativeIdlePlayback ||
+								!chState.nativeAnchorValid) {
+								continue;
+							}
+							if (static_cast<int16_t>(chState.nativeAnchorPose.size()) ==
+								poseHeader.numData) {
+								holdVal = haveExitCam ? &exitCamVal :
+									&chState.nativeAnchorPose[chCamIdx];
+							}
+							break;
+						}
+					}
+				}
+				const float easeAlpha = PostExitCamEaseAlpha(actor);
+				const bool easing = easeAlpha > 0.001f;
+				if (camPoseAdditive) {
+					// Additive layer (camera bob/sway): the snapshot is a
+					// composited value and bakes the delivery-time additive,
+					// so while the pins hold it the live delta must stay
+					// suppressed, ramping back in as the ease decays.
+					// Post-exit only — during the blend-out the additive
+					// rides on the live carrier legitimately.
+					if (easing && poseHeader.onFraction > 0.0f) {
+						RE::hkQsTransformRaw addIdentity{};
+						addIdentity.rotation[3] = 1.f;
+						addIdentity.scale[0] = 1.f;
+						addIdentity.scale[1] = 1.f;
+						addIdentity.scale[2] = 1.f;
+						LerpTransform(outputPose[chCamIdx], addIdentity, easeAlpha);
+						SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
+						if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+							logger::info("[OAR-IdleStop] Camera additive-eased (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
+								chCamIdx, easeAlpha, reinterpret_cast<uintptr_t>(a_this),
+								reinterpret_cast<uintptr_t>(character),
+								camInPostExit ? "post-exit window" : "blend-out");
+						}
+					}
+				} else {
+					const RE::hkQsTransformRaw* bindVal = nullptr;
+					if (!holdVal) {
+						// Foreign skeleton (weapon subgraph / 3P): neutralize with
+						// its own bind-pose camera local.
+						if (auto* nSetup = character->setup._ptr) {
+							if (auto* nSkel = reinterpret_cast<uint8_t*>(nSetup->animationSkeleton._ptr)) {
+								auto* nRef = reinterpret_cast<RE::hkArrayRawLayout*>(nSkel + RE::kSkeletonOffset_referencePose);
+								if (nRef->data && nRef->size > chCamIdx &&
+									!IsBadReadPtr(nRef->data, static_cast<size_t>(nRef->size) * sizeof(RE::hkQsTransformRaw))) {
+									bindVal = &reinterpret_cast<const RE::hkQsTransformRaw*>(nRef->data)[chCamIdx];
+								}
+							}
+						}
+						holdVal = bindVal;
+					}
+					if (holdVal) {
+						bool wrote = false;
+						if (eqHardStrip) {
+							// The equip clip's camera never contributes at all.
+							outputPose[chCamIdx] = *holdVal;
+							wrote = true;
+						} else if (easing && easeAlpha > 0.001f) {
+							// Everything else: ease anchor -> live over the
+							// post-exit fade instead of landing in one frame.
+							LerpTransform(outputPose[chCamIdx], *holdVal, easeAlpha);
+							wrote = true;
+						}
+						if (wrote) {
+							SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
+							if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+								logger::info("[OAR-IdleStop] Camera {} (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
+									eqHardStrip ? "STRIPPED" : "eased", chCamIdx, easeAlpha,
+									reinterpret_cast<uintptr_t>(a_this),
+									reinterpret_cast<uintptr_t>(character),
+									camInPostExit ? "post-exit window" : "blend-out");
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Snapshot which filters are registered for this actor, and bail out
 		// entirely if this clip's slot currently holds ANY registered replacement
 		// — that means we're inside a swap-fallback's recursive _Generate and
@@ -9776,6 +10536,11 @@ namespace
 			auto* filterPtr = state.filter;
 			auto* replacement = state.replacement;
 			if (!filterPtr || !filterPtr->enabled || !replacement) return;
+
+			// Post-exit anchor fade owns this state's output now (dedicated
+			// block above); the donor-keyed stamps/holds here would pull the
+			// reactivated live clips back toward the DONOR pose.
+			if (state.postExitAnchorFade) return;
 
 			bool isSourceClip = (state.sourceClips.count(a_this) > 0);
 			const auto currentFrame = s_currentFrame.load(std::memory_order_relaxed);
@@ -9939,6 +10704,10 @@ namespace
 				// the source clip's first sample captures the value.
 				// nativeIdleMode holds ignore the blend envelope (see the source
 				// path): underneath the hold is the donor's own track.
+				// During the exit blend-out the holds FADE with alpha: the
+				// reactivating ready clips underneath carry the correct live
+				// weapon, and the full-weight pin was what hard-released the
+				// weapon onto the divergent exit pose (forensics 2026-08-27).
 				const float fastHoldW =
 					(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback)
 						? filterPtr->weight
@@ -9958,6 +10727,17 @@ namespace
 					} else {
 						auto fIt = state.frozenByName.find(name);
 						if (fIt == state.frozenByName.end()) continue;
+						// nativeIdlePlayback holds pin to the ANCHOR's value for
+						// this bone — exact havok space, provably equal to the
+						// post-exit pose. The NI-scene-node frozen capture is
+						// CONJUGATED (probe 2026-08-27: post-exit Weapon ==
+						// anchor except a flipped w — the pop at release).
+						const RE::hkQsTransformRaw& heldVal =
+							(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+								state.nativeAnchorValid &&
+								idx < static_cast<int16_t>(state.nativeAnchorPose.size()))
+								? state.nativeAnchorPose[idx]
+								: fIt->second;
 						// Weapon-freeze tracking (field 2026-08-26: weapon jumps out
 						// of place / disappears while frozen). One line per ~second
 						// showing the live value being overwritten and the held one.
@@ -9970,7 +10750,7 @@ namespace
 								s_wpnFreezeLastFrame.compare_exchange_strong(wfLast, wfFrame) &&
 								s_wpnFreezeLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 								const auto& lv = outputPose[idx];
-								const auto& fv = fIt->second;
+								const auto& fv = heldVal;
 								logger::info("[OAR-TF-WeaponDiag] freeze-apply(fast) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 									reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
 									lv.translation[0], lv.translation[1], lv.translation[2],
@@ -9979,7 +10759,7 @@ namespace
 									fv.rotation[0], fv.rotation[1], fv.rotation[2], fv.rotation[3]);
 							}
 						}
-						LerpTransform(outputPose[idx], fIt->second, fastHoldW);
+						LerpTransform(outputPose[idx], heldVal, fastHoldW);
 					}
 					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
@@ -10893,8 +11673,13 @@ namespace
 				// Runs BEFORE the frozen holds so the weapon set is re-pinned
 				// afterwards (anchor's weapon ~= held value anyway). Bones the
 				// donor doesn't move sit near the anchor already — near-no-op.
+				// The anchor serves the ENTRY blend only. During the exit fade
+				// it would drag the pose toward the STALE entry-time snapshot
+				// while the reactivating ready clips already carry the correct
+				// live pose (the weapon/right-arm exit snap, forensics
+				// 2026-08-27) — skip it once blendingOut.
 				if (nativeIdleMode && state.nativeAnchorValid && applyToThisClip &&
-					static_cast<int16_t>(state.nativeAnchorPose.size()) == numOutputBones) {
+										static_cast<int16_t>(state.nativeAnchorPose.size()) == numOutputBones) {
 					const float backW = (1.0f - state.blendAlpha) * filterPtr->weight;
 					if (backW > 0.001f) {
 						for (int16_t abi = 0; abi < numOutputBones; ++abi) {
@@ -10984,9 +11769,18 @@ namespace
 					// blends it seamlessly — apply at full filter weight for the
 					// clip's entire life.
 					{
-						const float holdW = nativeIdleMode ? filterPtr->weight : weight;
+						const float holdW =
+							nativeIdleMode ? filterPtr->weight : weight;
+						// nativeIdlePlayback holds pin to the ANCHOR's value for
+						// this bone (see the fast path — the NI frozen capture
+						// is conjugated; probe 2026-08-27).
+						const RE::hkQsTransformRaw& heldVal =
+							(nativeIdleMode && state.nativeAnchorValid &&
+								idx < static_cast<int16_t>(state.nativeAnchorPose.size()))
+								? state.nativeAnchorPose[idx]
+								: fIt->second;
 						if (holdW > 0.001f && applyToThisClip) {
-							LerpTransform(outputPose[idx], fIt->second, holdW);
+							LerpTransform(outputPose[idx], heldVal, holdW);
 							SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 						}
 					}
@@ -11150,7 +11944,14 @@ namespace
 					if (fIt == state2.frozenByName.end()) {
 						fIt = state2.frozenByName.emplace(name, outputPose[idx]).first;
 					}
-					LerpTransform(outputPose[idx], fIt->second, fbHoldW);
+					// nativeIdlePlayback holds pin to the ANCHOR (see fast path).
+					const RE::hkQsTransformRaw& heldVal =
+						(state2.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+							state2.nativeAnchorValid &&
+							idx < static_cast<int16_t>(state2.nativeAnchorPose.size()))
+							? state2.nativeAnchorPose[idx]
+							: fIt->second;
+					LerpTransform(outputPose[idx], heldVal, fbHoldW);
 					SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 				}
 			}
@@ -11310,6 +12111,14 @@ namespace
 			} else {
 				auto fIt = state.frozenByName.find(name);
 				if (fIt == state.frozenByName.end()) continue;
+				// nativeIdlePlayback holds pin to the ANCHOR (see fast path —
+				// the NI frozen capture is conjugated; probe 2026-08-27).
+				const RE::hkQsTransformRaw& heldVal =
+					(state.standaloneSpecialIdle && filterPtr->nativeIdlePlayback &&
+						state.nativeAnchorValid &&
+						idx < static_cast<int16_t>(state.nativeAnchorPose.size()))
+						? state.nativeAnchorPose[idx]
+						: fIt->second;
 				// Slow-path twin of the fast-path Weapon-freeze tracking.
 				if (name == "Weapon") {
 					static std::atomic<int> s_wpnFreezeSlowLog{ 0 };
@@ -11320,7 +12129,7 @@ namespace
 						s_wpnFreezeSlowLastFrame.compare_exchange_strong(wfLast, wfFrame) &&
 						s_wpnFreezeSlowLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 						const auto& lv = outputPose[idx];
-						const auto& fv = fIt->second;
+						const auto& fv = heldVal;
 						logger::info("[OAR-TF-WeaponDiag] freeze-apply(slow) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 							reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
 							lv.translation[0], lv.translation[1], lv.translation[2],
@@ -11329,7 +12138,7 @@ namespace
 							fv.rotation[0], fv.rotation[1], fv.rotation[2], fv.rotation[3]);
 					}
 				}
-				LerpTransform(outputPose[idx], fIt->second, slowHoldW);
+				LerpTransform(outputPose[idx], heldVal, slowHoldW);
 			}
 			SetPoseBoneMaskBit(tracksPtr, poseHeader, idx);
 		}
@@ -11350,6 +12159,45 @@ namespace
 
 		for (auto* filterKey : actorFilters) {
 			processFilter(filterKey);
+		}
+
+		// FINAL camera release (aim-rework 2026-08-28): runs AFTER every
+		// writer above — the source stamp re-sets the camera's pose-mask bit,
+		// so any earlier release would be undone. While a live carrier
+		// generates during the blend-out, the native source clip contributes
+		// NO camera at all; the carrier's decaying donor stamp blends
+		// donor -> live aim on its own and the fade lands on CURRENT aim
+		// instead of the vault-entry pitch.
+		if ((poseHeader.flags & 0x01) == 0) {
+			bool rlRelease = false;
+			{
+				std::shared_lock rlShared(s_trackFilterMutex);
+				auto rlIt = s_charTrackFilterMap.find(actor);
+				if (rlIt != s_charTrackFilterMap.end()) {
+					for (auto& rlState : rlIt->second) {
+						if (!rlState.standaloneSpecialIdle || !rlState.blendingOut ||
+							rlState.dormant || !rlState.filter ||
+							!rlState.filter->nativeIdlePlayback ||
+							rlState.nativeHoldCamera) {
+							continue;
+						}
+						rlRelease = rlState.sourceClips.count(a_this) > 0 &&
+							IsLiveCamCarrierFresh(actor,
+								s_currentFrame.load(std::memory_order_relaxed));
+						break;
+					}
+				}
+			}
+			if (rlRelease) {
+				const int16_t rlCamIdx = GetCharCameraBoneIndex(character);
+				if (rlCamIdx >= 0 && rlCamIdx < poseHeader.numData) {
+					ClearPoseBoneMaskBit(tracksPtr, poseHeader, rlCamIdx);
+					if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+						logger::info("[OAR-IdleStop] Camera RELEASED (bone {}) on the native clip {:X} during the blend-out (live carrier drives aim)",
+							rlCamIdx, reinterpret_cast<uintptr_t>(a_this));
+					}
+				}
+			}
 		}
 	}
 
@@ -11530,15 +12378,29 @@ namespace
 		}
 
 		// Compute frame delta time for blend ramping (shared by track filter + full-body)
-		static const auto s_initTick = std::chrono::high_resolution_clock::now();
-		static auto s_lastTick = s_initTick;
+		static auto s_lastTick = std::chrono::high_resolution_clock::now();
 		auto now = std::chrono::high_resolution_clock::now();
 		float dt = std::chrono::duration<float>(now - s_lastTick).count();
-		dt = std::clamp(dt, 0.0001f, 0.1f);
 		s_lastTick = now;
 
-		// Publish wall-clock "now" for the Generate hook's staleness stamps.
-		s_tfNowSec.store(std::chrono::duration<float>(now - s_initTick).count(),
+		// GAME-time scaling (field 2026-08-27): the graph animates in SCALED
+		// time (sgtm / slow-mo / bullet time), and a wall-clock overlay ran
+		// donor playback and blend ramps at the wrong speed under any non-1.0
+		// global time multiplier. Prefer the engine's own scaled frame delta;
+		// fall back to wall time if the timer is unavailable or reads odd
+		// (paused delta == 0 falls back too, matching the old behavior).
+		if (auto* gameTimer = RE::BSTimer::GetSingleton()) {
+			const float gameDt = gameTimer->delta;
+			if (gameDt > 0.0f && gameDt < 1.0f) {
+				dt = gameDt;
+			}
+		}
+		dt = std::clamp(dt, 0.0001f, 0.1f);
+
+		// Publish the accumulated GAME-time "now" for the Generate hook's
+		// clocks and staleness stamps (donor self-advance, blend envelopes,
+		// stale-entry cleanup all scale with the time multiplier).
+		s_tfNowSec.store(s_tfNowSec.load(std::memory_order_relaxed) + dt,
 			std::memory_order_relaxed);
 
 		// --- Track filter blend update ---
@@ -11769,6 +12631,7 @@ namespace
 								state.dormant = true;
 								state.blendingOut = false;
 								state.blendAlpha = 0.0f;
+								state.postExitAnchorFade = false;
 								if (!state.onEndFired && state.parentSubMod) {
 									QueueCustomEvents(mapIt->first, state.parentSubMod->eventsOnEnd, "onEnd/trackFilter");
 									state.onEndFired = true;
@@ -11798,6 +12661,22 @@ namespace
 								if (s_dormLog < 10) {
 									logger::info("[OAR-TrackFilter] Blend-out COMPLETE — '{}' dormant (awaiting reactivation)", state.suffix);
 									s_dormLog++;
+								}
+								// A parked IdleStop for this actor is released by
+								// the end-of-tick sweep (outside this lock — the
+								// delivery fast-forwards the graph, which re-enters
+								// the Generate hooks and takes this mutex). While
+								// it pends, DELAY dormancy: the state keeps pinning
+								// the base pose (anchor at full backW + holds) over
+								// the lingering native clip through the settle
+								// window — going dormant would stop every stamp and
+								// expose the clip's raw donor final frame.
+								if (state.standaloneSpecialIdle && filterPtr &&
+									filterPtr->nativeIdlePlayback &&
+									HasDeferredIdleStop(mapIt->first)) {
+									state.blendAlpha = 0.0f;
+									++stIt;
+									continue;
 								}
 								goDormant();
 								++stIt;
@@ -11862,6 +12741,205 @@ namespace
 				} else {
 					++it;
 				}
+			}
+		}
+
+		// Camera trace (field 2026-08-27: the view still snaps into place
+		// after the exit even with the pose camera pinned). Log the POSE
+		// camera bone next to the SCENE-GRAPH camera node once per tick
+		// through the fade and the post-exit window — whichever one
+		// discontinues is the snap's real source (a divergence proves the
+		// view is driven by a path our pose stamps never touch).
+		{
+			auto* tracePlayer = RE::PlayerCharacter::GetSingleton();
+			bool doTrace = false;
+			float traceAlpha = -1.0f;
+			const char* tracePhase = "";
+			if (tracePlayer) {
+				if (InPostExitCameraHold(tracePlayer)) {
+					doTrace = true;
+					tracePhase = "postExit";
+					traceAlpha = PostExitCamEaseAlpha(tracePlayer);
+				} else {
+					std::shared_lock trLock(s_trackFilterMutex);
+					auto trIt = s_charTrackFilterMap.find(tracePlayer);
+					if (trIt != s_charTrackFilterMap.end()) {
+						for (auto& trState : trIt->second) {
+							if (trState.standaloneSpecialIdle && trState.filter &&
+								trState.filter->nativeIdlePlayback && !trState.dormant) {
+								doTrace = true;
+								traceAlpha = trState.blendAlpha;
+								tracePhase = trState.blendingOut ? "fade" : "play";
+								break;
+							}
+						}
+					}
+				}
+			}
+			if (doTrace && s_camTraceLogUsed.fetch_add(1, std::memory_order_relaxed) < 240) {
+				float poseR[4] = { 0, 0, 0, 0 };
+				bool havePose = false;
+				RE::BSTSmartPointer<RE::BSAnimationGraphManager> trMgr;
+				if (tracePlayer->GetAnimationGraphManagerImpl(trMgr) && trMgr) {
+					const int32_t fpIdx = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+					const uint32_t gi =
+						(fpIdx >= 0 && static_cast<uint32_t>(fpIdx) < trMgr->graph.size())
+							? static_cast<uint32_t>(fpIdx)
+							: 0u;
+					if (gi < trMgr->graph.size() && trMgr->graph[gi]) {
+						auto* trChar = &trMgr->graph[gi]->character;
+						if (trChar->generatorOutput &&
+							!IsBadReadPtr(trChar->generatorOutput, sizeof(void*))) {
+							auto* trTracks = *reinterpret_cast<uint8_t**>(trChar->generatorOutput);
+							if (trTracks) {
+								auto* trHeaders = reinterpret_cast<RE::TrackHeaderRaw*>(
+									trTracks + sizeof(RE::TrackMasterHeaderRaw));
+								auto& trPose = trHeaders[RE::kTrackIndex_Pose];
+								if (trPose.numData > 78 && trPose.dataOffset > 0) {
+									auto* trOut = reinterpret_cast<RE::hkQsTransformRaw*>(
+										trTracks + trPose.dataOffset);
+									for (int q = 0; q < 4; ++q) poseR[q] = trOut[78].rotation[q];
+									havePose = true;
+								}
+							}
+						}
+					}
+				}
+				float nodeR[4] = { 0, 0, 0, 0 };
+				bool haveNode = false;
+				if (auto* trRoot = tracePlayer->Get3D(true)) {
+					if (auto* camNode = trRoot->GetObjectByName(RE::BSFixedString("Camera"))) {
+						MatrixToQuat(camNode->local.rotate, nodeR);
+						haveNode = true;
+					}
+				}
+				logger::info("[OAR-CamTrace] {} alpha={:.3f} pose78{} R=({:.3f},{:.3f},{:.3f},{:.3f}) node{} R=({:.3f},{:.3f},{:.3f},{:.3f})",
+					tracePhase, traceAlpha,
+					havePose ? "" : "(x)", poseR[0], poseR[1], poseR[2], poseR[3],
+					haveNode ? "" : "(x)", nodeR[0], nodeR[1], nodeR[2], nodeR[3]);
+			}
+		}
+
+		// Service parked IdleStops (nativeIdlePlayback deferral): deliver the
+		// moment the actor's fade is no longer active (dormant/erased this
+		// tick), or on the safety timeout. Runs OUTSIDE every filter lock —
+		// delivery fast-forwards the graph, which re-enters the Generate
+		// hooks and takes s_trackFilterMutex.
+		{
+			// Snapshot first, evaluate fades WITHOUT the deferred lock, then
+			// re-lock to update the settle bookkeeping — s_deferredIdleStopMutex
+			// stays a LEAF lock (never held across a track-filter lock), which
+			// lets the tick's dormancy code peek it safely from inside the
+			// filter lock.
+			std::vector<RE::TESObjectREFR*> deferredActors;
+			{
+				std::lock_guard dLock(s_deferredIdleStopMutex);
+				deferredActors.reserve(s_deferredIdleStops.size());
+				for (auto& [dRefr, dRec] : s_deferredIdleStops) {
+					deferredActors.push_back(dRefr);
+				}
+			}
+			std::vector<RE::TESObjectREFR*> toDeliver;
+			std::vector<const char*> toDeliverReason;
+			if (!deferredActors.empty()) {
+				const auto dNow = std::chrono::steady_clock::now();
+				for (auto* dRefr : deferredActors) {
+					const bool fadeActive = HasActiveNativeIdleFade(dRefr, nullptr);
+					std::lock_guard dLock(s_deferredIdleStopMutex);
+					auto dIt = s_deferredIdleStops.find(dRefr);
+					if (dIt == s_deferredIdleStops.end()) continue;
+					auto& dRec = dIt->second;
+					const float dAge =
+						std::chrono::duration<float>(dNow - dRec.deferredAt).count();
+					if (dAge > kDeferredIdleStopTimeoutSec) {
+						toDeliver.push_back(dRefr);
+						toDeliverReason.push_back("timeout");
+						continue;
+					}
+					if (fadeActive) {
+						dRec.settling = false;
+						continue;
+					}
+					// Fade done: rest at base for the settle window before
+					// jolting the graph with the fast-forward. Dormancy is
+					// delayed meanwhile, so the overlay keeps pinning base.
+					if (!dRec.settling) {
+						dRec.settling = true;
+						dRec.settleStart = dNow;
+						continue;
+					}
+					if (std::chrono::duration<float>(dNow - dRec.settleStart).count() >=
+						kDeferredIdleStopSettleSec) {
+						toDeliver.push_back(dRefr);
+						toDeliverReason.push_back("fade complete + settle");
+					}
+				}
+			}
+			for (size_t di = 0; di < toDeliver.size(); ++di) {
+				// Exit-camera snapshot: the camera value the viewer is looking
+				// at RIGHT NOW (last composited generatorOutput, before the
+				// delivery's fast-forward mutates it). The fade provably does
+				// NOT land the camera on the anchor (arms yes, camera no — it
+				// varies per vault), so the post-exit strip/ease pin to THIS
+				// value for continuity by construction.
+				RE::hkQsTransformRaw exitCam{};
+				bool haveExitCam = false;
+				if (auto* dActor = toDeliver[di]->As<RE::Actor>()) {
+					RE::BSTSmartPointer<RE::BSAnimationGraphManager> exMgr;
+					if (dActor->GetAnimationGraphManagerImpl(exMgr) && exMgr) {
+						const int32_t exFp = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+						const uint32_t exGi =
+							(exFp >= 0 && static_cast<uint32_t>(exFp) < exMgr->graph.size())
+								? static_cast<uint32_t>(exFp)
+								: 0u;
+						if (exGi < exMgr->graph.size() && exMgr->graph[exGi]) {
+							auto* exChar = &exMgr->graph[exGi]->character;
+							if (exChar->generatorOutput &&
+								!IsBadReadPtr(exChar->generatorOutput, sizeof(void*))) {
+								auto* exTracks = *reinterpret_cast<uint8_t**>(exChar->generatorOutput);
+								if (exTracks) {
+									auto* exHeaders = reinterpret_cast<RE::TrackHeaderRaw*>(
+										exTracks + sizeof(RE::TrackMasterHeaderRaw));
+									auto& exPose = exHeaders[RE::kTrackIndex_Pose];
+									int16_t exCamIdx = -1;
+									if (auto* exSetup = exChar->setup._ptr) {
+										if (auto* exSkel = reinterpret_cast<uint8_t*>(exSetup->animationSkeleton._ptr)) {
+											auto* exBones = reinterpret_cast<RE::hkArrayRawLayout*>(exSkel + RE::kSkeletonOffset_bones);
+											if (exBones->data && exBones->size > 0) {
+												auto* exData = reinterpret_cast<uint8_t*>(exBones->data);
+												for (int16_t xb = 0; xb < static_cast<int16_t>(exBones->size); ++xb) {
+													auto namePtr = *reinterpret_cast<uintptr_t*>(exData + xb * RE::kHkaBoneStride);
+													namePtr &= ~uintptr_t(1);
+													const char* xn = reinterpret_cast<const char*>(namePtr);
+													if (xn && reinterpret_cast<uintptr_t>(xn) > 0x10000 &&
+														IsTrackFilterCameraBone(xn)) {
+														exCamIdx = xb;
+														break;
+													}
+												}
+											}
+										}
+									}
+									if (exCamIdx >= 0 && exPose.numData > exCamIdx && exPose.dataOffset > 0) {
+										auto* exOut = reinterpret_cast<RE::hkQsTransformRaw*>(
+											exTracks + exPose.dataOffset);
+										exitCam = exOut[exCamIdx];
+										haveExitCam = true;
+										logger::info("[OAR-IdleStop] Exit-camera snapshot (bone {}) R=({:.3f},{:.3f},{:.3f},{:.3f}) for actor {:X}",
+											exCamIdx, exitCam.rotation[0], exitCam.rotation[1],
+											exitCam.rotation[2], exitCam.rotation[3],
+											toDeliver[di]->GetFormID());
+									}
+								}
+							}
+						}
+					}
+				}
+				DeliverDeferredIdleStop(toDeliver[di], toDeliverReason[di],
+					haveExitCam ? &exitCam : nullptr);
+				// User-hypothesis probe: the pose the exit LANDED on vs the
+				// anchor the fade parked at — any residual pop is this delta.
+				LogDeferredExitProbe(toDeliver[di]);
 			}
 		}
 	}
@@ -12354,8 +13432,63 @@ namespace Hooks
 			// an actor-scoped gameplay action.
 			auto* refr = reinterpret_cast<RE::TESObjectREFR*>(
 				reinterpret_cast<uintptr_t>(a_sinkThis) - 0x38);
-			const bool applyIdleStopFix = evtStr && _stricmp(evtStr, "IdleStop") == 0 &&
-				ConsumeIdleStopSuppression(refr);
+
+			// SoundPlay burst suppression (submod option, default ON): the
+			// skipped span's events are NOT all delivered synchronously inside
+			// UpdateAnimation(1000) — the field showed zero synchronous
+			// catches — they drain from the event queue over the following
+			// frames. Filter on a per-actor TIMED window armed at the
+			// fast-forward (the thread_local flags remain as the synchronous
+			// fast path).
+			if (evtStr && _strnicmp(evtStr, "SoundPlay", 9) == 0 &&
+				((s_inIdleStopFastForward && s_suppressFastForwardSounds) ||
+					InSoundSuppressWindow(refr))) {
+				static std::atomic<int> s_sndSwallowLog{ 0 };
+				if (s_sndSwallowLog.fetch_add(1, std::memory_order_relaxed) < 24) {
+					logger::info("[OAR-IdleStop] Swallowed 'SoundPlay.{}' in the post-fix window (suppressIdleStopSounds)",
+						a_event.payload.c_str() ? a_event.payload.c_str() : "");
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+			// Window diagnostic: name the non-SoundPlay tags passing during an
+			// active window, in case the offending sound rides a different tag.
+			if (evtStr && evtStr[0] && InSoundSuppressWindow(refr)) {
+				static std::atomic<int> s_sndWindowDiagLog{ 0 };
+				if (s_sndWindowDiagLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+					logger::info("[OAR-IdleStop] window event '{}' (payload '{}') passed unsuppressed",
+						evtStr, a_event.payload.c_str() ? a_event.payload.c_str() : "");
+				}
+			}
+
+			// Deferral: an IdleStop arriving while a native-idle overlay is
+			// still fading is PARKED and swallowed; the tick delivers it (and
+			// runs the fast-forward) the moment the fade goes dormant. The
+			// exit then fires from the ready pose the fade landed on, instead
+			// of yanking the graph mid-fade (the weapon/right-arm exit snap).
+			const bool isIdleStop = evtStr && _stricmp(evtStr, "IdleStop") == 0;
+			if (isIdleStop && PeekIdleStopSuppression(refr)) {
+				float fadeAlpha = 0.0f;
+				if (HasActiveNativeIdleFade(refr, &fadeAlpha)) {
+					{
+						std::lock_guard dLock(s_deferredIdleStopMutex);
+						auto& rec = s_deferredIdleStops[refr];
+						rec.sinkThis = a_sinkThis;
+						rec.original = a_original;
+						rec.holderID = a_event.holderID;
+						rec.deferredAt = std::chrono::steady_clock::now();
+					}
+					static std::atomic<int> s_deferLog{ 0 };
+					if (s_deferLog.fetch_add(1, std::memory_order_relaxed) < 16) {
+						logger::info("[OAR-IdleStop] Deferred IdleStop for actor {:X} until blend-out completes (alpha={:.3f})",
+							refr ? refr->GetFormID() : 0, fadeAlpha);
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
+			}
+
+			bool suppressSounds = true;
+			const bool applyIdleStopFix = isIdleStop &&
+				ConsumeIdleStopSuppression(refr, &suppressSounds);
 
 			// OG keeps its proven registered-sink event log. This vfunc hook is
 			// installed there only so it can bypass the actor's IdleStop handler.
@@ -12378,7 +13511,15 @@ namespace Hooks
 				if (!applyingFix) {
 					if (auto* actor = refr ? refr->As<RE::Actor>() : nullptr) {
 						applyingFix = true;
+						if (suppressSounds) {
+							ArmSoundSuppressWindow(refr);
+						}
+						ArmPostExitCameraHold(refr);
+						s_inIdleStopFastForward = true;
+						s_suppressFastForwardSounds = suppressSounds;
 						actor->UpdateAnimation(1000.0f);
+						s_inIdleStopFastForward = false;
+						s_suppressFastForwardSounds = false;
 						applyingFix = false;
 						logger::info(
 							"[OAR-IdleStop] Fast-forwarded actor {:X} by 1000s before delivering IdleStop",
