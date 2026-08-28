@@ -741,11 +741,15 @@ static bool HasActiveNativeIdleFade(RE::TESObjectREFR* a_refr, float* a_outAlpha
 	return false;
 }
 
-static bool PeekIdleStopSuppression(RE::TESObjectREFR* a_refr)
+static bool PeekIdleStopSuppression(RE::TESObjectREFR* a_refr,
+	bool* a_outSuppressSounds = nullptr)
 {
 	if (!a_refr) return false;
 	std::lock_guard lock(s_idleStopSuppressionMutex);
-	return s_pendingIdleStopByActor.contains(a_refr->GetFormID());
+	auto it = s_pendingIdleStopByActor.find(a_refr->GetFormID());
+	if (it == s_pendingIdleStopByActor.end()) return false;
+	if (a_outSuppressSounds) *a_outSuppressSounds = it->second.second.suppressSounds;
+	return true;
 }
 
 static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSuppressSounds);
@@ -2070,6 +2074,24 @@ namespace
 	// that graph resolves to a "..._1stperson..." path. Lets us classify player
 	// clips whose own paths lack the marker (authored relative names).
 	static std::atomic<int32_t> s_firstPersonGraphIndex{ -1 };
+
+	// The player's FIRST-PERSON graph character. The graph objects persist
+	// across BGSAnimationSystemUtils::InitializeActorInstant (only their
+	// state is rebuilt), so this pointer is stable where the per-clip
+	// perspective CLASSIFIER is not — freshly rebuilt clips classify kUnknown
+	// until their caches warm, which made the post-exit anchor fade stamp
+	// intermittently (the hand/weapon jitter after the blend-out).
+	static RE::hkbCharacter* GetPlayer1PCharacter(RE::TESObjectREFR* a_refr)
+	{
+		if (!a_refr) return nullptr;
+		RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
+		if (!a_refr->GetAnimationGraphManagerImpl(mgr) || !mgr) return nullptr;
+		const int32_t fp = s_firstPersonGraphIndex.load(std::memory_order_relaxed);
+		if (fp < 0 || static_cast<uint32_t>(fp) >= mgr->graph.size() || !mgr->graph[fp]) {
+			return nullptr;
+		}
+		return &mgr->graph[fp]->character;
+	}
 
 	// Per-clip variant suffix cache (for kOnEachPlay: each clip gets its own roll)
 	static std::shared_mutex s_clipVariantMutex;
@@ -10300,9 +10322,13 @@ namespace
 							!pxState.nativeAnchorValid || !pxState.filter) {
 							continue;
 						}
-						if ((poseHeader.flags & 0x01) != 0) break;  // additive: skip
-						if (GetPlayingClipPerspectiveImpl(a_this) !=
-							OARClipPerspective::kFirstPerson) {
+						// Gate on the 1P graph's CHARACTER, not the per-clip
+						// perspective classifier: after the delivery's
+						// InitializeActorInstant rebuild, fresh clips classify
+						// kUnknown until their caches warm, and the classifier
+						// gate made this stamp flicker on and off frame to
+						// frame — the post-blend-out hand/weapon jitter.
+						if (character != GetPlayer1PCharacter(actor)) {
 							break;
 						}
 						if (static_cast<int16_t>(pxState.nativeAnchorPose.size()) !=
@@ -10310,7 +10336,34 @@ namespace
 							break;
 						}
 						const float pxW = pxState.blendAlpha * pxState.filter->weight;
-						if (pxW > 0.001f) {
+						if (pxW <= 0.001f) break;
+						const bool pxAdditive = (poseHeader.flags & 0x01) != 0;
+						if (pxAdditive) {
+							// Reactivating additive layer (jiggle/sway): the
+							// anchor stamped on the non-additive clips already
+							// bakes the delivery-time additive, so a live
+							// additive clip re-adding its full delta on top
+							// double-counts — the residual hand/weapon jitter
+							// (the camera got this identity-ease in rounds
+							// 33/37; the arms never did). Ease the delta in from
+							// identity at the fade weight; ramps back to full as
+							// the fade releases. The camera bone is owned by the
+							// dedicated post-exit camera pass (its own clock) —
+							// skip it here to avoid double-easing.
+							if (poseHeader.onFraction <= 0.0f) break;
+							const int16_t pxCamIdx = GetCharCameraBoneIndex(character);
+							RE::hkQsTransformRaw addIdentity{};
+							addIdentity.rotation[3] = 1.f;
+							addIdentity.scale[0] = 1.f;
+							addIdentity.scale[1] = 1.f;
+							addIdentity.scale[2] = 1.f;
+							for (int16_t pb = 0; pb < poseHeader.numData; ++pb) {
+								if (pb == pxCamIdx) continue;
+								LerpTransform(outputPose[pb], addIdentity, pxW);
+								SetPoseBoneMaskBit(tracksPtr, poseHeader, pb);
+							}
+							pxApplied = true;
+						} else {
 							for (int16_t pb = 0; pb < poseHeader.numData; ++pb) {
 								LerpTransform(outputPose[pb],
 									pxState.nativeAnchorPose[pb], pxW);
@@ -12540,6 +12593,22 @@ namespace
 							// No deactivation delay here — that setting is for
 							// condition-driven ends; a finished one-shot goes now.
 							state.deactivationDelayActive = false;
+							// Open the sound-suppress window NOW, at the START of the
+							// exit (field 2026-08-28): the engine's wpnequipfast
+							// exit transition begins ~70ms before the deferred
+							// IdleStop delivers, so its weaponDraw fires while the
+							// delivery-time window is still closed and the equip
+							// sound is heard. Arming here (once, on the transition
+							// frame) covers the whole exit. Baked SoundPlay
+							// annotations bypass this sink entirely, so if the sound
+							// persists it is baked and only a graph snap can stop it.
+							if (filterPtr && filterPtr->nativeIdlePlayback) {
+								bool armSounds = true;
+								PeekIdleStopSuppression(mapIt->first, &armSounds);
+								if (armSounds) {
+									ArmSoundSuppressWindow(mapIt->first);
+								}
+							}
 							state.blendingOut = true;
 							state.blendDuration = filterPtr ? filterPtr->blendOutTime : 0.0f;
 							// Continue from the current alpha (alpha maps to elapsed
@@ -13440,13 +13509,24 @@ namespace Hooks
 			// frames. Filter on a per-actor TIMED window armed at the
 			// fast-forward (the thread_local flags remain as the synchronous
 			// fast path).
-			if (evtStr && _strnicmp(evtStr, "SoundPlay", 9) == 0 &&
+			// Swallow set (field 2026-08-28): SoundPlay annotations provably
+			// NEVER traverse this sink (zero catches across every session) —
+			// the audible "equip sound" is the game's response to the
+			// WEAPONDRAW graph event, which DOES traverse here (the window
+			// diagnostic caught it passing unsuppressed at delivery). The
+			// weapon stays drawn throughout a native special idle, so the
+			// notification is redundant inside the window and its handler's
+			// draw sound is the artifact.
+			const bool suppressibleTag = evtStr &&
+				(_strnicmp(evtStr, "SoundPlay", 9) == 0 ||
+					_stricmp(evtStr, "weaponDraw") == 0);
+			if (suppressibleTag &&
 				((s_inIdleStopFastForward && s_suppressFastForwardSounds) ||
 					InSoundSuppressWindow(refr))) {
 				static std::atomic<int> s_sndSwallowLog{ 0 };
 				if (s_sndSwallowLog.fetch_add(1, std::memory_order_relaxed) < 24) {
-					logger::info("[OAR-IdleStop] Swallowed 'SoundPlay.{}' in the post-fix window (suppressIdleStopSounds)",
-						a_event.payload.c_str() ? a_event.payload.c_str() : "");
+					logger::info("[OAR-IdleStop] Swallowed '{}.{}' in the post-fix window (suppressIdleStopSounds)",
+						evtStr, a_event.payload.c_str() ? a_event.payload.c_str() : "");
 				}
 				return RE::BSEventNotifyControl::kContinue;
 			}
