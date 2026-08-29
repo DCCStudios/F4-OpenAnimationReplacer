@@ -201,6 +201,10 @@ public:
 		// of following the clip's playback time — a held static pose.
 		// Negative = disabled (sample at the clip's current time).
 		float sampleFrame = -1.0f;
+		// Leaf-name prefixes whose source clips should be treated as continuous
+		// loops even when the behavior graph exposes them as SINGLE_PLAY or
+		// USER_CONTROLLED. Action clips remain one-shot unless explicitly listed.
+		std::vector<std::string> loopSourcePrefixes;
 		// Model-space anchoring (Override + playback-following only): the
 		// filtered chain's ROOT bones are re-expressed so the chain lands
 		// exactly where the donor animation puts it relative to the character

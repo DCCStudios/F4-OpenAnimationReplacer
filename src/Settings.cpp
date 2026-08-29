@@ -1,20 +1,36 @@
 #include "Settings.h"
 
+#include <filesystem>
+
 void Settings::Load()
 {
-	CSimpleIniA ini;
-	ini.SetUnicode();
+	CSimpleIniA defaults;
+	defaults.SetUnicode();
 
-	bool loaded = (ini.LoadFile(kSettingsPath) >= 0);
-	if (!loaded) {
+	const bool defaultsLoaded = (defaults.LoadFile(kSettingsPath) >= 0);
+	if (!defaultsLoaded) {
 		logger::warn("[OAR] No INI found at '{}' - using defaults", kSettingsPath);
 	}
 
+	CSimpleIniA user;
+	user.SetUnicode();
+	const bool userLoaded = (user.LoadFile(kUserSettingsPath) >= 0);
+	if (userLoaded) {
+		logger::info("[OAR] User settings loaded from '{}' (defaults: '{}')",
+			kUserSettingsPath, kSettingsPath);
+	}
+
 	auto getB = [&](const char* sec, const char* key, bool def) {
-		return ini.GetBoolValue(sec, key, def);
+		return user.GetBoolValue(sec, key, defaults.GetBoolValue(sec, key, def));
 	};
 	auto getI = [&](const char* sec, const char* key, int def) {
-		return static_cast<int>(ini.GetLongValue(sec, key, def));
+		return static_cast<int>(user.GetLongValue(sec, key, defaults.GetLongValue(sec, key, def)));
+	};
+	auto getD = [&](const char* sec, const char* key, double def) {
+		return user.GetDoubleValue(sec, key, defaults.GetDoubleValue(sec, key, def));
+	};
+	auto getS = [&](const char* sec, const char* key, const char* def) {
+		return user.GetValue(sec, key, defaults.GetValue(sec, key, def));
 	};
 
 	bEnabled                      = getB("General", "bEnabled", bEnabled);
@@ -28,13 +44,14 @@ void Settings::Load()
 	iAutoReloadMode               = std::clamp(getI("General", "iAutoReloadMode", iAutoReloadMode), 0, 2);
 	bPlayDryFireSound             = getB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
-	iToggleKey   = static_cast<std::uint32_t>(ini.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
+	iToggleKey   = static_cast<std::uint32_t>(user.GetLongValue("UI", "iToggleKey",
+		defaults.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey))));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
 	iTextSizePercent = std::clamp(getI("UI", "iTextSizePercent", iTextSizePercent), 50, 200);
-	sLanguage = ini.GetValue("UI", "sLanguage", sLanguage.c_str());
-	sCJKFontPath = ini.GetValue("UI", "sCJKFontPath", sCJKFontPath.c_str());
+	sLanguage = getS("UI", "sLanguage", sLanguage.c_str());
+	sCJKFontPath = getS("UI", "sCJKFontPath", sCJKFontPath.c_str());
 
 	bLogActivate   = getB("AnimationLog", "bLogActivate", bLogActivate);
 	bLogReplace    = getB("AnimationLog", "bLogReplace", bLogReplace);
@@ -50,11 +67,11 @@ void Settings::Load()
 	iHavokHeapMultiplier = std::clamp(iHavokHeapMultiplier, 1, 8);
 
 	bEnableAnimationQueueProgressBar = getB("UI", "bEnableAnimationQueueProgressBar", bEnableAnimationQueueProgressBar);
-	fAnimationQueueLingerTime = static_cast<float>(ini.GetDoubleValue("UI", "fAnimationQueueLingerTime", fAnimationQueueLingerTime));
+	fAnimationQueueLingerTime = static_cast<float>(getD("UI", "fAnimationQueueLingerTime", fAnimationQueueLingerTime));
 
 	bVerboseLogging = getB("Debug", "bVerboseLogging", bVerboseLogging);
 
-	const char* rvaStr = ini.GetValue("Debug", "iLoadClipsAddressRVA", "0");
+	const char* rvaStr = getS("Debug", "iLoadClipsAddressRVA", "0");
 	if (rvaStr) {
 		iLoadClipsAddressRVA = std::strtoull(rvaStr, nullptr, 16);
 	}
@@ -68,7 +85,7 @@ void Settings::Save()
 {
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	ini.LoadFile(kSettingsPath);
+	ini.LoadFile(kUserSettingsPath);
 
 	auto setB = [&](const char* sec, const char* key, bool val) {
 		ini.SetBoolValue(sec, key, val);
@@ -110,9 +127,18 @@ void Settings::Save()
 
 	setB("Debug", "bVerboseLogging", bVerboseLogging);
 
-	if (ini.SaveFile(kSettingsPath) >= 0) {
-		logger::info("[OAR] Settings saved to '{}'", kSettingsPath);
+	const std::filesystem::path userPath(kUserSettingsPath);
+	std::error_code ec;
+	std::filesystem::create_directories(userPath.parent_path(), ec);
+	if (ec) {
+		logger::error("[OAR] Failed to create user settings directory '{}': {}",
+			userPath.parent_path().string(), ec.message());
+	}
+
+	if (!ec && ini.SaveFile(kUserSettingsPath) >= 0) {
+		logger::info("[OAR] User settings saved to '{}' (defaults preserved at '{}')",
+			kUserSettingsPath, kSettingsPath);
 	} else {
-		logger::error("[OAR] Failed to save settings to '{}'", kSettingsPath);
+		logger::error("[OAR] Failed to save user settings to '{}'", kUserSettingsPath);
 	}
 }

@@ -1376,7 +1376,7 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 				auto tempCond = fn();
 				bool condIsStub = tempCond && tempCond->IsStub();
 				std::string displayName = UICommon::T(name.c_str());
-				if (condIsStub) displayName += "  [N/A]";
+				if (condIsStub) displayName += std::string("  ") + UICommon::T("[N/A]");
 				if (condIsStub) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.1f, 1.0f));
 				if (ImGui::MenuItem(displayName.c_str())) {
 					a_condSet->AddCondition(fn());

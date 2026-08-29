@@ -7,6 +7,7 @@
 #include "Settings.h"
 #include "Variants.h"
 #include "Utils.h"
+#include "BA2Archive.h"
 
 namespace Parsing
 {
@@ -80,7 +81,8 @@ namespace Parsing
 	}
 
 	static void ScanDirectoryForOAR(const std::filesystem::path& a_searchRoot,
-		const std::filesystem::path& a_meshesBase, int& a_modCount, int& a_subModCount, int& a_animCount)
+		const std::filesystem::path& a_meshesBase, int& a_modCount, int& a_subModCount, int& a_animCount,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		if (!std::filesystem::exists(a_searchRoot)) return;
 
@@ -99,7 +101,7 @@ namespace Parsing
 					if (!modEntry.is_directory()) continue;
 
 					try {
-						auto mod = ParseReplacerMod(modEntry.path(), meshesPrefix);
+						auto mod = ParseReplacerMod(modEntry.path(), meshesPrefix, a_archiveIndex);
 						if (mod) {
 							for (const auto& sub : mod->GetSubMods()) {
 								a_subModCount++;
@@ -118,6 +120,52 @@ namespace Parsing
 		}
 	}
 
+	// Collects the lowercased stems (filename without extension) of every plugin active
+	// in the current load order, including light (ESL) plugins. The BA2 index uses this
+	// set to skip archives whose owning plugin is not loaded - archives the game's own
+	// resource layer never registers. Reading TESDataHandler's compiled file collection
+	// is a settled-data-structure lookup; unlike probing the resource manager it does not
+	// race the startup BA2 registration this parse runs alongside. Returns an empty set
+	// when the data handler is unavailable, which leaves the index ungated (legacy scan).
+	static std::unordered_set<std::string> CollectRegisteredArchiveOwners()
+	{
+		std::unordered_set<std::string> owners;
+
+		auto* dataHandler = RE::TESDataHandler::GetSingleton();
+		if (!dataHandler) {
+			return owners;
+		}
+
+		auto addStem = [&owners](const char* a_fileName) {
+			if (!a_fileName || a_fileName[0] == '\0') {
+				return;
+			}
+			std::string stem(a_fileName);
+			if (const auto dot = stem.find_last_of('.'); dot != std::string::npos) {
+				stem.erase(dot);
+			}
+			std::ranges::transform(stem, stem.begin(), [](unsigned char c) {
+				return static_cast<char>(std::tolower(c));
+			});
+			if (!stem.empty()) {
+				owners.insert(std::move(stem));
+			}
+		};
+
+		for (auto* file : dataHandler->compiledFileCollection.files) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+		for (auto* file : dataHandler->compiledFileCollection.smallFiles) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+
+		return owners;
+	}
+
 	void ParseAllMods()
 	{
 		RegisterAllConditions();
@@ -134,8 +182,20 @@ namespace Parsing
 		if (!std::filesystem::exists(meshesPath)) {
 			logger::warn("[OAR] Meshes directory not found at '{}'", meshesPath.string());
 			oar->isLoading.store(false);
+			oar->loadingComplete.store(true);
+			oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kIdle);
 			return;
 		}
+
+		// OAR configuration remains loose, but replacement HKX may be supplied
+		// by the game's resource layer. Index General BA2 paths once per parse so
+		// each submod can merge its loose and archived files without scanning all
+		// archives repeatedly. Gate the index by the load order so archives owned by
+		// disabled plugins (present on disk but never registered by the game) are
+		// excluded instead of producing dead entries or silent wrong-file fallbacks.
+		auto registeredOwners = CollectRegisteredArchiveOwners();
+		logger::info("[OAR] {} plugin(s) in load order gate BA2 indexing", registeredOwners.size());
+		auto archiveIndex = OAR::BA2::Index::Build(meshesPath.parent_path(), registeredOwners);
 
 		int modCount = 0;
 		int subModCount = 0;
@@ -156,7 +216,7 @@ namespace Parsing
 					// intentionally place OpenAnimationReplacer directly beneath the race.
 					// A single recursive pass also avoids discovering deeper layouts twice.
 					ScanDirectoryForOAR(
-						raceDir.path(), meshesPath, modCount, subModCount, animCount);
+						raceDir.path(), meshesPath, modCount, subModCount, animCount, &archiveIndex);
 				}
 			} catch (const std::filesystem::filesystem_error& e) {
 				logger::error("[OAR] Filesystem error scanning actors: {}", e.what());
@@ -165,7 +225,7 @@ namespace Parsing
 
 		if (modCount == 0) {
 			logger::info("[OAR] No mods found via targeted scan, falling back to full Meshes scan");
-			ScanDirectoryForOAR(meshesPath, meshesPath, modCount, subModCount, animCount);
+			ScanDirectoryForOAR(meshesPath, meshesPath, modCount, subModCount, animCount, &archiveIndex);
 		}
 
 		auto elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -180,7 +240,8 @@ namespace Parsing
 	}
 
 	std::unique_ptr<ReplacerMod> ParseReplacerMod(const std::filesystem::path& a_modPath,
-		const std::filesystem::path& a_meshesPrefix)
+		const std::filesystem::path& a_meshesPrefix,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		auto modName = a_modPath.filename().string();
 		auto mod = std::make_unique<ReplacerMod>(modName, a_modPath);
@@ -197,7 +258,7 @@ namespace Parsing
 			if (!subEntry.is_directory()) continue;
 
 			try {
-				auto subMod = ParseSubMod(subEntry.path(), a_meshesPrefix, mod.get());
+				auto subMod = ParseSubMod(subEntry.path(), a_meshesPrefix, mod.get(), a_archiveIndex);
 				if (subMod) {
 					mod->AddSubMod(std::move(subMod));
 				}
@@ -211,7 +272,8 @@ namespace Parsing
 	}
 
 	std::unique_ptr<SubMod> ParseSubMod(const std::filesystem::path& a_subModPath,
-		const std::filesystem::path& a_meshesPrefix, ReplacerMod* a_parentMod)
+		const std::filesystem::path& a_meshesPrefix, ReplacerMod* a_parentMod,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		auto subModName = a_subModPath.filename().string();
 
@@ -236,6 +298,8 @@ namespace Parsing
 
 		struct HkxFileEntry {
 			std::filesystem::path diskPath;
+			std::string resourcePath;       // Data-relative path for BA2 resources
+			bool archiveResource{ false };
 			std::filesystem::path relativePath;  // relative to submod
 			std::string filename;
 			std::string stem;
@@ -244,20 +308,23 @@ namespace Parsing
 			bool isBase;          // true if no _N suffix detected
 		};
 
-		// First pass: collect all .hkx files
+		// First pass: collect all .hkx files. Loose files win over an archived
+		// file with the same relative path, matching the game's resource order.
 		std::vector<HkxFileEntry> allFiles;
 		std::unordered_set<std::string> baseKeys;  // keys that have a base file (no _N suffix)
+		std::unordered_set<std::string> seenRelativePaths;
 
-		for (auto& fileEntry : std::filesystem::recursive_directory_iterator(a_subModPath,
-			std::filesystem::directory_options::skip_permission_denied))
-		{
-			if (!fileEntry.is_regular_file()) continue;
-
-			auto ext = fileEntry.path().extension().string();
+		auto addFile = [&](const std::filesystem::path& a_relativePath,
+			const std::filesystem::path& a_diskPath, std::string a_resourcePath,
+			bool a_archiveResource) {
+			auto ext = a_relativePath.extension().string();
 			std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (ext != ".hkx") continue;
+			if (ext != ".hkx") return;
 
-			auto relativePath = std::filesystem::relative(fileEntry.path(), a_subModPath);
+			auto relativePath = a_relativePath.lexically_normal();
+			auto normalizedRelative = Utils::NormalizePath(relativePath);
+			if (!seenRelativePaths.insert(normalizedRelative).second) return;
+
 			std::string stem = relativePath.stem().string();
 			std::string relDir = relativePath.parent_path().string();
 
@@ -291,7 +358,9 @@ namespace Parsing
 			if (isBase) baseKeys.insert(baseKey);
 
 			HkxFileEntry hfe;
-			hfe.diskPath = fileEntry.path();
+			hfe.diskPath = a_diskPath;
+			hfe.resourcePath = std::move(a_resourcePath);
+			hfe.archiveResource = a_archiveResource;
 			hfe.relativePath = relativePath;
 			hfe.filename = relativePath.filename().string();
 			hfe.stem = stem;
@@ -299,6 +368,25 @@ namespace Parsing
 			hfe.variantIndex = variantIdx;
 			hfe.isBase = isBase;
 			allFiles.push_back(std::move(hfe));
+		};
+
+		for (auto& fileEntry : std::filesystem::recursive_directory_iterator(a_subModPath,
+			std::filesystem::directory_options::skip_permission_denied))
+		{
+			if (!fileEntry.is_regular_file()) continue;
+			addFile(std::filesystem::relative(fileEntry.path(), a_subModPath), fileEntry.path(), {}, false);
+		}
+
+		if (a_archiveIndex) {
+			auto subModPrefix = Utils::NormalizePath(
+				std::filesystem::path("meshes") / ExtractPathAfterMeshes(a_subModPath));
+			if (!subModPrefix.ends_with('\\')) subModPrefix.push_back('\\');
+
+			for (const auto& archiveEntry : a_archiveIndex->GetEntriesUnderPrefix(subModPrefix)) {
+				auto relativeString = archiveEntry.path.substr(subModPrefix.size());
+				if (relativeString.empty()) continue;
+				addFile(std::filesystem::path(relativeString), {}, archiveEntry.path, true);
+			}
 		}
 
 		// Second pass: group files — only treat _N files as variants if a base exists
@@ -320,26 +408,32 @@ namespace Parsing
 			}
 		}
 
-		// Helper lambda to register a single file as a ReplacementAnimation
+		auto sourcePathFor = [](const HkxFileEntry* a_file) {
+			return a_file->archiveResource ? std::filesystem::path(a_file->resourcePath) : a_file->diskPath;
+		};
+
+		auto normalizedReplacementFor = [&](const HkxFileEntry* a_file) {
+			auto afterMeshes = ExtractPathAfterMeshes(sourcePathFor(a_file));
+			auto afterMeshesStr = afterMeshes.string();
+			std::string normalizedReplacement;
+			auto lowerAfter = afterMeshesStr;
+			std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			auto animPos = lowerAfter.find("animations\\");
+			if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
+			if (animPos != std::string::npos) {
+				normalizedReplacement = afterMeshesStr.substr(animPos);
+			} else {
+				normalizedReplacement = afterMeshesStr;
+			}
+			std::ranges::replace(normalizedReplacement, '/', '\\');
+			return normalizedReplacement;
+		};
+
+		// Helper lambda to register a single file as a ReplacementAnimation.
 		auto registerSingleFile = [&](HkxFileEntry* f) {
 			auto originalPath = a_meshesPrefix / f->relativePath;
 			auto normalizedOriginal = Utils::NormalizePath(originalPath);
-
-			auto afterMeshes = ExtractPathAfterMeshes(f->diskPath);
-			auto afterMeshesStr = afterMeshes.string();
-			std::string normalizedReplacement;
-			{
-				auto lowerAfter = afterMeshesStr;
-				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-				auto animPos = lowerAfter.find("animations\\");
-				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
-				if (animPos != std::string::npos) {
-					normalizedReplacement = afterMeshesStr.substr(animPos);
-				} else {
-					normalizedReplacement = afterMeshesStr;
-				}
-				std::ranges::replace(normalizedReplacement, '/', '\\');
-			}
+			auto normalizedReplacement = normalizedReplacementFor(f);
 
 			auto replacement = std::make_unique<ReplacementAnimation>(
 				normalizedOriginal, normalizedReplacement, -1, subMod.get());
@@ -347,7 +441,9 @@ namespace Parsing
 			ReplacementAnimFileInfo fileInfo;
 			fileInfo.originalPath = normalizedOriginal;
 			fileInfo.replacementPath = normalizedReplacement;
-			fileInfo.absoluteDiskPath = f->diskPath.string();
+			fileInfo.absoluteDiskPath = f->archiveResource ? std::string{} : f->diskPath.string();
+			fileInfo.resourcePath = f->resourcePath;
+			fileInfo.archiveResource = f->archiveResource;
 			fileInfo.parentSubMod = subMod.get();
 			fileInfo.replacementAnim = replacement.get();
 			OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(normalizedOriginal, fileInfo);
@@ -382,22 +478,8 @@ namespace Parsing
 			auto originalPath = a_meshesPrefix / baseFile->relativePath;
 			auto normalizedOriginal = Utils::NormalizePath(originalPath);
 
-			// Compute normalizedReplacement for the base file
-			auto afterMeshes = ExtractPathAfterMeshes(baseFile->diskPath);
-			auto afterMeshesStr = afterMeshes.string();
-			std::string normalizedReplacement;
-			{
-				auto lowerAfter = afterMeshesStr;
-				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-				auto animPos = lowerAfter.find("animations\\");
-				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
-				if (animPos != std::string::npos) {
-					normalizedReplacement = afterMeshesStr.substr(animPos);
-				} else {
-					normalizedReplacement = afterMeshesStr;
-				}
-				std::ranges::replace(normalizedReplacement, '/', '\\');
-			}
+			// Compute normalizedReplacement for the base file.
+			auto normalizedReplacement = normalizedReplacementFor(baseFile);
 
 			auto replacement = std::make_unique<ReplacementAnimation>(
 				normalizedOriginal, normalizedReplacement, -1, subMod.get());
@@ -430,7 +512,9 @@ namespace Parsing
 				ReplacementAnimFileInfo fileInfo;
 				fileInfo.originalPath = variantCachePath;
 				fileInfo.replacementPath = normalizedReplacement;
-				fileInfo.absoluteDiskPath = f->diskPath.string();
+				fileInfo.absoluteDiskPath = f->archiveResource ? std::string{} : f->diskPath.string();
+				fileInfo.resourcePath = f->resourcePath;
+				fileInfo.archiveResource = f->archiveResource;
 				fileInfo.parentSubMod = subMod.get();
 				fileInfo.replacementAnim = replacement.get();
 				OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(variantCachePath, fileInfo);
@@ -595,6 +679,12 @@ namespace Parsing
 			a_subMod->trackFilter.blendOutTime = tf.value("blendOutTime", 0.0f);
 			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
+			if (tf.contains("loopSourcePrefixes") && tf["loopSourcePrefixes"].is_array()) {
+				for (const auto& prefix : tf["loopSourcePrefixes"]) {
+					if (prefix.is_string())
+						a_subMod->trackFilter.loopSourcePrefixes.push_back(prefix.get<std::string>());
+				}
+			}
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", false);
 			a_subMod->trackFilter.nativeIdlePlayback = tf.value("nativeIdlePlayback", false);
 			a_subMod->trackFilter.triggerOnlySpecialIdle = tf.value("triggerOnlySpecialIdle", false);

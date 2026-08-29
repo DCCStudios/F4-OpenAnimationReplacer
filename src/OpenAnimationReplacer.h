@@ -12,6 +12,10 @@ struct ReplacementAnimFileInfo
 	std::string originalPath;
 	std::string replacementPath;
 	std::string absoluteDiskPath;
+	// Non-empty for HKX files resolved through the game's BSResource layer
+	// (including BA2). The path is Data-relative and uses backslashes.
+	std::string resourcePath;
+	bool archiveResource{ false };
 	SubMod* parentSubMod{ nullptr };
 	ReplacementAnimation* replacementAnim{ nullptr };
 };

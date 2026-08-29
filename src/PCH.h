@@ -15,6 +15,7 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
+#include <fmt/format.h>
 
 // The multi-runtime CommonLibF4 fork has no F4SE::log wrapper; logger:: call
 // sites map 1:1 onto spdlog's free functions (default logger installed by

@@ -1,6 +1,7 @@
 #include "AnimationCache.h"
 #include "OpenAnimationReplacer.h"
 #include "Settings.h"
+#include "RE/B/BSResourceNiBinaryStream.h"
 
 // Per-file load logging is gated behind bVerboseLogging: at tens of thousands
 // of animations the ~15 info lines each file emits during preload dominate
@@ -85,63 +86,92 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		return false;
 	}
 	const auto diskMTime = std::filesystem::last_write_time(a_absolutePath, ec);
+	const bool hasDiskMTime = !ec;
 
-	// Fast path: this exact file is already cached. The cache's real identity
-	// is the on-disk file, not the owner tag — a config reload recreates every
-	// SubMod, so matching on owner would miss ALL entries and re-read every
-	// animation file from disk (seconds of hitching with thousands of anims).
-	// Match by path instead and, when size+mtime are unchanged, just re-bind
-	// the entry to the new owner/priority: the parsed data, annotations, and
-	// runtime clone all stay valid because the bytes they were built from are
-	// the same. A changed file (author replaced the .hkx and hit reload) falls
-	// through to a full re-read that replaces the entry below.
-	const std::string pathStr = a_absolutePath.string();
-	{
-		std::unique_lock lock(m_mutex);
-		auto it = m_cache.find(a_suffix);
-		if (it != m_cache.end()) {
-			for (auto& existing : it->second) {
-				if (!existing || existing->filePath != pathStr) continue;
-				if (existing->fileSize == diskSize && existing->fileMTime == diskMTime) {
-					existing->owner = a_owner;
-					existing->priority = a_priority;
-					existing->pendingRebind = false;
-					// Priority may have changed; keep index 0 = highest.
-					std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
-						return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
-					});
-					// Count toward the loading progress bar like a real load.
-					OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
-					return true;
-				}
-				break;
-			}
-		}
+	const auto pathStr = a_absolutePath.string();
+	if (TryRebindCached(a_suffix, pathStr, hasDiskMTime, static_cast<uint64_t>(diskSize),
+		diskMTime, a_owner, a_priority)) {
+		return true;
 	}
-
-	auto entry = std::make_unique<CachedAnimation>();
-	entry->filePath = pathStr;
-	entry->owner = a_owner;
-	entry->priority = a_priority;
-	entry->fileSize = diskSize;
-	entry->fileMTime = diskMTime;
 
 	std::ifstream file(a_absolutePath, std::ios::binary | std::ios::ate);
 	if (!file.is_open()) {
-		logger::warn("[OAR-Cache] Cannot open: '{}'", a_absolutePath.string());
+		logger::warn("[OAR-Cache] Cannot open: '{}'", pathStr);
 		return false;
 	}
 
-	auto fileSize = file.tellg();
+	const auto fileSize = file.tellg();
 	if (fileSize < 64 || fileSize > 50 * 1024 * 1024) {
-		logger::warn("[OAR-Cache] Invalid file size ({}) for: '{}'", (int64_t)fileSize, a_absolutePath.string());
+		logger::warn("[OAR-Cache] Invalid file size ({}) for: '{}'", static_cast<int64_t>(fileSize), pathStr);
 		return false;
 	}
 
-	entry->fileData.resize(static_cast<size_t>(fileSize));
+	std::vector<uint8_t> bytes(static_cast<size_t>(fileSize));
 	file.seekg(0);
-	file.read(reinterpret_cast<char*>(entry->fileData.data()), fileSize);
-	file.close();
+	file.read(reinterpret_cast<char*>(bytes.data()), fileSize);
+	if (!file) {
+		logger::warn("[OAR-Cache] Failed to read: '{}'", pathStr);
+		return false;
+	}
+	return LoadAnimationBytes(a_suffix, pathStr, std::move(bytes), hasDiskMTime,
+		static_cast<uint64_t>(diskSize), diskMTime, a_owner, a_priority);
+}
+
+bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
+	const void* a_owner, int32_t a_priority)
+{
+	RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
+	if (!stream) {
+		logger::warn("[OAR-Cache] Resource not found: '{}'", a_resourcePath);
+		return false;
+	}
+
+	RE::NiBinaryStream::BufferInfo bufferInfo{};
+	stream.GetBufferInfo(bufferInfo);
+	if (bufferInfo.fileSize < 64 || bufferInfo.fileSize > 50 * 1024 * 1024) {
+		logger::warn("[OAR-Cache] Invalid resource size ({}) for: '{}'", bufferInfo.fileSize, a_resourcePath);
+		return false;
+	}
+	if (TryRebindCached(a_suffix, a_resourcePath, false,
+		static_cast<uint64_t>(bufferInfo.fileSize), {}, a_owner, a_priority)) {
+		return true;
+	}
+
+	std::vector<uint8_t> bytes(bufferInfo.fileSize);
+	const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
+	if (bytesRead != bytes.size()) {
+		logger::warn("[OAR-Cache] Failed to read resource '{}' ({} / {} bytes)",
+			a_resourcePath, bytesRead, bytes.size());
+		return false;
+	}
+
+	return LoadAnimationBytes(a_suffix, a_resourcePath, std::move(bytes), false,
+		static_cast<uint64_t>(bufferInfo.fileSize), {}, a_owner, a_priority);
+}
+
+bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
+	std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
+	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority)
+{
+	const auto sourceSize = a_sourceSize != 0 ? a_sourceSize : static_cast<uint64_t>(a_bytes.size());
+	if (a_bytes.size() < 64 || a_bytes.size() > 50 * 1024 * 1024) {
+		logger::warn("[OAR-Cache] Invalid source size ({}) for: '{}'", a_bytes.size(), a_sourceIdentity);
+		return false;
+	}
+
+	if (TryRebindCached(a_suffix, a_sourceIdentity, a_hasFileMTime, sourceSize,
+		a_sourceMTime, a_owner, a_priority)) {
+		return true;
+	}
+
+	auto entry = std::make_unique<CachedAnimation>();
+	entry->filePath = std::move(a_sourceIdentity);
+	entry->owner = a_owner;
+	entry->priority = a_priority;
+	entry->fileSize = sourceSize;
+	entry->fileMTime = a_sourceMTime;
+	entry->hasFileMTime = a_hasFileMTime;
+	entry->fileData = std::move(a_bytes);
 
 	auto magic = *reinterpret_cast<uint32_t*>(entry->fileData.data());
 
@@ -151,19 +181,19 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	} else if (magic == kTagfileMagic) {
 		parsed = ParseTagfile(*entry);
 	} else {
-		logger::warn("[OAR-Cache] Unknown file format (magic=0x{:08X}) for: '{}'", magic, a_absolutePath.string());
+		logger::warn("[OAR-Cache] Unknown file format (magic=0x{:08X}) for: '{}'", magic, entry->filePath);
 		return false;
 	}
 
 	if (!parsed || !entry->animation) {
-		logger::warn("[OAR-Cache] Failed to parse animation from: '{}'", a_absolutePath.string());
+		logger::warn("[OAR-Cache] Failed to parse animation from: '{}'", entry->filePath);
 		return false;
 	}
 
 	if (VerboseCacheLog()) {
 		logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
 			a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
-			a_absolutePath.string());
+			entry->filePath);
 	}
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
@@ -193,6 +223,40 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 	});
 	files.insert(insertAt, std::move(entry));
 	return true;
+}
+
+bool AnimationCache::TryRebindCached(const std::string& a_suffix,
+	std::string_view a_sourceIdentity, bool a_hasFileMTime, std::uint64_t a_sourceSize,
+	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority)
+{
+	std::unique_lock lock(m_mutex);
+	auto it = m_cache.find(a_suffix);
+	if (it == m_cache.end()) return false;
+
+	for (auto& existing : it->second) {
+		if (!existing || existing->filePath != a_sourceIdentity) continue;
+		const bool timestampMatches = a_hasFileMTime
+			? existing->hasFileMTime && existing->fileMTime == a_sourceMTime
+			: !existing->hasFileMTime;
+		if (existing->fileSize != a_sourceSize || !timestampMatches) continue;
+
+		existing->owner = a_owner;
+		existing->priority = a_priority;
+		existing->pendingRebind = false;
+		for (const auto& clone : existing->clones) {
+			if (const auto lookup = m_cloneLookup.find(clone.clone); lookup != m_cloneLookup.end()) {
+				lookup->second.suffix = a_suffix;
+				lookup->second.owner = existing->owner;
+				lookup->second.retired = false;
+			}
+		}
+		std::ranges::stable_sort(it->second, [](const auto& a, const auto& b) {
+			return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
+		});
+		OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
+		return true;
+	}
+	return false;
 }
 
 // Select the cached file for a suffix: the given owner's file when present,
@@ -441,6 +505,15 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		newClone.originalNumTracks = *reinterpret_cast<const int32_t*>(origBytes + 0x18);
 	}
 	entry.clones.push_back(std::move(newClone));
+	const auto& registeredClone = entry.clones.back();
+	m_cloneLookup[registeredClone.clone] = CloneLookup{
+		.gameOriginal = registeredClone.gameOriginal,
+		.originalDuration = registeredClone.originalDuration,
+		.originalNumTracks = registeredClone.originalNumTracks,
+		.suffix = a_suffix,
+		.owner = entry.owner,
+		.retired = false
+	};
 
 	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}' ({} clone(s) live)",
 		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim),
@@ -495,22 +568,7 @@ bool AnimationCache::IsOurReplacement(RE::hkaAnimation* a_anim) const
 {
 	if (!a_anim) return false;
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				if (rc.clone == a_anim) return true;
-			}
-		}
-	}
-	// Retired clones are still "ours": a clip that held a clone across an
-	// invalidation must not mistake it for a game animation (see RetiredClone
-	// comment in the header). Their original reverse link is retained so a
-	// later activation can scrub a shared binding safely.
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_anim) return true;
-	}
-	return false;
+	return m_cloneLookup.contains(a_anim);
 }
 
 bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::string& a_outSuffix,
@@ -518,30 +576,12 @@ bool AnimationCache::GetReplacementIdentity(RE::hkaAnimation* a_anim, std::strin
 {
 	if (!a_anim) return false;
 	std::shared_lock lock(m_mutex);
-	// Live entries first: the clip is still playing a current clone.
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				if (rc.clone == a_anim) {
-					a_outSuffix = key;
-					a_outOwner = entry->owner;
-					return true;
-				}
-			}
-		}
-	}
-	// Retired clones: the clip carried a kept-alive buffer across an
-	// invalidation (mid-session save load, weapon switch). The identity was
-	// stamped onto the record at retire time.
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_anim && !retired.suffix.empty()) {
-			a_outSuffix = retired.suffix;
-			a_outOwner = retired.owner;
-			return true;
-		}
-	}
-	return false;
+	const auto it = m_cloneLookup.find(a_anim);
+	if (it == m_cloneLookup.end()) return false;
+	if (it->second.retired && it->second.suffix.empty()) return false;
+	a_outSuffix = it->second.suffix;
+	a_outOwner = it->second.owner;
+	return true;
 }
 
 RE::hkaAnimation* AnimationCache::GetGameOriginalForSuffix(const std::string& a_suffix) const
@@ -566,27 +606,13 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromReplacement(RE::hkaAnimation* a
 			*reinterpret_cast<const int32_t*>(bytes + 0x18) == a_numTracks;
 	};
 	std::shared_lock lock(m_mutex);
-	for (auto& [key, files] : m_cache) {
-		for (auto& entry : files) {
-			if (!entry) continue;
-			for (auto& rc : entry->clones) {
-				// The recorded original may be stale (freed on weapon switch
-				// while the clone stays live for other originals) — callers
-				// already validate the returned pointer before use.
-				if (rc.clone == a_replacement &&
-					originalStillMatches(rc.gameOriginal, rc.originalDuration, rc.originalNumTracks)) {
-					return rc.gameOriginal;
-				}
-			}
-		}
-	}
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_replacement &&
-			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
-			return retired.gameOriginal;
-		}
-	}
-	return nullptr;
+	const auto it = m_cloneLookup.find(a_replacement);
+	if (it == m_cloneLookup.end()) return nullptr;
+	// The recorded original may be stale (freed on weapon switch while the
+	// clone stays live for other originals). Callers validate the returned
+	// pointer before use, and this preserves the old duration/track guard.
+	return originalStillMatches(it->second.gameOriginal, it->second.originalDuration,
+		it->second.originalNumTracks) ? it->second.gameOriginal : nullptr;
 }
 
 RE::hkaAnimation* AnimationCache::GetOriginalFromRetiredReplacement(RE::hkaAnimation* a_replacement) const
@@ -600,13 +626,10 @@ RE::hkaAnimation* AnimationCache::GetOriginalFromRetiredReplacement(RE::hkaAnima
 	};
 
 	std::shared_lock lock(m_mutex);
-	for (auto& retired : m_retiredClones) {
-		if (retired.clonePtr == a_replacement &&
-			originalStillMatches(retired.gameOriginal, retired.originalDuration, retired.originalNumTracks)) {
-			return retired.gameOriginal;
-		}
-	}
-	return nullptr;
+	const auto it = m_cloneLookup.find(a_replacement);
+	if (it == m_cloneLookup.end() || !it->second.retired) return nullptr;
+	return originalStillMatches(it->second.gameOriginal, it->second.originalDuration,
+		it->second.originalNumTracks) ? it->second.gameOriginal : nullptr;
 }
 
 void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_index,
@@ -614,9 +637,14 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 {
 	if (a_index >= a_entry.clones.size()) return;
 	auto& rc = a_entry.clones[a_index];
+	const auto clonePtr = rc.clone;
+	m_cloneLookup.erase(clonePtr);
 	if (!rc.structBuffer.empty()) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
+				m_cloneLookup.erase(retiredPtr);
+			}
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
 		RetiredClone rec;
@@ -628,6 +656,14 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 		rec.suffix = a_suffix;
 		rec.owner = a_entry.owner;
 		m_retiredClones.push_back(std::move(rec));
+		m_cloneLookup[clonePtr] = CloneLookup{
+			.gameOriginal = rc.gameOriginal,
+			.originalDuration = rc.originalDuration,
+			.originalNumTracks = rc.originalNumTracks,
+			.suffix = a_suffix,
+			.owner = a_entry.owner,
+			.retired = true
+		};
 	}
 	a_entry.clones.erase(a_entry.clones.begin() + a_index);
 }
@@ -648,6 +684,9 @@ void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBa
 	if (retireData) {
 		constexpr size_t kMaxRetiredClones = 256;
 		if (m_retiredClones.size() >= kMaxRetiredClones) {
+			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
+				m_cloneLookup.erase(retiredPtr);
+			}
 			m_retiredClones.erase(m_retiredClones.begin());
 		}
 		RetiredClone rec;
@@ -710,6 +749,16 @@ void AnimationCache::InvalidateRuntimeClones()
 void AnimationCache::Clear()
 {
 	std::unique_lock lock(m_mutex);
+	// Retired clones remain in their keep-alive list, so only remove live-clone
+	// identities before dropping the cached file entries.
+	for (auto& [key, files] : m_cache) {
+		for (auto& entry : files) {
+			if (!entry) continue;
+			for (const auto& clone : entry->clones) {
+				m_cloneLookup.erase(clone.clone);
+			}
+		}
+	}
 	m_cache.clear();
 }
 

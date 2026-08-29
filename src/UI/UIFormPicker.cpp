@@ -15,7 +15,7 @@ namespace UIFormPicker
 		size_t a_filterBufSize)
 	{
 		bool changed = false;
-		if (ImGui::BeginCombo(a_label, a_preview)) {
+		if (ImGui::BeginCombo(UICommon::T(a_label), a_preview)) {
 			ImGui::SetNextItemWidth(-1);
 			ImGui::InputText(UICommon::StableID("##filter"), a_filterBuf, a_filterBufSize);
 
@@ -99,9 +99,9 @@ namespace UIFormPicker
 				// the manual fields to the right still accept typed IDs.
 				ImGui::SameLine();
 				ImGui::SetNextItemWidth(300);
-				if (ImGui::BeginCombo("Form", "(no forms of this type in plugin)")) {
-					ImGui::TextDisabled("Nothing of the relevant type found here.");
-					ImGui::TextDisabled("Type the form ID manually on the right.");
+				if (ImGui::BeginCombo(UICommon::T("Form"), UICommon::T("(no forms of this type in plugin)"))) {
+					ImGui::TextDisabled(UICommon::T("Nothing of the relevant type found here."));
+					ImGui::TextDisabled(UICommon::T("Type the form ID manually on the right."));
 					ImGui::EndCombo();
 				}
 			}
