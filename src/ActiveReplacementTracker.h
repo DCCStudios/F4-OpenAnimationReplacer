@@ -62,10 +62,43 @@ public:
 	void Update(uint32_t a_actorFormID, const std::string& a_clipSuffix, const ActiveReplacementEntry& a_entry)
 	{
 		CompositeKey key{ a_actorFormID, a_clipSuffix };
+		const auto now = std::chrono::steady_clock::now();
+		{
+			std::shared_lock lock(m_mutex);
+			auto it = m_active.find(key);
+			if (it != m_active.end()) {
+				const auto& current = it->second.entry;
+				const bool unchanged =
+					current.clipSuffix == a_entry.clipSuffix &&
+					current.subModName == a_entry.subModName &&
+					current.replacementPath == a_entry.replacementPath &&
+					current.fullPath == a_entry.fullPath &&
+					current.actorName == a_entry.actorName &&
+					current.actorFormID == a_entry.actorFormID &&
+					current.conditionsPassed == a_entry.conditionsPassed &&
+					current.subMod == a_entry.subMod;
+				if (unchanged && now - it->second.lastTouched < kRefreshInterval) {
+					return;
+				}
+			}
+		}
+
 		std::unique_lock lock(m_mutex);
 		auto& timed = m_active[key];
-		timed.entry = a_entry;
-		timed.lastTouched = std::chrono::steady_clock::now();
+		const auto& current = timed.entry;
+		const bool unchanged =
+			current.clipSuffix == a_entry.clipSuffix &&
+			current.subModName == a_entry.subModName &&
+			current.replacementPath == a_entry.replacementPath &&
+			current.fullPath == a_entry.fullPath &&
+			current.actorName == a_entry.actorName &&
+			current.actorFormID == a_entry.actorFormID &&
+			current.conditionsPassed == a_entry.conditionsPassed &&
+			current.subMod == a_entry.subMod;
+		if (!unchanged) {
+			timed.entry = a_entry;
+		}
+		timed.lastTouched = now;
 	}
 
 	void Remove(uint32_t a_actorFormID, const std::string& a_clipSuffix)
@@ -113,6 +146,11 @@ public:
 	}
 
 private:
+	// The tracker feeds diagnostics/UI, not animation state. Refreshing an
+	// unchanged entry at this cadence keeps PurgeStale semantics while avoiding
+	// an exclusive lock and repeated string assignment on every clip update.
+	static constexpr auto kRefreshInterval = std::chrono::seconds(1);
+
 	mutable std::shared_mutex m_mutex;
 	std::unordered_map<CompositeKey, TimedEntry, CompositeKeyHash> m_active;
 };

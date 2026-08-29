@@ -60,6 +60,7 @@ set(SOURCES
 	src/OpenAnimationReplacer.cpp
 	src/Hooks.cpp
 	src/AnimationCache.cpp
+	src/BA2Archive.cpp
 	src/ReplacerMods.cpp
 	src/ReplacementAnimation.cpp
 	src/ActiveClip.cpp
@@ -97,6 +98,7 @@ set(HEADERS
 	src/OpenAnimationReplacer.h
 	src/Hooks.h
 	src/AnimationCache.h
+	src/BA2Archive.h
 	src/ReplacerMods.h
 	src/ReplacementAnimation.h
 	src/ActiveClip.h

@@ -482,66 +482,129 @@ void UIMain::DrawModTree()
 	ImGui::Text(UICommon::T("%zu mods, %zu replacements"), mods.size(), oar->GetTotalReplacementCount());
 	ImGui::Separator();
 
-	for (const auto& mod : mods) {
-		if (filterText[0] != '\0') {
-			bool anyMatch = UICommon::FuzzyMatch(filterText, mod->GetName().c_str()) ||
-			                UICommon::FuzzyMatch(filterText, mod->GetAuthor().c_str());
-			if (!anyMatch) {
-				for (const auto& sub : mod->GetSubMods()) {
-					if (UICommon::FuzzyMatch(filterText, sub->GetName().c_str())) {
-						anyMatch = true;
-						break;
-					}
-				}
-			}
-			if (!anyMatch) continue;
+	if (!Settings::GetSingleton()->bSeparateArchiveMods) {
+		// Single-pass: render every mod in its existing order (legacy behavior).
+		for (const auto& mod : mods) {
+			DrawReplacerModNode(mod.get());
 		}
-
-		ImGui::PushID(mod.get());
-
-		// Flag mods with no config.json on disk so the user knows the folder is
-		// running under its raw folder name and can formalize it.
-		const bool modNoConfig = !mod->hasConfig;
-		std::string modLabel = mod->GetName();
-		if (modNoConfig) modLabel += UICommon::T("  (no config)");
-		if (modNoConfig) ImGui::PushStyleColor(ImGuiCol_Text, UICommon::Colors::Disabled);
-
-		ImGuiTreeNodeFlags modFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
-		bool modOpen = ImGui::TreeNodeEx(modLabel.c_str(), modFlags);
-
-		if (modNoConfig) ImGui::PopStyleColor();
-
-		if (ImGui::IsItemHovered() && !mod->GetDescription().empty()) {
-			ImGui::BeginTooltip();
-			ImGui::TextUnformatted(mod->GetDescription().c_str());
-			if (!mod->GetAuthor().empty()) {
-				ImGui::TextColored(UICommon::Colors::Disabled, UICommon::T("Author: %s"), mod->GetAuthor().c_str());
-			}
-			ImGui::EndTooltip();
-		}
-
-		// Right-click a mod folder: offer to create its config.json (name /
-		// author / description) when it has none.
-		if (ImGui::BeginPopupContextItem(UICommon::StableID("ModContext"))) {
-			if (modNoConfig) {
-				if (ImGui::MenuItem(UICommon::T("Create config.json..."))) {
-					BeginCreateModConfig(mod.get());
-				}
-			} else {
-				ImGui::TextDisabled(UICommon::T("config.json present"));
-			}
-			ImGui::EndPopup();
-		}
-
-		if (modOpen) {
-			for (const auto& sub : mod->GetSubMods()) {
-				DrawSubModNode(sub.get(), mod.get());
-			}
-			ImGui::TreePop();
-		}
-
-		ImGui::PopID();
+		return;
 	}
+
+	// Two-pass grouping: loose mods first, then BA2-packed mods under a divider.
+	// A mod "passes the filter" here using the same name/author/submod match
+	// that DrawReplacerModNode applies, so the divider is only emitted when at
+	// least one archive mod would actually be visible (no dangling separator).
+	auto passesFilter = [&](ReplacerMod* a_mod) {
+		if (filterText[0] == '\0') {
+			return true;
+		}
+		if (UICommon::FuzzyMatch(filterText, a_mod->GetName().c_str()) ||
+			UICommon::FuzzyMatch(filterText, a_mod->GetAuthor().c_str())) {
+			return true;
+		}
+		for (const auto& sub : a_mod->GetSubMods()) {
+			if (UICommon::FuzzyMatch(filterText, sub->GetName().c_str())) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	bool anyLooseVisible = false;
+	for (const auto& mod : mods) {
+		if (!mod->IsArchiveMod() && passesFilter(mod.get())) {
+			anyLooseVisible = true;
+			break;
+		}
+	}
+
+	if (anyLooseVisible) {
+		ImGui::SeparatorText(UICommon::T("Loose"));
+	}
+	for (const auto& mod : mods) {
+		if (!mod->IsArchiveMod()) {
+			DrawReplacerModNode(mod.get());
+		}
+	}
+
+	bool anyArchiveVisible = false;
+	for (const auto& mod : mods) {
+		if (mod->IsArchiveMod() && passesFilter(mod.get())) {
+			anyArchiveVisible = true;
+			break;
+		}
+	}
+
+	if (anyArchiveVisible) {
+		ImGui::SeparatorText(UICommon::T("BA2 Packed"));
+		for (const auto& mod : mods) {
+			if (mod->IsArchiveMod()) {
+				DrawReplacerModNode(mod.get());
+			}
+		}
+	}
+}
+
+void UIMain::DrawReplacerModNode(ReplacerMod* a_mod)
+{
+	if (filterText[0] != '\0') {
+		bool anyMatch = UICommon::FuzzyMatch(filterText, a_mod->GetName().c_str()) ||
+		                UICommon::FuzzyMatch(filterText, a_mod->GetAuthor().c_str());
+		if (!anyMatch) {
+			for (const auto& sub : a_mod->GetSubMods()) {
+				if (UICommon::FuzzyMatch(filterText, sub->GetName().c_str())) {
+					anyMatch = true;
+					break;
+				}
+			}
+		}
+		if (!anyMatch) return;
+	}
+
+	ImGui::PushID(a_mod);
+
+	// Flag mods with no config.json on disk so the user knows the folder is
+	// running under its raw folder name and can formalize it.
+	const bool modNoConfig = !a_mod->hasConfig;
+	std::string modLabel = a_mod->GetName();
+	if (modNoConfig) modLabel += UICommon::T("  (no config)");
+	if (modNoConfig) ImGui::PushStyleColor(ImGuiCol_Text, UICommon::Colors::Disabled);
+
+	ImGuiTreeNodeFlags modFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+	bool modOpen = ImGui::TreeNodeEx(modLabel.c_str(), modFlags);
+
+	if (modNoConfig) ImGui::PopStyleColor();
+
+	if (ImGui::IsItemHovered() && !a_mod->GetDescription().empty()) {
+		ImGui::BeginTooltip();
+		ImGui::TextUnformatted(a_mod->GetDescription().c_str());
+		if (!a_mod->GetAuthor().empty()) {
+			ImGui::TextColored(UICommon::Colors::Disabled, UICommon::T("Author: %s"), a_mod->GetAuthor().c_str());
+		}
+		ImGui::EndTooltip();
+	}
+
+	// Right-click a mod folder: offer to create its config.json (name /
+	// author / description) when it has none.
+	if (ImGui::BeginPopupContextItem(UICommon::StableID("ModContext"))) {
+		if (modNoConfig) {
+			if (ImGui::MenuItem(UICommon::T("Create config.json..."))) {
+				BeginCreateModConfig(a_mod);
+			}
+		} else {
+			ImGui::TextDisabled(UICommon::T("config.json present"));
+		}
+		ImGui::EndPopup();
+	}
+
+	if (modOpen) {
+		for (const auto& sub : a_mod->GetSubMods()) {
+			DrawSubModNode(sub.get(), a_mod);
+		}
+		ImGui::TreePop();
+	}
+
+	ImGui::PopID();
 }
 
 void UIMain::DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod)
@@ -1376,7 +1439,7 @@ void UIMain::DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_d
 				auto tempCond = fn();
 				bool condIsStub = tempCond && tempCond->IsStub();
 				std::string displayName = UICommon::T(name.c_str());
-				if (condIsStub) displayName += "  [N/A]";
+				if (condIsStub) displayName += std::string("  ") + UICommon::T("[N/A]");
 				if (condIsStub) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.4f, 0.1f, 1.0f));
 				if (ImGui::MenuItem(displayName.c_str())) {
 					a_condSet->AddCondition(fn());
@@ -2521,6 +2584,11 @@ void UIMain::DrawSettingsPanel()
 			"a third-person asset through the first-person behavior graph.\n\n"
 			"WARNING: With this disabled, a wrongly matched animation from another\n"
 			"skeleton may corrupt the current game session."));
+	}
+	dirty |= ImGui::Checkbox(UICommon::T("Separate BA2-packed mods"), &settings->bSeparateArchiveMods);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("%s", UICommon::T(
+			"Group mods packed inside BA2 archives under their own divider in the list."));
 	}
 	{
 		// The engine's own auto-reloads are always suppressed (they are

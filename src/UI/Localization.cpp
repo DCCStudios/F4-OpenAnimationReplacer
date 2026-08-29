@@ -13,7 +13,9 @@
 #include <memory>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -54,9 +56,23 @@ namespace
 			"OpenAnimationReplacer" / "locales";
     }
 
-    std::filesystem::path GetLocalePath(const std::string& a_language)
+    std::vector<std::filesystem::path> GetLocaleDirectories()
     {
-        return GetLocaleDirectory() / (a_language + ".json");
+        std::vector<std::filesystem::path> directories;
+        const auto addUnique = [&directories](const std::filesystem::path& a_directory) {
+            if (a_directory.empty() || std::find(directories.begin(), directories.end(), a_directory) != directories.end()) {
+                return;
+            }
+            directories.push_back(a_directory);
+        };
+
+        // The module directory is the normal location for OAR's own files.
+        // The relative Data path is also required so MO2 can merge extension
+        // packs supplied by other mods into the same virtual directory.
+        addUnique(GetLocaleDirectory());
+        addUnique(std::filesystem::path("Data") / "F4SE" / "Plugins" /
+            "OpenAnimationReplacer" / "locales");
+        return directories;
     }
 
     std::vector<std::filesystem::path> GetFontCandidates()
@@ -140,6 +156,65 @@ namespace
 		return true;
 	}
 
+    bool LoadTranslationFile(const std::filesystem::path& a_path, bool a_required, std::size_t& a_loaded)
+    {
+        std::ifstream file(a_path, std::ios::binary);
+        if (!file) {
+            if (a_required) {
+                logger::warn("[OAR] UI language file not found: '{}' - using English fallback", a_path.string());
+            }
+            return false;
+        }
+
+        try {
+            const auto json = nlohmann::json::parse(file);
+            if (!json.is_object()) {
+                logger::warn("[OAR] UI language file is not an object: '{}'", a_path.string());
+                return false;
+            }
+
+            for (const auto& [key, value] : json.items()) {
+                if (value.is_string()) {
+                    auto translation = value.get<std::string>();
+                    if (ValidateAndNormalizeTranslation(key, translation)) {
+                        // Extension packs are loaded after the base file. A
+                        // later pack may intentionally override a translation
+                        // without changing any runtime condition identifier.
+                        g_translations[key] = std::move(translation);
+                        ++a_loaded;
+                    }
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            logger::error("[OAR] Failed to parse UI language file '{}': {}", a_path.string(), e.what());
+            return false;
+        }
+    }
+
+    std::vector<std::filesystem::path> GetTranslationExtensionFiles(const std::filesystem::path& a_localeDirectory,
+        const std::string& a_language)
+    {
+        std::vector<std::filesystem::path> files;
+        std::error_code error;
+        const auto directory = a_localeDirectory / (a_language + ".d");
+        if (!std::filesystem::is_directory(directory, error)) {
+            return files;
+        }
+
+        for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+            if (error) break;
+            if (entry.is_regular_file(error) && entry.path().extension() == ".json") {
+                files.push_back(entry.path());
+            }
+        }
+
+        std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+            return left.filename().string() < right.filename().string();
+        });
+        return files;
+    }
+
     bool AddCurrentLanguageFont()
     {
         auto& io = ImGui::GetIO();
@@ -196,33 +271,44 @@ namespace UICommon
             return;
         }
 
-        const auto path = GetLocalePath(g_language);
-        std::ifstream file(path, std::ios::binary);
-        if (!file) {
-            logger::warn("[OAR] UI language file not found: '{}' - using English fallback", path.string());
+        std::size_t loaded = 0;
+        bool baseLoaded = false;
+        const auto localeDirectories = GetLocaleDirectories();
+        for (std::size_t i = 0; i < localeDirectories.size(); ++i) {
+            const auto candidate = localeDirectories[i] / (g_language + ".json");
+            if (LoadTranslationFile(candidate, i + 1 == localeDirectories.size(), loaded)) {
+                baseLoaded = true;
+                break;
+            }
+        }
+        if (!baseLoaded) {
+            g_translations.clear();
             return;
         }
 
-        try {
-            const auto json = nlohmann::json::parse(file);
-            if (!json.is_object()) {
-                logger::warn("[OAR] UI language file is not an object: '{}'", path.string());
-                return;
-            }
+        std::unordered_set<std::string> loadedExtensionNames;
+        std::size_t extensionPackCount = 0;
+        for (const auto& localeDirectory : localeDirectories) {
+            const auto extensionFiles = GetTranslationExtensionFiles(localeDirectory, g_language);
+            for (const auto& extensionFile : extensionFiles) {
+                // Pack filenames are the stable identity of an extension
+                // pack. This prevents loading OAR's own file twice when the
+                // module directory is also visible through the MO2 Data path.
+                if (!loadedExtensionNames.insert(extensionFile.filename().string()).second) {
+                    continue;
+                }
 
-            for (const auto& [key, value] : json.items()) {
-                if (value.is_string()) {
-					auto translation = value.get<std::string>();
-					if (ValidateAndNormalizeTranslation(key, translation)) {
-						g_translations.emplace(key, std::move(translation));
-					}
+                const auto before = loaded;
+                if (LoadTranslationFile(extensionFile, false, loaded)) {
+                    ++extensionPackCount;
+                    logger::info("[OAR] UI language extension '{}' loaded: {} translations",
+                        extensionFile.filename().string(), loaded - before);
                 }
             }
-            logger::info("[OAR] UI language '{}' loaded: {} translations", g_language, g_translations.size());
-        } catch (const std::exception& e) {
-            logger::error("[OAR] Failed to parse UI language file '{}': {}", path.string(), e.what());
-            g_translations.clear();
         }
+
+        logger::info("[OAR] UI language '{}' loaded: {} translations ({} extension packs)",
+            g_language, g_translations.size(), extensionPackCount);
     }
 
     const char* T(const char* a_source)
@@ -232,7 +318,26 @@ namespace UICommon
         }
 
         const auto it = g_translations.find(a_source);
-        return it != g_translations.end() ? it->second.c_str() : a_source;
+        if (it != g_translations.end()) {
+            return it->second.c_str();
+        }
+
+        // Keep ImGui IDs untranslated while still translating the visible
+        // label. This lets a locale contain one `Plugin` entry that covers
+        // Plugin##kw, Plugin##manual, and similar stable-ID labels.
+        const std::string_view source(a_source);
+        const auto idPos = source.find("##");
+        if (idPos != std::string_view::npos) {
+            const auto visible = g_translations.find(std::string(source.substr(0, idPos)));
+            if (visible != g_translations.end()) {
+                thread_local std::string localizedLabel;
+                localizedLabel = visible->second;
+                localizedLabel.append(source.substr(idPos));
+                return localizedLabel.c_str();
+            }
+        }
+
+        return a_source;
     }
 
     const std::vector<LanguageOption>& GetAvailableLanguages()

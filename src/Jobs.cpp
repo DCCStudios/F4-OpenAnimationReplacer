@@ -7,6 +7,7 @@ void JobQueue::Enqueue(std::unique_ptr<IJob> a_job)
 {
 	std::lock_guard lock(mutex);
 	jobs.push(std::move(a_job));
+	pending.store(true, std::memory_order_release);
 }
 
 void JobQueue::ProcessAll()
@@ -15,6 +16,7 @@ void JobQueue::ProcessAll()
 	{
 		std::lock_guard lock(mutex);
 		std::swap(localQueue, jobs);
+		pending.store(false, std::memory_order_release);
 	}
 
 	while (!localQueue.empty()) {
@@ -30,8 +32,7 @@ void JobQueue::ProcessAll()
 
 bool JobQueue::HasPending() const
 {
-	std::lock_guard lock(mutex);
-	return !jobs.empty();
+	return pending.load(std::memory_order_acquire);
 }
 
 void SaveConfigJob::Run()

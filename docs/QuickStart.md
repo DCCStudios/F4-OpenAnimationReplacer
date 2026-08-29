@@ -276,6 +276,11 @@ The **Animation Log** (View menu) shows replacements as they happen in real time
 
 `Data/F4SE/Plugins/OpenAnimationReplacer.ini`:
 
+`OpenAnimationReplacer.ini` supplies mod defaults. Changes made in the OAR
+Settings page, such as the language or activation key, are stored separately
+in `Data/F4SE/Plugins/OpenAnimationReplacer.user.ini` and override the
+defaults without rewriting the mod-provided file.
+
 ```ini
 [General]
 bEnabled = true
@@ -424,6 +429,23 @@ Keep `interruptible: false` on one-shot reloads.
 - **Dry-fire / silent** replacements: use `suppressAnnotations` if the replacement `.hkx`
   still has `WeaponFire` or sounds you do not want.
 - Conditions marked *(stub)* always evaluate false until their FO4 APIs are finished.
+
+### Localizing built-in and third-party conditions
+
+OAR translates built-in condition names and descriptions in the selected UI
+language. The strings shown in the editor are presentation text only: the
+`condition` IDs in `config.json` are never translated.
+
+Third-party condition authors can ship an optional flat JSON extension pack:
+
+```text
+Data/F4SE/Plugins/OpenAnimationReplacer/locales/<language>.d/<unique-name>.json
+```
+
+Use exact `GetName()` and `GetDescription()` strings as JSON keys. OAR loads
+the base locale and then extension packs in filename order. If a key is not
+provided, the original third-party string is displayed unchanged. This keeps
+the Conditions API independent from any specific translation or plugin.
 
 ---
 

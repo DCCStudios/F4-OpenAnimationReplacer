@@ -888,34 +888,51 @@ void UIManager::UpdateDPIScale()
 void UIManager::RenderFrame()
 {
 	// Process pending background jobs (config saves, reloads, etc.)
-	JobQueue::GetSingleton()->ProcessAll();
+	if (JobQueue::GetSingleton()->HasPending()) {
+		JobQueue::GetSingleton()->ProcessAll();
+	}
+
+	// ImGui can close the main window directly through its title-bar X. That
+	// changes UIWindow::isOpen but does not pass through the keyboard toggle
+	// path, so reconcile the manager's blocking-menu state before calculating
+	// the lock state for this frame.
+	if (menuOpen.load() && !UIMain::GetSingleton()->IsOpen()) {
+		logger::info("[OAR-UI] Main window closed by ImGui; leaving menu mode");
+		SetMenuOpen(false);
+	}
 
 	bool mainOpen = menuOpen.load();
 
-	bool anyIndependentOpen = false;
+	bool anyIndependentVisible = false;
+	bool anyIndependentInput = false;
 	for (auto& win : windows) {
-		if (win && win->IsIndependent() && (win->IsOpen() || win->ShouldDrawOverlay())) {
-			anyIndependentOpen = true;
-			break;
+		if (!win || !win->IsIndependent()) continue;
+		if (win->IsOpen()) {
+			anyIndependentVisible = true;
+			anyIndependentInput = true;
+		} else if (win->ShouldDrawOverlay()) {
+			// Progress/status overlays are visual-only. They must not keep the
+			// game in Resume or leave the OS/ImGui cursor visible.
+			anyIndependentVisible = true;
 		}
 	}
 	// Active 3D bone labels need the ImGui frame even with every window
 	// closed (they draw into the foreground draw list).
 	if (BoneDebugViz::HasActiveLabels()) {
-		anyIndependentOpen = true;
+		anyIndependentVisible = true;
 	}
 
 	// Determine and apply lock state each frame (matches framework GameLock pattern)
 	if (mainOpen) {
 		currentLockState = LockState::Locked;
-	} else if (anyIndependentOpen) {
+	} else if (anyIndependentInput) {
 		currentLockState = LockState::Resume;
 	} else {
 		currentLockState = LockState::Unlocked;
 	}
 	UpdateLockState();
 
-	if (!mainOpen && !anyIndependentOpen) return;
+	if (!mainOpen && !anyIndependentVisible) return;
 
 	// A language change is requested by the settings panel while the current
 	// ImGui frame is being drawn. Rebuild the DX11 font texture at the start of

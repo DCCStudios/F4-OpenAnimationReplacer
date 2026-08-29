@@ -7,10 +7,36 @@
 #include "Settings.h"
 #include "Variants.h"
 #include "Utils.h"
+#include "BA2Archive.h"
+#include "AnimationCache.h"
 
 namespace Parsing
 {
 	static constexpr std::string_view kOarFolderName = "OpenAnimationReplacer";
+
+	// Running count of submods created purely from an archived config (no loose
+	// dir of the same name). Reset at the start of each ParseAllMods; incremented
+	// wherever ParseReplacerMod builds an archive-only submod (both the loose pass,
+	// for mixed mods, and the archive-only mod pass). Reported in the summary line.
+	static int s_archiveOnlySubModCount = 0;
+
+	// Parse JSON from an in-memory string (archived config bytes), mirroring
+	// LoadJsonFile's tolerant settings (no exceptions, allow comments). On error
+	// returns a null json; callers guard via is_object() in the *FromJson cores.
+	static nlohmann::json ParseJsonString(const std::string& a_text, const std::string& a_identity)
+	{
+		try {
+			auto json = nlohmann::json::parse(a_text, nullptr, false, true);
+			if (json.is_discarded()) {
+				logger::warn("[OAR] Failed to parse archived JSON: '{}'", a_identity);
+				return nlohmann::json();
+			}
+			return json;
+		} catch (const std::exception& e) {
+			logger::error("[OAR] Error parsing archived JSON '{}': {}", a_identity, e.what());
+			return nlohmann::json();
+		}
+	}
 
 	// Mirrors ExtractAnimSuffix in Hooks.cpp: extracts the cache key from a full normalized path
 	static std::string PathToAnimSuffix(const std::string& a_normalizedPath)
@@ -80,7 +106,8 @@ namespace Parsing
 	}
 
 	static void ScanDirectoryForOAR(const std::filesystem::path& a_searchRoot,
-		const std::filesystem::path& a_meshesBase, int& a_modCount, int& a_subModCount, int& a_animCount)
+		const std::filesystem::path& a_meshesBase, int& a_modCount, int& a_subModCount, int& a_animCount,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		if (!std::filesystem::exists(a_searchRoot)) return;
 
@@ -99,7 +126,7 @@ namespace Parsing
 					if (!modEntry.is_directory()) continue;
 
 					try {
-						auto mod = ParseReplacerMod(modEntry.path(), meshesPrefix);
+						auto mod = ParseReplacerMod(modEntry.path(), meshesPrefix, a_archiveIndex);
 						if (mod) {
 							for (const auto& sub : mod->GetSubMods()) {
 								a_subModCount++;
@@ -118,6 +145,52 @@ namespace Parsing
 		}
 	}
 
+	// Collects the lowercased stems (filename without extension) of every plugin active
+	// in the current load order, including light (ESL) plugins. The BA2 index uses this
+	// set to skip archives whose owning plugin is not loaded - archives the game's own
+	// resource layer never registers. Reading TESDataHandler's compiled file collection
+	// is a settled-data-structure lookup; unlike probing the resource manager it does not
+	// race the startup BA2 registration this parse runs alongside. Returns an empty set
+	// when the data handler is unavailable, which leaves the index ungated (legacy scan).
+	static std::unordered_set<std::string> CollectRegisteredArchiveOwners()
+	{
+		std::unordered_set<std::string> owners;
+
+		auto* dataHandler = RE::TESDataHandler::GetSingleton();
+		if (!dataHandler) {
+			return owners;
+		}
+
+		auto addStem = [&owners](const char* a_fileName) {
+			if (!a_fileName || a_fileName[0] == '\0') {
+				return;
+			}
+			std::string stem(a_fileName);
+			if (const auto dot = stem.find_last_of('.'); dot != std::string::npos) {
+				stem.erase(dot);
+			}
+			std::ranges::transform(stem, stem.begin(), [](unsigned char c) {
+				return static_cast<char>(std::tolower(c));
+			});
+			if (!stem.empty()) {
+				owners.insert(std::move(stem));
+			}
+		};
+
+		for (auto* file : dataHandler->compiledFileCollection.files) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+		for (auto* file : dataHandler->compiledFileCollection.smallFiles) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+
+		return owners;
+	}
+
 	void ParseAllMods()
 	{
 		RegisterAllConditions();
@@ -134,12 +207,25 @@ namespace Parsing
 		if (!std::filesystem::exists(meshesPath)) {
 			logger::warn("[OAR] Meshes directory not found at '{}'", meshesPath.string());
 			oar->isLoading.store(false);
+			oar->loadingComplete.store(true);
+			oar->loadingPhase.store(OpenAnimationReplacer::LoadingPhase::kIdle);
 			return;
 		}
+
+		// OAR configuration remains loose, but replacement HKX may be supplied
+		// by the game's resource layer. Index General BA2 paths once per parse so
+		// each submod can merge its loose and archived files without scanning all
+		// archives repeatedly. Gate the index by the load order so archives owned by
+		// disabled plugins (present on disk but never registered by the game) are
+		// excluded instead of producing dead entries or silent wrong-file fallbacks.
+		auto registeredOwners = CollectRegisteredArchiveOwners();
+		logger::info("[OAR] {} plugin(s) in load order gate BA2 indexing", registeredOwners.size());
+		auto archiveIndex = OAR::BA2::Index::Build(meshesPath.parent_path(), registeredOwners);
 
 		int modCount = 0;
 		int subModCount = 0;
 		int animCount = 0;
+		s_archiveOnlySubModCount = 0;
 
 		auto start = std::chrono::high_resolution_clock::now();
 
@@ -156,7 +242,7 @@ namespace Parsing
 					// intentionally place OpenAnimationReplacer directly beneath the race.
 					// A single recursive pass also avoids discovering deeper layouts twice.
 					ScanDirectoryForOAR(
-						raceDir.path(), meshesPath, modCount, subModCount, animCount);
+						raceDir.path(), meshesPath, modCount, subModCount, animCount, &archiveIndex);
 				}
 			} catch (const std::filesystem::filesystem_error& e) {
 				logger::error("[OAR] Filesystem error scanning actors: {}", e.what());
@@ -165,7 +251,69 @@ namespace Parsing
 
 		if (modCount == 0) {
 			logger::info("[OAR] No mods found via targeted scan, falling back to full Meshes scan");
-			ScanDirectoryForOAR(meshesPath, meshesPath, modCount, subModCount, animCount);
+			ScanDirectoryForOAR(meshesPath, meshesPath, modCount, subModCount, animCount, &archiveIndex);
+		}
+
+		// Archive-only mod discovery. The loose passes above already picked up any
+		// mod whose OpenAnimationReplacer\<Mod> directory exists loose (including
+		// its archive-only submods, via ParseReplacerMod). What remains are mods
+		// packaged ENTIRELY inside a BA2 - no loose directory anywhere - which the
+		// filesystem scan can never see. Enumerate them from the index and build
+		// each with the archive-capable ParseReplacerMod. LOOSE wins: any mod with
+		// a loose directory is skipped here.
+		{
+			static constexpr std::string_view kMarker = "\\openanimationreplacer\\";
+			static constexpr std::size_t kMeshesLen = 7;  // "meshes\"
+
+			std::set<std::string> archiveModPrefixes;  // "meshes\...\openanimationreplacer\<mod>"
+			for (const auto& cfgPath : archiveIndex.GetOARSubModConfigPaths()) {
+				const auto oarPos = cfgPath.find(kMarker);
+				if (oarPos == std::string::npos) continue;
+				const auto modStart = oarPos + kMarker.size();
+				const auto modEnd = cfgPath.find('\\', modStart);
+				if (modEnd == std::string::npos) continue;
+				archiveModPrefixes.insert(cfgPath.substr(0, modEnd));
+			}
+
+			int archiveModCount = 0;
+			for (const auto& modPrefix : archiveModPrefixes) {
+				const auto oarPos = modPrefix.find(kMarker);
+				if (oarPos == std::string::npos) continue;
+
+				const std::string meshesRel =
+					(oarPos > kMeshesLen) ? modPrefix.substr(kMeshesLen, oarPos - kMeshesLen) : std::string{};
+				const std::string modName = modPrefix.substr(oarPos + kMarker.size());
+
+				// LOOSE wins: if the mod's directory exists loose (case-insensitive
+				// on Windows), the loose pass already built it and its submods.
+				std::filesystem::path looseModPath = meshesPath;
+				if (!meshesRel.empty()) looseModPath /= meshesRel;
+				looseModPath /= "OpenAnimationReplacer";
+				looseModPath /= modName;
+				if (std::filesystem::exists(looseModPath)) continue;
+
+				try {
+					auto mod = ParseReplacerMod(std::filesystem::path(modPrefix),
+						std::filesystem::path(meshesRel), &archiveIndex);
+					if (mod && !mod->GetSubMods().empty()) {
+						for (const auto& sub : mod->GetSubMods()) {
+							subModCount++;
+							animCount += static_cast<int>(sub->GetReplacementAnimations().size());
+						}
+						modCount++;
+						archiveModCount++;
+						mod->SetArchiveMod(true);
+						OpenAnimationReplacer::GetSingleton()->AddReplacerMod(std::move(mod));
+					}
+				} catch (const std::exception& e) {
+					logger::error("[OAR] Error parsing archive-only mod '{}': {}", modPrefix, e.what());
+				}
+			}
+
+			if (archiveModCount > 0 || s_archiveOnlySubModCount > 0) {
+				logger::info("[OAR] Discovered {} archive-only submod(s) from BA2 ({} fully-archived mod(s))",
+					s_archiveOnlySubModCount, archiveModCount);
+			}
 		}
 
 		auto elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -180,29 +328,89 @@ namespace Parsing
 	}
 
 	std::unique_ptr<ReplacerMod> ParseReplacerMod(const std::filesystem::path& a_modPath,
-		const std::filesystem::path& a_meshesPrefix)
+		const std::filesystem::path& a_meshesPrefix,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		auto modName = a_modPath.filename().string();
 		auto mod = std::make_unique<ReplacerMod>(modName, a_modPath);
 
+		const bool looseModDir = std::filesystem::exists(a_modPath);
+
+		// This mod's archive prefix ("meshes\...\openanimationreplacer\<mod>\"),
+		// lowercased to match the BA2 index. Empty when no index is available.
+		std::string modArchivePrefix;
+		if (a_archiveIndex) {
+			modArchivePrefix = Utils::NormalizePath(
+				std::filesystem::path("meshes") / ExtractPathAfterMeshes(a_modPath));
+			if (!modArchivePrefix.ends_with('\\')) modArchivePrefix.push_back('\\');
+		}
+
+		// Mod-level config: loose wins; otherwise read it from inside the BA2.
 		auto configPath = a_modPath / "config.json";
 		if (std::filesystem::exists(configPath)) {
 			mod->hasConfig = true;
 			ParseModConfig(mod.get(), configPath);
+		} else if (a_archiveIndex && !modArchivePrefix.empty()) {
+			const std::string archiveConfig = modArchivePrefix + "config.json";
+			if (a_archiveIndex->Contains(archiveConfig)) {
+				std::string text;
+				if (AnimationCache::ReadArchiveTextFile(archiveConfig, text)) {
+					mod->hasConfig = true;
+					ParseModConfigFromJson(mod.get(), ParseJsonString(text, archiveConfig));
+				}
+			}
 		}
 
-		for (auto& subEntry : std::filesystem::directory_iterator(a_modPath,
-			std::filesystem::directory_options::skip_permission_denied))
-		{
-			if (!subEntry.is_directory()) continue;
+		// Loose submods (today's behavior). Track their names (lowercased) so the
+		// archive pass below can skip any submod that already exists loose.
+		std::unordered_set<std::string> looseSubModNames;
+		if (looseModDir) {
+			for (auto& subEntry : std::filesystem::directory_iterator(a_modPath,
+				std::filesystem::directory_options::skip_permission_denied))
+			{
+				if (!subEntry.is_directory()) continue;
 
-			try {
-				auto subMod = ParseSubMod(subEntry.path(), a_meshesPrefix, mod.get());
-				if (subMod) {
-					mod->AddSubMod(std::move(subMod));
+				try {
+					auto subMod = ParseSubMod(subEntry.path(), a_meshesPrefix, mod.get(), a_archiveIndex);
+					if (subMod) {
+						auto lname = subEntry.path().filename().string();
+						std::ranges::transform(lname, lname.begin(),
+							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+						looseSubModNames.insert(std::move(lname));
+						mod->AddSubMod(std::move(subMod));
+					}
+				} catch (const std::exception& e) {
+					logger::error("[OAR] Error parsing submod at '{}': {}", subEntry.path().string(), e.what());
 				}
-			} catch (const std::exception& e) {
-				logger::error("[OAR] Error parsing submod at '{}': {}", subEntry.path().string(), e.what());
+			}
+		}
+
+		// Archive-only submods: any archived "<mod>\<submod>\config.json" whose
+		// submod folder is not present loose. LOOSE wins on conflict.
+		if (a_archiveIndex && !modArchivePrefix.empty()) {
+			for (const auto& cfgPath : a_archiveIndex->GetOARSubModConfigPaths()) {
+				if (!cfgPath.starts_with(modArchivePrefix)) continue;
+
+				const auto rest = cfgPath.substr(modArchivePrefix.size());  // <submod>\config.json
+				const auto slash = rest.find('\\');
+				if (slash == std::string::npos) continue;
+				const std::string subName = rest.substr(0, slash);
+				// Only accept a config directly under the submod folder (reject a
+				// stray deeper config.json that GetOARSubModConfigPaths may include).
+				if (rest != subName + "\\config.json") continue;
+				if (looseSubModNames.contains(subName)) continue;  // loose already built it
+
+				// Virtual submod path = the archived config path minus "\config.json".
+				const std::filesystem::path virtualSubPath = std::filesystem::path(cfgPath).parent_path();
+				try {
+					auto subMod = ParseSubMod(virtualSubPath, a_meshesPrefix, mod.get(), a_archiveIndex);
+					if (subMod) {
+						mod->AddSubMod(std::move(subMod));
+						++s_archiveOnlySubModCount;
+					}
+				} catch (const std::exception& e) {
+					logger::error("[OAR] Error parsing archived submod '{}': {}", cfgPath, e.what());
+				}
 			}
 		}
 
@@ -211,7 +419,8 @@ namespace Parsing
 	}
 
 	std::unique_ptr<SubMod> ParseSubMod(const std::filesystem::path& a_subModPath,
-		const std::filesystem::path& a_meshesPrefix, ReplacerMod* a_parentMod)
+		const std::filesystem::path& a_meshesPrefix, ReplacerMod* a_parentMod,
+		const OAR::BA2::Index* a_archiveIndex)
 	{
 		auto subModName = a_subModPath.filename().string();
 
@@ -222,20 +431,54 @@ namespace Parsing
 
 		auto subMod = std::make_unique<SubMod>(subModName, priority, a_subModPath);
 
+		// Archive prefix for this submod (used for both archived config lookup and
+		// the archived HKX merge below). meshesPrefix-relative reconstruction so it
+		// matches the (lowercased, backslash) paths stored in the BA2 index. Works
+		// for a virtual (archive-only) a_subModPath too — ExtractPathAfterMeshes is
+		// purely string-based.
+		std::string subModPrefix;
+		if (a_archiveIndex) {
+			subModPrefix = Utils::NormalizePath(
+				std::filesystem::path("meshes") / ExtractPathAfterMeshes(a_subModPath));
+			if (!subModPrefix.ends_with('\\')) subModPrefix.push_back('\\');
+		}
+
+		// config.json: loose wins; otherwise read it from inside the BA2.
 		auto configPath = a_subModPath / "config.json";
 		if (std::filesystem::exists(configPath)) {
 			subMod->hasConfig = true;
 			ParseSubModConfig(subMod.get(), configPath);
+		} else if (a_archiveIndex && !subModPrefix.empty()) {
+			const std::string archiveConfig = subModPrefix + "config.json";
+			if (a_archiveIndex->Contains(archiveConfig)) {
+				std::string text;
+				if (AnimationCache::ReadArchiveTextFile(archiveConfig, text)) {
+					subMod->hasConfig = true;
+					ParseSubModConfigFromJson(subMod.get(), ParseJsonString(text, archiveConfig));
+				}
+			}
 		}
 
+		// user.json: loose wins; otherwise read it from inside the BA2.
 		auto userPath = a_subModPath / "user.json";
 		if (std::filesystem::exists(userPath)) {
 			ParseUserConfig(subMod.get(), userPath);
 			subMod->hasUserConfig = true;
+		} else if (a_archiveIndex && !subModPrefix.empty()) {
+			const std::string archiveUser = subModPrefix + "user.json";
+			if (a_archiveIndex->Contains(archiveUser)) {
+				std::string text;
+				if (AnimationCache::ReadArchiveTextFile(archiveUser, text)) {
+					ParseUserConfigFromJson(subMod.get(), ParseJsonString(text, archiveUser));
+					subMod->hasUserConfig = true;
+				}
+			}
 		}
 
 		struct HkxFileEntry {
 			std::filesystem::path diskPath;
+			std::string resourcePath;       // Data-relative path for BA2 resources
+			bool archiveResource{ false };
 			std::filesystem::path relativePath;  // relative to submod
 			std::string filename;
 			std::string stem;
@@ -244,20 +487,23 @@ namespace Parsing
 			bool isBase;          // true if no _N suffix detected
 		};
 
-		// First pass: collect all .hkx files
+		// First pass: collect all .hkx files. Loose files win over an archived
+		// file with the same relative path, matching the game's resource order.
 		std::vector<HkxFileEntry> allFiles;
 		std::unordered_set<std::string> baseKeys;  // keys that have a base file (no _N suffix)
+		std::unordered_set<std::string> seenRelativePaths;
 
-		for (auto& fileEntry : std::filesystem::recursive_directory_iterator(a_subModPath,
-			std::filesystem::directory_options::skip_permission_denied))
-		{
-			if (!fileEntry.is_regular_file()) continue;
-
-			auto ext = fileEntry.path().extension().string();
+		auto addFile = [&](const std::filesystem::path& a_relativePath,
+			const std::filesystem::path& a_diskPath, std::string a_resourcePath,
+			bool a_archiveResource) {
+			auto ext = a_relativePath.extension().string();
 			std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (ext != ".hkx") continue;
+			if (ext != ".hkx") return;
 
-			auto relativePath = std::filesystem::relative(fileEntry.path(), a_subModPath);
+			auto relativePath = a_relativePath.lexically_normal();
+			auto normalizedRelative = Utils::NormalizePath(relativePath);
+			if (!seenRelativePaths.insert(normalizedRelative).second) return;
+
 			std::string stem = relativePath.stem().string();
 			std::string relDir = relativePath.parent_path().string();
 
@@ -291,7 +537,9 @@ namespace Parsing
 			if (isBase) baseKeys.insert(baseKey);
 
 			HkxFileEntry hfe;
-			hfe.diskPath = fileEntry.path();
+			hfe.diskPath = a_diskPath;
+			hfe.resourcePath = std::move(a_resourcePath);
+			hfe.archiveResource = a_archiveResource;
 			hfe.relativePath = relativePath;
 			hfe.filename = relativePath.filename().string();
 			hfe.stem = stem;
@@ -299,6 +547,27 @@ namespace Parsing
 			hfe.variantIndex = variantIdx;
 			hfe.isBase = isBase;
 			allFiles.push_back(std::move(hfe));
+		};
+
+		// An archive-only submod has no loose directory; guard so the walk does
+		// not throw. The archived HKX merge below still attaches its animations.
+		if (std::filesystem::exists(a_subModPath)) {
+			for (auto& fileEntry : std::filesystem::recursive_directory_iterator(a_subModPath,
+				std::filesystem::directory_options::skip_permission_denied))
+			{
+				if (!fileEntry.is_regular_file()) continue;
+				addFile(std::filesystem::relative(fileEntry.path(), a_subModPath), fileEntry.path(), {}, false);
+			}
+		}
+
+		if (a_archiveIndex && !subModPrefix.empty()) {
+			for (const auto& archiveEntry : a_archiveIndex->GetEntriesUnderPrefix(subModPrefix)) {
+				auto relativeString = archiveEntry.path.substr(subModPrefix.size());
+				if (relativeString.empty()) continue;
+				// config.json / user.json are also indexed now; addFile's .hkx ext
+				// check rejects them, so passing them through is harmless.
+				addFile(std::filesystem::path(relativeString), {}, archiveEntry.path, true);
+			}
 		}
 
 		// Second pass: group files — only treat _N files as variants if a base exists
@@ -320,26 +589,32 @@ namespace Parsing
 			}
 		}
 
-		// Helper lambda to register a single file as a ReplacementAnimation
+		auto sourcePathFor = [](const HkxFileEntry* a_file) {
+			return a_file->archiveResource ? std::filesystem::path(a_file->resourcePath) : a_file->diskPath;
+		};
+
+		auto normalizedReplacementFor = [&](const HkxFileEntry* a_file) {
+			auto afterMeshes = ExtractPathAfterMeshes(sourcePathFor(a_file));
+			auto afterMeshesStr = afterMeshes.string();
+			std::string normalizedReplacement;
+			auto lowerAfter = afterMeshesStr;
+			std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			auto animPos = lowerAfter.find("animations\\");
+			if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
+			if (animPos != std::string::npos) {
+				normalizedReplacement = afterMeshesStr.substr(animPos);
+			} else {
+				normalizedReplacement = afterMeshesStr;
+			}
+			std::ranges::replace(normalizedReplacement, '/', '\\');
+			return normalizedReplacement;
+		};
+
+		// Helper lambda to register a single file as a ReplacementAnimation.
 		auto registerSingleFile = [&](HkxFileEntry* f) {
 			auto originalPath = a_meshesPrefix / f->relativePath;
 			auto normalizedOriginal = Utils::NormalizePath(originalPath);
-
-			auto afterMeshes = ExtractPathAfterMeshes(f->diskPath);
-			auto afterMeshesStr = afterMeshes.string();
-			std::string normalizedReplacement;
-			{
-				auto lowerAfter = afterMeshesStr;
-				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-				auto animPos = lowerAfter.find("animations\\");
-				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
-				if (animPos != std::string::npos) {
-					normalizedReplacement = afterMeshesStr.substr(animPos);
-				} else {
-					normalizedReplacement = afterMeshesStr;
-				}
-				std::ranges::replace(normalizedReplacement, '/', '\\');
-			}
+			auto normalizedReplacement = normalizedReplacementFor(f);
 
 			auto replacement = std::make_unique<ReplacementAnimation>(
 				normalizedOriginal, normalizedReplacement, -1, subMod.get());
@@ -347,7 +622,9 @@ namespace Parsing
 			ReplacementAnimFileInfo fileInfo;
 			fileInfo.originalPath = normalizedOriginal;
 			fileInfo.replacementPath = normalizedReplacement;
-			fileInfo.absoluteDiskPath = f->diskPath.string();
+			fileInfo.absoluteDiskPath = f->archiveResource ? std::string{} : f->diskPath.string();
+			fileInfo.resourcePath = f->resourcePath;
+			fileInfo.archiveResource = f->archiveResource;
 			fileInfo.parentSubMod = subMod.get();
 			fileInfo.replacementAnim = replacement.get();
 			OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(normalizedOriginal, fileInfo);
@@ -382,22 +659,8 @@ namespace Parsing
 			auto originalPath = a_meshesPrefix / baseFile->relativePath;
 			auto normalizedOriginal = Utils::NormalizePath(originalPath);
 
-			// Compute normalizedReplacement for the base file
-			auto afterMeshes = ExtractPathAfterMeshes(baseFile->diskPath);
-			auto afterMeshesStr = afterMeshes.string();
-			std::string normalizedReplacement;
-			{
-				auto lowerAfter = afterMeshesStr;
-				std::ranges::transform(lowerAfter, lowerAfter.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-				auto animPos = lowerAfter.find("animations\\");
-				if (animPos == std::string::npos) animPos = lowerAfter.find("animations/");
-				if (animPos != std::string::npos) {
-					normalizedReplacement = afterMeshesStr.substr(animPos);
-				} else {
-					normalizedReplacement = afterMeshesStr;
-				}
-				std::ranges::replace(normalizedReplacement, '/', '\\');
-			}
+			// Compute normalizedReplacement for the base file.
+			auto normalizedReplacement = normalizedReplacementFor(baseFile);
 
 			auto replacement = std::make_unique<ReplacementAnimation>(
 				normalizedOriginal, normalizedReplacement, -1, subMod.get());
@@ -430,7 +693,9 @@ namespace Parsing
 				ReplacementAnimFileInfo fileInfo;
 				fileInfo.originalPath = variantCachePath;
 				fileInfo.replacementPath = normalizedReplacement;
-				fileInfo.absoluteDiskPath = f->diskPath.string();
+				fileInfo.absoluteDiskPath = f->archiveResource ? std::string{} : f->diskPath.string();
+				fileInfo.resourcePath = f->resourcePath;
+				fileInfo.archiveResource = f->archiveResource;
 				fileInfo.parentSubMod = subMod.get();
 				fileInfo.replacementAnim = replacement.get();
 				OpenAnimationReplacer::GetSingleton()->AddReplacementFileInfo(variantCachePath, fileInfo);
@@ -465,8 +730,12 @@ namespace Parsing
 
 	void ParseModConfig(ReplacerMod* a_mod, const std::filesystem::path& a_configPath)
 	{
-		auto json = LoadJsonFile(a_configPath);
-		if (json.is_null()) return;
+		ParseModConfigFromJson(a_mod, LoadJsonFile(a_configPath));
+	}
+
+	void ParseModConfigFromJson(ReplacerMod* a_mod, const nlohmann::json& json)
+	{
+		if (!json.is_object()) return;
 
 		if (json.contains("name")) a_mod->SetName(json["name"].get<std::string>());
 		if (json.contains("author")) a_mod->SetAuthor(json["author"].get<std::string>());
@@ -475,8 +744,12 @@ namespace Parsing
 
 	void ParseSubModConfig(SubMod* a_subMod, const std::filesystem::path& a_configPath)
 	{
-		auto json = LoadJsonFile(a_configPath);
-		if (json.is_null()) return;
+		ParseSubModConfigFromJson(a_subMod, LoadJsonFile(a_configPath));
+	}
+
+	void ParseSubModConfigFromJson(SubMod* a_subMod, const nlohmann::json& json)
+	{
+		if (!json.is_object()) return;
 
 		if (json.contains("name")) a_subMod->SetName(json["name"].get<std::string>());
 		if (json.contains("description")) a_subMod->SetDescription(json["description"].get<std::string>());
@@ -595,6 +868,13 @@ namespace Parsing
 			a_subMod->trackFilter.blendOutTime = tf.value("blendOutTime", 0.0f);
 			a_subMod->trackFilter.blendOutAtEnd = tf.value("blendOutAtEnd", false);
 			a_subMod->trackFilter.sampleFrame = tf.value("sampleFrame", -1.0f);
+			a_subMod->trackFilter.syncToSourceCycle = tf.value("syncToSourceCycle", false);
+			if (tf.contains("loopSourcePrefixes") && tf["loopSourcePrefixes"].is_array()) {
+				for (const auto& prefix : tf["loopSourcePrefixes"]) {
+					if (prefix.is_string())
+						a_subMod->trackFilter.loopSourcePrefixes.push_back(prefix.get<std::string>());
+				}
+			}
 			a_subMod->trackFilter.modelSpaceAnchor = tf.value("modelSpaceAnchor", false);
 			a_subMod->trackFilter.nativeIdlePlayback = tf.value("nativeIdlePlayback", false);
 			a_subMod->trackFilter.triggerOnlySpecialIdle = tf.value("triggerOnlySpecialIdle", false);
@@ -633,8 +913,12 @@ namespace Parsing
 
 	void ParseUserConfig(SubMod* a_subMod, const std::filesystem::path& a_userConfigPath)
 	{
-		auto json = LoadJsonFile(a_userConfigPath);
-		if (json.is_null()) return;
+		ParseUserConfigFromJson(a_subMod, LoadJsonFile(a_userConfigPath));
+	}
+
+	void ParseUserConfigFromJson(SubMod* a_subMod, const nlohmann::json& json)
+	{
+		if (!json.is_object()) return;
 
 		if (json.contains("priority")) a_subMod->SetPriority(json["priority"].get<int32_t>());
 		if (json.contains("disabled")) a_subMod->SetDisabled(json["disabled"].get<bool>());
