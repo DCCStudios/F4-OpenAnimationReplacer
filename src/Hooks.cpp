@@ -12519,9 +12519,18 @@ namespace
 			const float gameDt = gameTimer->delta;
 			if (gameDt > 0.0f && gameDt < 1.0f) {
 				dt = gameDt;
+			} else if (gameDt <= 0.0f) {
+				// Paused/frozen (menu open, load) reads delta 0 — the graph is
+				// NOT advancing, so neither should our blends. Without this the
+				// wall-clock fallback advanced (and could complete) the exit fade
+				// behind a pause opened mid-exit. Only a NULL timer keeps the
+				// wall fallback. Robustness note: ordinary hitches are handled by
+				// the 0.1s clamp below (a spike spreads the blend over more frames
+				// instead of snapping it); this covers the pause extreme.
+				dt = 0.0f;
 			}
 		}
-		dt = std::clamp(dt, 0.0001f, 0.1f);
+		dt = std::clamp(dt, 0.0f, 0.1f);
 
 		// Publish the accumulated GAME-time "now" for the Generate hook's
 		// clocks and staleness stamps (donor self-advance, blend envelopes,
