@@ -205,6 +205,12 @@ public:
 		// loops even when the behavior graph exposes them as SINGLE_PLAY or
 		// USER_CONTROLLED. Action clips remain one-shot unless explicitly listed.
 		std::vector<std::string> loopSourcePrefixes;
+		// Opt-in: lock a GRAPH looping donor's phase to the host source's cycle
+		// (donor is rescaled so it completes exactly once per source loop). Default
+		// OFF so a looping replacement plays at its AUTHORED speed / own duration,
+		// which is correct for override sprint/walk replacements (e.g. Super Sprint).
+		// Set true only when a donor must foot-sync to the underlying source cycle.
+		bool syncToSourceCycle = false;
 		// Model-space anchoring (Override + playback-following only): the
 		// filtered chain's ROOT bones are re-expressed so the chain lands
 		// exactly where the donor animation puts it relative to the character
@@ -290,6 +296,9 @@ public:
 
 	const std::vector<std::unique_ptr<SubMod>>& GetSubMods() const { return subMods; }
 
+	bool IsArchiveMod() const { return isArchiveMod; }
+	void SetArchiveMod(bool a_v) { isArchiveMod = a_v; }
+
 	std::string name;
 	std::string author;
 	std::string description;
@@ -298,6 +307,11 @@ public:
 	// name/author/description). A folder without one still loads under its
 	// folder name; the UI offers "Create config.json" to name it.
 	bool hasConfig{ false };
+	// True when this mod was discovered by the archive-only pass (all of its
+	// submods live inside a BA2 with no loose directory on disk). Mixed mods
+	// that have a loose directory plus some archive submods stay false and
+	// count as loose. Drives the optional BA2 divider in the UI mod list.
+	bool isArchiveMod{ false };
 	std::vector<ConditionPreset> conditionPresets;
 	std::vector<std::unique_ptr<SubMod>> subMods;
 };

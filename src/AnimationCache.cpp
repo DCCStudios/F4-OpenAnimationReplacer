@@ -149,6 +149,35 @@ bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const st
 		static_cast<uint64_t>(bufferInfo.fileSize), {}, a_owner, a_priority);
 }
 
+bool AnimationCache::ReadArchiveTextFile(const std::string& a_resourcePath, std::string& a_out)
+{
+	try {
+		RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
+		if (!stream) {
+			return false;
+		}
+
+		RE::NiBinaryStream::BufferInfo bufferInfo{};
+		stream.GetBufferInfo(bufferInfo);
+		// OAR config/user JSON files are tiny; cap generously to reject anything
+		// that is clearly not a config (or a corrupt size) without allocating huge.
+		if (bufferInfo.fileSize == 0 || bufferInfo.fileSize > 16 * 1024 * 1024) {
+			return false;
+		}
+
+		std::string bytes(bufferInfo.fileSize, '\0');
+		const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
+		if (bytesRead != bytes.size()) {
+			return false;
+		}
+
+		a_out = std::move(bytes);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
 bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
 	std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
 	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority)
@@ -465,7 +494,7 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		*reinterpret_cast<uint32_t*>(cloneBase + 0x34) = 0x80000000u; // DONT_DEALLOCATE
 	}
 
-	logger::info("[OAR-Annot] Clone '{}': patched extractedMotion+annotationTracks, {} parsed replacement annotations (using trigger NULLing + manual firing)",
+	OAR_VLOG("[OAR-Annot] Clone '{}': patched extractedMotion+annotationTracks, {} parsed replacement annotations (using trigger NULLing + manual firing)",
 		entry.filePath, entry.annotations.size());
 
 	// Clear m_transformOffsets (let game compute at runtime - game knows its own format)

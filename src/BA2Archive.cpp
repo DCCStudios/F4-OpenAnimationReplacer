@@ -159,7 +159,16 @@ namespace OAR::BA2
 			}
 
 			path = NormalizeArchivePath(std::move(path));
-			if (!path.starts_with("meshes\\") || !path.ends_with(".hkx")) continue;
+			// Index replacement HKX (as before) plus OAR config.json / user.json
+			// files that live under an "openanimationreplacer" directory, so a
+			// fully-packaged BA2 mod (config inside the archive) can be discovered.
+			// Paths are already lowercased by NormalizeArchivePath.
+			if (!path.starts_with("meshes\\")) continue;
+			const bool isHkx = path.ends_with(".hkx");
+			const bool isOarConfig =
+				(path.ends_with("\\config.json") || path.ends_with("\\user.json")) &&
+				path.find("\\openanimationreplacer\\") != std::string::npos;
+			if (!isHkx && !isOarConfig) continue;
 			if (!seenPaths.insert(path).second) continue;
 
 			// ParseAllMods runs on OAR's background loader. Do not call the game's
@@ -172,7 +181,7 @@ namespace OAR::BA2
 			++added;
 		}
 
-		logger::info("[OAR-BA2] Archive '{}' version {} contributed {} HKX entries",
+		logger::info("[OAR-BA2] Archive '{}' version {} contributed {} resource entries",
 			a_archivePath.filename().string(), version, added);
 	}
 
@@ -194,5 +203,34 @@ namespace OAR::BA2
 			std::to_address(first),
 			static_cast<std::size_t>(std::distance(first, last))
 		};
+	}
+
+	bool Index::Contains(std::string_view a_path) const
+	{
+		if (entries.empty() || a_path.empty()) return false;
+		const std::string needle = NormalizeArchivePath(std::string(a_path));
+		return std::ranges::binary_search(entries, needle, {}, &Entry::path);
+	}
+
+	std::vector<std::string> Index::GetOARSubModConfigPaths() const
+	{
+		static constexpr std::string_view kMarker = "\\openanimationreplacer\\";
+		std::vector<std::string> result;
+		for (const auto& entry : entries) {
+			if (!entry.path.ends_with("\\config.json")) continue;
+			const auto oarPos = entry.path.find(kMarker);
+			if (oarPos == std::string::npos) continue;
+
+			// Segments after the marker must be "<mod>\<submod>\config.json":
+			// at least two directory segments before the trailing filename.
+			const auto after = entry.path.substr(oarPos + kMarker.size());
+			const auto firstSlash = after.find('\\');
+			if (firstSlash == std::string::npos) continue;
+			const auto secondSlash = after.find('\\', firstSlash + 1);
+			if (secondSlash == std::string::npos) continue;  // "<mod>\config.json" = mod-level
+
+			result.push_back(entry.path);
+		}
+		return result;
 	}
 }

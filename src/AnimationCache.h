@@ -115,6 +115,13 @@ public:
 		const void* a_owner = nullptr, int32_t a_priority = 0);
 	bool LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
 		const void* a_owner = nullptr, int32_t a_priority = 0);
+	// Read an archived (BSResource) text file fully into a_out via the same
+	// resource-stream idiom LoadAnimationResource uses. Intended for small OAR
+	// config.json / user.json files packaged inside a BA2. Returns false on any
+	// failure (not found, empty, oversize, short read). Safe to call from the
+	// background parser at kGameDataReady, the context LoadAnimationResource
+	// targets. Static: uses no cache state.
+	static bool ReadArchiveTextFile(const std::string& a_resourcePath, std::string& a_out);
 	RE::hkaAnimation* GetCachedAnimation(const std::string& a_suffix,
 		const void* a_owner = nullptr) const;
 	// a_owner: the winning SubMod (from condition evaluation). Selects that

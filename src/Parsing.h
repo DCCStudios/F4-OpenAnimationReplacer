@@ -24,6 +24,13 @@ namespace Parsing
 	void ParseSubModConfig(SubMod* a_subMod, const std::filesystem::path& a_configPath);
 	void ParseUserConfig(SubMod* a_subMod, const std::filesystem::path& a_userConfigPath);
 
+	// JSON-core variants: parse from an already-loaded json value. The path-taking
+	// functions above are thin wrappers (read file -> parse -> call core). Used
+	// directly when the config bytes come from inside a BA2 archive.
+	void ParseModConfigFromJson(ReplacerMod* a_mod, const nlohmann::json& a_json);
+	void ParseSubModConfigFromJson(SubMod* a_subMod, const nlohmann::json& a_json);
+	void ParseUserConfigFromJson(SubMod* a_subMod, const nlohmann::json& a_json);
+
 	nlohmann::json LoadJsonFile(const std::filesystem::path& a_path);
 	void SaveJsonFile(const std::filesystem::path& a_path, const nlohmann::json& a_json);
 }

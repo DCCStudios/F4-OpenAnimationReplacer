@@ -356,7 +356,7 @@ static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESOb
 	arm.suppressSounds = subMod->GetSuppressIdleStopSounds();
 	s_idleStopArmedClips[a_clip] = arm;
 	s_pendingIdleStopByActor[actorFormID] = { a_clip, arm };
-	logger::info("[OAR-IdleStop] Armed actor {:X} from submod '{}' path='{}'",
+	OAR_VLOG("[OAR-IdleStop] Armed actor {:X} from submod '{}' path='{}'",
 		actorFormID, arm.subModName, arm.originalPath);
 }
 
@@ -367,7 +367,7 @@ static void RearmIdleStopSuppressionForEcho(RE::hkbClipGenerator* a_clip, SubMod
 	auto it = s_idleStopArmedClips.find(a_clip);
 	if (it == s_idleStopArmedClips.end() || it->second.owner != a_activeSubMod) return;
 	s_pendingIdleStopByActor[it->second.actorFormID] = { a_clip, it->second };
-	logger::info("[OAR-IdleStop] Re-armed echo for actor {:X} submod '{}'",
+	OAR_VLOG("[OAR-IdleStop] Re-armed echo for actor {:X} submod '{}'",
 		it->second.actorFormID, it->second.subModName);
 }
 
@@ -385,7 +385,7 @@ static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSup
 	}
 
 	if (a_outSuppressSounds) *a_outSuppressSounds = consumed.suppressSounds;
-	logger::info("[OAR-IdleStop] Consumed fix arm for actor {:X} submod '{}' path='{}'",
+	OAR_VLOG("[OAR-IdleStop] Consumed fix arm for actor {:X} submod '{}' path='{}'",
 		consumed.actorFormID, consumed.subModName, consumed.originalPath);
 	return true;
 }
@@ -929,7 +929,7 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 			RE::BSFixedString("IdleStop"), RE::BSFixedString() };
 		rec.original(rec.sinkThis, replay, nullptr);
 	}
-	logger::info("[OAR-IdleStop] Delivered deferred IdleStop ({}, initInstant={}) for actor {:X}",
+	OAR_VLOG("[OAR-IdleStop] Delivered deferred IdleStop ({}, initInstant={}) for actor {:X}",
 		a_reason, haveArm, a_refr->GetFormID());
 }
 
@@ -942,7 +942,7 @@ static void DropDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_reason
 		dropped = s_deferredIdleStops.erase(a_refr) > 0;
 	}
 	if (dropped) {
-		logger::info("[OAR-IdleStop] Dropped deferred IdleStop ({}) for actor {:X}",
+		OAR_VLOG("[OAR-IdleStop] Dropped deferred IdleStop ({}) for actor {:X}",
 			a_reason, a_refr->GetFormID());
 	}
 }
@@ -1707,11 +1707,11 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 		}
 	}
 
-	logger::trace("[OAR-TrackFilter] Resolved {} bones on character {:X} (skel size={}, wanted={}, version={})",
+	OAR_VLOG("[OAR-TrackFilter] Resolved {} bones on character {:X} (skel size={}, wanted={}, version={})",
 		a_resolved.nameAndIndex.size(), reinterpret_cast<uintptr_t>(a_character),
 		numBones, wantedNames.size(), curVersion);
 	for (auto& [name, idx] : a_resolved.nameAndIndex) {
-		logger::trace("[OAR-TrackFilter]   bone[{}] = '{}' (char {:X})",
+		OAR_VLOG("[OAR-TrackFilter]   bone[{}] = '{}' (char {:X})",
 			idx, name, reinterpret_cast<uintptr_t>(a_character));
 	}
 
@@ -1722,14 +1722,14 @@ static void ResolveForChar(SubMod::TrackFilter* a_filter,
 	{
 		static std::unordered_set<RE::hkbCharacter*> s_dumped;
 		if (s_dumped.insert(a_character).second) {
-			logger::info("[OAR-TrackFilter-Dump] Char {:X} ({} bones) full skeleton dump:",
+			OAR_VLOG("[OAR-TrackFilter-Dump] Char {:X} ({} bones) full skeleton dump:",
 				reinterpret_cast<uintptr_t>(a_character), numBones);
 			int dumpMax = std::min<int>(numBones, 80);
 			for (int16_t i = 0; i < dumpMax; ++i) {
 				auto namePtr = *reinterpret_cast<uintptr_t*>(boneData + i * RE::kHkaBoneStride);
 				namePtr &= ~uintptr_t(1);
 				const char* name = reinterpret_cast<const char*>(namePtr);
-				logger::info("[OAR-TrackFilter-Dump]   bone[{}] = '{}'", i, name ? name : "(null)");
+				OAR_VLOG("[OAR-TrackFilter-Dump]   bone[{}] = '{}'", i, name ? name : "(null)");
 			}
 		}
 	}
@@ -2788,7 +2788,7 @@ namespace
 		static std::atomic<int> s_armLog{ 0 };
 		if (backup.entries.empty()) {
 			if (s_armLog.fetch_add(1, std::memory_order_relaxed) < 30) {
-				logger::info("[OAR-VanillaBackup] engine trigger array complete for clipGen={:X} ({} triggers, {} annots) — no backup needed",
+				OAR_VLOG("[OAR-VanillaBackup] engine trigger array complete for clipGen={:X} ({} triggers, {} annots) — no backup needed",
 					reinterpret_cast<uintptr_t>(a_clip), liveCount, origAnnots.size());
 			}
 			return;
@@ -2815,7 +2815,7 @@ namespace
 				if (!names.empty()) names += ", ";
 				names += std::format("'{}'@{:.3f}", e.text, e.time);
 			}
-			logger::info("[OAR-VanillaBackup] armed {} missing annotation(s) for clipGen={:X} (live triggers={}, original annots={}, from t={:.3f}): {}",
+			OAR_VLOG("[OAR-VanillaBackup] armed {} missing annotation(s) for clipGen={:X} (live triggers={}, original annots={}, from t={:.3f}): {}",
 				backup.entries.size(), reinterpret_cast<uintptr_t>(a_clip),
 				liveCount, origAnnots.size(), a_startTime, names);
 		}
@@ -2862,7 +2862,7 @@ namespace
 			}
 			static std::atomic<int> s_vbFlushLog{ 0 };
 			if (s_vbFlushLog.fetch_add(1, std::memory_order_relaxed) < 60) {
-				logger::info("[OAR-VanillaBackup] End-flush '{}' (clipGen={:X}, {}, prevT={:.3f})",
+				OAR_VLOG("[OAR-VanillaBackup] End-flush '{}' (clipGen={:X}, {}, prevT={:.3f})",
 					e.text, reinterpret_cast<uintptr_t>(a_clip), a_reason, backup.prevT);
 			}
 		}
@@ -3170,7 +3170,7 @@ namespace
 			if (a_event.opening &&
 				(a_event.menuName == "LoadingMenu" || a_event.menuName == "PipboyMenu")) {
 				ClearIdleStopSuppressionState();
-				logger::info("[OAR-IdleStop] Cleared pending suppression on '{}' open", a_event.menuName.c_str());
+				OAR_VLOG("[OAR-IdleStop] Cleared pending suppression on '{}' open", a_event.menuName.c_str());
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -3187,7 +3187,7 @@ namespace
 				if (auto* source = ui->GetEventSource<RE::MenuOpenCloseEvent>()) {
 					source->RegisterSink(&s_idleStopMenuWatcher);
 					s_idleStopMenuWatcher.registered = true;
-					logger::info("[OAR-IdleStop] Registered menu reset watcher");
+					OAR_VLOG("[OAR-IdleStop] Registered menu reset watcher");
 				}
 			}
 		}
@@ -3202,7 +3202,7 @@ namespace
 			static bool s_logged = false;
 			if (!s_logged) {
 				s_logged = true;
-				logger::info("[OAR-Annot] Registered-sink path skipped on this runtime; event log fed by the BSTEventSink vfunc hook instead");
+				OAR_VLOG("[OAR-Annot] Registered-sink path skipped on this runtime; event log fed by the BSTEventSink vfunc hook instead");
 			}
 			return;
 		}
@@ -3216,7 +3216,7 @@ namespace
 				if (src) src->RegisterSink(&s_suppressionSink);
 			}
 			s_suppressionSink.registered = true;
-			logger::info("[OAR-Annot] Registered annotation suppression sink ({} sources)", sources.size());
+			OAR_VLOG("[OAR-Annot] Registered annotation suppression sink ({} sources)", sources.size());
 		}
 	}
 
@@ -3320,6 +3320,45 @@ static uint64_t GetPlayerWeaponFingerprint()
 		mix(weapon.equipIndex);
 	}
 	return fingerprint;
+}
+
+// True while the player's behavior graph is mid-rebuild/transition
+// (updateActiveNodes at +0x1AC or stateOrTransitionChanged at +0x1AD). During this
+// window the game's async loader is streaming and rewiring animation bindings on the
+// IOManagerThread, so mutating those binding slots here (the weapon-change clone
+// restore/retire) races it — the confirmed cause of the BA2-weapon-switch crash, since
+// BA2-sourced replacements make OAR splice clones into exactly those async-loaded
+// bindings. Reuses the GunMover-derived detector already used elsewhere
+// (SubgraphResolveViaRootGraphWalk) and the manager->graph path from SetHavokBool.
+// Fails open (returns false) when it cannot validate, so teardown is only ever
+// deferred on a positively-detected transition, never stalled indefinitely.
+static bool PlayerAnimGraphIsRebuilding()
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player) return false;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
+	if (!player->GetAnimationGraphManagerImpl(mgr) || !mgr) return false;
+	const auto mgrAddr = reinterpret_cast<std::uintptr_t>(mgr.get());
+
+	auto* graphPtr = *reinterpret_cast<void**>(mgrAddr + 0xC0);  // BShkbAnimationGraph
+	if (!graphPtr) return false;
+	const auto graphAddr = reinterpret_cast<std::uintptr_t>(graphPtr);
+
+	static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+	if (IsBadReadPtr(reinterpret_cast<void*>(graphAddr), 0x378 + sizeof(void*)) ||
+		*reinterpret_cast<uintptr_t*>(graphAddr) != bshkbVtbl.address()) {
+		return false;
+	}
+
+	const auto hkGraph = *reinterpret_cast<std::uintptr_t*>(graphAddr + 0x378);  // root hkbBehaviorGraph
+	if (!hkGraph || hkGraph < 0x10000 ||
+		IsBadReadPtr(reinterpret_cast<void*>(hkGraph), 0x1B0)) {
+		return false;
+	}
+
+	return *reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+		*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0;
 }
 
 static void CheckAndInvalidateOnWeaponChange()
@@ -5112,7 +5151,7 @@ namespace
 		}
 		static std::atomic<int> s_rekeyLog{ 0 };
 		if (s_rekeyLog.fetch_add(1, std::memory_order_relaxed) < 40) {
-			logger::info("[OAR-DirectPath] Re-keyed clip {:X} suffix '{}' -> '{}' (real path '{}')",
+			OAR_VLOG("[OAR-DirectPath] Re-keyed clip {:X} suffix '{}' -> '{}' (real path '{}')",
 				reinterpret_cast<uintptr_t>(a_clip), oldSuffix, matchKey, a_realPath);
 		}
 	}
@@ -5200,7 +5239,7 @@ namespace
 								!IsBadReadPtr(rawPath, 1) && rawPath[0] != '\0' &&
 								ClassifyPerspectiveFromPath(rawPath) == AnimationLog::Perspective::kFirstPerson) {
 								s_firstPersonGraphIndex.store(static_cast<int32_t>(gi), std::memory_order_relaxed);
-								logger::info("[OAR-Poll] Player root graph [{}] identified as 1st-person (project path '{}')",
+								OAR_VLOG("[OAR-Poll] Player root graph [{}] identified as 1st-person (project path '{}')",
 									gi, rawPath);
 							}
 						}
@@ -5379,11 +5418,11 @@ namespace
 					if (s_firstPersonGraphIndex.load(std::memory_order_relaxed) < 0 &&
 						ClassifyPerspectiveFromPath(path) == AnimationLog::Perspective::kFirstPerson) {
 						s_firstPersonGraphIndex.store(static_cast<int32_t>(gi), std::memory_order_relaxed);
-						logger::info("[OAR-Poll] Player root graph [{}] identified as 1st-person (via '{}')", gi, path);
+						OAR_VLOG("[OAR-Poll] Player root graph [{}] identified as 1st-person (via '{}')", gi, path);
 					}
 					static std::atomic<int> s_pollResolveLog{ 0 };
 					if (s_pollResolveLog.fetch_add(1) < 60) {
-						logger::info("[OAR-Poll] graph[{}] clip='{}' -> '{}'", gi, leaf, path);
+						OAR_VLOG("[OAR-Poll] graph[{}] clip='{}' -> '{}'", gi, leaf, path);
 					}
 				} else if (SubgraphShouldLogPollFailure(clip) && s_pollDiagCount.fetch_add(1) < 30) {
 					// Stage diagnostics for the first failures (once per clip —
@@ -5811,7 +5850,7 @@ namespace
 						registered = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
 					}
 					if (s_sourceLogCount < 80) {
-						logger::info("[OAR-Suffix] SourceS-Subgraph: realPath='{}' -> suffix='{}' registered={}",
+						OAR_VLOG("[OAR-Suffix] SourceS-Subgraph: realPath='{}' -> suffix='{}' registered={}",
 							realPath, suffix, registered);
 						s_sourceLogCount++;
 					}
@@ -5831,7 +5870,7 @@ namespace
 					// layouts that only match by leaf name keep working.
 					auto resolved = ResolveOrLeafFallback(suffix);
 					if (resolved != suffix && s_sourceLogCount < 80) {
-						logger::info("[OAR-Suffix] SourceS-Subgraph: leaf-bridged '{}' -> '{}'",
+						OAR_VLOG("[OAR-Suffix] SourceS-Subgraph: leaf-bridged '{}' -> '{}'",
 							suffix, resolved);
 						s_sourceLogCount++;
 					}
@@ -5853,7 +5892,7 @@ namespace
 			auto suffix = DirectSuffixFromCachedPath(a_this);
 			if (!suffix.empty()) {
 				if (s_sourceLogCount < 80) {
-					logger::info("[OAR-Suffix] SourceS-Cached: suffix='{}' (poll-resolved real path)", suffix);
+					OAR_VLOG("[OAR-Suffix] SourceS-Cached: suffix='{}' (poll-resolved real path)", suffix);
 					s_sourceLogCount++;
 				}
 				return suffix;
@@ -5892,14 +5931,14 @@ namespace
 							std::shared_lock rlock(s_nameLookupMutex);
 							if (s_suffixToInfos.find(candidateSuffix) != s_suffixToInfos.end()) {
 								if (s_sourceLogCount < 40) {
-									logger::info("[OAR-Suffix] Source0-WeaponGraph: folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
+									OAR_VLOG("[OAR-Suffix] Source0-WeaponGraph: folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
 										s_weaponAnimFolder, clipLeaf, candidateSuffix);
 									s_sourceLogCount++;
 								}
 								return candidateSuffix;
 							}
 							if (s_sourceLogCount < 40) {
-								logger::info("[OAR-Suffix] Source0-WeaponGraph: tried '{}' (no match in registry)",
+								OAR_VLOG("[OAR-Suffix] Source0-WeaponGraph: tried '{}' (no match in registry)",
 									candidateSuffix);
 								s_sourceLogCount++;
 							}
@@ -5917,7 +5956,7 @@ namespace
 							std::shared_lock rlock(s_nameLookupMutex);
 							if (s_suffixToInfos.find(candidateSuffix) != s_suffixToInfos.end()) {
 								if (s_sourceLogCount < 40) {
-									logger::info("[OAR-Suffix] Source0-CreateFile: latest folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
+									OAR_VLOG("[OAR-Suffix] Source0-CreateFile: latest folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
 										latestIt->second, clipLeaf, candidateSuffix);
 									s_sourceLogCount++;
 								}
@@ -5933,7 +5972,7 @@ namespace
 								std::shared_lock rlock(s_nameLookupMutex);
 								if (s_suffixToInfos.find(candidateSuffix) != s_suffixToInfos.end()) {
 									if (s_sourceLogCount < 40) {
-										logger::info("[OAR-Suffix] Source0-CreateFile: folder='{}' + leaf='{}' -> suffix='{}' (MATCH from set)",
+										OAR_VLOG("[OAR-Suffix] Source0-CreateFile: folder='{}' + leaf='{}' -> suffix='{}' (MATCH from set)",
 											folder, clipLeaf, candidateSuffix);
 										s_sourceLogCount++;
 									}
@@ -5954,7 +5993,7 @@ namespace
 								std::shared_lock rlock(s_nameLookupMutex);
 								if (s_suffixToInfos.find(candidateSuffix) != s_suffixToInfos.end()) {
 									if (s_sourceLogCount < 40) {
-										logger::info("[OAR-Suffix] Source0-SubGraphID: id={:X} folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
+										OAR_VLOG("[OAR-Suffix] Source0-SubGraphID: id={:X} folder='{}' + leaf='{}' -> suffix='{}' (MATCH)",
 											curSubID, sgIt->second, clipLeaf, candidateSuffix);
 										s_sourceLogCount++;
 									}
@@ -5984,7 +6023,7 @@ namespace
 			std::string animPath;
 			auto* projData = character->projectData._ptr;
 			if (logDiag) {
-				logger::info("[OAR-Diag] character={:X} name='{}' setup={:X} projectData={:X} behaviorGraph={:X}",
+				OAR_VLOG("[OAR-Diag] character={:X} name='{}' setup={:X} projectData={:X} behaviorGraph={:X}",
 					reinterpret_cast<uintptr_t>(character),
 					(character->name.data() && !IsBadReadPtr(character->name.data(), 1)) ? character->name.data() : "(null)",
 					reinterpret_cast<uintptr_t>(character->setup._ptr),
@@ -5995,13 +6034,13 @@ namespace
 				!IsBadReadPtr(projData, 0x30)) {
 				auto* projStrData = projData->stringData._ptr;
 				if (logDiag) {
-					logger::info("[OAR-Diag]   projData->stringData={:X}", reinterpret_cast<uintptr_t>(projStrData));
+					OAR_VLOG("[OAR-Diag]   projData->stringData={:X}", reinterpret_cast<uintptr_t>(projStrData));
 				}
 				if (projStrData && reinterpret_cast<uintptr_t>(projStrData) > 0x10000 &&
 					!IsBadReadPtr(projStrData, 0x80)) {
 					const char* rawAnimPath = projStrData->animationPath.data();
 					if (logDiag) {
-						logger::info("[OAR-Diag]   projStrData->animationPath raw={:X} val='{}'",
+						OAR_VLOG("[OAR-Diag]   projStrData->animationPath raw={:X} val='{}'",
 							reinterpret_cast<uintptr_t>(rawAnimPath),
 							(rawAnimPath && reinterpret_cast<uintptr_t>(rawAnimPath) > 0x10000 && !IsBadReadPtr(rawAnimPath, 1)) ? rawAnimPath : "(bad)");
 					}
@@ -6016,19 +6055,19 @@ namespace
 			// Path B: setup -> data -> characterStringData -> animationNames[bindIdx].fileName
 			auto* setup = character->setup._ptr;
 			if (logDiag && (!setup || reinterpret_cast<uintptr_t>(setup) < 0x10000)) {
-				logger::info("[OAR-Diag]   setup is NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(setup));
+				OAR_VLOG("[OAR-Diag]   setup is NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(setup));
 			}
 			if (setup && reinterpret_cast<uintptr_t>(setup) > 0x10000 &&
 				!IsBadReadPtr(setup, 0x50)) {
 				auto* data = *reinterpret_cast<RE::hkbCharacterData**>(reinterpret_cast<uint8_t*>(setup) + 0x40);
 				if (logDiag) {
-					logger::info("[OAR-Diag]   setup->data(+0x40)={:X}", reinterpret_cast<uintptr_t>(data));
+					OAR_VLOG("[OAR-Diag]   setup->data(+0x40)={:X}", reinterpret_cast<uintptr_t>(data));
 				}
 				if (data && reinterpret_cast<uintptr_t>(data) > 0x10000 &&
 					!IsBadReadPtr(data, 0xC0)) {
 					auto* stringData = *reinterpret_cast<RE::hkbCharacterStringData**>(reinterpret_cast<uint8_t*>(data) + 0xB0);
 					if (logDiag) {
-						logger::info("[OAR-Diag]   data->stringData(+0xB0)={:X}", reinterpret_cast<uintptr_t>(stringData));
+						OAR_VLOG("[OAR-Diag]   data->stringData(+0xB0)={:X}", reinterpret_cast<uintptr_t>(stringData));
 					}
 					if (stringData && reinterpret_cast<uintptr_t>(stringData) > 0x10000 &&
 						!IsBadReadPtr(stringData, 0x40)) {
@@ -6039,7 +6078,7 @@ namespace
 							if (it != s_loadClipsPathMap.end()) {
 								animPath = it->second;
 								if (logDiag) {
-									logger::info("[OAR-Diag]   LoadClipsMap hit! animPath='{}'", animPath);
+									OAR_VLOG("[OAR-Diag]   LoadClipsMap hit! animPath='{}'", animPath);
 								}
 							}
 						}
@@ -6051,7 +6090,7 @@ namespace
 						int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
 
 						if (logDiag) {
-							logger::info("[OAR-Diag]   animNames: data={:X} size={} bindIdx={}",
+							OAR_VLOG("[OAR-Diag]   animNames: data={:X} size={} bindIdx={}",
 								reinterpret_cast<uintptr_t>(nameData), nameSize, bindIdx);
 						}
 
@@ -6060,7 +6099,7 @@ namespace
 						{
 							const char* fileName = nameData[bindIdx].fileName.data();
 							if (logDiag) {
-								logger::info("[OAR-Diag]   animNames[{}].fileName='{}'", bindIdx,
+								OAR_VLOG("[OAR-Diag]   animNames[{}].fileName='{}'", bindIdx,
 									(fileName && reinterpret_cast<uintptr_t>(fileName) > 0x10000 && !IsBadReadPtr(fileName, 1)) ? fileName : "(bad)");
 							}
 							if (fileName && reinterpret_cast<uintptr_t>(fileName) > 0x10000 && fileName[0] != '\0') {
@@ -6070,7 +6109,7 @@ namespace
 									if (!suffix.empty()) {
 										auto resolved = ResolveOrLeafFallback(suffix);
 										if (s_sourceLogCount < 40) {
-											logger::info("[OAR-Suffix] Source1-Combined: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
+											OAR_VLOG("[OAR-Suffix] Source1-Combined: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
 												animPath, fileName, suffix, resolved);
 											s_sourceLogCount++;
 										}
@@ -6081,7 +6120,7 @@ namespace
 								if (!suffix.empty()) {
 									auto resolved = ResolveOrLeafFallback(suffix);
 									if (s_sourceLogCount < 40) {
-										logger::info("[OAR-Suffix] Source1b-FileName: fileName='{}' -> '{}' resolved='{}'",
+										OAR_VLOG("[OAR-Suffix] Source1b-FileName: fileName='{}' -> '{}' resolved='{}'",
 											fileName, suffix, resolved);
 										s_sourceLogCount++;
 									}
@@ -6163,7 +6202,7 @@ namespace
 						if (!suffix.empty()) {
 							auto resolved = ResolveOrLeafFallback(suffix);
 							if (s_sourceLogCount < 40) {
-								logger::info("[OAR-Suffix] Source1d-KnownSD: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
+								OAR_VLOG("[OAR-Suffix] Source1d-KnownSD: animPath='{}' + fileName='{}' -> '{}' resolved='{}'",
 									animPath, fileName, suffix, resolved);
 								s_sourceLogCount++;
 							}
@@ -6175,7 +6214,7 @@ namespace
 					if (!suffix.empty()) {
 						auto resolved = ResolveOrLeafFallback(suffix);
 						if (s_sourceLogCount < 40) {
-							logger::info("[OAR-Suffix] Source1d-KnownSD: fileName='{}' -> '{}' resolved='{}'",
+							OAR_VLOG("[OAR-Suffix] Source1d-KnownSD: fileName='{}' -> '{}' resolved='{}'",
 								fileName, suffix, resolved);
 							s_sourceLogCount++;
 						}
@@ -6194,7 +6233,7 @@ namespace
 				if (!suffix.empty()) {
 					auto resolved = ResolveOrLeafFallback(suffix);
 					if (s_sourceLogCount < 20) {
-						logger::info("[OAR-Suffix] Source2: idleAnimData='{}' -> '{}' resolved='{}'",
+						OAR_VLOG("[OAR-Suffix] Source2: idleAnimData='{}' -> '{}' resolved='{}'",
 							it->second, suffix, resolved);
 						s_sourceLogCount++;
 					}
@@ -6213,7 +6252,7 @@ namespace
 			if (!fullSuffix.empty()) {
 				auto resolved = ResolveOrLeafFallback(fullSuffix);
 				if (s_sourceLogCount < 40) {
-					logger::info("[OAR-Suffix] Source3: animationName='{}' -> '{}' resolved='{}'",
+					OAR_VLOG("[OAR-Suffix] Source3: animationName='{}' -> '{}' resolved='{}'",
 						clipName, fullSuffix, resolved);
 					s_sourceLogCount++;
 				}
@@ -6621,7 +6660,7 @@ namespace
 				}
 				static std::atomic<int> s_prePlayCapLog{ 0 };
 				if (s_prePlayCapLog.fetch_add(1, std::memory_order_relaxed) < 12) {
-					logger::info("[OAR-TrackFilter] Captured {} pre-play local(s) from the scene nodes (nativeIdlePlayback hold set)",
+					OAR_VLOG("[OAR-TrackFilter] Captured {} pre-play local(s) from the scene nodes (nativeIdlePlayback hold set)",
 						captured.size());
 				}
 			}
@@ -6853,7 +6892,19 @@ namespace
 		// animation. The retired records retain their original reverse links for
 		// any other shared binding encountered later.
 		if (playerGraphIndex >= 0 && s_gameFullyLoaded.load()) {
-			CheckAndInvalidateOnWeaponChange();
+			// Defer the weapon-change clone teardown while the player graph is mid
+			// transition: the async loader is rewiring bindings on the IO thread and
+			// our slot restore/retire would race it (the confirmed BA2 weapon-switch
+			// crash). We do NOT record the weapon change, so the next stable Activate
+			// re-detects it and tears down safely once the graph has settled.
+			if (PlayerAnimGraphIsRebuilding()) {
+				static std::atomic<int> s_deferLog{ 0 };
+				if (s_deferLog.fetch_add(1, std::memory_order_relaxed) < 30) {
+					logger::info("[OAR-WeaponChange] Deferred clone teardown — player graph rebuilding (avoids async-loader race)");
+				}
+			} else {
+				CheckAndInvalidateOnWeaponChange();
+			}
 		}
 
 		// PRE-SWAP: If we have a cached replacement for this clip, swap it in BEFORE
@@ -7260,7 +7311,7 @@ namespace
 				std::shared_lock rlock(s_nameLookupMutex);
 				bool hasMatch = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
 				rlock.unlock();
-				logger::info("[OAR-Activate] Cached suffix='{}' match={}", suffix, hasMatch);
+				OAR_VLOG("[OAR-Activate] Cached suffix='{}' match={}", suffix, hasMatch);
 				s_cacheLogCount++;
 			}
 			{
@@ -7295,7 +7346,7 @@ namespace
 				s_annotStateMap.erase(a_this);
 				static int s_resetLog = 0;
 				if (s_resetLog < 30) {
-					logger::info("[OAR-Activate] ClipGen {} reused for new suffix '{}' — reset original/annot state",
+					OAR_VLOG("[OAR-Activate] ClipGen {} reused for new suffix '{}' — reset original/annot state",
 						reinterpret_cast<uintptr_t>(a_this), suffix);
 					s_resetLog++;
 				}
@@ -7441,7 +7492,7 @@ namespace
 
 					static int s_origAnnotLog = 0;
 					if (s_origAnnotLog < 10) {
-						logger::info("[OAR-Annot] Cached {} original annotations for actor {:X}",
+						OAR_VLOG("[OAR-Annot] Cached {} original annotations for actor {:X}",
 							origAnnots.size(), actorID);
 						s_origAnnotLog++;
 					}
@@ -7538,7 +7589,7 @@ namespace
 
 			static int s_ceLog = 0;
 			if (s_ceLog < 50) {
-				logger::info("[OAR-CustomEvent] Fired '{}' ({}) on {:X}", de.eventName, de.label,
+				OAR_VLOG("[OAR-CustomEvent] Fired '{}' ({}) on {:X}", de.eventName, de.label,
 					de.refr->GetFormID());
 				s_ceLog++;
 			}
@@ -7628,7 +7679,7 @@ namespace
 					}
 					static int s_endFlushLog = 0;
 					if (s_endFlushLog < 100) {
-						logger::info("[OAR-Annot] End-flush '{}' (clip '{}', {}, prevT={:.3f} duration={:.3f})",
+						OAR_VLOG("[OAR-Annot] End-flush '{}' (clip '{}', {}, prevT={:.3f} duration={:.3f})",
 							ann.text, flushSuffix, a_reason, flushPrevT, duration);
 						s_endFlushLog++;
 					}
@@ -7642,7 +7693,7 @@ namespace
 				// that outgrow the window are visible in the field.
 				static int s_endFlushSkipLog = 0;
 				if (s_endFlushSkipLog < 30) {
-					logger::info("[OAR-Annot] End-flush skipped for '{}' ({}, prevT={:.3f} duration={:.3f}, {} pending)",
+					OAR_VLOG("[OAR-Annot] End-flush skipped for '{}' ({}, prevT={:.3f} duration={:.3f}, {} pending)",
 						flushSuffix, a_reason, flushPrevT, duration, total - (flushLastIdx + 1));
 					s_endFlushSkipLog++;
 				}
@@ -7890,7 +7941,7 @@ namespace
 								PlaySoundDirect(s.c_str() + 10, vbRefr);
 								static std::atomic<int> s_vbFireLog{ 0 };
 								if (s_vbFireLog.fetch_add(1, std::memory_order_relaxed) < 60) {
-									logger::info("[OAR-VanillaBackup] Fired '{}' (clipGen={:X}, t={:.3f})",
+									OAR_VLOG("[OAR-VanillaBackup] Fired '{}' (clipGen={:X}, t={:.3f})",
 										s, reinterpret_cast<uintptr_t>(a_this), vbCurT);
 								}
 							}
@@ -7899,7 +7950,7 @@ namespace
 								static std::atomic<int> s_vbEvtLog{ 0 };
 								for (auto& e : vbEvents) {
 									if (s_vbEvtLog.fetch_add(1, std::memory_order_relaxed) < 60) {
-										logger::info("[OAR-VanillaBackup] Queued event '{}' (clipGen={:X}, t={:.3f})",
+										OAR_VLOG("[OAR-VanillaBackup] Queued event '{}' (clipGen={:X}, t={:.3f})",
 											e, reinterpret_cast<uintptr_t>(a_this), vbCurT);
 									}
 								}
@@ -8109,7 +8160,7 @@ namespace
 							if (inherited) {
 								static std::atomic<int> s_inheritPromoteLog{ 0 };
 								if (s_inheritPromoteLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-									logger::info("[OAR-DirectPath] Clip {:X} inherited binding path '{}' (subgraph walk unavailable)",
+									OAR_VLOG("[OAR-DirectPath] Clip {:X} inherited binding path '{}' (subgraph walk unavailable)",
 										reinterpret_cast<uintptr_t>(a_this), realPath);
 								}
 							}
@@ -8145,7 +8196,7 @@ namespace
 				std::unique_lock ulock(s_loggedSuffixMutex);
 				if (s_loggedSuffixes.insert(suffix).second) {
 					bool found = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
-					logger::info("[OAR-Match] suffix='{}' match={}", suffix, found);
+					OAR_VLOG("[OAR-Match] suffix='{}' match={}", suffix, found);
 				}
 			}
 		}
@@ -8808,7 +8859,7 @@ namespace
 			if (transCount < 50) {
 				std::string winnerName = (winningInfo && winningInfo->parentSubMod)
 					? winningInfo->parentSubMod->GetName() : "(none)";
-				logger::info("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={} clipGen={:X} t={:.3f})",
+				OAR_VLOG("[OAR-Transition] '{}' shouldReplace {}->{} winner='{}' (cands total={} disabled={} evalFalse={} noCond={} clipGen={:X} t={:.3f})",
 					resolvedSuffix, prevKnown ? (prev ? "true" : "false") : "?",
 					shouldReplace ? "true" : "false", winnerName,
 					totalCands, disabledCands, evalFalseCands, noCondCands,
@@ -8819,13 +8870,13 @@ namespace
 						if (!info || !info->parentSubMod || info->parentSubMod->IsDisabled()) continue;
 						auto* cs = info->parentSubMod->GetConditionSet();
 						if (!cs || cs->IsEmpty()) continue;
-						logger::info("[OAR-CondDetail]   SubMod='{}' conditions:", info->parentSubMod->GetName());
+						OAR_VLOG("[OAR-CondDetail]   SubMod='{}' conditions:", info->parentSubMod->GetName());
 						for (const auto& cond : cs->GetConditions()) {
 							if (!cond) continue;
 							std::string prefix = cond->IsNegated() ? "NOT " : "";
 							std::string evalStr = cond->lastEvalResult.has_value()
 								? (cond->lastEvalResult.value() ? "PASS" : "FAIL") : "?";
-							logger::info("[OAR-CondDetail]     {}{} [{}] -> {}",
+							OAR_VLOG("[OAR-CondDetail]     {}{} [{}] -> {}",
 								prefix, cond->GetName(), cond->GetParameterString(), evalStr);
 						}
 					}
@@ -8856,7 +8907,7 @@ namespace
 			static std::atomic<int> s_updateDiagCounter{ 0 };
 			int count = s_updateDiagCounter.fetch_add(1);
 			if (count < 5 || count % 3000 == 0) {
-				logger::info("[OAR-Diag] Update running for '{}': shouldReplace={} animSlot={:X} original={:X} current={:X}",
+				OAR_VLOG("[OAR-Diag] Update running for '{}': shouldReplace={} animSlot={:X} original={:X} current={:X}",
 					resolvedSuffix, shouldReplace,
 					reinterpret_cast<uintptr_t>(animSlot),
 					reinterpret_cast<uintptr_t>(originalAnim),
@@ -9014,7 +9065,7 @@ namespace
 						filterKey->nativeIdlePlayback) {
 						static std::atomic<int> s_nativeConvertSkipLog{ 0 };
 						if (s_nativeConvertSkipLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-							logger::info("[OAR-TrackFilter] Skipped source registration onto live native-idle state ('{}' stays standalone)",
+							OAR_VLOG("[OAR-TrackFilter] Skipped source registration onto live native-idle state ('{}' stays standalone)",
 								statePtr->suffix);
 						}
 					} else {
@@ -9110,7 +9161,7 @@ namespace
 						state.onEndFired = false;
 						static std::atomic<int> s_loopStateResetLog{ 0 };
 						if (s_loopStateResetLog.fetch_add(1, std::memory_order_relaxed) < 40) {
-							logger::info("[OAR-TrackFilter] Reset one-shot state for configured loop: suffix='{}'",
+							OAR_VLOG("[OAR-TrackFilter] Reset one-shot state for configured loop: suffix='{}'",
 								cacheSuffix);
 						}
 					}
@@ -9243,7 +9294,7 @@ namespace
 			}
 			static int s_tfLog = 0;
 			if (s_tfLog < 3) {
-				logger::info("[OAR-TrackFilter] Registered filtered replacement for '{}' on actor {:X} (submod '{}')",
+				OAR_VLOG("[OAR-TrackFilter] Registered filtered replacement for '{}' on actor {:X} (submod '{}')",
 					resolvedSuffix, reinterpret_cast<uintptr_t>(refr),
 					winningInfo->parentSubMod->GetName());
 				s_tfLog++;
@@ -9564,7 +9615,7 @@ namespace
 						astate.activeOwner = winningOwner;
 						static int s_annotInitLog = 0;
 						if (s_annotInitLog < 30) {
-							logger::info("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f}, nested={})",
+							OAR_VLOG("[OAR-Annot] Init tracking for '{}' ({} annotations, localTime={:.3f}, nested={})",
 								annotSuffix, annotations->size(), localTime, nestedNotify);
 							s_annotInitLog++;
 						}
@@ -9649,7 +9700,7 @@ namespace
 							replayBoneVisAnnots(astate.lastFiredIndex + 1, seekIdx, toFire);
 							static int s_seekLog = 0;
 							if (s_seekLog < 30) {
-								logger::info("[OAR-Annot] Seek '{}' prev={:.3f} cur={:.3f} (dt={:.3f}, replaying {} bone-vis annots)",
+								OAR_VLOG("[OAR-Annot] Seek '{}' prev={:.3f} cur={:.3f} (dt={:.3f}, replaying {} bone-vis annots)",
 									annotSuffix, prevT, curT, dt, toFire.size());
 								s_seekLog++;
 							}
@@ -9674,7 +9725,7 @@ namespace
 						// nested updates therefore fire nothing, same as before.
 						static int s_nestSkipLog = 0;
 						if (s_nestSkipLog < 30) {
-							logger::info("[OAR-Annot] Nested Update — passive for '{}' at t={:.3f} (tracker at {:.3f})",
+							OAR_VLOG("[OAR-Annot] Nested Update — passive for '{}' at t={:.3f} (tracker at {:.3f})",
 								annotSuffix, localTime, astate.prevLocalTime);
 							s_nestSkipLog++;
 						}
@@ -9696,7 +9747,7 @@ namespace
 						if (annotSubMod->IsAnnotationSuppressed(t)) {
 							static int s_suppressLog = 0;
 							if (s_suppressLog < 30) {
-								logger::info("[OAR-Annot] Suppressed '{}' (submod '{}')",
+								OAR_VLOG("[OAR-Annot] Suppressed '{}' (submod '{}')",
 									t, annotSubMod->GetName());
 								s_suppressLog++;
 							}
@@ -9751,7 +9802,7 @@ namespace
 						// later plays look like they lost annotations in the log).
 						static int s_annotFireLog = 0;
 						if (s_annotFireLog < 1000) {
-							logger::info("[OAR-Annot] Fired '{}' (clip '{}')",
+							OAR_VLOG("[OAR-Annot] Fired '{}' (clip '{}')",
 								text, suffix);
 							s_annotFireLog++;
 						}
@@ -10355,7 +10406,7 @@ namespace
 		// to consider this track valid downstream.
 		static int s_poseHdrLog = 0;
 		if (s_poseHdrLog < 3) {
-			logger::info("[OAR-TrackFilter] poseHeader: numData={} capacity={} elemSize={} dataOff={} onFrac={:.3f} flags=0x{:02X} type={}",
+			OAR_VLOG("[OAR-TrackFilter] poseHeader: numData={} capacity={} elemSize={} dataOff={} onFrac={:.3f} flags=0x{:02X} type={}",
 				poseHeader.numData, poseHeader.capacity, poseHeader.elementSizeBytes,
 				poseHeader.dataOffset, poseHeader.onFraction,
 				static_cast<uint8_t>(poseHeader.flags), poseHeader.type);
@@ -10431,7 +10482,7 @@ namespace
 					}
 					static std::atomic<int> s_censusCount{ 0 };
 					if (logCensus && s_censusCount.fetch_add(1, std::memory_order_relaxed) < 300) {
-						logger::info("[OAR-TF-NativeCensus] clip={:X} leaf='{}' cachedSuffix='{}' persp={} onFrac={:.2f} nBones={} match={}",
+						OAR_VLOG("[OAR-TF-NativeCensus] clip={:X} leaf='{}' cachedSuffix='{}' persp={} onFrac={:.2f} nBones={} match={}",
 							reinterpret_cast<uintptr_t>(a_this), censusLeaf, suppressClipSuffix,
 							static_cast<int>(GetPlayingClipPerspectiveImpl(a_this)),
 							poseHeader.onFraction, poseHeader.numData, isNativeIdleClip);
@@ -10459,7 +10510,7 @@ namespace
 						// single, blendable camera driver.
 						static std::atomic<int> s_nativeIdleAdoptLog{ 0 };
 						if (s_nativeIdleAdoptLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-							logger::info("[OAR-TrackFilter] Native idle 1P clip adopted as overlay source '{}' (clipGen={:X}, onFrac={:.2f})",
+							OAR_VLOG("[OAR-TrackFilter] Native idle 1P clip adopted as overlay source '{}' (clipGen={:X}, onFrac={:.2f})",
 								nativeIdleSuffix, reinterpret_cast<uintptr_t>(a_this), poseHeader.onFraction);
 						}
 
@@ -10574,7 +10625,7 @@ namespace
 						if (camIdx >= 0 && ClearPoseBoneMaskBit(tracksPtr, poseHeader, camIdx)) {
 							static std::atomic<int> s_camClearLog{ 0 };
 							if (s_camClearLog.fetch_add(1, std::memory_order_relaxed) < 12) {
-								logger::info("[OAR-TrackFilter] Cleared Camera track (bone {}) on the native idle's 3P clip '{}' (clipGen={:X}) — player keeps look control",
+								OAR_VLOG("[OAR-TrackFilter] Cleared Camera track (bone {}) on the native idle's 3P clip '{}' (clipGen={:X}) — player keeps look control",
 									camIdx, nativeIdleSuffix, reinterpret_cast<uintptr_t>(a_this));
 							}
 						}
@@ -10730,7 +10781,7 @@ namespace
 					if (eqHardStrip) {
 						ClearPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
 						if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
-							logger::info("[OAR-IdleStop] Camera MASKED (bone {}) on clip {:X} (char {:X}) during the blend-out",
+							OAR_VLOG("[OAR-IdleStop] Camera MASKED (bone {}) on clip {:X} (char {:X}) during the blend-out",
 								chCamIdx, reinterpret_cast<uintptr_t>(a_this),
 								reinterpret_cast<uintptr_t>(character));
 						}
@@ -10791,7 +10842,7 @@ namespace
 						LerpTransform(outputPose[chCamIdx], addIdentity, easeAlpha);
 						SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
 						if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
-							logger::info("[OAR-IdleStop] Camera additive-eased (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
+							OAR_VLOG("[OAR-IdleStop] Camera additive-eased (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
 								chCamIdx, easeAlpha, reinterpret_cast<uintptr_t>(a_this),
 								reinterpret_cast<uintptr_t>(character),
 								camInPostExit ? "post-exit window" : "blend-out");
@@ -10828,7 +10879,7 @@ namespace
 						if (wrote) {
 							SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
 							if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
-								logger::info("[OAR-IdleStop] Camera {} (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
+								OAR_VLOG("[OAR-IdleStop] Camera {} (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
 									eqHardStrip ? "STRIPPED" : "eased", chCamIdx, easeAlpha,
 									reinterpret_cast<uintptr_t>(a_this),
 									reinterpret_cast<uintptr_t>(character),
@@ -10978,7 +11029,7 @@ namespace
 				if (state.blendingOut) {
 					static int s_nsBoLog = 0;
 					if (s_nsBoLog < 20) {
-						logger::info("[OAR-TrackFilter] NonSrc-FastPath BLEND-OUT: suffix='{}' clip={:X} additive={} weight={:.4f} alpha={:.4f} onFrac={:.3f}",
+						OAR_VLOG("[OAR-TrackFilter] NonSrc-FastPath BLEND-OUT: suffix='{}' clip={:X} additive={} weight={:.4f} alpha={:.4f} onFrac={:.3f}",
 							state.suffix, reinterpret_cast<uintptr_t>(a_this),
 							isAdditiveClip, weight, state.blendAlpha, poseHeader.onFraction);
 						s_nsBoLog++;
@@ -11019,7 +11070,7 @@ namespace
 								s_rhStampLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 								const auto& lv = outputPose[idx];
 								const auto& rv = rIt->second;
-								logger::info("[OAR-TF-WeaponDiag] RArm_Hand stamp(fast) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+								OAR_VLOG("[OAR-TF-WeaponDiag] RArm_Hand stamp(fast) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 									reinterpret_cast<uintptr_t>(a_this), idx, weight, state.blendingOut,
 									lv.translation[0], lv.translation[1], lv.translation[2],
 									lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
@@ -11093,7 +11144,7 @@ namespace
 								s_wpnFreezeLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 								const auto& lv = outputPose[idx];
 								const auto& fv = heldVal;
-								logger::info("[OAR-TF-WeaponDiag] freeze-apply(fast) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+								OAR_VLOG("[OAR-TF-WeaponDiag] freeze-apply(fast) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 									reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
 									lv.translation[0], lv.translation[1], lv.translation[2],
 									lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
@@ -11113,7 +11164,7 @@ namespace
 						if (dumped++ >= 2) break;
 						if (idx < 0 || idx >= numOutputBones) continue;
 						auto& f = outputPose[idx];
-						logger::info("[OAR-TrackFilter] FINAL nonsrc(fast) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
+						OAR_VLOG("[OAR-TrackFilter] FINAL nonsrc(fast) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
 							name, idx, f.translation[0], f.translation[1], f.translation[2], isAdditiveClip);
 					}
 					s_nonSrcFastLog++;
@@ -11192,7 +11243,7 @@ namespace
 
 		static int s_genEntryLog = 0;
 		if (s_genEntryLog < 6) {
-			logger::info("[OAR-TrackFilter] Generate: char={:X} a_this={:X} isSource={} bones={}",
+			OAR_VLOG("[OAR-TrackFilter] Generate: char={:X} a_this={:X} isSource={} bones={}",
 				reinterpret_cast<uintptr_t>(character),
 				reinterpret_cast<uintptr_t>(a_this),
 				isSourceClip, cr.nameAndIndex.size());
@@ -11267,7 +11318,7 @@ namespace
 
 			static int s_pathLog = 0;
 			if (s_pathLog < 6) {
-				logger::info("[OAR-TrackFilter] Source path: clip={:X} mapping={} identity={} bindingTracks={} donorMap={} donorIdentity={}",
+				OAR_VLOG("[OAR-TrackFilter] Source path: clip={:X} mapping={} identity={} bindingTracks={} donorMap={} donorIdentity={}",
 					reinterpret_cast<uintptr_t>(a_this), haveMapping, haveIdentityBinding,
 					haveMapping ? trackToBoneArr->size : 0, donorMapSize, donorIdentity);
 				s_pathLog++;
@@ -11296,7 +11347,7 @@ namespace
 				if (configuredLoopingSource && !graphLoopingSource && sourceState) {
 					static std::atomic<int> s_configuredLoopLog{ 0 };
 					if (s_configuredLoopLog.fetch_add(1, std::memory_order_relaxed) < 40) {
-						logger::info("[OAR-TrackFilter] Configured source loop: suffix='{}' sourceMode={} donorDuration={:.3f}s",
+						OAR_VLOG("[OAR-TrackFilter] Configured source loop: suffix='{}' sourceMode={} donorDuration={:.3f}s",
 							sourceSuffix, static_cast<int>(a_this->mode), repDuration);
 					}
 				}
@@ -11322,10 +11373,12 @@ namespace
 					}
 				} else if (repDuration > 0.001f) {
 					if (loopingSource) {
-						if (graphLoopingSource && sourceDuration > 0.001f) {
-							// Preserve native source phase when source and donor durations
-							// differ. Raw seconds would shift the donor phase on every
-							// source wrap.
+						if (graphLoopingSource && sourceDuration > 0.001f && filterPtr->syncToSourceCycle) {
+							// Opt-in only (syncToSourceCycle): rescale the donor so it
+							// completes exactly once per host source loop, preserving native
+							// source phase across source wraps. Kept off by default because it
+							// silently retimes any looping replacement whose duration differs
+							// from the source (e.g. Super Sprint played at repDur/srcDur speed).
 							float sourcePhase = std::fmod(localTime, sourceDuration) / sourceDuration;
 							if (sourcePhase < 0.0f) sourcePhase += 1.0f;
 							localTime = sourcePhase * repDuration;
@@ -11463,7 +11516,7 @@ namespace
 							selfAdvanceBaseTime = 0.0f;
 							static std::atomic<int> s_ovClockLog{ 0 };
 							if (s_ovClockLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-								logger::info("[OAR-TrackFilter] Override clock started for '{}' (host t={:.3f} ignored from here on)",
+								OAR_VLOG("[OAR-TrackFilter] Override clock started for '{}' (host t={:.3f} ignored from here on)",
 									state.suffix, localTime);
 							}
 						}
@@ -11575,7 +11628,7 @@ namespace
 				static int s_bindingDiagLog = 0;
 				bool wantBindingDiag = (s_bindingDiagLog < 3);
 				if (wantBindingDiag) {
-					logger::info("[OAR-TrackFilter-Binding] char={:X} bindingTracks={} animTracks={} localTime={:.3f}",
+					OAR_VLOG("[OAR-TrackFilter-Binding] char={:X} bindingTracks={} animTracks={} localTime={:.3f}",
 						reinterpret_cast<uintptr_t>(character),
 						bindingNumTracks, animNumTracks, localTime);
 				}
@@ -11770,7 +11823,7 @@ namespace
 						if (s_tfPlayDiagCount.fetch_add(1, std::memory_order_relaxed) < 60) {
 							diagLogThisSample = true;
 							const char* diagClipName = a_this->animationName.data();
-							logger::info("[OAR-TF-PlayDiag] ---- play sample for '{}' (donor t={:.3f}, weight={:.3f}, alpha={:.3f}, sampler clipGen={:X} clip='{}') ----",
+							OAR_VLOG("[OAR-TF-PlayDiag] ---- play sample for '{}' (donor t={:.3f}, weight={:.3f}, alpha={:.3f}, sampler clipGen={:X} clip='{}') ----",
 								state.suffix, localTime, weight, state.blendAlpha,
 								reinterpret_cast<uintptr_t>(a_this),
 								(diagClipName && reinterpret_cast<uintptr_t>(diagClipName) > 0x10000) ? diagClipName : "(unknown)");
@@ -11788,7 +11841,7 @@ namespace
 					const int32_t trackIdx = donorTrackFor(idx);
 
 					if (wantBindingDiag) {
-						logger::info("[OAR-TrackFilter-Binding]   '{}': boneIdx={} trackIdx={} (identity={})",
+						OAR_VLOG("[OAR-TrackFilter-Binding]   '{}': boneIdx={} trackIdx={} (identity={})",
 							name, idx, trackIdx, (trackIdx == idx ? "yes" : "no"));
 					}
 
@@ -12011,7 +12064,7 @@ namespace
 						(name == "LArm_Collarbone" || name == "LArm_UpperArm" || name == "LArm_Hand")) {
 						const bool anchored =
 							std::memcmp(&diagRawVal, &repVal, sizeof(RE::hkQsTransformRaw)) != 0;
-						logger::info("[OAR-TF-PlayDiag] '{}' raw T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | {} T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | base T=({:.4f},{:.4f},{:.4f})",
+						OAR_VLOG("[OAR-TF-PlayDiag] '{}' raw T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | {} T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | base T=({:.4f},{:.4f},{:.4f})",
 							name,
 							diagRawVal.translation[0], diagRawVal.translation[1], diagRawVal.translation[2],
 							diagRawVal.rotation[0], diagRawVal.rotation[1], diagRawVal.rotation[2], diagRawVal.rotation[3],
@@ -12074,7 +12127,7 @@ namespace
 											RE::hkQsTransformRaw diagModel{};
 											const bool haveModel = modelTransform(i, nullptr, diagModel);
 											const auto& lp = outputPose[i];
-											logger::info("[OAR-TF-PlayDiag] '{}' (unfiltered) local T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | model T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}){}",
+											OAR_VLOG("[OAR-TF-PlayDiag] '{}' (unfiltered) local T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}) | model T=({:.4f},{:.4f},{:.4f}) R=({:.4f},{:.4f},{:.4f},{:.4f}){}",
 												want,
 												lp.translation[0], lp.translation[1], lp.translation[2],
 												lp.rotation[0], lp.rotation[1], lp.rotation[2], lp.rotation[3],
@@ -12141,7 +12194,7 @@ namespace
 								fIt = state.frozenByName.emplace(name, skelRefPose[idx]).first;
 								static std::atomic<int> s_fzBindLog{ 0 };
 								if (s_fzBindLog.fetch_add(1, std::memory_order_relaxed) < 24) {
-									logger::info("[OAR-TrackFilter] Captured frozen '{}' from the BIND pose (nativeIdlePlayback source)",
+									OAR_VLOG("[OAR-TrackFilter] Captured frozen '{}' from the BIND pose (nativeIdlePlayback source)",
 										name);
 								}
 							} else {
@@ -12240,7 +12293,7 @@ namespace
 						auto repIt = state.cachedRepByName.find(name);
 						if (baseIt == state.cachedBaseByName.end() || repIt == state.cachedRepByName.end())
 							continue;
-						logger::info("[OAR-TrackFilter] FINAL(direct) src char={:X} '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
+						OAR_VLOG("[OAR-TrackFilter] FINAL(direct) src char={:X} '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
 							reinterpret_cast<uintptr_t>(character), name, idx,
 							baseIt->second.translation[0], baseIt->second.translation[1], baseIt->second.translation[2],
 							repIt->second.translation[0], repIt->second.translation[1], repIt->second.translation[2],
@@ -12392,7 +12445,7 @@ namespace
 					auto bIt = state2.cachedBaseByName.find(name);
 					auto rIt = state2.cachedRepByName.find(name);
 					if (bIt != state2.cachedBaseByName.end() && rIt != state2.cachedRepByName.end()) {
-						logger::info("[OAR-TrackFilter] FINAL(fallback) '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
+						OAR_VLOG("[OAR-TrackFilter] FINAL(fallback) '{}'[{}]: base=({:.3f},{:.3f},{:.3f}) rep=({:.3f},{:.3f},{:.3f}) out=({:.3f},{:.3f},{:.3f}) mode={} w={:.2f}",
 							name, idx,
 							bIt->second.translation[0], bIt->second.translation[1], bIt->second.translation[2],
 							rIt->second.translation[0], rIt->second.translation[1], rIt->second.translation[2],
@@ -12457,7 +12510,7 @@ namespace
 					state.frozenByName.emplace(fzName, fzVal);
 					static std::atomic<int> s_fz1pLog{ 0 };
 					if (s_fz1pLog.fetch_add(1, std::memory_order_relaxed) < 24) {
-						logger::info("[OAR-TrackFilter] Captured frozen '{}' from 1P clip {:X} idx={} T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) (nativeIdlePlayback)",
+						OAR_VLOG("[OAR-TrackFilter] Captured frozen '{}' from 1P clip {:X} idx={} T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) (nativeIdlePlayback)",
 							fzName, reinterpret_cast<uintptr_t>(a_this), fzIdx,
 							fzVal.translation[0], fzVal.translation[1], fzVal.translation[2],
 							fzVal.rotation[0], fzVal.rotation[1], fzVal.rotation[2], fzVal.rotation[3]);
@@ -12495,7 +12548,7 @@ namespace
 						s_rhStampSlowLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 						const auto& lv = outputPose[idx];
 						const auto& rv = rIt->second;
-						logger::info("[OAR-TF-WeaponDiag] RArm_Hand stamp(slow) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+						OAR_VLOG("[OAR-TF-WeaponDiag] RArm_Hand stamp(slow) clip={:X} idx={} w={:.3f} blendingOut={} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> rep T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 							reinterpret_cast<uintptr_t>(a_this), idx, weight, state.blendingOut,
 							lv.translation[0], lv.translation[1], lv.translation[2],
 							lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
@@ -12557,7 +12610,7 @@ namespace
 						s_wpnFreezeSlowLog.fetch_add(1, std::memory_order_relaxed) < 60) {
 						const auto& lv = outputPose[idx];
 						const auto& fv = heldVal;
-						logger::info("[OAR-TF-WeaponDiag] freeze-apply(slow) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+						OAR_VLOG("[OAR-TF-WeaponDiag] freeze-apply(slow) clip={:X} idx={} w={:.3f} onFrac={:.2f} live T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) -> frozen T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 							reinterpret_cast<uintptr_t>(a_this), idx, weight, poseHeader.onFraction,
 							lv.translation[0], lv.translation[1], lv.translation[2],
 							lv.rotation[0], lv.rotation[1], lv.rotation[2], lv.rotation[3],
@@ -12577,7 +12630,7 @@ namespace
 				if (dumped++ >= 2) break;
 				if (idx < 0 || idx >= numOutputBones) continue;
 				auto& f = outputPose[idx];
-				logger::info("[OAR-TrackFilter] FINAL nonsrc(slow) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
+				OAR_VLOG("[OAR-TrackFilter] FINAL nonsrc(slow) '{}'[{}]: trans=({:.3f},{:.3f},{:.3f}) additive={}",
 					name, idx, f.translation[0], f.translation[1], f.translation[2], isAdditiveClip);
 			}
 			s_nonSrcFinalLog++;
@@ -12630,7 +12683,7 @@ namespace
 						if (kExitDiagTrace) {
 							static std::atomic<int> s_boHoldLog{ 0 };
 							if (s_boHoldLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-								logger::info("[OAR-IdleStop] Blend-out arm hold w={:.3f} (clip {:X}) overriding exit equip toward anchor",
+								OAR_VLOG("[OAR-IdleStop] Blend-out arm hold w={:.3f} (clip {:X}) overriding exit equip toward anchor",
 									boW, reinterpret_cast<uintptr_t>(a_this));
 							}
 						}
@@ -12671,7 +12724,7 @@ namespace
 				if (rlCamIdx >= 0 && rlCamIdx < poseHeader.numData) {
 					ClearPoseBoneMaskBit(tracksPtr, poseHeader, rlCamIdx);
 					if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
-						logger::info("[OAR-IdleStop] Camera RELEASED (bone {}) on the native clip {:X} during the blend-out (live carrier drives aim)",
+						OAR_VLOG("[OAR-IdleStop] Camera RELEASED (bone {}) on the native clip {:X} during the blend-out (live carrier drives aim)",
 							rlCamIdx, reinterpret_cast<uintptr_t>(a_this));
 					}
 				}
@@ -13065,7 +13118,7 @@ namespace
 								1.0f - state.blendAlpha) * state.blendDuration;
 							static int s_osLog = 0;
 							if (s_osLog < 10) {
-								logger::info("[OAR-TrackFilter] One-shot end for '{}' ({}) — blending out ({:.2f}s)",
+								OAR_VLOG("[OAR-TrackFilter] One-shot end for '{}' ({}) — blending out ({:.2f}s)",
 									state.suffix,
 									currentOneShotDone ? "donor completed"
 										: currentEarlyBlendOutArmed ? "approaching donor end"
@@ -13094,7 +13147,7 @@ namespace
 								1.0f - state.blendAlpha) * state.blendDuration;
 								static int s_boLog = 0;
 								if (s_boLog < 10) {
-									logger::info("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
+									OAR_VLOG("[OAR-TrackFilter] Blend-out started for '{}' (duration={:.2f}s)",
 										state.suffix, state.blendDuration);
 									s_boLog++;
 								}
@@ -13165,7 +13218,7 @@ namespace
 							static float s_lastBlendLog = 0.0f;
 							if (kExitDiagTrace &&
 								(state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f)) {
-								logger::info("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
+								OAR_VLOG("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
 									state.suffix, state.blendElapsed, state.blendDuration, t, state.blendAlpha, dt);
 								s_lastBlendLog = state.blendElapsed;
 							}
@@ -13174,7 +13227,7 @@ namespace
 								s_lastBlendLog = 0.0f;
 								static int s_dormLog = 0;
 								if (s_dormLog < 10) {
-									logger::info("[OAR-TrackFilter] Blend-out COMPLETE — '{}' dormant (awaiting reactivation)", state.suffix);
+									OAR_VLOG("[OAR-TrackFilter] Blend-out COMPLETE — '{}' dormant (awaiting reactivation)", state.suffix);
 									s_dormLog++;
 								}
 								// A parked IdleStop for this actor is released by
@@ -13473,7 +13526,7 @@ namespace
 											exTracks + exPose.dataOffset);
 										exitCam = exOut[exCamIdx];
 										haveExitCam = true;
-										logger::info("[OAR-IdleStop] Exit-camera snapshot (bone {}) R=({:.3f},{:.3f},{:.3f},{:.3f}) for actor {:X}",
+										OAR_VLOG("[OAR-IdleStop] Exit-camera snapshot (bone {}) R=({:.3f},{:.3f},{:.3f},{:.3f}) for actor {:X}",
 											exCamIdx, exitCam.rotation[0], exitCam.rotation[1],
 											exitCam.rotation[2], exitCam.rotation[3],
 											toDeliver[di]->GetFormID());
@@ -14004,7 +14057,7 @@ namespace Hooks
 					InSoundSuppressWindow(refr))) {
 				static std::atomic<int> s_sndSwallowLog{ 0 };
 				if (s_sndSwallowLog.fetch_add(1, std::memory_order_relaxed) < 24) {
-					logger::info("[OAR-IdleStop] Swallowed '{}.{}' in the post-fix window (suppressIdleStopSounds)",
+					OAR_VLOG("[OAR-IdleStop] Swallowed '{}.{}' in the post-fix window (suppressIdleStopSounds)",
 						evtStr, a_event.payload.c_str() ? a_event.payload.c_str() : "");
 				}
 				return RE::BSEventNotifyControl::kContinue;
@@ -14014,7 +14067,7 @@ namespace Hooks
 			if (evtStr && evtStr[0] && InSoundSuppressWindow(refr)) {
 				static std::atomic<int> s_sndWindowDiagLog{ 0 };
 				if (s_sndWindowDiagLog.fetch_add(1, std::memory_order_relaxed) < 40) {
-					logger::info("[OAR-IdleStop] window event '{}' (payload '{}') passed unsuppressed",
+					OAR_VLOG("[OAR-IdleStop] window event '{}' (payload '{}') passed unsuppressed",
 						evtStr, a_event.payload.c_str() ? a_event.payload.c_str() : "");
 				}
 			}
@@ -14038,7 +14091,7 @@ namespace Hooks
 					}
 					static std::atomic<int> s_deferLog{ 0 };
 					if (s_deferLog.fetch_add(1, std::memory_order_relaxed) < 16) {
-						logger::info("[OAR-IdleStop] Deferred IdleStop for actor {:X} until blend-out completes (alpha={:.3f})",
+						OAR_VLOG("[OAR-IdleStop] Deferred IdleStop for actor {:X} until blend-out completes (alpha={:.3f})",
 							refr ? refr->GetFormID() : 0, fadeAlpha);
 					}
 					return RE::BSEventNotifyControl::kContinue;

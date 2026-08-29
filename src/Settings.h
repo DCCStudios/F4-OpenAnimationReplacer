@@ -37,6 +37,10 @@ public:
 	// a third-person-authored animation through the first-person behavior graph.
 	bool  bSkeletonCompatibilityGate{ false };
 
+	// When true, the in-game mod list groups fully BA2-packed mods under their
+	// own labeled divider, rendered after the loose mods. Purely cosmetic.
+	bool  bSeparateArchiveMods{ true };
+
 	// Auto-reload mode. The engine's own automatic reloads (fire-on-empty and
 	// last-round) are ALWAYS suppressed: they are attack-initiated, so the
 	// engine exits the reload state the moment the reloadComplete annotation

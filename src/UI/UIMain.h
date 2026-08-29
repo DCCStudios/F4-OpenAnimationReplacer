@@ -38,6 +38,7 @@ private:
 	void DrawReplacerModsTab();
 	void DrawReplacementAnimsTab();
 	void DrawModTree();
+	void DrawReplacerModNode(ReplacerMod* a_mod);
 	void DrawSubModDetails(SubMod* a_subMod);
 	void DrawSubModNode(SubMod* a_subMod, ReplacerMod* a_mod);
 	void DrawConditionSet(ConditionSet* a_condSet, SubMod* a_subMod, int a_depth = 0);

@@ -41,6 +41,7 @@ void Settings::Load()
 	bShowWelcomeBanner            = getB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	bDirectPathMatching           = getB("General", "bDirectPathMatching", bDirectPathMatching);
 	bSkeletonCompatibilityGate    = getB("General", "bSkeletonCompatibilityGate", bSkeletonCompatibilityGate);
+	bSeparateArchiveMods          = getB("General", "bSeparateArchiveMods", bSeparateArchiveMods);
 	iAutoReloadMode               = std::clamp(getI("General", "iAutoReloadMode", iAutoReloadMode), 0, 2);
 	bPlayDryFireSound             = getB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
@@ -81,6 +82,14 @@ void Settings::Load()
 		bDirectPathMatching, bSkeletonCompatibilityGate, iLoadClipsAddressRVA);
 }
 
+// Runtime verbose gate backing OAR_VLOG (declared in PCH.h). Deliberately does NOT
+// touch the global spdlog level: the high-frequency diagnostics are gated per-call
+// on this flag instead, so toggling verbose has no process-global side effect.
+bool OAR_IsVerboseLogging()
+{
+	return Settings::GetSingleton() && Settings::GetSingleton()->bVerboseLogging;
+}
+
 void Settings::Save()
 {
 	CSimpleIniA ini;
@@ -102,6 +111,7 @@ void Settings::Save()
 	setB("General", "bShowWelcomeBanner", bShowWelcomeBanner);
 	setB("General", "bDirectPathMatching", bDirectPathMatching);
 	setB("General", "bSkeletonCompatibilityGate", bSkeletonCompatibilityGate);
+	setB("General", "bSeparateArchiveMods", bSeparateArchiveMods);
 	setI("General", "iAutoReloadMode", iAutoReloadMode);
 	setB("General", "bPlayDryFireSound", bPlayDryFireSound);
 

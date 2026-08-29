@@ -27,6 +27,18 @@ namespace OAR::BA2
 		std::size_t GetEntryCount() const { return entries.size(); }
 		std::span<const Entry> GetEntriesUnderPrefix(std::string_view a_prefix) const;
 
+		// True when the exact (normalized) path is present in the index. Used to
+		// probe for an archived OAR config.json/user.json before reading it.
+		bool Contains(std::string_view a_path) const;
+
+		// Every indexed OAR submod-level config path: paths ending in
+		// "\config.json" that contain "\openanimationreplacer\" and have a
+		// "<mod>\<submod>\config.json" shape (at least two path segments after the
+		// openanimationreplacer marker). Mod-level configs
+		// ("openanimationreplacer\<mod>\config.json", one segment) are excluded —
+		// those are probed directly by path via Contains during mod parsing.
+		std::vector<std::string> GetOARSubModConfigPaths() const;
+
 	private:
 		void ScanArchive(const std::filesystem::path& a_archivePath);
 
