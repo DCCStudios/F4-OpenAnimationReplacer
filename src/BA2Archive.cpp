@@ -46,14 +46,37 @@ namespace
 		if (std::memcmp(magic, "BTDX", 4) != 0 || std::memcmp(type, "GNRL", 4) != 0) return false;
 		return a_version == 1 || a_version == 7 || a_version == 8;
 	}
+
+	// Derives the owning plugin stem from an archive filename. The game auto-loads
+	// archives named "<PluginName> - <Component>.ba2" (e.g. "MyMod - Main.ba2"), so the
+	// owner is the substring before the last " - " separator, lowercased. Archives with
+	// no separator (rare, non-plugin-named) fall back to the whole stem. Splitting on the
+	// LAST separator tolerates plugin names that themselves contain " - ".
+	std::string ArchiveOwner(const std::filesystem::path& a_archivePath)
+	{
+		auto stem = a_archivePath.stem().string();
+		std::ranges::transform(stem, stem.begin(), [](unsigned char c) {
+			return static_cast<char>(std::tolower(c));
+		});
+		if (const auto sep = stem.rfind(" - "); sep != std::string::npos) {
+			stem.erase(sep);
+		}
+		return stem;
+	}
 }
 
 namespace OAR::BA2
 {
-	Index Index::Build(const std::filesystem::path& a_dataRoot)
+	Index Index::Build(const std::filesystem::path& a_dataRoot,
+		const std::unordered_set<std::string>& a_registeredOwners)
 	{
 		Index result;
 		if (!std::filesystem::exists(a_dataRoot)) return result;
+
+		// When the caller could not resolve the load order, index every archive so we
+		// never regress into finding nothing. Otherwise gate by registered ownership.
+		const bool gateByOwner = !a_registeredOwners.empty();
+		std::size_t skippedUnregistered = 0;
 
 		try {
 			for (const auto& entry : std::filesystem::directory_iterator(
@@ -66,6 +89,14 @@ namespace OAR::BA2
 				});
 				if (extension != ".ba2") continue;
 
+				if (gateByOwner && !a_registeredOwners.contains(ArchiveOwner(entry.path()))) {
+					// Present on disk but owned by a plugin that is not in the load order;
+					// the game will not register it, so indexing it would only produce
+					// dead entries or a silent wrong-file fallback.
+					++skippedUnregistered;
+					continue;
+				}
+
 				result.ScanArchive(entry.path());
 			}
 		} catch (const std::filesystem::filesystem_error& e) {
@@ -74,7 +105,8 @@ namespace OAR::BA2
 
 		std::ranges::sort(result.entries, {}, &Entry::path);
 
-		logger::info("[OAR-BA2] Indexed {} General BA2 resources from Data", result.entries.size());
+		logger::info("[OAR-BA2] Indexed {} General BA2 resources from Data ({} archive(s) skipped as unregistered)",
+			result.entries.size(), skippedUnregistered);
 		return result;
 	}
 

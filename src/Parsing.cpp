@@ -120,6 +120,52 @@ namespace Parsing
 		}
 	}
 
+	// Collects the lowercased stems (filename without extension) of every plugin active
+	// in the current load order, including light (ESL) plugins. The BA2 index uses this
+	// set to skip archives whose owning plugin is not loaded - archives the game's own
+	// resource layer never registers. Reading TESDataHandler's compiled file collection
+	// is a settled-data-structure lookup; unlike probing the resource manager it does not
+	// race the startup BA2 registration this parse runs alongside. Returns an empty set
+	// when the data handler is unavailable, which leaves the index ungated (legacy scan).
+	static std::unordered_set<std::string> CollectRegisteredArchiveOwners()
+	{
+		std::unordered_set<std::string> owners;
+
+		auto* dataHandler = RE::TESDataHandler::GetSingleton();
+		if (!dataHandler) {
+			return owners;
+		}
+
+		auto addStem = [&owners](const char* a_fileName) {
+			if (!a_fileName || a_fileName[0] == '\0') {
+				return;
+			}
+			std::string stem(a_fileName);
+			if (const auto dot = stem.find_last_of('.'); dot != std::string::npos) {
+				stem.erase(dot);
+			}
+			std::ranges::transform(stem, stem.begin(), [](unsigned char c) {
+				return static_cast<char>(std::tolower(c));
+			});
+			if (!stem.empty()) {
+				owners.insert(std::move(stem));
+			}
+		};
+
+		for (auto* file : dataHandler->compiledFileCollection.files) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+		for (auto* file : dataHandler->compiledFileCollection.smallFiles) {
+			if (file) {
+				addStem(file->filename);
+			}
+		}
+
+		return owners;
+	}
+
 	void ParseAllMods()
 	{
 		RegisterAllConditions();
@@ -144,8 +190,12 @@ namespace Parsing
 		// OAR configuration remains loose, but replacement HKX may be supplied
 		// by the game's resource layer. Index General BA2 paths once per parse so
 		// each submod can merge its loose and archived files without scanning all
-		// archives repeatedly.
-		auto archiveIndex = OAR::BA2::Index::Build(meshesPath.parent_path());
+		// archives repeatedly. Gate the index by the load order so archives owned by
+		// disabled plugins (present on disk but never registered by the game) are
+		// excluded instead of producing dead entries or silent wrong-file fallbacks.
+		auto registeredOwners = CollectRegisteredArchiveOwners();
+		logger::info("[OAR] {} plugin(s) in load order gate BA2 indexing", registeredOwners.size());
+		auto archiveIndex = OAR::BA2::Index::Build(meshesPath.parent_path(), registeredOwners);
 
 		int modCount = 0;
 		int subModCount = 0;
