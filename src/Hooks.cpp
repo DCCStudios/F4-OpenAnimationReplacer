@@ -131,15 +131,29 @@ static constexpr float kDeferredIdleStopTimeoutSec = 3.0f;
 // the settle's held pose read as a frozen beat before locomotion resumed).
 static constexpr float kDeferredIdleStopSettleSec = 0.0f;
 // Duration of the post-exit anchor fade over the reactivated live clips.
-static constexpr float kPostExitAnchorFadeSec = 0.2f;
+// Lengthened 0.2 -> 0.4 (field 2026-08-28) for a softer anchor -> settled-base
+// landing now that kExitInitUpdateSec lands the graph on the settled pose.
+static constexpr float kPostExitAnchorFadeSec = 0.4f;
+
+// Master switch for the heavy per-frame exit DIAGNOSTIC logging (CamTrace,
+// ArmTrace, WeaponDiag, blend-out ticks, per-clip strip/hold lines). These
+// dump hundreds of flushed lines PER VAULT straight to the log, which is
+// written through MO2's USVFS overlay — cheap at first but progressively
+// slower as the file grows, so after many vaults the per-exit flush hitches
+// frames and the jitter creeps back (field 2026-08-28: "solved initially, came
+// back with more vaults"). The functional fixes are in; keep this OFF. Flip on
+// only to re-diagnose.
+static constexpr bool kExitDiagTrace = false;
 // Settle step advanced through the graph right after
 // BGSAnimationSystemUtils::InitializeActorInstant rebuilds it at delivery.
-// SeamlessInspect's value; the committed-good (36e13ed) behavior. Tuning it
-// smaller (0.033/FLT_MIN) or larger (1.0) chasing the residual one-frame arm
-// spike did not help — that spike is the GAME's exit wpnequipfast playing on
-// the unfiltered arm bones during the blend-out TAIL (pre-delivery), which
-// this post-delivery step cannot touch. Left at the known-good value.
-static constexpr float kExitInitUpdateSec = 0.2f;
+// InitializeActorInstant RE-EQUIPS the weapon (re-triggers wpnequipfast); this
+// step advances THROUGH that equip so the graph lands on the SETTLED base
+// pose. SeamlessInspect's 0.2 left the equip only partly advanced, so it
+// played out over ~1s AFTER the post-exit fade released = the "weapon holds
+// then blends back to base" the user reported. 1.0s clears any equip length.
+// (This exposed the PRE-delivery blend-out equip spike in round 47, but that
+// is now handled by the blend-out arm hold, so a large step is safe here.)
+static constexpr float kExitInitUpdateSec = 1.0f;
 
 // Sound-burst suppression window for the IdleStop fast-forward (submod
 // option suppressIdleStopSounds). File-scope thread_locals because delivery
@@ -10452,7 +10466,7 @@ namespace
 				if (!camPoseAdditive) {
 					if (eqHardStrip) {
 						ClearPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
-						if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+						if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
 							logger::info("[OAR-IdleStop] Camera MASKED (bone {}) on clip {:X} (char {:X}) during the blend-out",
 								chCamIdx, reinterpret_cast<uintptr_t>(a_this),
 								reinterpret_cast<uintptr_t>(character));
@@ -10513,7 +10527,7 @@ namespace
 						addIdentity.scale[2] = 1.f;
 						LerpTransform(outputPose[chCamIdx], addIdentity, easeAlpha);
 						SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
-						if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+						if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
 							logger::info("[OAR-IdleStop] Camera additive-eased (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
 								chCamIdx, easeAlpha, reinterpret_cast<uintptr_t>(a_this),
 								reinterpret_cast<uintptr_t>(character),
@@ -10550,7 +10564,7 @@ namespace
 						}
 						if (wrote) {
 							SetPoseBoneMaskBit(tracksPtr, poseHeader, chCamIdx);
-							if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+							if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
 								logger::info("[OAR-IdleStop] Camera {} (bone {}, a={:.3f}) on clip {:X} (char {:X}) during the {}",
 									eqHardStrip ? "STRIPPED" : "eased", chCamIdx, easeAlpha,
 									reinterpret_cast<uintptr_t>(a_this),
@@ -10728,7 +10742,7 @@ namespace
 						// reportedly not applying to the right hand). The logged
 						// weight IS the blend alpha in action; live shows what the
 						// stamp is blending against.
-						if (name == "RArm_Hand") {
+						if (kExitDiagTrace && name == "RArm_Hand") {
 							static std::atomic<int> s_rhStampLog{ 0 };
 							static std::atomic<uint64_t> s_rhStampLastFrame{ 0 };
 							const auto rhFrame = s_currentFrame.load(std::memory_order_relaxed);
@@ -12261,10 +12275,12 @@ namespace
 								boState.nativeAnchorPose[pb], boW);
 							SetPoseBoneMaskBit(tracksPtr, poseHeader, pb);
 						}
-						static std::atomic<int> s_boHoldLog{ 0 };
-						if (s_boHoldLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-							logger::info("[OAR-IdleStop] Blend-out arm hold w={:.3f} (clip {:X}) overriding exit equip toward anchor",
-								boW, reinterpret_cast<uintptr_t>(a_this));
+						if (kExitDiagTrace) {
+							static std::atomic<int> s_boHoldLog{ 0 };
+							if (s_boHoldLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+								logger::info("[OAR-IdleStop] Blend-out arm hold w={:.3f} (clip {:X}) overriding exit equip toward anchor",
+									boW, reinterpret_cast<uintptr_t>(a_this));
+							}
 						}
 						break;
 					}
@@ -12302,7 +12318,7 @@ namespace
 				const int16_t rlCamIdx = GetCharCameraBoneIndex(character);
 				if (rlCamIdx >= 0 && rlCamIdx < poseHeader.numData) {
 					ClearPoseBoneMaskBit(tracksPtr, poseHeader, rlCamIdx);
-					if (s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
+					if (kExitDiagTrace && s_camStripLogUsed.fetch_add(1, std::memory_order_relaxed) < 40) {
 						logger::info("[OAR-IdleStop] Camera RELEASED (bone {}) on the native clip {:X} during the blend-out (live carrier drives aim)",
 							rlCamIdx, reinterpret_cast<uintptr_t>(a_this));
 					}
@@ -12775,7 +12791,8 @@ namespace
 
 							// Diagnostic: log blend-out progress every ~0.1s
 							static float s_lastBlendLog = 0.0f;
-							if (state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f) {
+							if (kExitDiagTrace &&
+								(state.blendElapsed - s_lastBlendLog > 0.1f || state.blendAlpha <= 0.001f)) {
 								logger::info("[OAR-TrackFilter] BLEND-OUT tick: suffix='{}' elapsed={:.3f}/{:.3f} t={:.3f} alpha={:.4f} dt={:.4f}",
 									state.suffix, state.blendElapsed, state.blendDuration, t, state.blendAlpha, dt);
 								s_lastBlendLog = state.blendElapsed;
@@ -12876,7 +12893,7 @@ namespace
 		// through the fade and the post-exit window — whichever one
 		// discontinues is the snap's real source (a divergence proves the
 		// view is driven by a path our pose stamps never touch).
-		{
+		if (kExitDiagTrace) {
 			auto* tracePlayer = RE::PlayerCharacter::GetSingleton();
 			bool doTrace = false;
 			float traceAlpha = -1.0f;
