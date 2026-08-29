@@ -97,6 +97,12 @@ public:
 		// runtime clone. Disabled by default because most weapon animation
 		// replacements are pose-only and should not inherit donor root motion.
 		bool preserveExtractedMotion{ false };
+		// The extracted-motion pointer is only preserved when the packfile
+		// identifies it as a supported hkaDefaultAnimatedReferenceFrame object.
+		// Do not infer this from a non-null pointer: weapon animation packfiles
+		// commonly contain other pointer-shaped data at the same offset.
+		VtableFixupKind extractedMotionKind{ VtableFixupKind::kGameAnimation };
+		bool hasExtractedMotionFixup{ false };
 
 		// Source identity at load time. A config reload recreates every SubMod,
 		// so `owner` always misses — the load functions match by filePath instead
@@ -213,6 +219,10 @@ private:
 		bool a_preserveExtractedMotion);
 	RE::hkaAnimation* FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable);
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
+	// Resolve the supported reference-frame vtable from CommonLib's runtime
+	// Address Library entry and patch already-parsed packfiles when it becomes
+	// available. Returns zero when this runtime has no usable entry.
+	uintptr_t EnsureReferenceFrameVtable();
 
 	// Caller must hold m_mutex (shared or unique).
 	CachedAnimation* SelectEntry(const std::string& a_suffix, const void* a_owner) const;
@@ -243,9 +253,13 @@ private:
 
 	mutable std::shared_mutex m_mutex;
 	// Retired clone buffers, kept alive because clips may still reference them
-	// after invalidation (weapon switch, save load). Capped; oldest dropped
-	// first — by the time hundreds of invalidations have passed, no clip from
-	// the oldest one can still be active.
+	// after invalidation (weapon switch, save load). They intentionally remain
+	// allocated for the lifetime of the process. hkbClipGenerator exposes no
+	// reliable reference count here, so an age/count cap can free a buffer that
+	// a live clip still owns and turn a benign invalidation into a use-after-free.
+	// The cache singleton is destroyed after the game has stopped using its
+	// animation graphs, making process-lifetime retention the conservative
+	// lifetime boundary for this focused fix.
 	//
 	// clonePtr is remembered so IsOurReplacement() still recognizes a retired
 	// clone sitting in a clip's animation slot. Without it, the Update hook

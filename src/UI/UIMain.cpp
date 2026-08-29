@@ -781,7 +781,9 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
 			UICommon::T("Keep the replacement animation's extracted-motion reference frame\n"
 			"when OAR builds its runtime clone. Enable only for donors authored\n"
-			"with root motion; disabled by default for pose-only replacements."));
+			"with root motion; disabled by default for pose-only replacements.\n"
+			"Reload all configs after changing this option so existing runtime\n"
+			"clones are rebuilt with the new policy."));
 
 		bool replOnLoop = a_subMod->GetReplaceOnLoop();
 		if (ImGui::Checkbox(UICommon::T("Replace on Loop (?)"), &replOnLoop)) {
