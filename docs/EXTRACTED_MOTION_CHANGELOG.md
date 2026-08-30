@@ -33,6 +33,9 @@ replacement feature proposed in PR #7.
   lifetime. There is no heuristic FIFO eviction because the inspected clip
   bindings expose no reliable liveness signal; an age/count cap could free a
   buffer still referenced by Havok.
+- The reference-frame validator uses the Fallout 4 runtime layout: duration at
+  `+0x40` and the sample array at `+0x48/+0x50`. This keeps valid weapon HKX
+  motion donors from being rejected by stale field offsets.
 
 ## Non-Goals
 

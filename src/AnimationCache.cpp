@@ -96,7 +96,14 @@ namespace
 	static constexpr uint32_t kTagfileMagic   = 0xCAB00D1E;
 	static constexpr uint32_t kVersion11      = 0x0B;
 	static constexpr size_t kExtractedMotionOffset = 0x20;
-	static constexpr size_t kReferenceFrameObjectSize = 0x48;
+	// Fallout 4's hkaDefaultAnimatedReferenceFrame layout is:
+	//   +0x10/+0x20: hkVector4 basis data
+	//   +0x40:       duration
+	//   +0x48:       hkArray<hkVector4> samples (ptr/size/capacity)
+	// Keep the complete fixed header in the bounds check. The previous offsets
+	// treated +0x30 as duration and +0x38/+0x40 as the sample array, rejecting
+	// valid extracted-motion objects from the game's weapon HKXs.
+	static constexpr size_t kReferenceFrameObjectSize = 0x58;
 	static constexpr size_t kReferenceFrameSampleSize = 0x10;
 	static constexpr int32_t kMaxReferenceFrameSamples = 1'000'000;
 
@@ -131,18 +138,18 @@ namespace
 			return false;
 		}
 
-		// hkaDefaultAnimatedReferenceFrame contains up, forward, duration and
-		// an hkArray<hkVector4> referenceFrameSamples in this runtime layout.
+		// hkaDefaultAnimatedReferenceFrame contains basis vectors, duration and
+		// an hkArray<hkVector4> reference-frame samples in this runtime layout.
 		if (!IsFiniteVector(object + 0x10) || !IsFiniteVector(object + 0x20)) {
 			return false;
 		}
-		const auto duration = *reinterpret_cast<const float*>(object + 0x30);
+		const auto duration = *reinterpret_cast<const float*>(object + 0x40);
 		if (!std::isfinite(duration) || duration < 0.f || duration > 600.f) {
 			return false;
 		}
 
-		const auto samples = *reinterpret_cast<const uintptr_t*>(object + 0x38);
-		const auto sampleCount = *reinterpret_cast<const int32_t*>(object + 0x40);
+		const auto samples = *reinterpret_cast<const uintptr_t*>(object + 0x48);
+		const auto sampleCount = *reinterpret_cast<const int32_t*>(object + 0x50);
 		if (sampleCount < 0 || sampleCount > kMaxReferenceFrameSamples) {
 			return false;
 		}
