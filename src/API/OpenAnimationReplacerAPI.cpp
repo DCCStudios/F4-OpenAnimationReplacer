@@ -73,7 +73,7 @@ namespace
 				return a_factory();
 			});
 
-			logger::info("[OAR-API] Registered custom condition: '{}'", name);
+			OAR_VLOG("[OAR-API] Registered custom condition: '{}'", name);
 			return APIResult::OK;
 		}
 
@@ -93,7 +93,7 @@ namespace
 			}
 
 			factories.erase(it);
-			logger::info("[OAR-API] Unregistered condition: '{}'", name);
+			OAR_VLOG("[OAR-API] Unregistered condition: '{}'", name);
 			return true;
 		}
 
@@ -474,12 +474,12 @@ namespace
 
 extern "C" OAR_API void* RequestPluginAPI_Conditions()
 {
-	logger::info("[OAR-API] Conditions API requested (version 2)");
+	OAR_VLOG("[OAR-API] Conditions API requested (version 2)");
 	return static_cast<IConditionsAPIInternal*>(&g_conditionsAPI);
 }
 
 extern "C" OAR_API void* RequestPluginAPI_Clips()
 {
-	logger::info("[OAR-API] Clips API requested (version 2)");
+	OAR_VLOG("[OAR-API] Clips API requested (version 2)");
 	return static_cast<IClipsAPIInternal*>(&g_clipsAPI);
 }

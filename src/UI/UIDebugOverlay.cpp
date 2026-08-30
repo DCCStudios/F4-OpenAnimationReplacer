@@ -6,11 +6,47 @@
 
 #include <imgui.h>
 #include <algorithm>
+#include <cstdio>
 
 void UIDebugOverlay::DrawContents()
 {
 	auto* tracker = ActiveReplacementTracker::GetSingleton();
+	// This window is drawn every frame it is visible, so flag live view: Update()
+	// then bumps active clips every frame and PurgeStale() switches to a tight
+	// eviction window, so the list reflects what is actually replacing RIGHT NOW
+	// (a clip that stops — condition flips, weapon holstered — drops within a
+	// couple of frames instead of lingering up to 30s).
+	tracker->SetLiveViewActive();
+	tracker->PurgeStale();
 	auto snapshot = tracker->GetSnapshot();
+
+	// Actor filter (mirrors the Animation Log's "Filter by Actor"): show only the
+	// rows for one actor by FormID. "Player" fills in 0x14.
+	ImGui::Checkbox(UICommon::T("Filter by Actor"), &showOnlyActor);
+	if (showOnlyActor) {
+		ImGui::SameLine();
+		if (targetFormIDBuf[0] == '\0') {
+			snprintf(targetFormIDBuf, sizeof(targetFormIDBuf), "0x%X", targetFormID);
+		}
+		ImGui::SetNextItemWidth(120);
+		if (ImGui::InputText(UICommon::StableID("##arTargetID"), targetFormIDBuf, sizeof(targetFormIDBuf))) {
+			try { targetFormID = std::stoul(targetFormIDBuf, nullptr, 16); } catch (...) {}
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip(UICommon::T("Enter actor FormID (e.g. 0x14 for player)"));
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton(UICommon::T("Player"))) {
+			targetFormID = 0x14;
+			snprintf(targetFormIDBuf, sizeof(targetFormIDBuf), "0x14");
+		}
+
+		if (targetFormID != 0) {
+			std::erase_if(snapshot, [&](const ActiveReplacementEntry& e) {
+				return e.actorFormID != targetFormID;
+			});
+		}
+	}
 
 	ImGui::Text(UICommon::T("Active Replacements: %zu"), snapshot.size());
 	ImGui::Separator();
@@ -63,6 +99,14 @@ void UIDebugOverlay::DrawContents()
 
 			ImGui::TableNextColumn();
 			ImGui::TextWrapped(UICommon::T("%s"), entry.subModName.c_str());
+			// Other submods whose conditions also pass for this clip but lost to
+			// the winner on priority — shown dim and tagged so it's clear they are
+			// matching-but-overridden, not replacing.
+			for (const auto& overridden : entry.overriddenSubMods) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.55f, 0.30f, 1.0f));
+				ImGui::TextWrapped(UICommon::T("%s (overridden)"), overridden.c_str());
+				ImGui::PopStyleColor();
+			}
 
 			ImGui::TableNextColumn();
 			// Re-evaluate conditions live against the current game state

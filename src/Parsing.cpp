@@ -715,7 +715,7 @@ namespace Parsing
 			replacement->SetVariants(std::move(variants));
 
 			if (Settings::GetSingleton()->bVerboseLogging) {
-				logger::info("[OAR-Variants] Grouped {} variants for '{}' in submod '{}' (mode={})",
+				OAR_VLOG("[OAR-Variants] Grouped {} variants for '{}' in submod '{}' (mode={})",
 					files.size(), normalizedOriginal, subMod->GetName(),
 					subMod->variantMode == VariantMode::kSequential ? "sequential" : "random");
 			}

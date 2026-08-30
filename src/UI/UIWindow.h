@@ -37,6 +37,12 @@ protected:
 	virtual ImVec2 GetDefaultSize() const { return ImVec2(800, 600); }
 	virtual void OnOpen() {}
 	virtual void OnClose() {}
+	// Per-frame window opacity, applied uniformly to BOTH the window background
+	// and its content. Pushed before Begin() so the background rect (drawn inside
+	// Begin) fades together with the text — a fading overlay must never show an
+	// opaque box with invisible text. Default fully opaque; overlays that fade
+	// (e.g. the welcome banner) override this.
+	virtual float GetWindowAlpha() const { return 1.0f; }
 
 	WindowID windowID;
 	const char* title;

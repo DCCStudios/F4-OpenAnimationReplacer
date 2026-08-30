@@ -34,7 +34,7 @@ int32_t Variants::SelectIndex(uint32_t a_refrFormID, bool a_keepOnLoop, bool a_s
 		static std::atomic<int> s_rollLog{ 0 };
 		int rc = s_rollLog.fetch_add(1);
 		if (rc < 30) {
-			logger::info("[OAR-Variant] Fresh roll for refr={:X}: index={} / {} entries",
+			OAR_VLOG("[OAR-Variant] Fresh roll for refr={:X}: index={} / {} entries",
 				a_refrFormID, result, entries.size());
 		}
 		return result;
@@ -79,7 +79,7 @@ void Variants::ResetState(uint32_t a_refrFormID)
 	static std::atomic<int> s_resetLog{ 0 };
 	int rc = s_resetLog.fetch_add(1);
 	if (rc < 30) {
-		logger::info("[OAR-Variant] ResetState refr={:X} hadCachedResult={}", a_refrFormID, hadEntry);
+		OAR_VLOG("[OAR-Variant] ResetState refr={:X} hadCachedResult={}", a_refrFormID, hadEntry);
 	}
 }
 

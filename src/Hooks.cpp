@@ -1768,58 +1768,58 @@ void PopulateKnownStringData()
 	std::unique_lock lock(s_knownStringDataMutex);
 	s_knownStringDataList.clear();
 
-	logger::info("[OAR-StringData] Walking {} player graphs for stringData...", manager->graph.size());
+	OAR_VLOG("[OAR-StringData] Walking {} player graphs for stringData...", manager->graph.size());
 	for (uint32_t i = 0; i < manager->graph.size(); i++) {
 		auto* character = &manager->graph[i]->character;
-		logger::info("[OAR-StringData]   graph[{}] character={:X} name='{}'", i,
+		OAR_VLOG("[OAR-StringData]   graph[{}] character={:X} name='{}'", i,
 			reinterpret_cast<uintptr_t>(character),
 			(character->name.data() && !IsBadReadPtr(character->name.data(), 1)) ? character->name.data() : "(null)");
 
 		auto* setup = character->setup._ptr;
 		if (!setup || reinterpret_cast<uintptr_t>(setup) < 0x10000 || IsBadReadPtr(setup, 0x50)) {
-			logger::info("[OAR-StringData]     setup=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(setup));
+			OAR_VLOG("[OAR-StringData]     setup=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(setup));
 			continue;
 		}
-		logger::info("[OAR-StringData]     setup={:X}", reinterpret_cast<uintptr_t>(setup));
+		OAR_VLOG("[OAR-StringData]     setup={:X}", reinterpret_cast<uintptr_t>(setup));
 
 		auto* data = *reinterpret_cast<RE::hkbCharacterData**>(reinterpret_cast<uint8_t*>(setup) + 0x40);
 		if (!data || reinterpret_cast<uintptr_t>(data) < 0x10000 || IsBadReadPtr(data, 0xC0)) {
-			logger::info("[OAR-StringData]     data=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(data));
+			OAR_VLOG("[OAR-StringData]     data=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(data));
 			continue;
 		}
-		logger::info("[OAR-StringData]     data={:X}", reinterpret_cast<uintptr_t>(data));
+		OAR_VLOG("[OAR-StringData]     data={:X}", reinterpret_cast<uintptr_t>(data));
 
 		auto* stringData = *reinterpret_cast<RE::hkbCharacterStringData**>(reinterpret_cast<uint8_t*>(data) + 0xB0);
 		if (!stringData || reinterpret_cast<uintptr_t>(stringData) < 0x10000 || IsBadReadPtr(stringData, 0x40)) {
-			logger::info("[OAR-StringData]     stringData=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(stringData));
+			OAR_VLOG("[OAR-StringData]     stringData=NULL/invalid ({:X})", reinterpret_cast<uintptr_t>(stringData));
 			continue;
 		}
 
 		uintptr_t vtbl = *reinterpret_cast<uintptr_t*>(stringData);
-		logger::info("[OAR-StringData]     stringData={:X} vtbl={:X}", reinterpret_cast<uintptr_t>(stringData), vtbl);
+		OAR_VLOG("[OAR-StringData]     stringData={:X} vtbl={:X}", reinterpret_cast<uintptr_t>(stringData), vtbl);
 
 		auto& animNames = stringData->animationNames;
 		auto* arrBase = reinterpret_cast<const uint8_t*>(&animNames);
 		auto* nameData = *reinterpret_cast<RE::hkbCharacterStringData::FileNameMeshNamePair* const*>(arrBase);
 		int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
-		logger::info("[OAR-StringData]     animationNames: count={} data={:X}", nameSize, reinterpret_cast<uintptr_t>(nameData));
+		OAR_VLOG("[OAR-StringData]     animationNames: count={} data={:X}", nameSize, reinterpret_cast<uintptr_t>(nameData));
 
 		if (nameData && !IsBadReadPtr(nameData, sizeof(void*)) && nameSize > 0) {
 			int dumpCount = std::min(nameSize, 10);
 			for (int j = 0; j < dumpCount; j++) {
 				const char* fn = nameData[j].fileName.data();
 				if (fn && reinterpret_cast<uintptr_t>(fn) > 0x10000 && !IsBadReadPtr(fn, 1)) {
-					logger::info("[OAR-StringData]       [{}] '{}'", j, fn);
+					OAR_VLOG("[OAR-StringData]       [{}] '{}'", j, fn);
 				}
 			}
 			if (nameSize > 10) {
-				logger::info("[OAR-StringData]       ... ({} more entries)", nameSize - 10);
+				OAR_VLOG("[OAR-StringData]       ... ({} more entries)", nameSize - 10);
 			}
 		}
 
 		s_knownStringDataList.push_back(stringData);
 	}
-	logger::info("[OAR-StringData] Collected {} known stringData objects", s_knownStringDataList.size());
+	OAR_VLOG("[OAR-StringData] Collected {} known stringData objects", s_knownStringDataList.size());
 }
 
 // ============ Option 1: Read weapon graph's projectData->stringData->animationPath ============
@@ -1869,7 +1869,7 @@ void RefreshWeaponAnimFolder()
 			const char* charName = character->name.data();
 			std::string nameStr = (charName && reinterpret_cast<uintptr_t>(charName) > 0x10000 &&
 				!IsBadReadPtr(charName, 1)) ? charName : "(null)";
-			logger::info("[OAR-WeaponPath]   graph[{}] name='{}' animationPath='{}'",
+			OAR_VLOG("[OAR-WeaponPath]   graph[{}] name='{}' animationPath='{}'",
 				i, nameStr, pathStr.empty() ? "(empty)" : pathStr);
 		}
 
@@ -1900,7 +1900,7 @@ void RefreshWeaponAnimFolder()
 				if (i >= 1) {
 					s_weaponAnimFolder = folderPrefix;
 					s_weaponAnimFolderValid.store(true);
-					logger::info("[OAR-WeaponPath] Weapon animation folder = '{}'", folderPrefix);
+					OAR_VLOG("[OAR-WeaponPath] Weapon animation folder = '{}'", folderPrefix);
 				}
 			}
 		}
@@ -1921,7 +1921,7 @@ void RefreshWeaponAnimFolder()
 					std::unique_lock sgLock(s_subGraphToFolderMutex);
 					if (s_subGraphIDToFolder.find(id) == s_subGraphIDToFolder.end()) {
 						s_subGraphIDToFolder[id] = s_weaponAnimFolder;
-						logger::info("[OAR-SubGraphID] Mapped {:X} -> '{}'", id, s_weaponAnimFolder);
+						OAR_VLOG("[OAR-SubGraphID] Mapped {:X} -> '{}'", id, s_weaponAnimFolder);
 					}
 				}
 			}
@@ -1929,7 +1929,7 @@ void RefreshWeaponAnimFolder()
 	}
 
 	if (verbose) {
-		logger::info("[OAR-WeaponPath] Refresh complete. weaponFolder='{}' valid={}",
+		OAR_VLOG("[OAR-WeaponPath] Refresh complete. weaponFolder='{}' valid={}",
 			s_weaponAnimFolder, s_weaponAnimFolderValid.load());
 	}
 }
@@ -2302,7 +2302,7 @@ namespace
 		s_vtableClipTriggerArray.store(arrVtbl);
 		s_vtableStringEventPayload.store(payVtbl);
 
-		logger::info("[OAR-TrigBuild] Resolved vtables from REL::ID — hkbClipTriggerArray={:X}, hkbStringEventPayload={:X}",
+		OAR_VLOG("[OAR-TrigBuild] Resolved vtables from REL::ID — hkbClipTriggerArray={:X}, hkbStringEventPayload={:X}",
 			arrVtbl, payVtbl);
 	}
 
@@ -2387,9 +2387,9 @@ namespace
 		*reinterpret_cast<int32_t*>(aMem + 0x18) = static_cast<int32_t>(trigCount);
 		*reinterpret_cast<uint32_t*>(aMem + 0x1C) = static_cast<uint32_t>(trigCount) | 0x80000000u;
 
-		logger::info("[OAR-TrigBuild] Built replacement triggers for '{}': {} entries", a_suffix, trigCount);
+		OAR_VLOG("[OAR-TrigBuild] Built replacement triggers for '{}': {} entries", a_suffix, trigCount);
 		for (size_t i = 0; i < trigCount && i < 5; ++i) {
-			logger::info("[OAR-TrigBuild]   t={:.4f}s '{}'", (*annotations)[i].time, (*annotations)[i].text);
+			OAR_VLOG("[OAR-TrigBuild]   t={:.4f}s '{}'", (*annotations)[i].time, (*annotations)[i].text);
 		}
 
 		auto* result = built->GetTriggerArray();
@@ -2553,14 +2553,14 @@ namespace
 			const bool drop = !a_keepAnnotations && (isAnnotFlag || matchesOrigAnnot);
 			if (!drop) keep.push_back(i);
 			if (dump) {
-				logger::info("[OAR-TrigFilter]   [{}] t={:.3f} id={} isAnnot={} text='{}' -> {}",
+				OAR_VLOG("[OAR-TrigFilter]   [{}] t={:.3f} id={} isAnnot={} text='{}' -> {}",
 					i, *reinterpret_cast<const float*>(trig),
 					*reinterpret_cast<const int32_t*>(trig + 0x08),
 					isAnnotFlag, text ? text : "(none)", drop ? "DROP" : "KEEP");
 			}
 		}
 		if (dump) {
-			logger::info("[OAR-TrigFilter] src={:X}: {} triggers, kept {} behavior triggers",
+			OAR_VLOG("[OAR-TrigFilter] src={:X}: {} triggers, kept {} behavior triggers",
 				reinterpret_cast<uintptr_t>(a_src), srcCount, keep.size());
 		}
 		if (keep.empty()) return nullptr;
@@ -2597,7 +2597,7 @@ namespace
 					trig[0x18] = 0;
 					static int s_retimeLog = 0;
 					if (s_retimeLog < 30) {
-						logger::info("[OAR-TrigFilter] EndClipIfShorter: re-timed end trigger id={} rel={:.3f} -> abs={:.3f} (repDur={:.3f})",
+						OAR_VLOG("[OAR-TrigFilter] EndClipIfShorter: re-timed end trigger id={} rel={:.3f} -> abs={:.3f} (repDur={:.3f})",
 							*reinterpret_cast<const int32_t*>(trig + 0x08), rel, absTime, a_endClipDuration);
 						s_retimeLog++;
 					}
@@ -2927,7 +2927,7 @@ namespace
 
 			static int s_installLog = 0;
 			if (s_installLog < 30) {
-				logger::info("[OAR-Triggers] Filtered clipGen={:X} orig triggers={:X}/{:X} -> behaviorOnly={:X}",
+				OAR_VLOG("[OAR-Triggers] Filtered clipGen={:X} orig triggers={:X}/{:X} -> behaviorOnly={:X}",
 					reinterpret_cast<uintptr_t>(a_clipGen),
 					reinterpret_cast<uintptr_t>(backup.triggers),
 					reinterpret_cast<uintptr_t>(backup.originalTriggers),
@@ -2987,7 +2987,7 @@ namespace
 			*origTriggersPtr = it->second.originalTriggers;
 			static int s_restoreLog = 0;
 			if (s_restoreLog < 30) {
-				logger::info("[OAR-Triggers] Restored clipGen={:X} triggers={:X} originalTriggers={:X}",
+				OAR_VLOG("[OAR-Triggers] Restored clipGen={:X} triggers={:X} originalTriggers={:X}",
 					reinterpret_cast<uintptr_t>(a_clipGen),
 					reinterpret_cast<uintptr_t>(it->second.triggers),
 					reinterpret_cast<uintptr_t>(it->second.originalTriggers));
@@ -3956,14 +3956,14 @@ namespace
 
 		s_idleAnimReverseBuilt.store(true);
 		s_building.store(false);
-		logger::info("[OAR-IdleAnim] Built reverse map: {} entries ({} skipped) from {} total",
+		OAR_VLOG("[OAR-IdleAnim] Built reverse map: {} entries ({} skipped) from {} total",
 			captured, skipped, arrHeader->size);
 
 		int logged = 0;
 		std::shared_lock lock(s_idleAnimReverseMutex);
 		for (auto& [clipPtr, name] : s_idleAnimReverseMap) {
 			if (logged >= 10) break;
-			logger::info("[OAR-IdleAnim]   clip={:X} -> '{}'",
+			OAR_VLOG("[OAR-IdleAnim]   clip={:X} -> '{}'",
 				reinterpret_cast<uintptr_t>(clipPtr), name);
 			logged++;
 		}
@@ -4272,7 +4272,21 @@ namespace
 			std::string suffix;
 			const ReplacementAnimFileInfo* info;
 		};
-		std::vector<PreloadItem> work;
+		// Archive (BA2) items are captured BY VALUE: their resource opens are
+		// deferred to a main-thread task that runs after this background load, so
+		// they must not depend on the parse data still being alive when it runs.
+		// `owner` is an opaque cache key (AnimationCache only ever stores/compares
+		// it, never dereferences it), so a raw SubMod* is safe to copy even if a
+		// later config reload frees it.
+		struct DeferredArchiveItem
+		{
+			std::string suffix;
+			std::string resourcePath;
+			const void* owner;
+			int32_t priority;
+		};
+		std::vector<PreloadItem> looseWork;
+		std::vector<DeferredArchiveItem> archiveWork;
 		std::atomic<int> failed{ 0 };
 
 		for (auto& [mapKey, replacementInfos] : pathMap) {
@@ -4285,18 +4299,28 @@ namespace
 					failed.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
-				work.push_back({ suffix, &info });
+				// Loose files load on the parallel workers below (safe: plain file
+				// IO). Archive resources are deferred to a serial main-thread pass
+				// (see after the loose load) because opening BSResourceNiBinaryStream
+				// off the main thread during startup archive registration
+				// access-violates. This mirrors the original per-item
+				// archiveResource branch that used to run inside runWorker.
+				if (info.archiveResource) {
+					const auto priority = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
+					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority });
+				} else {
+					looseWork.push_back({ suffix, &info });
+				}
 			}
 		}
 
-		// Progress bar denominator must match what LoadAnimation increments
-		// (loadingLoadedAnims), not the ReplacementAnimation object count.
-		// Variant groups are ONE ReplacementAnimation but N cache files
-		// (base + __v1/__v2/...), and multiple SubMods can each contribute a
-		// file for the same original path — that used to show as "40/36".
-		oar->loadingTotalAnims.store(static_cast<int>(work.size()));
+		// Progress bar denominator tracks the loose load (the dominant cost, run
+		// synchronously on this background thread). Archive resources load on a
+		// short deferred main-thread pass afterward; loadingLoadedAnims can briefly
+		// exceed this total once they finish, which UIAnimationQueue clamps to 100%.
+		oar->loadingTotalAnims.store(static_cast<int>(looseWork.size()));
 		oar->loadingLoadedAnims.store(0);
-		oar->loadingParsedAnims.store(static_cast<int>(work.size()));
+		oar->loadingParsedAnims.store(static_cast<int>(looseWork.size()));
 
 		std::atomic<int> loaded{ 0 };
 		std::atomic<size_t> nextItem{ 0 };
@@ -4304,12 +4328,11 @@ namespace
 		auto runWorker = [&]() {
 			for (;;) {
 				const size_t i = nextItem.fetch_add(1, std::memory_order_relaxed);
-				if (i >= work.size()) break;
-				const auto& item = work[i];
+				if (i >= looseWork.size()) break;
+				const auto& item = looseWork[i];
 				const auto priority = item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0;
-				const auto loadedFromSource = item.info->archiveResource
-					? cache->LoadAnimationResource(item.suffix, item.info->resourcePath, item.info->parentSubMod, priority)
-					: cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
+				const bool loadedFromSource =
+					cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
 				if (loadedFromSource) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {
@@ -4325,9 +4348,9 @@ namespace
 		// dominate the cost on Windows (the AV scans each loose file on open),
 		// so overlapping them scales nearly linearly with thread count.
 		unsigned threadCount = 1;
-		if (Settings::GetSingleton()->bAsyncParsing && work.size() > 1) {
+		if (Settings::GetSingleton()->bAsyncParsing && looseWork.size() > 1) {
 			threadCount = std::clamp(std::thread::hardware_concurrency(), 2u, 16u);
-			threadCount = std::min(threadCount, static_cast<unsigned>(work.size()));
+			threadCount = std::min(threadCount, static_cast<unsigned>(looseWork.size()));
 		}
 
 		const auto start = std::chrono::high_resolution_clock::now();
@@ -4347,8 +4370,49 @@ namespace
 			std::chrono::high_resolution_clock::now() - start)
 		                    .count();
 
-		logger::info("[OAR-Preload] Pre-loaded {} animations ({} failed) on {} thread(s) in {}ms, cache size: {}",
+		logger::info("[OAR-Preload] Pre-loaded {} loose animations ({} failed) on {} thread(s) in {}ms, cache size: {}",
 			loaded.load(), failed.load(), threadCount, ms, cache->GetCacheSize());
+
+		// Deferred archive (BA2) load pass. BSResourceNiBinaryStream MUST NOT be
+		// opened from the parallel workers above: during startup the game is still
+		// registering BA2 locations, and touching the resource manager off the main
+		// thread mid-registration access-violates in CreateStandardContext (the same
+		// hazard BA2Archive.cpp avoids at index time). Route every archive open
+		// through a single F4SE task instead — it runs serially on the MAIN thread
+		// on the next frame, by which point kGameDataReady has returned and archive
+		// registration has settled, so the resource system is safe to call.
+		if (!archiveWork.empty()) {
+			logger::info("[OAR-Preload] Deferring {} archive (BA2) animation(s) to a main-thread load pass",
+				archiveWork.size());
+
+			auto loadArchives = [items = std::move(archiveWork)]() {
+				auto* cache = AnimationCache::GetSingleton();
+				int aLoaded = 0;
+				int aFailed = 0;
+				for (const auto& it : items) {
+					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority)) {
+						++aLoaded;
+					} else {
+						++aFailed;
+					}
+				}
+				logger::info("[OAR-Preload] Archive (BA2) load pass complete: {} loaded, {} failed, cache size: {}",
+					aLoaded, aFailed, cache->GetCacheSize());
+				if (auto log = spdlog::default_logger()) {
+					log->flush();
+				}
+			};
+
+			if (auto* tasks = F4SE::GetTaskInterface()) {
+				tasks->AddTask(loadArchives);
+			} else {
+				// No task interface (should not happen after F4SEPlugin_Load). Run
+				// inline as a last resort; LoadAnimationResource's SEH guard is the
+				// safety net if the registration race bites here.
+				logger::warn("[OAR-Preload] No F4SE task interface available; loading archives inline");
+				loadArchives();
+			}
+		}
 	}
 
 	// Full "Reload All Configs" implementation. GAME THREAD ONLY — drained
@@ -5450,12 +5514,12 @@ namespace
 							const auto dumpArray = [&](uintptr_t a_off, const char* a_label) {
 								const auto array = dataBlock + a_off;
 								if (IsBadReadPtr(reinterpret_cast<void*>(array), 0x18)) {
-									logger::info("[OAR-PollDump]   {} @+{:X}: unreadable", a_label, a_off);
+									OAR_VLOG("[OAR-PollDump]   {} @+{:X}: unreadable", a_label, a_off);
 									return;
 								}
 								const auto entries = *reinterpret_cast<uintptr_t*>(array);
 								const auto size = *reinterpret_cast<uint32_t*>(array + 0x10);
-								logger::info("[OAR-PollDump]   {} @+{:X}: entries={:X} size={}", a_label, a_off, entries, size);
+								OAR_VLOG("[OAR-PollDump]   {} @+{:X}: entries={:X} size={}", a_label, a_off, entries, size);
 								if (!entries || size == 0 || size > 0x400 ||
 									IsBadReadPtr(reinterpret_cast<void*>(entries), size * sizeof(void*))) {
 									return;
@@ -5466,11 +5530,11 @@ namespace
 									if (!s) s = "(null)";
 									// Show the candidate this entry yields for the failing leaf + probe result
 									auto cand = SubgraphBuildCandidate(s, leaf);
-									logger::info("[OAR-PollDump]     [{}] '{}' -> cand='{}' exists={}",
+									OAR_VLOG("[OAR-PollDump]     [{}] '{}' -> cand='{}' exists={}",
 										k, s, cand, !cand.empty() && SubgraphResourceExists(cand));
 								}
 							};
-							logger::info("[OAR-PollDump] dataBlock={:X} (for clip '{}')", dataBlock, leaf);
+							OAR_VLOG("[OAR-PollDump] dataBlock={:X} (for clip '{}')", dataBlock, leaf);
 							dumpArray(kData_FileArrayPrimary, "primary");
 							dumpArray(kData_FileArrayFallback, "fallback");
 						}
@@ -5775,7 +5839,7 @@ namespace
 			if (fileSig == clipSig) return true;
 			static std::atomic<int> s_skelGateLog{ 0 };
 			if (s_skelGateLog.fetch_add(1, std::memory_order_relaxed) < 30) {
-				logger::info("[OAR-SkelGate] blocked candidate: file root='{}' clip root='{}' (clipGen={:X}, file='{}')",
+				OAR_VLOG("[OAR-SkelGate] blocked candidate: file root='{}' clip root='{}' (clipGen={:X}, file='{}')",
 					fileSig, clipSig, reinterpret_cast<uintptr_t>(a_clip), a_info->replacementPath);
 			}
 			return false;
@@ -6736,7 +6800,7 @@ namespace
 							aState && aState->nativeAnchorPose.size() > 28) {
 							const auto& ah = aState->nativeAnchorPose[26];
 							const auto& aw = aState->nativeAnchorPose[28];
-							logger::info("[OAR-TF-Anchor] Captured {}-bone final-pose anchor: RArm_Hand T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) | Weapon T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
+							OAR_VLOG("[OAR-TF-Anchor] Captured {}-bone final-pose anchor: RArm_Hand T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f}) | Weapon T=({:.3f},{:.3f},{:.3f}) R=({:.3f},{:.3f},{:.3f},{:.3f})",
 								aState->nativeAnchorPose.size(),
 								ah.translation[0], ah.translation[1], ah.translation[2],
 								ah.rotation[0], ah.rotation[1], ah.rotation[2], ah.rotation[3],
@@ -6799,7 +6863,7 @@ namespace
 		static std::atomic<int> s_scrubBailLog{ 0 };
 		auto bail = [&](const char* a_stage) {
 			if (s_scrubBailLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-				logger::info("[OAR-Scrub] bail: {} (clipGen={:X}, playerGraph={})",
+				OAR_VLOG("[OAR-Scrub] bail: {} (clipGen={:X}, playerGraph={})",
 					a_stage, reinterpret_cast<uintptr_t>(a_this), a_playerGraphIndex);
 			}
 		};
@@ -6837,7 +6901,7 @@ namespace
 		if (bindIdx < 0 || bindIdx >= bindingCount) {
 			static std::atomic<int> s_scrubIdxLog{ 0 };
 			if (s_scrubIdxLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-				logger::info("[OAR-Scrub] bail: bindIdx {} out of range [0,{}) (clipGen={:X})",
+				OAR_VLOG("[OAR-Scrub] bail: bindIdx {} out of range [0,{}) (clipGen={:X})",
 					bindIdx, bindingCount, reinterpret_cast<uintptr_t>(a_this));
 			}
 			return;
@@ -7217,7 +7281,7 @@ namespace
 			InstallReplacementTriggers(a_this, "", endClipDurAct);
 			static int s_actNullLog = 0;
 			if (s_actNullLog < 20) {
-				logger::info("[OAR-Triggers] Activation pre-NULL for clipGen={:X} (winner '{}')",
+				OAR_VLOG("[OAR-Triggers] Activation pre-NULL for clipGen={:X} (winner '{}')",
 					reinterpret_cast<uintptr_t>(a_this),
 					preSwapWinner->parentSubMod->GetName());
 				s_actNullLog++;
@@ -8367,7 +8431,7 @@ namespace
 				// the probe pick a different variant's file.
 				static std::atomic<int> s_bindInheritLog{ 0 };
 				if (s_bindInheritLog.fetch_add(1, std::memory_order_relaxed) < 20) {
-					logger::info("[OAR-MultiMatch] leaf='{}' settled real suffix='{}' (registered={})",
+					OAR_VLOG("[OAR-MultiMatch] leaf='{}' settled real suffix='{}' (registered={})",
 						leafName, exactSuffix, candidatesPtr != nullptr);
 				}
 			}
@@ -8471,7 +8535,7 @@ namespace
 							}
 							static int s_multiRestoreLog = 0;
 							if (s_multiRestoreLog < 30) {
-								logger::info("[OAR-MultiMatch] leaf='{}' - restoring validated original (conditions no longer met)", leafName);
+								OAR_VLOG("[OAR-MultiMatch] leaf='{}' - restoring validated original (conditions no longer met)", leafName);
 								s_multiRestoreLog++;
 							}
 						} else {
@@ -8498,7 +8562,7 @@ namespace
 
 			static int s_multiLog = 0;
 			if (s_multiLog < 20) {
-				logger::info("[OAR-MultiMatch] leaf='{}' resolved to suffix='{}'",
+				OAR_VLOG("[OAR-MultiMatch] leaf='{}' resolved to suffix='{}'",
 					leafName, resolvedSuffix);
 				s_multiLog++;
 			}
@@ -8525,7 +8589,7 @@ namespace
 			// keep a tiny breadcrumb at info for genuine stuck cases.
 			static int s_slotNullLog = 0;
 			if (s_slotNullLog < 5) {
-				logger::info("[OAR-SlotNull] animSlot not ready for '{}' clipGen={:X} ctrl={:X} (transient; skipped)",
+				OAR_VLOG("[OAR-SlotNull] animSlot not ready for '{}' clipGen={:X} ctrl={:X} (transient; skipped)",
 					resolvedSuffix, reinterpret_cast<uintptr_t>(a_this),
 					reinterpret_cast<uintptr_t>(a_this->GetAnimationControlRaw()));
 				s_slotNullLog++;
@@ -8646,7 +8710,7 @@ namespace
 			static std::atomic<int> s_condEvalReachCount{ 0 };
 			int reachCount = s_condEvalReachCount.fetch_add(1);
 			if (reachCount < 5) {
-				logger::info("[OAR-CondEval] Reached condition eval for '{}' (count={}, original={:X}, animSlot={:X})",
+				OAR_VLOG("[OAR-CondEval] Reached condition eval for '{}' (count={}, original={:X}, animSlot={:X})",
 					resolvedSuffix, reachCount,
 					reinterpret_cast<uintptr_t>(originalAnim),
 					reinterpret_cast<uintptr_t>(*animSlot));
@@ -8957,7 +9021,7 @@ namespace
 							static std::atomic<int> s_variantSelectLog{ 0 };
 							int vCount = s_variantSelectLog.fetch_add(1);
 							if (vCount < 30 || vCount % 500 == 0) {
-								logger::info("[OAR-Variant] Fresh roll (OnEachPlay) clip={:X} refr={:X}: suffix='{}' (count={})",
+								OAR_VLOG("[OAR-Variant] Fresh roll (OnEachPlay) clip={:X} refr={:X}: suffix='{}' (count={})",
 									reinterpret_cast<uintptr_t>(a_this), refr->GetFormID(), variantSuffix,
 									variants->GetCount());
 							}
@@ -9496,6 +9560,35 @@ namespace
 				entry.subModName = winningInfo->parentSubMod->GetName();
 				entry.subMod = winningInfo->parentSubMod;
 			}
+			// Overridden-by-priority list (only while the Active Replacements
+			// window is open, so normal play pays no extra condition evals):
+			// candidates are priority-sorted and the winner is the FIRST passing
+			// one, so any OTHER candidate whose conditions ALSO pass is a
+			// lower-priority submod the winner is overriding. Report them so the
+			// window shows every submod matching this clip and marks the losers.
+			if (refr && ActiveReplacementTracker::GetSingleton()->IsLiveViewActive()) {
+				for (auto* other : candidates) {
+					if (!other || !other->parentSubMod) continue;
+					auto* osm = other->parentSubMod;
+					if (osm == winningInfo->parentSubMod) continue;
+					if (osm->IsDisabled()) continue;
+					if (!ClaimSkeletonAllowed(a_this, other)) continue;
+					bool passes = false;
+					auto* ocs = osm->GetConditionSet();
+					if (!ocs || ocs->IsEmpty()) {
+						passes = true;
+					} else {
+						try { passes = osm->EvaluateConditions(refr, a_this); }
+						catch (...) { passes = false; }
+					}
+					if (!passes) continue;
+					std::string oname = osm->GetName();
+					if (std::find(entry.overriddenSubMods.begin(), entry.overriddenSubMods.end(), oname) ==
+						entry.overriddenSubMods.end()) {
+						entry.overriddenSubMods.push_back(std::move(oname));
+					}
+				}
+			}
 		}
 		uint32_t actorID = 0;
 		if (refr) {
@@ -9853,7 +9946,7 @@ namespace
 					}
 					static int s_trigRestoreLog = 0;
 					if (s_trigRestoreLog < 20) {
-						logger::info("[OAR-Triggers] Restored triggers for '{}' (anim completed, localTime={:.3f} duration={:.3f} clipGen={:X}) [playOnce unlocked]",
+						OAR_VLOG("[OAR-Triggers] Restored triggers for '{}' (anim completed, localTime={:.3f} duration={:.3f} clipGen={:X}) [playOnce unlocked]",
 							resolvedSuffix, localTime, duration, reinterpret_cast<uintptr_t>(a_this));
 						s_trigRestoreLog++;
 					}
@@ -12816,7 +12909,7 @@ namespace
 					InstallReplacementTriggers(a_this, "", endClipDurEcho);
 					static int s_echoRenullLog = 0;
 					if (s_echoRenullLog < 20) {
-						logger::info("[OAR-Triggers] Echo restart — re-NULL'd triggers for clipGen={:X}",
+						OAR_VLOG("[OAR-Triggers] Echo restart — re-NULL'd triggers for clipGen={:X}",
 							reinterpret_cast<uintptr_t>(a_this));
 						s_echoRenullLog++;
 					}
@@ -13795,7 +13888,7 @@ namespace
 				auto* nameData = *reinterpret_cast<RE::hkbCharacterStringData::FileNameMeshNamePair* const*>(arrBase);
 				int32_t nameSize = *reinterpret_cast<const int32_t*>(arrBase + 8);
 
-				logger::info("[OAR-LoadClips2-Dump] stringData={:X} animNames.size={}", 
+				OAR_VLOG("[OAR-LoadClips2-Dump] stringData={:X} animNames.size={}", 
 					reinterpret_cast<uintptr_t>(a_stringData), nameSize);
 
 				if (nameData && !IsBadReadPtr(nameData, sizeof(void*)) && nameSize > 0) {
@@ -13803,9 +13896,9 @@ namespace
 					for (int i = 0; i < dumpCount; i++) {
 						const char* fn = nameData[i].fileName.data();
 						if (fn && reinterpret_cast<uintptr_t>(fn) > 0x10000 && !IsBadReadPtr(fn, 1)) {
-							logger::info("[OAR-LoadClips2-Dump]   [{}] fileName='{}'", i, fn);
+							OAR_VLOG("[OAR-LoadClips2-Dump]   [{}] fileName='{}'", i, fn);
 						} else {
-							logger::info("[OAR-LoadClips2-Dump]   [{}] fileName=(bad ptr {:X})", i, reinterpret_cast<uintptr_t>(fn));
+							OAR_VLOG("[OAR-LoadClips2-Dump]   [{}] fileName=(bad ptr {:X})", i, reinterpret_cast<uintptr_t>(fn));
 						}
 					}
 				}

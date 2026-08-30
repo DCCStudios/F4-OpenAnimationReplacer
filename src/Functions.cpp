@@ -37,7 +37,7 @@ void SetGraphVariableFunction::Execute(RE::TESObjectREFR* a_refr, RE::hkbClipGen
 	// Fallback: Use the underlying virtual table call
 	// IAnimationGraphManagerHolder vtable index for SetGraphVariable* varies
 	// For safety, just log
-	logger::info("[OAR-Func] SetGraphVariable '{}' on {:X} (value pending implementation)", variableName, a_refr->GetFormID());
+	OAR_VLOG("[OAR-Func] SetGraphVariable '{}' on {:X} (value pending implementation)", variableName, a_refr->GetFormID());
 }
 
 void SetGraphVariableFunction::Initialize(const nlohmann::json& a_json)
@@ -134,7 +134,7 @@ void UnequipSlotFunction::Execute(RE::TESObjectREFR* a_refr, RE::hkbClipGenerato
 	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return;
 	// Unequip by biped slot index - requires ActorEquipManager
 	// For now, log intent but don't crash
-	logger::info("[OAR-Func] UnequipSlot {} on {:X}", slotIndex, a_refr->GetFormID());
+	OAR_VLOG("[OAR-Func] UnequipSlot {} on {:X}", slotIndex, a_refr->GetFormID());
 }
 
 void UnequipSlotFunction::Initialize(const nlohmann::json& a_json)

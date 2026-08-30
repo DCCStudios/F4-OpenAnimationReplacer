@@ -12,25 +12,20 @@ void Settings::Load()
 		logger::warn("[OAR] No INI found at '{}' - using defaults", kSettingsPath);
 	}
 
-	CSimpleIniA user;
-	user.SetUnicode();
-	const bool userLoaded = (user.LoadFile(kUserSettingsPath) >= 0);
-	if (userLoaded) {
-		logger::info("[OAR] User settings loaded from '{}' (defaults: '{}')",
-			kUserSettingsPath, kSettingsPath);
-	}
-
+	// Single-INI model (user-directed): read and write ONE shipped INI
+	// (kSettingsPath). The previous user.ini overlay is removed so the file the user
+	// edits by hand and the file the Settings page writes are always the same one.
 	auto getB = [&](const char* sec, const char* key, bool def) {
-		return user.GetBoolValue(sec, key, defaults.GetBoolValue(sec, key, def));
+		return defaults.GetBoolValue(sec, key, def);
 	};
 	auto getI = [&](const char* sec, const char* key, int def) {
-		return static_cast<int>(user.GetLongValue(sec, key, defaults.GetLongValue(sec, key, def)));
+		return static_cast<int>(defaults.GetLongValue(sec, key, def));
 	};
 	auto getD = [&](const char* sec, const char* key, double def) {
-		return user.GetDoubleValue(sec, key, defaults.GetDoubleValue(sec, key, def));
+		return defaults.GetDoubleValue(sec, key, def);
 	};
 	auto getS = [&](const char* sec, const char* key, const char* def) {
-		return user.GetValue(sec, key, defaults.GetValue(sec, key, def));
+		return defaults.GetValue(sec, key, def);
 	};
 
 	bEnabled                      = getB("General", "bEnabled", bEnabled);
@@ -45,8 +40,7 @@ void Settings::Load()
 	iAutoReloadMode               = std::clamp(getI("General", "iAutoReloadMode", iAutoReloadMode), 0, 2);
 	bPlayDryFireSound             = getB("General", "bPlayDryFireSound", bPlayDryFireSound);
 
-	iToggleKey   = static_cast<std::uint32_t>(user.GetLongValue("UI", "iToggleKey",
-		defaults.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey))));
+	iToggleKey   = static_cast<std::uint32_t>(defaults.GetLongValue("UI", "iToggleKey", static_cast<long>(iToggleKey)));
 	bRequireShift = getB("UI", "bRequireShift", bRequireShift);
 	bPauseOnMenuOpen = getB("UI", "bPauseOnMenuOpen", bPauseOnMenuOpen);
 	iEditorMode = std::clamp(getI("UI", "iEditorMode", iEditorMode), 0, 2);
@@ -94,7 +88,10 @@ void Settings::Save()
 {
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	ini.LoadFile(kUserSettingsPath);
+	// Single-INI model (user-directed): load, modify, and re-save the shipped INI in
+	// place so hand edits and Settings-page writes share one file. Loading first
+	// preserves comments/keys we don't manage.
+	ini.LoadFile(kSettingsPath);
 
 	auto setB = [&](const char* sec, const char* key, bool val) {
 		ini.SetBoolValue(sec, key, val);
@@ -137,18 +134,17 @@ void Settings::Save()
 
 	setB("Debug", "bVerboseLogging", bVerboseLogging);
 
-	const std::filesystem::path userPath(kUserSettingsPath);
+	const std::filesystem::path iniPath(kSettingsPath);
 	std::error_code ec;
-	std::filesystem::create_directories(userPath.parent_path(), ec);
+	std::filesystem::create_directories(iniPath.parent_path(), ec);
 	if (ec) {
-		logger::error("[OAR] Failed to create user settings directory '{}': {}",
-			userPath.parent_path().string(), ec.message());
+		logger::error("[OAR] Failed to create settings directory '{}': {}",
+			iniPath.parent_path().string(), ec.message());
 	}
 
-	if (!ec && ini.SaveFile(kUserSettingsPath) >= 0) {
-		logger::info("[OAR] User settings saved to '{}' (defaults preserved at '{}')",
-			kUserSettingsPath, kSettingsPath);
+	if (!ec && ini.SaveFile(kSettingsPath) >= 0) {
+		logger::info("[OAR] Settings saved to '{}'", kSettingsPath);
 	} else {
-		logger::error("[OAR] Failed to save user settings to '{}'", kUserSettingsPath);
+		logger::error("[OAR] Failed to save settings to '{}'", kSettingsPath);
 	}
 }

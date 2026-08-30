@@ -117,7 +117,36 @@ bool AnimationCache::LoadAnimation(const std::string& a_suffix, const std::files
 		static_cast<uint64_t>(diskSize), diskMTime, a_owner, a_priority);
 }
 
+namespace
+{
+	// SEH __except handlers must not create objects with destructors in the enclosing
+	// frame, so route logging through this helper (keeps the __try wrapper frame free
+	// of C++ objects that require unwinding — avoids C2712).
+	bool ReportResourceFaultAndFail(std::string_view a_what, const std::string& a_path)
+	{
+		logger::warn("[OAR-Cache] Skipped {} after an access violation opening it "
+			"(BA2 resource system not ready, or malformed/unregistered archive): '{}'",
+			a_what, a_path);
+		return false;
+	}
+}
+
 bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
+	const void* a_owner, int32_t a_priority)
+{
+	// The game's BSResourceNiBinaryStream ctor can ACCESS-VIOLATE (CreateStandardContext
+	// null-deref) while the BA2 resource system is still registering archives during
+	// startup, or for a malformed/unregistered archive. An access violation is an SEH
+	// exception a C++ try/catch cannot catch, so guard the open/read with __try and skip
+	// the faulting resource instead of taking the whole game down on load.
+	__try {
+		return DoLoadAnimationResourceUnsafe(a_suffix, a_resourcePath, a_owner, a_priority);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return ReportResourceFaultAndFail("archive animation", a_resourcePath);
+	}
+}
+
+bool AnimationCache::DoLoadAnimationResourceUnsafe(const std::string& a_suffix, const std::string& a_resourcePath,
 	const void* a_owner, int32_t a_priority)
 {
 	RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
@@ -151,31 +180,40 @@ bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const st
 
 bool AnimationCache::ReadArchiveTextFile(const std::string& a_resourcePath, std::string& a_out)
 {
-	try {
-		RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
-		if (!stream) {
-			return false;
-		}
+	// SEH-guard the BA2 stream open exactly like LoadAnimationResource: an access
+	// violation raised in the game's resource-system ctor during startup archive
+	// registration is NOT catchable by a C++ try/catch (which is why the previous
+	// try/catch here did not prevent the load crash).
+	__try {
+		return DoReadArchiveTextFileUnsafe(a_resourcePath, a_out);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return ReportResourceFaultAndFail("archive config", a_resourcePath);
+	}
+}
 
-		RE::NiBinaryStream::BufferInfo bufferInfo{};
-		stream.GetBufferInfo(bufferInfo);
-		// OAR config/user JSON files are tiny; cap generously to reject anything
-		// that is clearly not a config (or a corrupt size) without allocating huge.
-		if (bufferInfo.fileSize == 0 || bufferInfo.fileSize > 16 * 1024 * 1024) {
-			return false;
-		}
-
-		std::string bytes(bufferInfo.fileSize, '\0');
-		const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
-		if (bytesRead != bytes.size()) {
-			return false;
-		}
-
-		a_out = std::move(bytes);
-		return true;
-	} catch (...) {
+bool AnimationCache::DoReadArchiveTextFileUnsafe(const std::string& a_resourcePath, std::string& a_out)
+{
+	RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
+	if (!stream) {
 		return false;
 	}
+
+	RE::NiBinaryStream::BufferInfo bufferInfo{};
+	stream.GetBufferInfo(bufferInfo);
+	// OAR config/user JSON files are tiny; cap generously to reject anything
+	// that is clearly not a config (or a corrupt size) without allocating huge.
+	if (bufferInfo.fileSize == 0 || bufferInfo.fileSize > 16 * 1024 * 1024) {
+		return false;
+	}
+
+	std::string bytes(bufferInfo.fileSize, '\0');
+	const auto bytesRead = stream.binary_read(bytes.data(), bytes.size());
+	if (bytesRead != bytes.size()) {
+		return false;
+	}
+
+	a_out = std::move(bytes);
+	return true;
 }
 
 bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
@@ -220,7 +258,7 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 	}
 
 	if (VerboseCacheLog()) {
-		logger::info("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
+		OAR_VLOG("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
 			a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
 			entry->filePath);
 	}
@@ -241,7 +279,7 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 			std::ranges::stable_sort(files, [](const auto& a, const auto& b) {
 				return (a ? a->priority : INT32_MIN) > (b ? b->priority : INT32_MIN);
 			});
-			logger::info("[OAR-Cache] Replaced changed file for '{}' (old entry retired)", a_suffix);
+			OAR_VLOG("[OAR-Cache] Replaced changed file for '{}' (old entry retired)", a_suffix);
 			return true;
 		}
 	}
@@ -330,7 +368,7 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 		}
 	}
 	if (patched > 0) {
-		logger::info("[OAR-Cache] Retroactively patched {} vtable slots across {} cached suffixes",
+		OAR_VLOG("[OAR-Cache] Retroactively patched {} vtable slots across {} cached suffixes",
 			patched, m_cache.size());
 	}
 }
@@ -371,7 +409,7 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 			if (dur == rc.originalDuration && trk == rc.originalNumTracks) {
 				return rc.clone;
 			}
-			logger::info("[OAR-Cache] Original address {:X} reused by a different animation for '{}' (dur {:.3f}->{:.3f} tracks {}->{}) — retiring stale clone",
+			OAR_VLOG("[OAR-Cache] Original address {:X} reused by a different animation for '{}' (dur {:.3f}->{:.3f} tracks {}->{}) — retiring stale clone",
 				reinterpret_cast<uintptr_t>(a_gameAnim), a_suffix,
 				rc.originalDuration, dur, rc.originalNumTracks, trk);
 			RetireSingleCloneLocked(entry, i, a_suffix);
@@ -464,10 +502,10 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 			if (!entry.annotations.empty()) {
 				std::ranges::sort(entry.annotations,
 					[](const auto& a, const auto& b) { return a.time < b.time; });
-				logger::info("[OAR-Cache] Parsed {} annotations from replacement '{}'",
+				OAR_VLOG("[OAR-Cache] Parsed {} annotations from replacement '{}'",
 					entry.annotations.size(), entry.filePath);
 				for (auto& pa : entry.annotations) {
-					logger::info("[OAR-Cache]   t={:.4f}s  '{}'", pa.time, pa.text);
+					OAR_VLOG("[OAR-Cache]   t={:.4f}s  '{}'", pa.time, pa.text);
 				}
 			}
 		}
@@ -544,7 +582,7 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		.retired = false
 	};
 
-	logger::info("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}' ({} clone(s) live)",
+	OAR_VLOG("[OAR-Cache] Built runtime clone for '{}': base={:X} gameStruct={:X} file='{}' ({} clone(s) live)",
 		a_suffix, reinterpret_cast<uintptr_t>(cloneBase), reinterpret_cast<uintptr_t>(a_gameAnim),
 		entry.filePath, entry.clones.size());
 
@@ -770,7 +808,7 @@ void AnimationCache::InvalidateRuntimeClones()
 		}
 	}
 	if (count > 0) {
-		logger::info("[OAR-Cache] Invalidated {} runtime clones (retired buffers kept alive: {})",
+		OAR_VLOG("[OAR-Cache] Invalidated {} runtime clones (retired buffers kept alive: {})",
 			count, m_retiredClones.size());
 	}
 }
@@ -809,7 +847,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 	const bool verbose = VerboseCacheLog();
 	if (verbose) {
-		logger::info("[OAR-Cache] Packfile: ver=0x{:X}, ptrSize={}, numSec={}, contIdx={}, contOff={}, v11={}",
+		OAR_VLOG("[OAR-Cache] Packfile: ver=0x{:X}, ptrSize={}, numSec={}, contIdx={}, contOff={}, v11={}",
 			header->fileVersion, header->pointerSize,
 			header->numSections, header->contentsSectionIndex, header->contentsSectionOffset, isV11);
 	}
@@ -866,7 +904,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			sections[i].endOffset = s->endOffset;
 		}
 		if (verbose) {
-			logger::info("[OAR-Cache]   Section[{}] '{}': absStart=0x{:X}, localFix=0x{:X}, globalFix=0x{:X}, virtFix=0x{:X}, end=0x{:X}",
+			OAR_VLOG("[OAR-Cache]   Section[{}] '{}': absStart=0x{:X}, localFix=0x{:X}, globalFix=0x{:X}, virtFix=0x{:X}, end=0x{:X}",
 				i, sections[i].tag, sections[i].absoluteDataStart,
 				sections[i].localFixupsOffset, sections[i].globalFixupsOffset,
 				sections[i].virtualFixupsOffset, sections[i].endOffset);
@@ -909,7 +947,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 	a_entry.sectionFileOffset = sectionFileOffset;
 
 	if (verbose) {
-		logger::info("[OAR-Cache] Data section payload: fileOffset=0x{:X}, size={} bytes", sectionFileOffset, sectionSize);
+		OAR_VLOG("[OAR-Cache] Data section payload: fileOffset=0x{:X}, size={} bytes", sectionFileOffset, sectionSize);
 	}
 
 	// === Apply local fixups ===
@@ -944,7 +982,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 		}
 	}
 	if (verbose) {
-		logger::info("[OAR-Cache] Applied {} local fixups", localFixCount);
+		OAR_VLOG("[OAR-Cache] Applied {} local fixups", localFixCount);
 	}
 
 	// === Apply global fixups ===
@@ -983,7 +1021,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 		}
 	}
 	if (verbose) {
-		logger::info("[OAR-Cache] Applied {} global fixups", globalFixCount);
+		OAR_VLOG("[OAR-Cache] Applied {} global fixups", globalFixCount);
 	}
 
 	// === Apply virtual fixups (vtable patching) ===
@@ -1021,7 +1059,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 		}
 	}
 	if (verbose) {
-		logger::info("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
+		OAR_VLOG("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
 			vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
 	}
 
@@ -1056,7 +1094,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			if (!sane) continue;
 			a_entry.trackToBoneIndices.assign(vals, vals + arrSize);
 			if (verbose) {
-				logger::info("[OAR-Cache]   Binding found at 0x{:X}: {} track->bone indices",
+				OAR_VLOG("[OAR-Cache]   Binding found at 0x{:X}: {} track->bone indices",
 					off - 0x18, arrSize);
 			}
 			return true;
@@ -1079,7 +1117,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 			auto* bytes = reinterpret_cast<uint8_t*>(candidate);
 			if (verbose) {
-				logger::info("[OAR-Cache]   Animation at root offset 0x{:X}: type={}, dur={:.3f}, tracks={}",
+				OAR_VLOG("[OAR-Cache]   Animation at root offset 0x{:X}: type={}, dur={:.3f}, tracks={}",
 					rootOffset, candidate->type, candidate->duration, candidate->numberOfTransformTracks);
 			}
 
@@ -1087,7 +1125,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			ComputeSplineOffsets(bytes, a_entry);
 
 			if (verbose) {
-				logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
+				OAR_VLOG("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
 					*reinterpret_cast<uintptr_t*>(bytes + 0x58),
 					*reinterpret_cast<uintptr_t*>(bytes + 0x68),
 					*reinterpret_cast<uintptr_t*>(bytes + 0x78),
@@ -1132,7 +1170,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 			auto* bytes = sectionData + off;
 			if (verbose) {
-				logger::info("[OAR-Cache]   Found animation (heuristic) at 0x{:X}: type={}, dur={:.3f}, tracks={}",
+				OAR_VLOG("[OAR-Cache]   Found animation (heuristic) at 0x{:X}: type={}, dur={:.3f}, tracks={}",
 					off, type, dur, tracks);
 			}
 			captureBinding(reinterpret_cast<uintptr_t>(bytes));
@@ -1141,7 +1179,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			ComputeSplineOffsets(bytes, a_entry);
 
 			if (verbose) {
-				logger::info("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
+				OAR_VLOG("[OAR-Cache]   Post-fixup ptrs: +0x58={:X} +0x68={:X} +0x78={:X} +0x88={:X} +0x98={:X}",
 					*reinterpret_cast<uintptr_t*>(bytes + 0x58),
 					*reinterpret_cast<uintptr_t*>(bytes + 0x68),
 					*reinterpret_cast<uintptr_t*>(bytes + 0x78),
@@ -1216,7 +1254,7 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 
 	const bool verbose = VerboseCacheLog();
 	if (verbose) {
-		logger::info("[OAR-Cache] ComputeSplineOffsets: maskAndQuantSz={}, dataSize={}, numBlocks={}, numTracks={}",
+		OAR_VLOG("[OAR-Cache] ComputeSplineOffsets: maskAndQuantSz={}, dataSize={}, numBlocks={}, numTracks={}",
 			maskAndQuantSz, dataSize, numBlocks, numTracks);
 	}
 
@@ -1369,7 +1407,7 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 		}
 
 		if (success && verbose) {
-			logger::info("[OAR-Cache] Block {} walk complete: final cursor={} (max={})", block, cursor, maxCursor);
+			OAR_VLOG("[OAR-Cache] Block {} walk complete: final cursor={} (max={})", block, cursor, maxCursor);
 		}
 	}
 
@@ -1385,7 +1423,7 @@ void AnimationCache::ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation&
 	*reinterpret_cast<uint32_t*>(a_animBytes + 0x84) = static_cast<uint32_t>(numEntries) | 0x80000000u;
 
 	if (verbose) {
-		logger::info("[OAR-Cache] Computed m_transformOffsets: {} entries ({} blocks x {} tracks)",
+		OAR_VLOG("[OAR-Cache] Computed m_transformOffsets: {} entries ({} blocks x {} tracks)",
 			numEntries, numBlocks, numTracks);
 	}
 }

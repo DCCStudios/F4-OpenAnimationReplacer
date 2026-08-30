@@ -19,7 +19,7 @@ void OAR_InitializeLogging(std::string_view a_pluginName);
 namespace Plugin
 {
 	static constexpr auto NAME    = "OpenAnimationReplacer"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 1, 10 };
+	static constexpr auto VERSION = REL::Version{ 1, 1, 11 };
 }
 
 // Version data consumed by the NG/AE F4SE loaders (0.7.x reads the exported
@@ -111,7 +111,7 @@ namespace StructProbe
 	static void RawScanStringData(RE::hkbCharacterStringData* sd)
 	{
 		auto* rawBytes = reinterpret_cast<uint8_t*>(sd);
-		logger::info("[OAR-Probe] === Raw string scan for layout verification ===");
+		OAR_VLOG("[OAR-Probe] === Raw string scan for layout verification ===");
 		for (int off = 0x10; off < 0x120; off += 8) {
 			auto* ptr = *reinterpret_cast<const char**>(rawBytes + off);
 			if (ptr && !IsBadReadPtr(ptr, 1)) {
@@ -123,7 +123,7 @@ namespace StructProbe
 				}
 			}
 		}
-		logger::info("[OAR-Probe] === End raw scan ===");
+		OAR_VLOG("[OAR-Probe] === End raw scan ===");
 	}
 
 	RE::hkbCharacterStringData* FindStringDataByVtable(void* baseObj, int scanStart, int scanEnd)

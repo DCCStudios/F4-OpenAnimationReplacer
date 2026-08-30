@@ -176,6 +176,14 @@ private:
 
 	bool ParsePackfile(CachedAnimation& a_entry);
 	bool ParseTagfile(CachedAnimation& a_entry);
+	// Bodies of the two BA2-resource readers, called from their SEH-wrapped public
+	// counterparts. Split out so the __try wrapper holds no C++ objects that require
+	// unwinding (the game's BSResourceNiBinaryStream ctor can raise an access
+	// violation during startup archive registration; an AV is SEH, not C++, so a
+	// try/catch cannot catch it — the wrapper must use __try/__except).
+	bool DoLoadAnimationResourceUnsafe(const std::string& a_suffix, const std::string& a_resourcePath,
+		const void* a_owner, int32_t a_priority);
+	static bool DoReadArchiveTextFileUnsafe(const std::string& a_resourcePath, std::string& a_out);
 	bool TryRebindCached(const std::string& a_suffix, std::string_view a_sourceIdentity,
 		bool a_hasFileMTime, std::uint64_t a_sourceSize,
 		std::filesystem::file_time_type a_sourceMTime, const void* a_owner,

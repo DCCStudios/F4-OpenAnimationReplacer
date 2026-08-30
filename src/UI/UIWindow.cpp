@@ -29,6 +29,16 @@ void UIWindow::TryDraw()
 {
 	if (!ShouldDraw()) return;
 
+	// Uniform window opacity (see GetWindowAlpha). Pushed BEFORE Begin so the
+	// background rect fades with the content; popped after End at every exit.
+	float windowAlpha = GetWindowAlpha();
+	if (windowAlpha < 0.0f) windowAlpha = 0.0f;
+	else if (windowAlpha > 1.0f) windowAlpha = 1.0f;
+	const bool fadeWindow = windowAlpha < 1.0f;
+	if (fadeWindow) {
+		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, windowAlpha);
+	}
+
 	const float uiScale = GetEffectiveUIScale();
 	const ImGuiWindowFlags flags = GetWindowFlags();
 	const ImVec2 defaultSize = GetDefaultSize();
@@ -63,6 +73,7 @@ void UIWindow::TryDraw()
 
 	if (!visible) {
 		ImGui::End();
+		if (fadeWindow) ImGui::PopStyleVar();
 		if (!open && isOpen) SetOpen(false);
 		return;
 	}
@@ -73,6 +84,7 @@ void UIWindow::TryDraw()
 
 	DrawContents();
 	ImGui::End();
+	if (fadeWindow) ImGui::PopStyleVar();
 }
 
 void UIWindow::SetOpen(bool a_open)

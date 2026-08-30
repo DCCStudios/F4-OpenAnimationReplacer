@@ -342,7 +342,7 @@ namespace BoneDebugViz
 			}
 		}
 		s_stateGeneration.fetch_add(1, std::memory_order_relaxed);
-		logger::info("[OAR-BoneViz] Highlight '{}' -> {}", a_boneName, nowOn ? "ON" : "OFF");
+		OAR_VLOG("[OAR-BoneViz] Highlight '{}' -> {}", a_boneName, nowOn ? "ON" : "OFF");
 		// Removal is handled by the next game tick, which diffs the desired
 		// set against s_tintedByBone and restores dropped bones there.
 	}
@@ -366,7 +366,7 @@ namespace BoneDebugViz
 			}
 		}
 		s_stateGeneration.fetch_add(1, std::memory_order_relaxed);
-		logger::info("[OAR-BoneViz] Label '{}' -> mode {} (0=off 1=joint 2=mesh)", a_boneName, newMode);
+		OAR_VLOG("[OAR-BoneViz] Label '{}' -> mode {} (0=off 1=joint 2=mesh)", a_boneName, newMode);
 	}
 
 	int GetLabelMode(const std::string& a_boneName)
@@ -424,7 +424,7 @@ namespace BoneDebugViz
 		}
 
 		if (trace) {
-			logger::info("[OAR-BoneViz] Tick: player={} root1st={:X} ('{}') root3rd={:X} ('{}') highlights={} labels={}",
+			OAR_VLOG("[OAR-BoneViz] Tick: player={} root1st={:X} ('{}') root3rd={:X} ('{}') highlights={} labels={}",
 				player ? "ok" : "NULL",
 				reinterpret_cast<uintptr_t>(root1st),
 				root1st && root1st->name.c_str() ? root1st->name.c_str() : "?",
@@ -466,7 +466,7 @@ namespace BoneDebugViz
 			if (res1.node) ApplyHighlight(res1.node, tinted, stats);
 			if (res3.node) ApplyHighlight(res3.node, tinted, stats);
 			if (trace) {
-				logger::info("[OAR-BoneViz]   Highlight '{}': 1st={} (node={:X}) 3rd={} (node={:X}) lightingGeoms={} emissiveNull={}",
+				OAR_VLOG("[OAR-BoneViz]   Highlight '{}': 1st={} (node={:X}) 3rd={} (node={:X}) lightingGeoms={} emissiveNull={}",
 					bone, res1.via, reinterpret_cast<uintptr_t>(res1.node),
 					res3.via, reinterpret_cast<uintptr_t>(res3.node),
 					stats.lightingGeoms, stats.emissiveNull);
@@ -480,7 +480,7 @@ namespace BoneDebugViz
 			const auto res = PickLabelBone(root1st, root3rd, bone.c_str());
 			if (!res.hasWorld) {
 				if (trace) {
-					logger::info("[OAR-BoneViz]   Label '{}': bone NOT FOUND in either skeleton", bone);
+					OAR_VLOG("[OAR-BoneViz]   Label '{}': bone NOT FOUND in either skeleton", bone);
 				}
 				continue;
 			}
@@ -510,7 +510,7 @@ namespace BoneDebugViz
 				? FirstPersonPointToScreenNorm(root1st, worldPos, draw.x, draw.y)
 				: WorldToScreenNorm(worldPos, draw.x, draw.y);
 			if (trace) {
-				logger::info("[OAR-BoneViz]   Label '{}': mode={} via={} fp={} world=({:.1f},{:.1f},{:.1f}) projected={} norm=({:.3f},{:.3f})",
+				OAR_VLOG("[OAR-BoneViz]   Label '{}': mode={} via={} fp={} world=({:.1f},{:.1f},{:.1f}) projected={} norm=({:.3f},{:.3f})",
 					bone, mode, res.via, res.firstPerson, worldPos.x, worldPos.y, worldPos.z, projected, draw.x, draw.y);
 			}
 			if (projected) {
@@ -553,7 +553,7 @@ namespace BoneDebugViz
 		static size_t s_lastDrawCount = 0;
 		if (draws.size() != s_lastDrawCount) {
 			s_lastDrawCount = draws.size();
-			logger::info("[OAR-BoneViz] DrawLabels: {} label(s) reaching the render thread", draws.size());
+			OAR_VLOG("[OAR-BoneViz] DrawLabels: {} label(s) reaching the render thread", draws.size());
 		}
 
 		const ImVec2 display = ImGui::GetIO().DisplaySize;
