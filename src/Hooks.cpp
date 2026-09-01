@@ -2259,7 +2259,7 @@ namespace
 	// holds dangling pointers.
 	// FO4 ships multiple hkaAnimation subclasses (spline-compressed, interleaved,
 	// etc.), each with its own vtable in the game EXE. We capture ONE vtable for
-	// packfile fixups (AnimationCache::SetVtableFromGame), but originals must
+	// packfile fixups per class (AnimationCache::CaptureGameVtable), but originals must
 	// accept ANY plausible game-module vtable — exact-match-only previously
 	// erased valid originals whose type differed from the first-seen one, so
 	// GetOrBuildRuntimeAnim got a null template and never built (conditions
@@ -2293,8 +2293,7 @@ namespace
 	static bool IsPlausibleGameAnimVtable(uintptr_t a_vtbl)
 	{
 		if (a_vtbl == 0) return false;
-		auto expected = AnimationCache::GetSingleton()->GetGameAnimVtable();
-		if (expected != 0 && a_vtbl == expected) return true;
+		if (AnimationCache::GetSingleton()->IsKnownGameVtable(a_vtbl)) return true;
 		return IsInGameModule(a_vtbl);
 	}
 
@@ -3224,6 +3223,32 @@ namespace
 	// The event observer uses this to distinguish OAR-sourced events from engine events.
 	static thread_local bool s_oarFiringAnnotations = false;
 
+	// Event-log attribution. While OAR walks a replacement's annotation list and
+	// fires them, this points at that clip's suffix so the sinks below can log the
+	// event as coming from it (the notify is synchronous on this thread). Engine-
+	// fired events carry no clip identity, so those fall back to the most recently
+	// activated clip on the actor, prefixed '~' so the UI can flag the guess.
+	static thread_local const std::string* s_eventSourceAnim = nullptr;
+	static std::mutex s_lastActivatedClipMutex;
+	static std::unordered_map<uint32_t, std::string> s_lastActivatedClipByActor;
+
+	static void RecordLastActivatedClip(RE::TESObjectREFR* a_refr, const std::string& a_anim)
+	{
+		if (!a_refr || a_anim.empty()) return;
+		std::lock_guard lock(s_lastActivatedClipMutex);
+		s_lastActivatedClipByActor[a_refr->GetFormID()] = a_anim;
+	}
+
+	static std::string EventSourceAnimFor(RE::TESObjectREFR* a_refr)
+	{
+		if (s_eventSourceAnim && !s_eventSourceAnim->empty()) return *s_eventSourceAnim;
+		if (!a_refr) return {};
+		std::lock_guard lock(s_lastActivatedClipMutex);
+		auto it = s_lastActivatedClipByActor.find(a_refr->GetFormID());
+		if (it == s_lastActivatedClipByActor.end()) return {};
+		return "~" + it->second;
+	}
+
 	// Direct audio playback — plays sounds through BSAudioManager by EditorID name.
 	struct OARSoundHandle
 	{
@@ -3367,7 +3392,7 @@ namespace
 					display += '.';
 					display += pay;
 				}
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, display);
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr));
 			}
 
 			return RE::BSEventNotifyControl::kContinue;
@@ -6657,11 +6682,10 @@ namespace
 			return ap > bp;
 		});
 
+		// No global vtable gate here: readiness is per animation class, and the
+		// per-candidate GetCachedAnimation below returns null for a donor whose
+		// class the game has not shown yet (audit 2026-09-01).
 		auto* cache = AnimationCache::GetSingleton();
-		if (!cache->GetGameAnimVtable()) {
-			SetStandaloneSpecialIdleRejection(a_rejectionReason, "game animation vtable is unavailable");
-			return false;
-		}
 		std::string lastCandidateRejection = "no candidate was eligible";
 		for (auto& [suffix, info] : candidates) {
 			if (!info || !info->parentSubMod) {
@@ -7549,10 +7573,10 @@ namespace
 		auto* cache = AnimationCache::GetSingleton();
 
 		auto* currentAnim = a_this->GetAnimation();
-		if (currentAnim && cache->GetGameAnimVtable() == 0) {
-			auto vtbl = *reinterpret_cast<uintptr_t*>(currentAnim);
-			cache->SetVtableFromGame(vtbl);
-			logger::info("[OAR] Captured game hkaAnimation vtable: {:X}", vtbl);
+		// Per-class capture (see CachedAnimation::animType): logs itself when a
+		// new animation type shows up, a couple of loads otherwise.
+		if (currentAnim) {
+			cache->CaptureGameVtable(currentAnim);
 		}
 
 		// Resolve Havok vtables from REL::ID for building replacement trigger arrays
@@ -7750,6 +7774,9 @@ namespace
 		// Parse the original hkaAnimation's annotationTracks and store event text per actor.
 		RE::TESObjectREFR* activateRefr = GetRefrFromContext(a_context);
 		if (!activateRefr) activateRefr = RE::PlayerCharacter::GetSingleton();
+		// Engine-fired events get attributed to this clip until the next activation
+		// on the same actor (see EventSourceAnimFor).
+		RecordLastActivatedClip(activateRefr, suffix);
 		if (activateRefr && animSlot && *animSlot) {
 			auto* origAnim = *animSlot;
 			auto* origBytes = reinterpret_cast<uint8_t*>(origAnim);
@@ -8100,10 +8127,8 @@ namespace
 		auto* cache = AnimationCache::GetSingleton();
 
 		auto* currentAnim = a_this->GetAnimation();
-		if (currentAnim && cache->GetGameAnimVtable() == 0) {
-			auto vtbl = *reinterpret_cast<uintptr_t*>(currentAnim);
-			cache->SetVtableFromGame(vtbl);
-			logger::info("[OAR] Captured game hkaAnimation vtable: {:X} (from Update)", vtbl);
+		if (currentAnim) {
+			cache->CaptureGameVtable(currentAnim);
 		}
 
 		// Look up the cached suffix (cached during Activate when animationName is still valid)
@@ -10086,6 +10111,7 @@ namespace
 					const bool ctrlReady = (a_this->GetAnimationControlRaw() != nullptr);
 
 					s_oarFiringAnnotations = true;
+					s_eventSourceAnim = &annotSuffix;
 					for (auto& text : toFire) {
 						static constexpr const char* kSoundPlayPrefix = "SoundPlay.";
 						static constexpr size_t kSoundPlayLen = 10;
@@ -10132,6 +10158,7 @@ namespace
 						}
 					}
 					s_oarFiringAnnotations = false;
+					s_eventSourceAnim = nullptr;
 				}
 			}
 		}
@@ -12033,6 +12060,22 @@ namespace
 				// counts from the animation itself — see SampleTracks in
 				// HavokTypes.h), so the buffers are sized by the animation's own
 				// track counts, independent of how many tracks we then map.
+				// The sample dispatches through the animation's vtable. Refuse
+				// anything that is not a vtable captured from a live game
+				// animation: a raw file value or another class's vtable runs
+				// sampleTracks over the wrong layout (crash-2026-09-01-01-58-59).
+				// Covers the frame-zero camera sample further down too (same
+				// repAnim).
+				if (!AnimationCache::GetSingleton()->IsKnownGameVtable(
+						*reinterpret_cast<const uintptr_t*>(repAnim))) {
+					static std::atomic<int> s_badVtblLog{ 0 };
+					if (s_badVtblLog.fetch_add(1, std::memory_order_relaxed) < 10) {
+						logger::warn("[OAR-TrackFilter] Donor '{}' has no known game vtable ({:X}, type {}) — skipping sample",
+							state.suffix, *reinterpret_cast<const uintptr_t*>(repAnim), repAnim->type);
+					}
+					return;
+				}
+
 				thread_local std::vector<RE::hkQsTransformRaw> tl_sampledTracks;
 				thread_local std::vector<float> tl_sampledFloats;
 				tl_sampledTracks.assign(animNumTracks, RE::hkQsTransformRaw{});
@@ -14644,7 +14687,7 @@ namespace Hooks
 					display += '.';
 					display += pay;
 				}
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, display);
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr));
 			}
 			if (applyIdleStopFix) {
 				// Match fallout4-idlestopfix: force the animation manager past the

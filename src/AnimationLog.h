@@ -32,6 +32,11 @@ public:
 		// Full resolved on-disk path of the original animation (from the
 		// subgraph swap-array resolution), when known. Display-only.
 		std::string fullPath;
+		// kAnimEvent only: the animation the event was fired from. Exact for
+		// OAR-fired annotations (the replacement clip being walked). Engine-fired
+		// events carry no clip identity, so those get the most recently activated
+		// clip on that actor, prefixed with '~' to mark it a best guess.
+		std::string sourceAnim;
 		Perspective perspective{ Perspective::kUnknown };
 		std::chrono::steady_clock::time_point timestamp;
 	};
@@ -48,7 +53,8 @@ public:
 		const std::string& a_fullPath = {},
 		Perspective a_perspective = Perspective::kUnknown);
 
-	void AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_eventName);
+	void AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_eventName,
+		const std::string& a_sourceAnim = {});
 
 	const std::deque<Entry>& GetEntries() const { return entries; }
 	const std::deque<Entry>& GetAnimEventEntries() const { return animEventEntries; }

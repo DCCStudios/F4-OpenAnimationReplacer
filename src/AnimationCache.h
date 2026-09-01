@@ -3,6 +3,8 @@
 #include <string_view>
 
 #include "HavokTypes.h"
+#include <array>
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +35,16 @@ public:
 		int32_t numTransformTracks{ 0 };
 		int32_t numFloatTracks{ 0 };
 		std::vector<uint32_t> vtableFixupOffsets;
+		// hkaAnimation::m_type of the file's animation object (3 = spline
+		// compressed). Selects WHICH game vtable the fixups receive: FO4 ships
+		// several hkaAnimation subclasses (spline, lossless, interleaved, ...)
+		// with different layouts, and stamping a spline donor with the lossless
+		// vtable dispatches sampleTracks into code that reads the wrong fields
+		// (crash-2026-09-01-01-58-59: idiv by a zero "numFrames" that was really
+		// a spline field). Until the game has shown an animation of this type the
+		// entry stays unpatched and every getter treats it as not loaded.
+		int32_t animType{ 0 };
+		bool vtablePatched{ false };
 		uint32_t sectionFileOffset{ 0 };
 		std::unique_ptr<uint32_t[]> computedTransformOffsets;
 		std::unique_ptr<uint32_t[]> computedFloatOffsets;
@@ -136,8 +148,21 @@ public:
 	// a_outIdentity=true means identity mapping.
 	bool GetDonorTrackMap(const std::string& a_suffix, const void* a_owner,
 		std::vector<int16_t>& a_outMap, bool& a_outIdentity) const;
-	void SetVtableFromGame(uintptr_t a_vtable);
-	uintptr_t GetGameAnimVtable() const { return m_gameAnimVtable.load(); }
+	// Learn the game vtable for a_gameAnim's animation type (see
+	// CachedAnimation::animType) and patch every deferred cached entry of that
+	// type. Cheap when the type is already known; call from the clip hooks with
+	// the clip's live animation. Returns true when a new type was captured.
+	bool CaptureGameVtable(const RE::hkaAnimation* a_gameAnim);
+	uintptr_t GetGameAnimVtable(int32_t a_type) const
+	{
+		return (a_type > 0 && a_type < kMaxAnimTypes) ? m_gameAnimVtableByType[a_type].load() : 0;
+	}
+	// The spline-compressed vtable: every donor file OAR has ever seen is type 3,
+	// so this is the "can replacements play yet" gate legacy callers ask for.
+	uintptr_t GetGameAnimVtable() const { return GetGameAnimVtable(kAnimType_SplineCompressed); }
+	// True when a_vtbl is one of the vtables captured from live game animations.
+	// Anything OAR hands to the engine or samples itself must pass this.
+	bool IsKnownGameVtable(uintptr_t a_vtbl) const;
 	size_t GetCacheSize() const;
 	bool IsOurReplacement(RE::hkaAnimation* a_anim) const;
 	RE::hkaAnimation* GetOriginalFromReplacement(RE::hkaAnimation* a_replacement) const;
@@ -265,5 +290,18 @@ private:
 	// same original path; variants get their own suffixes but can still
 	// collide across SubMods). Sorted by priority, highest first.
 	std::unordered_map<std::string, std::vector<std::unique_ptr<CachedAnimation>>> m_cache;
-	std::atomic<uintptr_t> m_gameAnimVtable{ 0 };
+
+	// Game vtables indexed by hkaAnimation::m_type. Havok 2014's AnimationType
+	// enum is small (interleaved=1, mirrored=2, spline=3, quantized=4,
+	// predictive=5, reference pose=6, lossless above that); 16 leaves headroom.
+	static constexpr int32_t kMaxAnimTypes = 16;
+	static constexpr int32_t kAnimType_SplineCompressed = 3;
+	std::array<std::atomic<uintptr_t>, kMaxAnimTypes> m_gameAnimVtableByType{};
+
+	// Stamp the entry's virtual fixups (and the animation object itself) with
+	// the game vtable for its animType, if known. Idempotent. Returns the number
+	// of slots written (0 when the type's vtable is still unknown). Only touches
+	// the entry's own buffer, so it is safe before the entry is published; for
+	// published entries the caller holds m_mutex (unique).
+	int ApplyEntryVtables(CachedAnimation& a_entry) const;
 };

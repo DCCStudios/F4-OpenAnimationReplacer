@@ -91,9 +91,10 @@ namespace UICommon
 				ImVec2(indicatorCenter.x - offset * 0.5f, indicatorCenter.y + offset),
 				ImVec2(indicatorCenter.x + offset, indicatorCenter.y - offset)
 			};
+			// imgui 1.92.8 swapped thickness and flags; the old order is deleted.
 			drawList->AddPolyline(points, 3,
 				ImGui::GetColorU32(Colors::Success),
-				ImDrawFlags_None, 2.f);
+				2.f, ImDrawFlags_None);
 		} else {
 			ImU32 failCol = ImGui::GetColorU32(Colors::Failure);
 			drawList->AddLine(

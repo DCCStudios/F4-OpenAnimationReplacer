@@ -21,7 +21,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE 
 
 project(
 	OpenAnimationReplacer
-	VERSION 1.1.11
+	VERSION 1.1.12
 	LANGUAGES CXX
 )
 

@@ -25,7 +25,8 @@ void UIAnimationEventLog::DrawContents()
 
 		if (filterText[0] != '\0' &&
 			!UICommon::FuzzyMatch(filterText, e.originalAnim.c_str()) &&
-			!UICommon::FuzzyMatch(filterText, e.refrName.c_str())) {
+			!UICommon::FuzzyMatch(filterText, e.refrName.c_str()) &&
+			!UICommon::FuzzyMatch(filterText, e.sourceAnim.c_str())) {
 			continue;
 		}
 
@@ -42,6 +43,20 @@ void UIAnimationEventLog::DrawContents()
 		ImGui::Text(UICommon::T("%s (0x%08X):"), e.refrName.c_str(), e.refrFormID);
 		ImGui::SameLine();
 		ImGui::TextColored(UICommon::Colors::LogEvent, UICommon::T("%s"), e.originalAnim.c_str());
+
+		// Source animation. A leading '~' marks the engine-event fallback (most
+		// recently activated clip on the actor) rather than an exact attribution.
+		if (!e.sourceAnim.empty()) {
+			const bool guessed = (e.sourceAnim[0] == '~');
+			const char* shown = guessed ? e.sourceAnim.c_str() + 1 : e.sourceAnim.c_str();
+			ImGui::SameLine();
+			ImGui::TextDisabled(guessed ? UICommon::T("from ~%s") : UICommon::T("from %s"), shown);
+			if (guessed && ImGui::IsItemHovered()) {
+				ImGui::SetTooltip("%s", UICommon::T(
+					"Best guess: engine-fired events carry no clip identity, so this is the most "
+					"recently activated clip on this actor. Events OAR fires itself are attributed exactly."));
+			}
+		}
 	}
 
 	ImGui::EndChild();

@@ -258,14 +258,18 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 	}
 
 	if (VerboseCacheLog()) {
-		OAR_VLOG("[OAR-Cache] Loaded '{}': duration={:.3f}s, tracks={}, floats={}, prio={}, path='{}'",
-			a_suffix, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
-			entry->filePath);
+		OAR_VLOG("[OAR-Cache] Loaded '{}': type={}, duration={:.3f}s, tracks={}, floats={}, prio={}, vtable={}, path='{}'",
+			a_suffix, entry->animType, entry->duration, entry->numTransformTracks, entry->numFloatTracks, a_priority,
+			entry->vtablePatched ? "applied" : "deferred", entry->filePath);
 	}
 
 	OpenAnimationReplacer::GetSingleton()->loadingLoadedAnims.fetch_add(1);
 
 	std::unique_lock lock(m_mutex);
+	// Close the parse/capture race: a vtable captured while this entry was
+	// being parsed off-lock patched only the published entries. Under the
+	// lock now, so this entry cannot be missed by a concurrent capture.
+	ApplyEntryVtables(*entry);
 	auto& files = m_cache[a_suffix];
 	// Path identity: a same-path entry here means the file CHANGED on disk
 	// (the unchanged case re-bound and returned above). Replace it in place —
@@ -350,33 +354,81 @@ AnimationCache::CachedAnimation* AnimationCache::SelectEntry(const std::string& 
 	return it->second[0].get();
 }
 
-void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
+bool AnimationCache::CaptureGameVtable(const RE::hkaAnimation* a_gameAnim)
 {
-	uintptr_t prev = m_gameAnimVtable.exchange(a_vtable);
-	if (prev != 0) return;
+	if (!a_gameAnim) return false;
+	// The clip is about to generate from this animation, so the header is
+	// readable. Keep the hot path to two loads when the type is already known.
+	const int32_t type = a_gameAnim->type;
+	if (type <= 0 || type >= kMaxAnimTypes) return false;
+	if (m_gameAnimVtableByType[type].load(std::memory_order_relaxed) != 0) return false;
 
-	std::shared_lock lock(m_mutex);
-	int patched = 0;
+	const uintptr_t vtbl = *reinterpret_cast<const uintptr_t*>(a_gameAnim);
+	if (vtbl < 0x10000) return false;
+	uintptr_t expected = 0;
+	if (!m_gameAnimVtableByType[type].compare_exchange_strong(expected, vtbl)) return false;
+
+	// Patch the entries that were parsed before this type's vtable was known.
+	std::unique_lock lock(m_mutex);
+	int patchedEntries = 0;
+	int patchedSlots = 0;
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (!entry || entry->fileData.empty()) continue;
-			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
-			for (uint32_t off : entry->vtableFixupOffsets) {
-				*reinterpret_cast<uintptr_t*>(sectionData + off) = a_vtable;
-				patched++;
+			if (!entry || entry->vtablePatched || entry->animType != type) continue;
+			const int n = ApplyEntryVtables(*entry);
+			if (n > 0) {
+				++patchedEntries;
+				patchedSlots += n;
 			}
 		}
 	}
-	if (patched > 0) {
-		OAR_VLOG("[OAR-Cache] Retroactively patched {} vtable slots across {} cached suffixes",
-			patched, m_cache.size());
+	logger::info("[OAR-Cache] Captured game hkaAnimation vtable {:X} for animation type {} — patched {} deferred cached file(s) ({} slots)",
+		vtbl, type, patchedEntries, patchedSlots);
+	return true;
+}
+
+bool AnimationCache::IsKnownGameVtable(uintptr_t a_vtbl) const
+{
+	if (a_vtbl == 0) return false;
+	for (const auto& slot : m_gameAnimVtableByType) {
+		if (slot.load(std::memory_order_relaxed) == a_vtbl) return true;
 	}
+	return false;
+}
+
+int AnimationCache::ApplyEntryVtables(CachedAnimation& a_entry) const
+{
+	if (a_entry.vtablePatched || !a_entry.animation || a_entry.fileData.empty()) return 0;
+	const uintptr_t vtbl = GetGameAnimVtable(a_entry.animType);
+	if (vtbl == 0) return 0;
+
+	uint8_t* sectionData = a_entry.fileData.data() + a_entry.sectionFileOffset;
+	int n = 0;
+	for (uint32_t off : a_entry.vtableFixupOffsets) {
+		*reinterpret_cast<uintptr_t*>(sectionData + off) = vtbl;
+		++n;
+	}
+	// The animation object itself, in case the heuristic locator found it at
+	// an offset the fixup table does not list.
+	*reinterpret_cast<uintptr_t*>(a_entry.animation) = vtbl;
+	a_entry.vtablePatched = true;
+	return n;
 }
 
 RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix, const void* a_owner) const
 {
 	std::shared_lock lock(m_mutex);
 	if (auto* entry = SelectEntry(a_suffix, a_owner)) {
+		// Unpatched = the game has not yet shown an animation of this file's
+		// class, so its vtable slots still hold raw file values. Not playable.
+		if (!entry->vtablePatched) {
+			static std::atomic<int> s_unpatchedLog{ 0 };
+			if (s_unpatchedLog.fetch_add(1, std::memory_order_relaxed) < 10) {
+				logger::warn("[OAR-Cache] '{}' (type {}) is not playable yet: no game vtable captured for its animation class",
+					a_suffix, entry->animType);
+			}
+			return nullptr;
+		}
 		return entry->animation;
 	}
 	return nullptr;
@@ -421,6 +473,14 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	}
 
 	if (!a_gameAnim || !entry.animation) return nullptr;
+	if (!entry.vtablePatched) {
+		static std::atomic<int> s_unpatchedCloneLog{ 0 };
+		if (s_unpatchedCloneLog.fetch_add(1, std::memory_order_relaxed) < 10) {
+			logger::warn("[OAR-Cache] Not cloning '{}' (type {}): no game vtable captured for its animation class yet",
+				a_suffix, entry.animType);
+		}
+		return nullptr;
+	}
 
 	// Bound the per-entry clone set. Path-scoped entries only ever hold one
 	// live clone (weapon switches retire via the address-reuse guard or leave
@@ -442,11 +502,40 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	uintptr_t aligned = (rawAddr + 15) & ~uintptr_t(15);
 	uint8_t* cloneBase = reinterpret_cast<uint8_t*>(aligned);
 
-	// Copy the game's animation struct
-	std::memcpy(cloneBase, reinterpret_cast<uint8_t*>(a_gameAnim), kStructSize);
-
 	// Now patch the clone with our animation's data pointers
 	auto* ourBytes = reinterpret_cast<uint8_t*>(entry.animation);
+
+	// Copy the game's animation struct. This is only a correct template when
+	// the original is the SAME class as our file: the patches below poke spline
+	// fields at spline offsets, and a memcpy'd original of another class (a
+	// lossless-compressed jiggle add, say) would keep that class's vtable and
+	// layout. For a class mismatch copy our own fixed-up file struct instead:
+	// it carries the game vtable for its own type (vtablePatched above) and
+	// the same spline layout the patches assume. The refcount header at +0x08
+	// still comes from the original so engine addRef/release behave as before.
+	const int32_t origType = *reinterpret_cast<const int32_t*>(
+		reinterpret_cast<const uint8_t*>(a_gameAnim) + 0x10);
+	if (origType == entry.animType) {
+		std::memcpy(cloneBase, reinterpret_cast<uint8_t*>(a_gameAnim), kStructSize);
+	} else {
+		const uint8_t* fileEnd = entry.fileData.data() + entry.fileData.size();
+		const size_t avail = static_cast<size_t>(std::max<ptrdiff_t>(0, fileEnd - ourBytes));
+		if (avail < kStructSize) {
+			// A truncated template would leave header fields zero. Fail safe:
+			// no replacement for this original rather than a half-built clone.
+			logger::warn("[OAR-Cache] '{}': file struct too close to the buffer end ({} bytes) to template a clone — skipping",
+				a_suffix, avail);
+			return nullptr;
+		}
+		std::memcpy(cloneBase, ourBytes, kStructSize);
+		*reinterpret_cast<uint64_t*>(cloneBase + 0x08) =
+			*reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(a_gameAnim) + 0x08);
+		static std::atomic<int> s_classMismatchLog{ 0 };
+		if (s_classMismatchLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+			logger::info("[OAR-Cache] '{}': original animation is type {} but the replacement file is type {} — clone built from the file struct",
+				a_suffix, origType, entry.animType);
+		}
+	}
 
 	// Patch m_data (hkArray<uint8> at +0x98): pointer, size, capacity
 	*reinterpret_cast<uintptr_t*>(cloneBase + 0x98) = *reinterpret_cast<uintptr_t*>(ourBytes + 0x98);
@@ -1027,8 +1116,9 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 	// === Apply virtual fixups (vtable patching) ===
 	// Virtual fixups are 12-byte records (src_u32, section_u32, nameOffset_u32)
 	// Each says: object at sectionData+src needs its vtable set
-	// Store all vtable offsets so we can retroactively patch when vtable is captured
-	uintptr_t gameVtable = m_gameAnimVtable.load();
+	// Only RECORD the offsets here: which game vtable they receive depends on
+	// the animation object's type, which is located further down. See
+	// ApplyEntryVtables / CachedAnimation::animType.
 	int vtableFixCount = 0;
 
 	if (ds.virtualFixupsOffset != 0 && ds.virtualFixupsOffset != 0xFFFFFFFF) {
@@ -1051,16 +1141,13 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 				if (src + 8 > sectionSize) continue;
 
 				a_entry.vtableFixupOffsets.push_back(src);
-				if (gameVtable != 0) {
-					*reinterpret_cast<uintptr_t*>(sectionData + src) = gameVtable;
-				}
 				vtableFixCount++;
 			}
 		}
 	}
 	if (verbose) {
-		OAR_VLOG("[OAR-Cache] Recorded {} virtual fixup offsets (vtable {})",
-			vtableFixCount, gameVtable != 0 ? "applied" : "deferred");
+		OAR_VLOG("[OAR-Cache] Recorded {} virtual fixup offsets (applied once the animation type is known)",
+			vtableFixCount);
 	}
 
 	// Locate the file's hkaAnimationBinding to capture the DONOR'S OWN
@@ -1113,6 +1200,8 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			a_entry.duration = candidate->duration;
 			a_entry.numTransformTracks = candidate->numberOfTransformTracks;
 			a_entry.numFloatTracks = candidate->numberOfFloatTracks;
+			a_entry.animType = candidate->type;
+			ApplyEntryVtables(a_entry);
 			captureBinding(reinterpret_cast<uintptr_t>(candidate));
 
 			auto* bytes = reinterpret_cast<uint8_t*>(candidate);
@@ -1136,21 +1225,9 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 		}
 	}
 
-	// Fallback: scan payload for animation-like objects (after fixups applied, vtable should match)
-	if (gameVtable != 0) {
-		auto* anim = FindAnimationInBuffer(sectionData, sectionSize, gameVtable);
-		if (anim) {
-			a_entry.animation = anim;
-			a_entry.duration = anim->duration;
-			a_entry.numTransformTracks = anim->numberOfTransformTracks;
-			a_entry.numFloatTracks = anim->numberOfFloatTracks;
-			captureBinding(reinterpret_cast<uintptr_t>(anim));
-			ComputeSplineOffsets(reinterpret_cast<uint8_t*>(anim), a_entry);
-			return true;
-		}
-	}
-
-	// Last resort: heuristic scan without vtable match
+	// Heuristic scan for the animation object. (The former vtable-match scan is
+	// gone: slots are no longer stamped before the type is known, and in
+	// practice every file went through this path anyway.)
 	for (size_t off = 0; off + 0x20 <= sectionSize; off += 8) {
 		auto type = *reinterpret_cast<int32_t*>(sectionData + off + 0x10);
 		auto dur = *reinterpret_cast<float*>(sectionData + off + 0x14);
@@ -1159,14 +1236,13 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 
 		if (type >= 1 && type <= 10 && dur > 0.001f && dur < 600.f &&
 			tracks >= 1 && tracks <= 500 && floats >= 0 && floats <= 200) {
-			if (gameVtable != 0) {
-				*reinterpret_cast<uintptr_t*>(sectionData + off) = gameVtable;
-			}
 			auto* candidate = reinterpret_cast<RE::hkaAnimation*>(sectionData + off);
 			a_entry.animation = candidate;
 			a_entry.duration = dur;
 			a_entry.numTransformTracks = tracks;
 			a_entry.numFloatTracks = floats;
+			a_entry.animType = type;
+			ApplyEntryVtables(a_entry);
 
 			auto* bytes = sectionData + off;
 			if (verbose) {

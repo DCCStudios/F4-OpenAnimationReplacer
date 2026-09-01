@@ -26,7 +26,8 @@ void AnimationLog::AddEntry(EventType a_type, RE::TESObjectREFR* a_refr,
 	}
 }
 
-void AnimationLog::AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_eventName)
+void AnimationLog::AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_eventName,
+	const std::string& a_sourceAnim)
 {
 	if (!enabled) return;
 
@@ -35,6 +36,7 @@ void AnimationLog::AddAnimEvent(RE::TESObjectREFR* a_refr, const std::string& a_
 	entry.refrName = GetRefrName(a_refr);
 	entry.refrFormID = a_refr ? a_refr->GetFormID() : 0;
 	entry.originalAnim = a_eventName;
+	entry.sourceAnim = a_sourceAnim;
 	entry.timestamp = std::chrono::steady_clock::now();
 
 	std::lock_guard lock(animEventMutex);
