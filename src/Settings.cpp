@@ -66,6 +66,7 @@ void Settings::Load()
 
 	bVerboseLogging = getB("Debug", "bVerboseLogging", bVerboseLogging);
 	bExitInitInstant = getB("Debug", "bExitInitInstant", bExitInitInstant);
+	sPlainReplayWeapons = getS("Debug", "sPlainReplayWeapons", sPlainReplayWeapons.c_str());
 
 	const char* rvaStr = getS("Debug", "iLoadClipsAddressRVA", "0");
 	if (rvaStr) {
@@ -83,6 +84,22 @@ void Settings::Load()
 bool OAR_IsVerboseLogging()
 {
 	return Settings::GetSingleton() && Settings::GetSingleton()->bVerboseLogging;
+}
+
+void Settings::AppendPlainReplayWeapon(std::uint64_t a_fp)
+{
+	char buf[24];
+	snprintf(buf, sizeof(buf), "%llX", static_cast<unsigned long long>(a_fp));
+	if (sPlainReplayWeapons.find(buf) != std::string::npos) return;
+	if (!sPlainReplayWeapons.empty()) sPlainReplayWeapons += ",";
+	sPlainReplayWeapons += buf;
+	// Persist just this key in place.
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	ini.LoadFile(kSettingsPath);
+	ini.SetValue("Debug", "sPlainReplayWeapons", sPlainReplayWeapons.c_str());
+	ini.SaveFile(kSettingsPath);
+	logger::info("[OAR] Persisted plain-replay weapon fingerprint {} ({} total)", buf, sPlainReplayWeapons);
 }
 
 void Settings::Save()

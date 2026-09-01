@@ -866,6 +866,52 @@ static bool PeekIdleStopSuppression(RE::TESObjectREFR* a_refr,
 static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSuppressSounds);
 
 static bool PlayerAnimGraphIsRebuilding();  // defined below (weapon-change deferral)
+static uint64_t GetPlayerWeaponFingerprint();  // defined below (weapon-change machinery)
+
+// Adaptive per-weapon exit mode (2026-08-31): weapons whose subgraph re-init
+// storms on the instant exit (their clips ASYNC-load after
+// InitializeActorInstant, and no synchronous settle - stepped or not - can let
+// IO complete inside one frame, so the blend evaluates an empty child set =
+// NaN) are LEARNED the moment the skeleton heal catches the storm, and use the
+// plain IdleStop replay (normal-speed exit transition) from then on. Common
+// weapons keep the seamless instant exit.
+static std::mutex s_plainReplayFpMutex;
+static std::unordered_set<uint64_t> s_plainReplayFingerprints;
+static std::atomic<uint64_t> s_lastDeliveryFp{ 0 };
+static std::atomic<float> s_lastDeliverySec{ -1000.0f };
+
+// Proactive subgraph-weapon detector: heavy guns attach their own SMALL
+// BSFlattenedBoneTree under the 1P root (cryolator: 23 bones; the body rig is
+// 123). Its presence at delivery time means the instant exit WILL storm (the
+// re-init reloads that subgraph's clips asynchronously), so the plain replay
+// is chosen up front - no first-vault learning flicker.
+static bool PlayerHasSubgraphWeaponTree()
+{
+	auto* pc = RE::PlayerCharacter::GetSingleton();
+	RE::NiAVObject* root = pc ? pc->Get3D(true) : nullptr;
+	if (!root) return false;
+	struct Walk
+	{
+		static bool Run(RE::NiAVObject* a_n, int a_depth)
+		{
+			if (!a_n || a_depth > 8) return false;
+			const auto* rtti = a_n->GetRTTI();
+			if (rtti && rtti->name && std::strcmp(rtti->name, "BSFlattenedBoneTree") == 0) {
+				auto* tree = static_cast<RE::BSFlattenedBoneTree*>(a_n);
+				if (tree->boneCountExpanded > 0 && tree->boneCountExpanded < 64) {
+					return true;
+				}
+			}
+			if (auto* node = a_n->IsNode()) {
+				for (std::uint32_t i = 0; i < node->children.size(); ++i) {
+					if (Run(node->children[i].get(), a_depth + 1)) return true;
+				}
+			}
+			return false;
+		}
+	};
+	return Walk::Run(root, 0);
+}
 
 // Executes a parked IdleStop: fast-forward (with the sound window) when the
 // arm is still present, then replay the event into the ORIGINAL sink vfunc
@@ -950,18 +996,79 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 			// update BEFORE the event is allowed through). The post-exit
 			// anchor fade and the exit-camera snapshot pin mask the one-frame
 			// graph rebuild; the sound window swallows its annotations.
-			if (Settings::GetSingleton()->bExitInitInstant) {
+			const uint64_t exitFp =
+				(a_refr->GetFormID() == 0x14) ? GetPlayerWeaponFingerprint() : 0;
+			{
+				// One-time load of fingerprints persisted from earlier sessions.
+				static std::atomic<bool> s_fpListParsed{ false };
+				if (!s_fpListParsed.exchange(true)) {
+					std::lock_guard fpLock(s_plainReplayFpMutex);
+					const auto& lst = Settings::GetSingleton()->sPlainReplayWeapons;
+					size_t pos = 0;
+					while (pos < lst.size()) {
+						size_t end = lst.find(',', pos);
+						if (end == std::string::npos) end = lst.size();
+						const std::string tok = lst.substr(pos, end - pos);
+						if (!tok.empty()) {
+							if (const uint64_t v = std::strtoull(tok.c_str(), nullptr, 16)) {
+								s_plainReplayFingerprints.insert(v);
+							}
+						}
+						pos = end + 1;
+					}
+				}
+			}
+			bool weaponNeedsPlainReplay = false;
+			const char* plainReason = nullptr;
+			if (exitFp) {
+				std::lock_guard fpLock(s_plainReplayFpMutex);
+				if (s_plainReplayFingerprints.count(exitFp) > 0) {
+					weaponNeedsPlainReplay = true;
+					plainReason = "learned storm weapon";
+				}
+			}
+			// The small-tree proactive detector over-matched (field: the P890
+			// pistol also carries a small flat tree and lost its seamless exit)
+			// - disabled; learning + INI persistence handles storm weapons with
+			// at most one flicker EVER per weapon. Diagnostic below gathers the
+			// graph count as the candidate mechanism-true discriminator
+			// (subgraph weapons add an animation graph).
+			if (!weaponNeedsPlainReplay && a_refr->GetFormID() == 0x14) {
+				RE::BSTSmartPointer<RE::BSAnimationGraphManager> dmgr;
+				if (auto* pc = RE::PlayerCharacter::GetSingleton();
+					pc && pc->GetAnimationGraphManagerImpl(dmgr) && dmgr) {
+					OAR_VLOG("[OAR-IdleStop] delivery graph count = {} (fp={:X})",
+						dmgr->graph.size(), exitFp);
+				}
+			}
+			if (Settings::GetSingleton()->bExitInitInstant && !weaponNeedsPlainReplay) {
 				s_inIdleStopFastForward = true;
 				s_suppressFastForwardSounds = suppressSounds;
 				RE::BGSAnimationSystemUtils::InitializeActorInstant(*actor, false);
-				actor->UpdateAnimation(kExitInitUpdateSec);
+				// STEPPED settle (2026-08-31): a single 1s advance expires every
+				// transition and one-shot in the freshly re-initialized graph
+				// SIMULTANEOUSLY — on heavy-gun subgraphs that left a zero-weight
+				// active set for one evaluation, and the blend's normalize
+				// emitted NaN into the Root composition for the whole blend-out
+				// window (the cryolator vault white-screen/tinnitus storm;
+				// trigger confirmed by A/B with bExitInitInstant=0). Advance the
+				// SAME total time in small steps instead, so the state machine
+				// takes its transitions one at a time with valid weights — the
+				// exit stays seamless and the degenerate evaluation never forms.
+				constexpr int kSettleSteps = 20;
+				for (int step = 0; step < kSettleSteps; ++step) {
+					actor->UpdateAnimation(kExitInitUpdateSec / kSettleSteps);
+				}
 				s_inIdleStopFastForward = false;
 				s_suppressFastForwardSounds = false;
+				s_lastDeliveryFp.store(exitFp, std::memory_order_relaxed);
+				s_lastDeliverySec.store(s_tfNowSec.load(std::memory_order_relaxed),
+					std::memory_order_relaxed);
 			} else {
 				// A/B experiment (vault NaN storm): skip the forced synchronous
 				// graph advance entirely; the plain IdleStop replay below drives
 				// a normal-speed exit transition.
-				OAR_VLOG("[OAR-IdleStop] bExitInitInstant=0: skipping InitializeActorInstant + settle fast-forward");
+				OAR_VLOG("[OAR-IdleStop] Plain IdleStop replay ({}): skipping InitializeActorInstant + settle", plainReason ? plainReason : "bExitInitInstant=0");
 			}
 		}
 	}
@@ -15478,6 +15585,19 @@ namespace Hooks
 			}
 
 			if (healedNodeLocal + healedFlatLocal + healedFlatWorld + healedTreeWorld > 0) {
+				// Adaptive learning: a storm within ~2.5s of an instant-exit
+				// delivery marks that weapon for the plain replay from now on.
+				const uint64_t stormFp = s_lastDeliveryFp.load(std::memory_order_relaxed);
+				const float sinceDelivery = s_tfNowSec.load(std::memory_order_relaxed) -
+					s_lastDeliverySec.load(std::memory_order_relaxed);
+				if (stormFp && sinceDelivery >= 0.0f && sinceDelivery < 2.5f) {
+					std::lock_guard fpLock(s_plainReplayFpMutex);
+					if (s_plainReplayFingerprints.insert(stormFp).second) {
+						logger::warn("[OAR-IdleStop] LEARNED: weapon fingerprint {:X} storms on the instant exit - "
+							"switching it to the plain IdleStop replay (persisted)", stormFp);
+						Settings::GetSingleton()->AppendPlainReplayWeapon(stormFp);
+					}
+				}
 				static std::atomic<uint32_t> s_healLog{ 0 };
 				const auto n = s_healLog.fetch_add(1, std::memory_order_relaxed);
 				if (n < 24 || (n % 600) == 0) {

@@ -99,6 +99,11 @@ public:
 	// fast-forward and just replays the event (visible exit transition returns,
 	// but the forced synchronous graph advance never runs).
 	bool  bExitInitInstant{ true };
+	// Comma-separated hex weapon fingerprints learned to storm on the instant
+	// exit (persisted so the one-time learning flicker never repeats).
+	std::string sPlainReplayWeapons;
+
+	void AppendPlainReplayWeapon(std::uint64_t a_fp);
 
 	// OpenAnimationReplacer.ini is the mod-provided default configuration. The
 	// settings page writes only the separate user overlay so a mod update or a
