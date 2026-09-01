@@ -1857,7 +1857,16 @@ void UIMain::DrawTrackFilterSection(SubMod* a_subMod, bool a_editable)
 						"The engine's full-body idle plays natively (the 3rd-person body performs the\n"
 						"animation with its annotations), and the overlay applies ONLY to first-person\n"
 						"clips, as raw replacement locals — so the 1st-person arms mirror the motion.\n"
-						"For 3rd-person-authored idles that must also read correctly in first person.\n"
+						"\n"
+						"WHEN TO ENABLE: only for replacements triggered as SPECIAL IDLES (PlayIdle /\n"
+						"scripted idles, e.g. parkour vaults or inspects) whose file is authored on the\n"
+						"3RD-person skeleton but must read correctly in first person. Regular clip\n"
+						"replacements (reloads, sprints, locomotion) do NOT need it — leave it Off.\n"
+						"\n"
+						"NOTE: in this mode the native idle drives EVERY bone that is not handled by\n"
+						"the filter. Bones you want to keep out of the animation (e.g. a weapon hand\n"
+						"that should stay on the grip) must be added to Frozen Bones MANUALLY — their\n"
+						"child bones are frozen with them automatically.\n"
 						"Default: Off."));
 				}
 			}

@@ -102,6 +102,10 @@ public:
 	// Comma-separated hex weapon fingerprints learned to storm on the instant
 	// exit (persisted so the one-time learning flicker never repeats).
 	std::string sPlainReplayWeapons;
+	// Storm weapons (plain replay): after replaying the IdleStop on the existing,
+	// fully loaded graph, fast-forward THROUGH the exit transition so it never
+	// renders in real time (no re-init => no subgraph reload => no async race).
+	bool  bPlainReplayFastForward{ true };
 
 	void AppendPlainReplayWeapon(std::uint64_t a_fp);
 

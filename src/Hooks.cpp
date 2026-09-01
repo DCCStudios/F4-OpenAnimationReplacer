@@ -979,6 +979,7 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 			}
 		}
 	}
+	bool plainReplayFastForward = false;
 	if (haveArm) {
 		if (auto* actor = a_refr->As<RE::Actor>()) {
 			if (suppressSounds) {
@@ -1069,6 +1070,7 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 				// graph advance entirely; the plain IdleStop replay below drives
 				// a normal-speed exit transition.
 				OAR_VLOG("[OAR-IdleStop] Plain IdleStop replay ({}): skipping InitializeActorInstant + settle", plainReason ? plainReason : "bExitInitInstant=0");
+				plainReplayFastForward = Settings::GetSingleton()->bPlainReplayFastForward;
 			}
 		}
 	}
@@ -1076,6 +1078,27 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 		const RE::BSAnimationGraphEvent replay{ rec.holderID,
 			RE::BSFixedString("IdleStop"), RE::BSFixedString() };
 		rec.original(rec.sinkThis, replay, nullptr);
+		// Storm weapons: the replay just started the exit transition
+		// (wpnequipfast) on the EXISTING, fully loaded graph — no re-init, no
+		// subgraph reload, no async race. Fast-forward THROUGH it in small steps
+		// so the transition never renders in real time; the post-exit camera
+		// hold and sound window armed above mask its camera track and equip
+		// sound exactly as they did for the legacy fast-forward design.
+		if (plainReplayFastForward && haveArm) {
+			if (auto* ffActor = a_refr->As<RE::Actor>()) {
+				constexpr float kExitTransitionSkipSec = 0.6f;
+				constexpr int kSkipSteps = 12;
+				s_inIdleStopFastForward = true;
+				s_suppressFastForwardSounds = suppressSounds;
+				for (int step = 0; step < kSkipSteps; ++step) {
+					ffActor->UpdateAnimation(kExitTransitionSkipSec / kSkipSteps);
+				}
+				s_inIdleStopFastForward = false;
+				s_suppressFastForwardSounds = false;
+				OAR_VLOG("[OAR-IdleStop] Plain replay: fast-forwarded {:.2f}s through the exit transition ({} steps)",
+					kExitTransitionSkipSec, kSkipSteps);
+			}
+		}
 	}
 	OAR_VLOG("[OAR-IdleStop] Delivered deferred IdleStop ({}, initInstant={}) for actor {:X}",
 		a_reason, haveArm, a_refr->GetFormID());
@@ -12621,16 +12644,36 @@ namespace
 					// write pass.
 					if (publishPostEval && fIt != state.frozenByName.end() &&
 						IsFiniteQs(fIt->second)) {
+						// Publish the ANCHOR-preferred hold — the same value the pose
+						// stamp below uses. Publishing the raw frozen capture stamped
+						// the BIND pose into the arm chain's node locals (field
+						// 2026-08-31: freezing RArm placed the whole arm at the
+						// outstretched bind pose on screen, while the pose-level hold
+						// was correct). Scene-node quats are the CONJUGATE of havok
+						// pose quats (probe 2026-08-27), so conjugate when sourcing
+						// the anchor for a scene-space write.
+						const bool pubUseAnchor = nativeIdleMode && state.nativeAnchorValid &&
+							idx < static_cast<int16_t>(state.nativeAnchorPose.size());
+						const RE::hkQsTransformRaw& pubVal = pubUseAnchor
+							? state.nativeAnchorPose[idx]
+							: fIt->second;
 						auto& tgt = state.pendingBoneTargets.emplace_back();
 						tgt.name = name;
 						tgt.chainRoot = false;
-						tgt.translation[0] = fIt->second.translation[0];
-						tgt.translation[1] = fIt->second.translation[1];
-						tgt.translation[2] = fIt->second.translation[2];
-						tgt.rotation[0] = fIt->second.rotation[0];
-						tgt.rotation[1] = fIt->second.rotation[1];
-						tgt.rotation[2] = fIt->second.rotation[2];
-						tgt.rotation[3] = fIt->second.rotation[3];
+						tgt.translation[0] = pubVal.translation[0];
+						tgt.translation[1] = pubVal.translation[1];
+						tgt.translation[2] = pubVal.translation[2];
+						if (pubUseAnchor) {
+							tgt.rotation[0] = -pubVal.rotation[0];
+							tgt.rotation[1] = -pubVal.rotation[1];
+							tgt.rotation[2] = -pubVal.rotation[2];
+							tgt.rotation[3] = pubVal.rotation[3];
+						} else {
+							tgt.rotation[0] = pubVal.rotation[0];
+							tgt.rotation[1] = pubVal.rotation[1];
+							tgt.rotation[2] = pubVal.rotation[2];
+							tgt.rotation[3] = pubVal.rotation[3];
+						}
 					}
 					// nativeIdleMode holds ignore the blend envelope: underneath
 					// the hold is the donor's own (wrong) track, not the base

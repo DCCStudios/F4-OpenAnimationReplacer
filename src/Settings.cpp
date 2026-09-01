@@ -67,6 +67,7 @@ void Settings::Load()
 	bVerboseLogging = getB("Debug", "bVerboseLogging", bVerboseLogging);
 	bExitInitInstant = getB("Debug", "bExitInitInstant", bExitInitInstant);
 	sPlainReplayWeapons = getS("Debug", "sPlainReplayWeapons", sPlainReplayWeapons.c_str());
+	bPlainReplayFastForward = getB("Debug", "bPlainReplayFastForward", bPlainReplayFastForward);
 
 	const char* rvaStr = getS("Debug", "iLoadClipsAddressRVA", "0");
 	if (rvaStr) {
