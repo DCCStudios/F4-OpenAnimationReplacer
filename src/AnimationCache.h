@@ -207,7 +207,7 @@ private:
 	// violation during startup archive registration; an AV is SEH, not C++, so a
 	// try/catch cannot catch it — the wrapper must use __try/__except).
 	bool DoLoadAnimationResourceUnsafe(const std::string& a_suffix, const std::string& a_resourcePath,
-		const void* a_owner, int32_t a_priority);
+		const void* a_owner, int32_t a_priority, bool a_preserveExtractedMotion);
 	static bool DoReadArchiveTextFileUnsafe(const std::string& a_resourcePath, std::string& a_out);
 	bool TryRebindCached(const std::string& a_suffix, std::string_view a_sourceIdentity,
 		bool a_hasFileMTime, std::uint64_t a_sourceSize,
@@ -221,7 +221,10 @@ private:
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 	// Resolve the supported reference-frame vtable from CommonLib's runtime
 	// Address Library entry and patch already-parsed packfiles when it becomes
-	// available. Returns zero when this runtime has no usable entry.
+	// available. Callers resolve it lazily only for opt-in entries. A missing
+	// Address Library ID follows CommonLib's fatal runtime dependency contract;
+	// zero is returned only when the resolved address fails post-resolution
+	// validation.
 	uintptr_t EnsureReferenceFrameVtable();
 
 	// Caller must hold m_mutex (shared or unique).

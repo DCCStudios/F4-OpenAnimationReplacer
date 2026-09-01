@@ -4,6 +4,7 @@
 #include "RE/B/BSResourceNiBinaryStream.h"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <string_view>
 
@@ -31,6 +32,32 @@ static uintptr_t ResolveVtable(AnimationCache::CachedAnimation::VtableFixupKind 
 	default:
 		return a_gameAnimationVtable;
 	}
+}
+
+// Patch one serialized virtual-fixup slot after validating the owning contents
+// section. All callers use this helper so deferred, retroactive, and inline
+// fixups share the same bounds and class-selection rules.
+static bool PatchVtableFixup(AnimationCache::CachedAnimation& a_entry,
+	const AnimationCache::CachedAnimation::VtableFixup& a_fixup,
+	uintptr_t a_gameAnimationVtable, uintptr_t a_referenceFrameVtable)
+{
+	if (a_entry.fileData.empty() || a_entry.sectionFileOffset > a_entry.fileData.size()) {
+		return false;
+	}
+
+	const auto sectionSize = a_entry.fileData.size() - a_entry.sectionFileOffset;
+	if (a_fixup.offset > sectionSize || sizeof(uintptr_t) > sectionSize - a_fixup.offset) {
+		return false;
+	}
+
+	const auto vtable = ResolveVtable(a_fixup.kind, a_gameAnimationVtable, a_referenceFrameVtable);
+	if (vtable == 0) {
+		return false;
+	}
+
+	std::memcpy(a_entry.fileData.data() + a_entry.sectionFileOffset + a_fixup.offset,
+		&vtable, sizeof(vtable));
+	return true;
 }
 
 namespace
@@ -264,14 +291,15 @@ bool AnimationCache::LoadAnimationResource(const std::string& a_suffix, const st
 	// exception a C++ try/catch cannot catch, so guard the open/read with __try and skip
 	// the faulting resource instead of taking the whole game down on load.
 	__try {
-		return DoLoadAnimationResourceUnsafe(a_suffix, a_resourcePath, a_owner, a_priority);
+		return DoLoadAnimationResourceUnsafe(a_suffix, a_resourcePath, a_owner, a_priority,
+			a_preserveExtractedMotion);
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 		return ReportResourceFaultAndFail("archive animation", a_resourcePath);
 	}
 }
 
 bool AnimationCache::DoLoadAnimationResourceUnsafe(const std::string& a_suffix, const std::string& a_resourcePath,
-	const void* a_owner, int32_t a_priority)
+	const void* a_owner, int32_t a_priority, bool a_preserveExtractedMotion)
 {
 	RE::BSResourceNiBinaryStream stream(a_resourcePath.c_str(), false, nullptr, true);
 	if (!stream) {
@@ -345,7 +373,9 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 	std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority,
 	bool a_preserveExtractedMotion)
 {
-	EnsureReferenceFrameVtable();
+	if (a_preserveExtractedMotion) {
+		EnsureReferenceFrameVtable();
+	}
 	const auto sourceSize = a_sourceSize != 0 ? a_sourceSize : static_cast<uint64_t>(a_bytes.size());
 	if (a_bytes.size() < 64 || a_bytes.size() > 50 * 1024 * 1024) {
 		logger::warn("[OAR-Cache] Invalid source size ({}) for: '{}'", a_bytes.size(), a_sourceIdentity);
@@ -498,12 +528,9 @@ void AnimationCache::SetVtableFromGame(uintptr_t a_vtable)
 	int referenceFramePatched = 0;
 	for (auto& [key, files] : m_cache) {
 		for (auto& entry : files) {
-			if (!entry || entry->fileData.empty()) continue;
-			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
+			if (!entry) continue;
 			for (const auto& fixup : entry->vtableFixups) {
-				const auto vtable = ResolveVtable(fixup.kind, gameAnimationVtable, referenceFrameVtable);
-				if (vtable == 0) continue;
-				*reinterpret_cast<uintptr_t*>(sectionData + fixup.offset) = vtable;
+				if (!PatchVtableFixup(*entry, fixup, gameAnimationVtable, referenceFrameVtable)) continue;
 				if (fixup.kind == CachedAnimation::VtableFixupKind::kGameAnimation) {
 					patched++;
 				} else {
@@ -523,18 +550,16 @@ uintptr_t AnimationCache::EnsureReferenceFrameVtable()
 	const auto cached = m_referenceFrameVtable.load(std::memory_order_acquire);
 	if (cached != 0) return cached;
 
+	// Unlike the old opportunistic capture, this is deterministic for the
+	// supported FO4 runtime and does not depend on a particular original
+	// animation already having extracted motion. CommonLib's Address Library
+	// lookup is a required runtime dependency: a missing ID is a fatal setup
+	// error, not an exception that this feature can turn into a soft fallback.
 	uintptr_t resolved = 0;
-	try {
-		// Unlike the old opportunistic capture, this is deterministic for the
-		// supported FO4 runtime and does not depend on a particular original
-		// animation already having extracted motion.
-		static REL::Relocation<uintptr_t> defaultReferenceFrameVtable{
-			RE::VTABLE::hkaDefaultAnimatedReferenceFrame[0]
-		};
-		resolved = defaultReferenceFrameVtable.address();
-	} catch (...) {
-		resolved = 0;
-	}
+	static REL::Relocation<uintptr_t> defaultReferenceFrameVtable{
+		RE::VTABLE::hkaDefaultAnimatedReferenceFrame[0]
+	};
+	resolved = defaultReferenceFrameVtable.address();
 	if (resolved < 0x10000 || IsBadReadPtr(reinterpret_cast<void*>(resolved), sizeof(uintptr_t))) {
 		logger::warn("[OAR-Motion] hkaDefaultAnimatedReferenceFrame vtable is unavailable on this runtime");
 		return 0;
@@ -554,17 +579,12 @@ uintptr_t AnimationCache::EnsureReferenceFrameVtable()
 	int retired = 0;
 	for (auto& [suffix, files] : m_cache) {
 		for (auto& entry : files) {
-			if (!entry || entry->fileData.empty()) continue;
-			uint8_t* sectionData = entry->fileData.data() + entry->sectionFileOffset;
+			if (!entry) continue;
 			for (const auto& fixup : entry->vtableFixups) {
 				if (fixup.kind != CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame ||
-					!IsFileRange(reinterpret_cast<uintptr_t>(sectionData),
-						entry->fileData.size() - entry->sectionFileOffset,
-						reinterpret_cast<uintptr_t>(sectionData) + fixup.offset,
-						sizeof(uintptr_t))) {
+					!PatchVtableFixup(*entry, fixup, 0, resolved)) {
 					continue;
 				}
-				*reinterpret_cast<uintptr_t*>(sectionData + fixup.offset) = resolved;
 				++patched;
 			}
 			if (entry->preserveExtractedMotion && !entry->clones.empty()) {
@@ -592,7 +612,17 @@ RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix
 RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim,
 	const void* a_owner)
 {
-	EnsureReferenceFrameVtable();
+	// Resolving the optional extracted-motion vtable is deferred until an
+	// opting-in entry is actually selected. Pose-only replacements keep the
+	// normal OAR dependency surface and do not require this Address Library ID.
+	{
+		std::shared_lock lock(m_mutex);
+		const auto* selected = SelectEntry(a_suffix, a_owner);
+		if (selected && selected->preserveExtractedMotion) {
+			lock.unlock();
+			EnsureReferenceFrameVtable();
+		}
+	}
 	std::unique_lock lock(m_mutex);
 	auto* selected = SelectEntry(a_suffix, a_owner);
 	if (!selected) return nullptr;
@@ -1302,8 +1332,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 			for (size_t i = 0; i + 12 <= fixupBytes; i += 12) {
 				uint32_t src = *reinterpret_cast<uint32_t*>(fixups + i);
 				uint32_t nameOffset = *reinterpret_cast<uint32_t*>(fixups + i + 8);
-				if (src == 0xFFFFFFFF) continue;
-				if (src + 8 > sectionSize) continue;
+				if (src == 0xFFFFFFFF || src > sectionSize || sizeof(uintptr_t) > sectionSize - src) continue;
 
 				const auto className = getVirtualClassName(nameOffset);
 				a_entry.vtableFixups.push_back({
@@ -1314,10 +1343,7 @@ bool AnimationCache::ParsePackfile(CachedAnimation& a_entry)
 				});
 
 				const auto vtableKind = a_entry.vtableFixups.back().kind;
-				const auto vtable = ResolveVtable(vtableKind, gameVtable, referenceFrameVtable);
-				if (vtable != 0) {
-					*reinterpret_cast<uintptr_t*>(sectionData + src) = vtable;
-				}
+				PatchVtableFixup(a_entry, a_entry.vtableFixups.back(), gameVtable, referenceFrameVtable);
 				if (vtableKind == CachedAnimation::VtableFixupKind::kGameAnimation) {
 					vtableFixCount++;
 				} else {

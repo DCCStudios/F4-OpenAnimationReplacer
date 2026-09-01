@@ -4510,6 +4510,7 @@ namespace
 			std::string resourcePath;
 			const void* owner;
 			int32_t priority;
+			bool preserveExtractedMotion;
 		};
 		std::vector<PreloadItem> looseWork;
 		std::vector<DeferredArchiveItem> archiveWork;
@@ -4533,7 +4534,8 @@ namespace
 				// archiveResource branch that used to run inside runWorker.
 				if (info.archiveResource) {
 					const auto priority = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
-					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority });
+					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority,
+						info.parentSubMod ? info.parentSubMod->GetPreserveExtractedMotion() : false });
 				} else {
 					looseWork.push_back({ suffix, &info });
 				}
@@ -4620,7 +4622,8 @@ namespace
 				int aLoaded = 0;
 				int aFailed = 0;
 				for (const auto& it : items) {
-					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority)) {
+					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority,
+						it.preserveExtractedMotion)) {
 						++aLoaded;
 					} else {
 						++aFailed;

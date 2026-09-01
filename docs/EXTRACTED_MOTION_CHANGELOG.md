@@ -29,10 +29,19 @@ replacement feature proposed in PR #7.
   fixups and retires preserve-enabled clones built before that point.
 - Changing the option during a config reload retires existing clones so the
   new policy takes effect on the next build.
-- Retired clone and backing-file buffers are retained for the process
-  lifetime. There is no heuristic FIFO eviction because the inspected clip
-  bindings expose no reliable liveness signal; an age/count cap could free a
-  buffer still referenced by Havok.
+- The reference-frame vtable is resolved lazily, only after a selected entry
+  opts into `preserveExtractedMotion`, through the required CommonLib Address
+  Library entry `587967`. A missing or mismatched Address Library database
+  follows CommonLib's fatal dependency contract when the opt-in feature is
+  used; pose-only replacements do not require this lookup.
+- Retired clone and backing-file buffers are retained for the process lifetime
+  as an intentional memory-for-lifetime tradeoff. There is no heuristic FIFO
+  eviction because the inspected clip bindings expose no reliable liveness
+  signal; an age/count cap could free a buffer still referenced by Havok. This
+  is a known limitation of the current implementation, not an unbounded live
+  cache policy that can be reclaimed safely without a future liveness API.
+- Inline parsing, first-vtable retroactive repair, and deferred cache repair all
+  use the same bounds-checked virtual-fixup patch helper.
 - The reference-frame validator uses the Fallout 4 runtime layout: duration at
   `+0x40` and the sample array at `+0x48/+0x50`. This keeps valid weapon HKX
   motion donors from being rejected by stale field offsets.
