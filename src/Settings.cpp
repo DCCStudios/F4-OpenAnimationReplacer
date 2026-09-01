@@ -65,6 +65,7 @@ void Settings::Load()
 	fAnimationQueueLingerTime = static_cast<float>(getD("UI", "fAnimationQueueLingerTime", fAnimationQueueLingerTime));
 
 	bVerboseLogging = getB("Debug", "bVerboseLogging", bVerboseLogging);
+	bExitInitInstant = getB("Debug", "bExitInitInstant", bExitInitInstant);
 
 	const char* rvaStr = getS("Debug", "iLoadClipsAddressRVA", "0");
 	if (rvaStr) {

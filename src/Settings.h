@@ -94,6 +94,11 @@ public:
 	float fAnimationQueueLingerTime{ 5.0f };
 
 	bool  bVerboseLogging{ false };
+	// A/B experiment switch (vault NaN storm hunt 2026-08-31): when false, the
+	// deferred-IdleStop delivery skips the InitializeActorInstant + 1s settle
+	// fast-forward and just replays the event (visible exit transition returns,
+	// but the forced synchronous graph advance never runs).
+	bool  bExitInitInstant{ true };
 
 	// OpenAnimationReplacer.ini is the mod-provided default configuration. The
 	// settings page writes only the separate user overlay so a mod update or a

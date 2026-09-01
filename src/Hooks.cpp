@@ -810,6 +810,14 @@ static std::atomic<uint64_t> s_currentFrame{ 0 };
 // 60fps but ~1.5s at 200fps), which made cached overrides drop out early on
 // fast/inconsistent framerates.
 static std::atomic<float> s_tfNowSec{ 0.0f };
+// Last game-time second at which the player's graph was OBSERVED mid-rebuild
+// (stamped inside PlayerAnimGraphIsRebuilding). The rebuild flags are
+// transient main-thread pulses while async clip loading continues for
+// hundreds of ms afterwards - gates that must cover the whole load window
+// check this sticky stamp, not just the instantaneous flag (field
+// 2026-08-31: the IdleStop delivery read the flag FALSE 2ms after the
+// weapon-change path read it TRUE, and the NaN followed).
+static std::atomic<float> s_lastRebuildSeenSec{ -1000.0f };
 // Threshold: if no source clip has fired Generate for this long, the entry
 // is considered stale and erased (so non-source clips stop applying old cached pose).
 static constexpr float kTrackFilterStaleSeconds = 5.0f;
@@ -857,6 +865,8 @@ static bool PeekIdleStopSuppression(RE::TESObjectREFR* a_refr,
 
 static bool ConsumeIdleStopSuppression(RE::TESObjectREFR* a_refr, bool* a_outSuppressSounds);
 
+static bool PlayerAnimGraphIsRebuilding();  // defined below (weapon-change deferral)
+
 // Executes a parked IdleStop: fast-forward (with the sound window) when the
 // arm is still present, then replay the event into the ORIGINAL sink vfunc
 // (no hook re-entry). Runs on the game thread (event hook or actor tick).
@@ -864,6 +874,30 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 	const RE::hkQsTransformRaw* a_exitCam = nullptr)
 {
 	if (!a_refr) return;
+	// ROOT-CAUSE GATE (forensics 2026-08-31, cryolator white-screen NaN): this
+	// delivery performs InitializeActorInstant + a settle update. Delivered at
+	// the same tick the player's graph is ALREADY rebuilding (heavy-gun fast
+	// re-equip at vault exit), the freshly rebuilt subgraph's additive layer
+	// evaluates against still-async-loading bindings and writes non-finite
+	// transforms into the 1P flattened bone tree. Postpone until the rebuild
+	// settles - the drain tick retries - with a 3s cap so a stuck flag can
+	// never park the IdleStop forever.
+	const float gateNowSec = s_tfNowSec.load(std::memory_order_relaxed);
+	const bool rebuildingNow = a_refr->GetFormID() == 0x14 && PlayerAnimGraphIsRebuilding();
+	const bool rebuildRecent = a_refr->GetFormID() == 0x14 &&
+		(gateNowSec - s_lastRebuildSeenSec.load(std::memory_order_relaxed)) < 0.75f;
+	if (rebuildingNow || rebuildRecent) {
+		std::lock_guard dLock(s_deferredIdleStopMutex);
+		auto pit = s_deferredIdleStops.find(a_refr);
+		if (pit != s_deferredIdleStops.end() &&
+			std::chrono::steady_clock::now() - pit->second.deferredAt < std::chrono::seconds(3)) {
+			static std::atomic<uint32_t> s_postponeLog{ 0 };
+			if (s_postponeLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+				logger::info("[OAR-IdleStop] Postponed deferred IdleStop ({}): graph rebuilding now={} recent={}", a_reason, rebuildingNow, rebuildRecent);
+			}
+			return;  // record stays parked; retried next tick
+		}
+	}
 	DeferredIdleStop rec;
 	{
 		std::lock_guard dLock(s_deferredIdleStopMutex);
@@ -916,12 +950,19 @@ static void DeliverDeferredIdleStop(RE::TESObjectREFR* a_refr, const char* a_rea
 			// update BEFORE the event is allowed through). The post-exit
 			// anchor fade and the exit-camera snapshot pin mask the one-frame
 			// graph rebuild; the sound window swallows its annotations.
-			s_inIdleStopFastForward = true;
-			s_suppressFastForwardSounds = suppressSounds;
-			RE::BGSAnimationSystemUtils::InitializeActorInstant(*actor, false);
-			actor->UpdateAnimation(kExitInitUpdateSec);
-			s_inIdleStopFastForward = false;
-			s_suppressFastForwardSounds = false;
+			if (Settings::GetSingleton()->bExitInitInstant) {
+				s_inIdleStopFastForward = true;
+				s_suppressFastForwardSounds = suppressSounds;
+				RE::BGSAnimationSystemUtils::InitializeActorInstant(*actor, false);
+				actor->UpdateAnimation(kExitInitUpdateSec);
+				s_inIdleStopFastForward = false;
+				s_suppressFastForwardSounds = false;
+			} else {
+				// A/B experiment (vault NaN storm): skip the forced synchronous
+				// graph advance entirely; the plain IdleStop replay below drives
+				// a normal-speed exit transition.
+				OAR_VLOG("[OAR-IdleStop] bExitInitInstant=0: skipping InitializeActorInstant + settle fast-forward");
+			}
 		}
 	}
 	if (rec.original && rec.sinkThis) {
@@ -1174,6 +1215,33 @@ static int32_t FindTrackIndexForBone(const RE::hkbClipGenerator* a_clip, int16_t
 // Override: lerp base toward replacement absolute pose
 static void LerpTransform(RE::hkQsTransformRaw& base, const RE::hkQsTransformRaw& rep, float w)
 {
+	// A zeroed slot (a bone this clip never writes: near-zero scale, degenerate
+	// quaternion) must never be lerped FROM. The blanket stamp loops hit such
+	// slots, ramping scale 0 -> ~w while setting the bone's mask bit; the
+	// engine's inverse math then divides by that near-zero scale — finite-in,
+	// NaN-out (cryolator track-filtered vault white-screen; agent audit
+	// 2026-08-31, candidate #3). Snap the slot to the target outright instead:
+	// for an unowned slot the anchor/hold value at full strength IS the intent.
+	const float ql =
+		base.rotation[0] * base.rotation[0] + base.rotation[1] * base.rotation[1] +
+		base.rotation[2] * base.rotation[2] + base.rotation[3] * base.rotation[3];
+	// PLAUSIBILITY, not just zero-detection (field 2026-08-31 round 12): slots a
+	// clip never writes hold stale HEAP GARBAGE, not zeros - finite random
+	// floats that pass every NaN scrub, then blend into the engine where
+	// huge/denormal values turn into inf-inf = NaN at the root composition.
+	// A legitimate pose transform ALWAYS has a ~unit quaternion, a scale near 1,
+	// and a bounded translation; anything else snaps to the target outright.
+	const bool quatPlausible = std::isfinite(ql) && ql > 0.25f && ql < 4.0f;
+	const bool scalePlausible = std::isfinite(base.scale[0]) &&
+		std::fabs(base.scale[0]) > 1.0e-2f && std::fabs(base.scale[0]) < 100.0f;
+	const bool transPlausible =
+		std::isfinite(base.translation[0]) && std::fabs(base.translation[0]) < 1.0e6f &&
+		std::isfinite(base.translation[1]) && std::fabs(base.translation[1]) < 1.0e6f &&
+		std::isfinite(base.translation[2]) && std::fabs(base.translation[2]) < 1.0e6f;
+	if (!quatPlausible || !scalePlausible || !transPlausible) {
+		base = rep;
+		return;
+	}
 	float iw = 1.0f - w;
 	for (int i = 0; i < 4; ++i)
 		base.translation[i] = base.translation[i] * iw + rep.translation[i] * w;
@@ -1460,6 +1528,28 @@ static void SetPoseBoneMaskBit(uint8_t* a_tracksPtr,
 // this clip so downstream blending ignores its written value (sparse tracks
 // only — dense tracks have no mask and cannot be unset this way; returns
 // whether the bit was actually cleared).
+// Fetch a bone's BIND-pose local from a character's animation skeleton
+// (hkaSkeleton::referencePose) — mirrors the post-exit fade's foreign-skeleton
+// neutralizer. Used to HOLD a bone at a valid neutral value instead of
+// CLEARING its mask bit: a cleared bone with no remaining contributor makes
+// the engine's per-bone normalize divide by zero accumulated weight
+// (finite-in, NaN-out — the cryolator vault Root-NaN storm; audit candidate #2).
+static bool GetBindPoseLocal(const RE::hkbCharacter* a_char, int16_t a_idx, RE::hkQsTransformRaw& a_out)
+{
+	if (!a_char || a_idx < 0) return false;
+	auto* setup = a_char->setup._ptr;
+	if (!setup) return false;
+	auto* skel = reinterpret_cast<uint8_t*>(setup->animationSkeleton._ptr);
+	if (!skel) return false;
+	auto* ref = reinterpret_cast<RE::hkArrayRawLayout*>(skel + RE::kSkeletonOffset_referencePose);
+	if (!ref->data || ref->size <= a_idx ||
+		IsBadReadPtr(ref->data, static_cast<size_t>(ref->size) * sizeof(RE::hkQsTransformRaw))) {
+		return false;
+	}
+	a_out = reinterpret_cast<const RE::hkQsTransformRaw*>(ref->data)[a_idx];
+	return true;
+}
+
 static bool ClearPoseBoneMaskBit(uint8_t* a_tracksPtr,
 	const RE::TrackHeaderRaw& a_poseHeader, int16_t a_boneIdx)
 {
@@ -3357,8 +3447,14 @@ static bool PlayerAnimGraphIsRebuilding()
 		return false;
 	}
 
-	return *reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
+	const bool rebuilding =
+		*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AC) != 0 ||
 		*reinterpret_cast<const uint8_t*>(hkGraph + 0x1AD) != 0;
+	if (rebuilding) {
+		s_lastRebuildSeenSec.store(s_tfNowSec.load(std::memory_order_relaxed),
+			std::memory_order_relaxed);
+	}
+	return rebuilding;
 }
 
 static void CheckAndInvalidateOnWeaponChange()
@@ -6636,6 +6732,11 @@ namespace
 				}
 				state->nativeHoldCamera = holdCam;
 			}
+			// Stale-character purge (audit candidate #4): subgraph characters are
+			// torn down and recreated across weapon re-equips; a recycled
+			// hkbCharacter* would resurrect bone indices resolved on a different
+			// skeleton, landing stamps/masks on wrong bones of subgraph tracks.
+			state->resolvedByChar.clear();
 			state->lastSourceTimeSec = nowSec;
 			state->lastSampleSec = 0.0f;
 			state->lastSampledLocalTime = -1.0f;
@@ -10493,6 +10594,80 @@ namespace
 		auto* outputPose = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + poseHeader.dataOffset);
 		int16_t numOutputBones = poseHeader.numData;
 
+		// NaN scrub (field 2026-08-31): the white-screen/tinnitus bug is the
+		// skeleton Root going non-finite during a track-filtered vault — the NaN
+		// then propagates down the world-transform chain to the Camera (white
+		// warp) and the audio listener (the ring). The anchor is already
+		// finite-guarded and the scene-node writes are guarded, so the NaN rides
+		// in on THIS clip's output pose from the sampler. Never let a non-finite
+		// bone reach the engine's blend: replace it with identity here, and name
+		// the first offender so the true source can be fixed at the math.
+		{
+			int nanBones = 0;
+			int16_t firstNanBone = -1;
+			for (int16_t bi = 0; bi < numOutputBones; ++bi) {
+				if (!IsFiniteQs(outputPose[bi])) {
+					if (firstNanBone < 0) firstNanBone = bi;
+					++nanBones;
+					auto& t = outputPose[bi];
+					t.translation[0] = t.translation[1] = t.translation[2] = t.translation[3] = 0.0f;
+					t.rotation[0] = t.rotation[1] = t.rotation[2] = 0.0f;
+					t.rotation[3] = 1.0f;
+					t.scale[0] = t.scale[1] = t.scale[2] = t.scale[3] = 1.0f;
+				}
+			}
+			if (nanBones > 0) {
+				static std::atomic<uint32_t> s_poseNanLog{ 0 };
+				if (s_poseNanLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+					const char* clipName = a_this->animationName.data();
+					logger::warn("[OAR-PoseScrub] Scrubbed {} non-finite bone(s) (first idx {}, numData {}) "
+						"from clip '{}' output pose to identity (prevents skeleton/camera/audio NaN)",
+						nanBones, firstNanBone, numOutputBones,
+						(clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0]) ? clipName : "(?)");
+				}
+			}
+
+			// Motion tracks (field 2026-08-31 round 2): the pose (track 2) proved
+			// clean while skeleton.nif STILL went NaN — with the F4Parkour position
+			// guard also silent. The remaining graph outputs are track 0
+			// (worldFromModel) and track 1 (extracted motion). The engine
+			// INTEGRATES the extracted-motion delta into the graph's worldFromModel
+			// accumulator, which places skeleton.nif every frame — one NaN delta
+			// poisons it permanently (until a graph rebuild, which is why
+			// holster/re-equip recovers). Weapon-dependent because the delta comes
+			// from the ACTIVE WEAPON SUBGRAPH's motion blend (cryolator/heavy-gun
+			// subgraphs, not the common one). Scrub a non-finite transform in
+			// either track to identity (zero motion delta) before the engine
+			// consumes it, and name the track + clip.
+			{
+				const auto* master = reinterpret_cast<RE::TrackMasterHeaderRaw*>(tracksPtr);
+				const int motionTracks = std::min(2, master->numTracks);
+				for (int ti = 0; ti < motionTracks; ++ti) {
+					auto& mh = headers[ti];
+					if (mh.numData <= 0 || mh.dataOffset <= 0 || mh.onFraction <= 0.0f) continue;
+					if (mh.elementSizeBytes != static_cast<int16_t>(sizeof(RE::hkQsTransformRaw))) continue;
+					auto* mData = reinterpret_cast<RE::hkQsTransformRaw*>(tracksPtr + mh.dataOffset);
+					for (int16_t mi = 0; mi < mh.numData; ++mi) {
+						if (IsFiniteQs(mData[mi])) continue;
+						auto& t = mData[mi];
+						t.translation[0] = t.translation[1] = t.translation[2] = t.translation[3] = 0.0f;
+						t.rotation[0] = t.rotation[1] = t.rotation[2] = 0.0f;
+						t.rotation[3] = 1.0f;
+						t.scale[0] = t.scale[1] = t.scale[2] = t.scale[3] = 1.0f;
+						static std::atomic<uint32_t> s_motionNanLog{ 0 };
+						if (s_motionNanLog.fetch_add(1, std::memory_order_relaxed) < 60) {
+							const char* clipName = a_this->animationName.data();
+							logger::warn("[OAR-PoseScrub] Scrubbed non-finite MOTION track {} ({}) entry {} "
+								"to identity on clip '{}' (numData={}, onFrac={:.2f})",
+								ti, ti == 0 ? "worldFromModel" : "extractedMotion", mi,
+								(clipName && reinterpret_cast<uintptr_t>(clipName) > 0x10000 && clipName[0]) ? clipName : "(?)",
+								mh.numData, mh.onFraction);
+						}
+					}
+				}
+			}
+		}
+
 		// One-shot diagnostic: log the pose track header so we can verify layout
 		// (size of element, capacity, onFraction, flags). The flags byte tells us
 		// if the pose is sparse/palette, and onFraction must be > 0 for the engine
@@ -10575,10 +10750,11 @@ namespace
 					}
 					static std::atomic<int> s_censusCount{ 0 };
 					if (logCensus && s_censusCount.fetch_add(1, std::memory_order_relaxed) < 300) {
-						OAR_VLOG("[OAR-TF-NativeCensus] clip={:X} leaf='{}' cachedSuffix='{}' persp={} onFrac={:.2f} nBones={} match={}",
+						OAR_VLOG("[OAR-TF-NativeCensus] clip={:X} leaf='{}' cachedSuffix='{}' persp={} onFrac={:.2f} nBones={} cap={} flags=0x{:02X} match={}",
 							reinterpret_cast<uintptr_t>(a_this), censusLeaf, suppressClipSuffix,
 							static_cast<int>(GetPlayingClipPerspectiveImpl(a_this)),
-							poseHeader.onFraction, poseHeader.numData, isNativeIdleClip);
+							poseHeader.onFraction, poseHeader.numData, poseHeader.capacity,
+							static_cast<uint8_t>(poseHeader.flags), isNativeIdleClip);
 					}
 				}
 				if (isNativeIdleClip) {
@@ -10835,7 +11011,23 @@ namespace
 						!cfState.dormant && cfState.filter &&
 						cfState.filter->nativeIdlePlayback && cfState.nativeAnchorValid) {
 						camFadeOutActive = true;
-						camClipIsNativeSource = cfState.sourceClips.count(a_this) > 0;
+						// sourceClips is ALWAYS empty for standalone native-idle
+						// states (only the non-standalone path fills it), so the
+						// old sourceClips test misclassified the native clip as a
+						// foreign live carrier during blend-out — flipping
+						// tailCamLive released the camera hold on the ONLY
+						// contributor while the equip camera was masked out below
+						// = zero camera contributors = the engine's 0/0 normalize
+						// (agent audit 2026-08-31, candidate #2). Identify the
+						// native source by clip identity, the same way the
+						// adoption gate does.
+						{
+							const char* cn = a_this->animationName.data();
+							if (cn && reinterpret_cast<uintptr_t>(cn) > 0x10000 && cn[0] != '\0') {
+								camClipIsNativeSource =
+									(SubgraphGetLeaf(cn) == GetSuffixLeaf(cfState.suffix));
+							}
+						}
 						break;
 					}
 				}
@@ -12918,6 +13110,58 @@ namespace
 		}
 	}
 
+	// --- Track-filter 1P camera diagnostic (verbose) -----------------------
+	// Reads the player's FIRST-PERSON "Camera" scene node — the exact node
+	// TrackFilterCameraHooks::ApplyCurrentContribution ACCUMULATES deltas into
+	// and RestorePreviousContribution may SKIP restoring — so a real off-map
+	// teleport (finite but huge translate) is told apart from matrix corruption
+	// (NaN/inf). Sampled ~2 Hz while a player track filter is active and once
+	// 2s after the last one ends (the persistent stuck state).
+	static float s_camProbeFireAtSec = -1.0f;  // >=0: fire the +2s probe at this s_tfNowSec
+	static void LogPlayer1PCameraNode(std::string_view a_tag)
+	{
+		if (!OAR_IsVerboseLogging()) return;
+		auto* pc = RE::PlayerCharacter::GetSingleton();
+		RE::NiAVObject* root = pc ? pc->Get3D(true) : nullptr;
+		RE::NiAVObject* cam = root ? root->GetObjectByName(RE::BSFixedString("Camera")) : nullptr;
+		if (!cam) {
+			OAR_VLOG("[OAR-CamProbe] {}: no 1P Camera node (1P-root={})", a_tag, static_cast<const void*>(root));
+			return;
+		}
+		const auto& L = cam->local.translate;
+		const auto& W = cam->world.translate;
+		const bool finite =
+			std::isfinite(L.x) && std::isfinite(L.y) && std::isfinite(L.z) &&
+			std::isfinite(W.x) && std::isfinite(W.y) && std::isfinite(W.z);
+		OAR_VLOG("[OAR-CamProbe] {}: 1P Camera local=({:.3f},{:.3f},{:.3f}) world=({:.1f},{:.1f},{:.1f}) finite={} appliedValid={}",
+			a_tag, L.x, L.y, L.z, W.x, W.y, W.z, finite, s_appliedTrackFilterCamera.valid);
+
+		// Camera local is finite but world is NaN => a PARENT's transform is
+		// poisoned. Walk up and name the first ancestor whose LOCAL is non-finite
+		// — that's the true NaN origin bone, whichever code path set it.
+		if (!finite) {
+			auto localFinite = [](RE::NiAVObject* n) {
+				const auto& t = n->local.translate;
+				return std::isfinite(t.x) && std::isfinite(t.y) && std::isfinite(t.z) &&
+					std::isfinite(n->local.scale);
+			};
+			RE::NiAVObject* culprit = nullptr;
+			for (RE::NiAVObject* n = cam; n; n = n->parent) {
+				if (!localFinite(n)) culprit = n;  // keep climbing; last non-finite = highest
+			}
+			if (culprit) {
+				const auto& c = culprit->local.translate;
+				OAR_VLOG("[OAR-CamProbe] {}: first non-finite LOCAL up the chain = '{}' local=({},{},{}) scale={}",
+					a_tag,
+					culprit->name.c_str() ? culprit->name.c_str() : "(unnamed)",
+					c.x, c.y, c.z, culprit->local.scale);
+			} else {
+				OAR_VLOG("[OAR-CamProbe] {}: world NaN but every ancestor LOCAL is finite "
+					"(NaN is in a rotation/scale, not translate)", a_tag);
+			}
+		}
+	}
+
 	void HookedActorUpdate()
 	{
 		s_currentFrame.fetch_add(1, std::memory_order_relaxed);
@@ -13035,6 +13279,34 @@ namespace
 		// stale-entry cleanup all scale with the time multiplier).
 		s_tfNowSec.store(s_tfNowSec.load(std::memory_order_relaxed) + dt,
 			std::memory_order_relaxed);
+
+		// Track-filter 1P camera probe (verbose diagnostic): sample the camera
+		// node ~2 Hz while a player track filter is active, and once at the
+		// scheduled +2s point after the last one ended.
+		if (OAR_IsVerboseLogging()) {
+			const float nowSec = s_tfNowSec.load(std::memory_order_relaxed);
+			bool playerFilterActive = false;
+			if (auto* pc = RE::PlayerCharacter::GetSingleton()) {
+				std::shared_lock lock(s_trackFilterMutex);
+				auto it = s_charTrackFilterMap.find(pc);
+				if (it != s_charTrackFilterMap.end()) {
+					for (const auto& st : it->second) {
+						if (!st.dormant) { playerFilterActive = true; break; }
+					}
+				}
+			}
+			if (playerFilterActive) {
+				static float s_lastDuringLogSec = -1.0f;
+				if (nowSec - s_lastDuringLogSec >= 0.5f) {
+					s_lastDuringLogSec = nowSec;
+					LogPlayer1PCameraNode("active");
+				}
+			}
+			if (s_camProbeFireAtSec >= 0.0f && nowSec >= s_camProbeFireAtSec) {
+				s_camProbeFireAtSec = -1.0f;
+				LogPlayer1PCameraNode("+2s-after-end");
+			}
+		}
 
 		// --- Track filter blend update ---
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) > 0) {
@@ -13301,6 +13573,13 @@ namespace
 								state.blendingOut = false;
 								state.blendAlpha = 0.0f;
 								state.postExitAnchorFade = false;
+								// Camera probe: capture the 1P camera at the exit and
+								// schedule a +2s follow-up to catch the persistent
+								// (stuck-offset) state.
+								if (OAR_IsVerboseLogging()) {
+									LogPlayer1PCameraNode("at-end");
+									s_camProbeFireAtSec = s_tfNowSec.load(std::memory_order_relaxed) + 2.0f;
+								}
 								if (!state.onEndFired && state.parentSubMod) {
 									QueueCustomEvents(mapIt->first, state.parentSubMod->eventsOnEnd, "onEnd/trackFilter");
 									state.onEndFired = true;
@@ -14738,10 +15017,22 @@ namespace Hooks
 				// OAR. Do not overwrite that newer state. The engine's animation update
 				// that follows normally regenerates the Camera local from the graph.
 				static std::atomic<uint32_t> s_restoreSkippedLogCount{ 0 };
-				if (s_restoreSkippedLogCount.fetch_add(1, std::memory_order_relaxed) < 8) {
-					logger::info(
-						"[OAR-TrackFilter-Camera] Previous scene-node contribution was already "
-						"changed; skipping restoration before animation evaluation");
+				if (s_restoreSkippedLogCount.fetch_add(1, std::memory_order_relaxed) < 40) {
+					const auto& ap = s_appliedTrackFilterCamera.applied.translate;
+					const auto& bs = s_appliedTrackFilterCamera.base.translate;
+					if (node) {
+						const auto& n = node->local.translate;
+						logger::info(
+							"[OAR-TrackFilter-Camera] skipping restoration (node changed by another "
+							"plugin/rebuild). node.local=({:.3f},{:.3f},{:.3f}) applied=({:.3f},{:.3f},{:.3f}) "
+							"base=({:.3f},{:.3f},{:.3f}) -> OAR offset LEFT in place",
+							n.x, n.y, n.z, ap.x, ap.y, ap.z, bs.x, bs.y, bs.z);
+					} else {
+						logger::info(
+							"[OAR-TrackFilter-Camera] skipping restoration (1P Camera node gone/rebuilt). "
+							"applied=({:.3f},{:.3f},{:.3f}) base=({:.3f},{:.3f},{:.3f})",
+							ap.x, ap.y, ap.z, bs.x, bs.y, bs.z);
+					}
 				}
 			}
 			s_appliedTrackFilterCamera = {};
@@ -14804,6 +15095,18 @@ namespace Hooks
 					"[OAR-TrackFilter-Camera] Applied {} sampled delta(s) to the post-eval "
 					"first-person Camera scene node (evaluation={})",
 					deltas.size(), a_evaluation);
+			}
+			// Per-apply accumulation trace (verbose): base translate, the summed
+			// delta this frame, and the resulting node translate. If the resulting
+			// value grows off-map frame over frame while base tracks it, restore is
+			// being skipped and the offset is accumulating (the teleport).
+			if (OAR_IsVerboseLogging()) {
+				float sdx = 0.f, sdy = 0.f, sdz = 0.f;
+				for (const auto& d : deltas) { sdx += d.translation[0]; sdy += d.translation[1]; sdz += d.translation[2]; }
+				const auto& b = s_appliedTrackFilterCamera.base.translate;
+				const auto& r = node->local.translate;
+				OAR_VLOG("[OAR-CamProbe] apply: base=({:.3f},{:.3f},{:.3f}) +delta=({:.3f},{:.3f},{:.3f}) -> ({:.3f},{:.3f},{:.3f})",
+					b.x, b.y, b.z, sdx, sdy, sdz, r.x, r.y, r.z);
 			}
 		}
 
@@ -14914,12 +15217,49 @@ namespace Hooks
 				if (tgt.chainRoot) {
 					RE::NiTransform pm;
 					if (!parentModel(node, pm)) continue;
+					// A degenerate or already-NaN parent-model makes InvertNi(pm)
+					// blow up to NaN. Written to this bone, that NaN propagates down
+					// the world-transform chain (Camera world = NaN = white-screen
+					// warp + NaN audio listener = the tinnitus). Refuse the poison
+					// write and record WHICH failure it was:
+					//   pmFinite=false -> the NaN came from ABOVE (a parent local was
+					//                     already non-finite; the source is upstream).
+					//   pmFinite=true & singular -> a finite-but-singular pm that
+					//                     InvertNi cannot invert (scale ~ 0).
+					const bool pmFinite =
+						std::isfinite(pm.translate.x) && std::isfinite(pm.translate.y) &&
+						std::isfinite(pm.translate.z) && std::isfinite(pm.scale);
+					const bool pmSingular = std::abs(pm.scale) < 1e-6f;
+					if (!pmFinite || pmSingular) {
+						static std::atomic<uint32_t> s_pmDegenLog{ 0 };
+						if (s_pmDegenLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+							logger::warn("[OAR-TrackFilter-Camera] Skipped model-space write for bone '{}': "
+								"parent-model pmFinite={} singular={} scale={} t=({:.3f},{:.3f},{:.3f})",
+								tgt.name, pmFinite, pmSingular, pm.scale,
+								pm.translate.x, pm.translate.y, pm.translate.z);
+						}
+						continue;
+					}
 					const RE::NiTransform donorModel(CameraQuatToMatrix(tgt.r), tp, 1.0f);
 					targetLocal = ComposeNi(InvertNi(pm), donorModel);
 				} else {
 					targetLocal = RE::NiTransform(CameraQuatToMatrix(tgt.r), tp, 1.0f);
 				}
 				targetLocal.scale = node->local.scale;
+
+				// Final belt: never write a non-finite local (catches a NaN donor
+				// rotation/translation, or a compose that still produced NaN).
+				if (!(std::isfinite(targetLocal.translate.x) && std::isfinite(targetLocal.translate.y) &&
+						std::isfinite(targetLocal.translate.z))) {
+					static std::atomic<uint32_t> s_nanTargetLog{ 0 };
+					if (s_nanTargetLog.fetch_add(1, std::memory_order_relaxed) < 40) {
+						logger::warn("[OAR-TrackFilter-Camera] Skipped NON-FINITE model-space local for bone '{}' "
+							"(chainRoot={}) t=({},{},{})",
+							tgt.name, tgt.chainRoot,
+							targetLocal.translate.x, targetLocal.translate.y, targetLocal.translate.z);
+					}
+					continue;
+				}
 
 				AppliedTrackFilterBone entry;
 				entry.node = node;
@@ -14950,6 +15290,204 @@ namespace Hooks
 			}
 		}
 
+		// Persistent-NaN healer (field 2026-08-31): with the clip pose, both
+		// motion tracks, every OAR scene/pose write, AND F4Parkour's positions
+		// all PROVEN finite by their guards, the 1P skeleton root
+		// ('skeleton.nif') still goes non-finite on the SECOND track-filtered
+		// vault with heavy-weapon subgraphs (cryolator etc.): the engine's own
+		// motion blend above the clips degenerates (divide by ~zero total
+		// weight) and poisons its worldFromModel accumulator, which re-writes
+		// this node every frame — a graph rebuild no longer clears it. Until
+		// the degenerate-weight source is found, restore the last finite local
+		// POST-evaluation each frame (this hook is the proven same-frame
+		// post-eval site), so the NaN never reaches the renderer or the audio
+		// listener.
+		static void HealSkeletonRootNaN(RE::PlayerCharacter* a_player, const char* a_site)
+		{
+			RE::NiAVObject* root = a_player ? a_player->Get3D(true) : nullptr;
+			if (!root) return;
+			static RE::NiAVObject* s_cachedRoot = nullptr;
+			static RE::NiAVObject* s_skel = nullptr;
+			static RE::BSFlattenedBoneTree* s_tree = nullptr;
+			static RE::NiAVObject* s_camNode = nullptr;
+			static std::unordered_map<RE::NiAVObject*, RE::NiTransform> s_lastFiniteByNode;
+			static RE::NiTransform s_lastTreeWorld;
+			static bool s_haveTreeWorld = false;
+			static RE::NiTransform s_lastTreeLocal;
+			static bool s_haveTreeLocal = false;
+			// Flat-store last-finite cache: (local, world) per flat bone index.
+			static std::vector<std::pair<RE::NiTransform, RE::NiTransform>> s_flatCache;
+			static std::vector<uint8_t> s_flatValid;
+			if (root != s_cachedRoot) {
+				s_cachedRoot = root;
+				s_skel = root->GetObjectByName(RE::BSFixedString("skeleton.nif"));
+				// The tree is NOT the root or skeleton.nif itself on this rig
+				// (field 2026-08-31: resolved tree=0x0) - search the whole 1P
+				// subtree for the BSFlattenedBoneTree instance.
+				struct TreeFind
+				{
+					static RE::BSFlattenedBoneTree* Run(RE::NiAVObject* a_n, int a_depth)
+					{
+						if (!a_n || a_depth > 8) return nullptr;
+						const auto* rtti = a_n->GetRTTI();
+						if (rtti && rtti->name &&
+							std::strcmp(rtti->name, "BSFlattenedBoneTree") == 0) {
+							return static_cast<RE::BSFlattenedBoneTree*>(a_n);
+						}
+						if (auto* node = a_n->IsNode()) {
+							for (std::uint32_t i = 0; i < node->children.size(); ++i) {
+								if (auto* r = Run(node->children[i].get(), a_depth + 1)) {
+									return r;
+								}
+							}
+						}
+						return nullptr;
+					}
+				};
+				s_tree = TreeFind::Run(root, 0);
+				if (!s_tree) {
+					// Map the actual hierarchy (2 levels, one-shot per root) so
+					// the log tells us where the flat store really lives.
+					auto dump = [](RE::NiAVObject* a_n, int a_lvl, auto&& a_self) -> void {
+						if (!a_n || a_lvl > 2) return;
+						const auto* rtti = a_n->GetRTTI();
+						logger::info("[OAR-SkelHeal]   lvl{} '{}' rtti='{}'",
+							a_lvl,
+							a_n->name.c_str() ? a_n->name.c_str() : "(unnamed)",
+							(rtti && rtti->name) ? rtti->name : "(no rtti)");
+						if (auto* node = a_n->IsNode()) {
+							for (std::uint32_t i = 0; i < node->children.size(); ++i) {
+								a_self(node->children[i].get(), a_lvl + 1, a_self);
+							}
+						}
+					};
+					dump(root, 0, dump);
+				}
+				s_camNode = root->GetObjectByName(RE::BSFixedString("Camera"));
+				s_lastFiniteByNode.clear();
+				s_haveTreeWorld = false;
+				s_haveTreeLocal = false;
+				s_flatCache.clear();
+				s_flatValid.clear();
+				logger::info("[OAR-SkelHeal] resolved 1P rig: skel={} tree={} bones={}",
+					static_cast<const void*>(s_skel), static_cast<const void*>(s_tree),
+					s_tree ? s_tree->boneCountExpanded : 0);
+			}
+			if (!s_skel) return;
+
+			auto trFinite = [](const RE::NiTransform& a_t) {
+				return std::isfinite(a_t.translate.x) && std::isfinite(a_t.translate.y) &&
+					std::isfinite(a_t.translate.z) && std::isfinite(a_t.scale);
+			};
+
+			int healedNodeLocal = 0, healedFlatLocal = 0, healedFlatWorld = 0, healedTreeWorld = 0;
+
+			// 1) ANCESTOR-CHAIN heal (field 2026-08-31: the first NaN sits on the
+			//    body 'Root' node's LOCAL - UPSTREAM of skeleton.nif and of the
+			//    flattened tree, whose worlds the engine recomposes from it in
+			//    the world-update pass that runs AFTER these hooks. Healing the
+			//    downstream worlds could therefore never stick. Heal EVERY
+			//    ancestor of the Camera whose local went non-finite, restoring
+			//    per-node last-finite values, so the later world pass recomposes
+			//    finite worlds for the renderer and the audio listener.
+			const char* firstHealedName = nullptr;
+			{
+				auto nodeFinite = [&](RE::NiAVObject* a_n) {
+					float q[4];
+					MatrixToQuat(a_n->local.rotate, q);
+					return trFinite(a_n->local) &&
+						std::isfinite(q[0]) && std::isfinite(q[1]) &&
+						std::isfinite(q[2]) && std::isfinite(q[3]);
+				};
+				RE::NiAVObject* start = s_camNode ? s_camNode : s_skel;
+				for (RE::NiAVObject* n = start; n; n = n->parent) {
+					if (nodeFinite(n)) {
+						s_lastFiniteByNode[n] = n->local;
+					} else {
+						auto itc = s_lastFiniteByNode.find(n);
+						n->local = (itc != s_lastFiniteByNode.end())
+							? itc->second : RE::NiTransform::IDENTITY;
+						++healedNodeLocal;
+						if (!firstHealedName) {
+							firstHealedName = n->name.c_str();
+						}
+					}
+					if (n == root) break;
+				}
+			}
+
+			// 2) THE AUTHORITATIVE STORE (agent RE 2026-08-31, layout verified in
+			//    the vendored BSFlattenedBoneTree.h): the 1P rig is a
+			//    BSFlattenedBoneTree; the animation system drives it through the
+			//    private flat bone array and writes node WORLDs from it - node
+			//    locals keep bind pose forever. Previous builds healed only the
+			//    NiNode (a copy), which is why render + audio stayed broken. Scrub
+			//    the flat locals AND worlds, restoring per-bone last-finite.
+			if (s_tree && s_tree->bone && s_tree->boneCountExpanded > 0) {
+				const auto count = static_cast<size_t>(s_tree->boneCountExpanded);
+				if (s_flatCache.size() != count) {
+					s_flatCache.assign(count, {});
+					s_flatValid.assign(count, 0);
+				}
+				for (size_t i = 0; i < count; ++i) {
+					auto& fb = s_tree->bone[i];
+					const bool lFin = trFinite(fb.local);
+					const bool wFin = trFinite(fb.world);
+					if (lFin && wFin) {
+						s_flatCache[i] = { fb.local, fb.world };
+						s_flatValid[i] = 1;
+						continue;
+					}
+					if (!lFin) {
+						fb.local = s_flatValid[i] ? s_flatCache[i].first : RE::NiTransform::IDENTITY;
+						++healedFlatLocal;
+					}
+					if (!wFin) {
+						fb.world = s_flatValid[i] ? s_flatCache[i].second : RE::NiTransform::IDENTITY;
+						++healedFlatWorld;
+						// Node worlds are written FROM the flat store; stamp the
+						// attached node (world + previousWorld, the motion-vector
+						// source) so this frame's consumers see the heal too.
+						if (auto* bn = fb.node.get()) {
+							bn->world = fb.world;
+							bn->previousWorld = fb.world;
+						}
+					}
+				}
+				// The tree object is itself a scene node; its LOCAL feeds the
+				// world pass and its world/previousWorld feed skinning and
+				// motion vectors.
+				if (trFinite(s_tree->local)) {
+					s_lastTreeLocal = s_tree->local;
+					s_haveTreeLocal = true;
+				} else {
+					s_tree->local = s_haveTreeLocal ? s_lastTreeLocal : RE::NiTransform::IDENTITY;
+					++healedTreeWorld;
+				}
+				if (trFinite(s_tree->world)) {
+					s_lastTreeWorld = s_tree->world;
+					s_haveTreeWorld = true;
+				} else {
+					s_tree->world = s_haveTreeWorld ? s_lastTreeWorld : RE::NiTransform::IDENTITY;
+					++healedTreeWorld;
+				}
+				if (!trFinite(s_tree->previousWorld)) {
+					s_tree->previousWorld = s_tree->world;
+					++healedTreeWorld;
+				}
+			}
+
+			if (healedNodeLocal + healedFlatLocal + healedFlatWorld + healedTreeWorld > 0) {
+				static std::atomic<uint32_t> s_healLog{ 0 };
+				const auto n = s_healLog.fetch_add(1, std::memory_order_relaxed);
+				if (n < 24 || (n % 600) == 0) {
+					logger::warn("[OAR-SkelHeal] healed at {}: nodeLocal={} flatLocal={} flatWorld={} treeWorld={} firstNode='{}' (heal #{})",
+						a_site, healedNodeLocal, healedFlatLocal, healedFlatWorld, healedTreeWorld,
+						firstHealedName ? firstHealedName : "-", n + 1);
+				}
+			}
+		}
+
 		struct PlayerUpdateAnimationHook
 		{
 			static void Thunk(RE::PlayerCharacter* a_player, float a_delta)
@@ -14963,6 +15501,7 @@ namespace Hooks
 				s_activeCameraEvaluation.store(0, std::memory_order_release);
 				ApplyCurrentContribution(a_player, evaluation);
 				ApplyCurrentBoneContribution(a_player, evaluation);
+				HealSkeletonRootNaN(a_player, "post-eval");
 			}
 
 			static void Install()
@@ -14977,9 +15516,37 @@ namespace Hooks
 			inline static REL::Relocation<decltype(Thunk)> Original;
 		};
 
+		// The post-eval heal was observed being OVERWRITTEN within the same
+		// frame (heals fired, bug still rendered): the 1P body placement is
+		// re-written LATER in the frame by the camera update (FirstPersonState
+		// positions skeleton.nif from its own smoothed state, which a single
+		// NaN input poisons permanently). Heal again at the TAIL of
+		// TESCamera::Update — after that writer, before render/audio consume
+		// the scene — so the restored transform is what the frame actually uses.
+		struct PlayerCameraUpdateHook
+		{
+			static void Thunk(RE::PlayerCamera* a_camera)
+			{
+				Original(a_camera);
+				HealSkeletonRootNaN(RE::PlayerCharacter::GetSingleton(), "post-camera");
+			}
+
+			static void Install()
+			{
+				REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE::PlayerCamera[0] };
+				Original = vtable.write_vfunc(0x3, Thunk);
+				logger::info(
+					"[OAR-TrackFilter-Camera] PlayerCamera::Update vfunc 0x3 hook installed "
+					"(post-camera skeleton-root NaN heal)");
+			}
+
+			inline static REL::Relocation<decltype(Thunk)> Original;
+		};
+
 		void Install()
 		{
 			PlayerUpdateAnimationHook::Install();
+			PlayerCameraUpdateHook::Install();
 		}
 	}
 
