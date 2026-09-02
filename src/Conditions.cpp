@@ -252,9 +252,31 @@ bool IsInAirCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenera
 	return actor->flyState != 0;
 }
 
+// DLL-created keywords (F4Parkour's GetOrCreateKeyword and the like) can
+// register AFTER OAR parsed its configs: F4SE plugin init order is load-order
+// dependent, so the same setup resolves on one machine and not another
+// (field report 2026-09-01). A parse-time null therefore must not be final —
+// re-resolve lazily on evaluation until the keyword exists. Once resolved the
+// cache is permanent and this is a null check; while unresolved it is one hash
+// lookup per evaluation. The racy write is benign: every thread writes the
+// same pointer.
+static RE::BGSKeyword* LateResolveKeyword(std::atomic<RE::BGSKeyword*>& a_cached,
+	const std::string& a_editorID, const char* a_condName)
+{
+	RE::BGSKeyword* kw = a_cached.load(std::memory_order_relaxed);
+	if (kw || a_editorID.empty()) return kw;
+	kw = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(a_editorID);
+	if (kw) {
+		a_cached.store(kw, std::memory_order_relaxed);
+		logger::info("[OAR] {}: late-resolved keyword '{}' (0x{:08X}) — it registered after config parse (DLL-created)",
+			a_condName, a_editorID, kw->GetFormID());
+	}
+	return kw;
+}
+
 bool HasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
-	if (!a_refr || !cachedKeyword) return false;
+	if (!a_refr || !LateResolveKeyword(cachedKeyword, editorID, "HasKeyword")) return false;
 	return a_refr->HasKeyword(cachedKeyword, nullptr);
 }
 
@@ -271,9 +293,9 @@ void HasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
 	}
-	if (cachedKeyword) {
+	if (auto* kwOk = cachedKeyword.load()) {
 		ImGui::SameLine();
-		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), UICommon::T("OK (0x%X)"), cachedKeyword->GetFormID());
+		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), UICommon::T("OK (0x%X)"), kwOk->GetFormID());
 	}
 }
 
@@ -811,14 +833,14 @@ bool CompareActorValueCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkb
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return false;
 
-	if (!avInfoResolved) {
-		avInfoResolved = true;
-		if (!actorValueName.empty()) {
-			cachedAVInfo = RE::TESForm::GetFormByEditorID<RE::ActorValueInfo>(actorValueName);
-			if (!cachedAVInfo) {
-				logger::warn("[OAR] CompareActorValue: failed to resolve AV '{}'", actorValueName);
-			}
+	// Retry while unresolved: DLL-created ActorValues register after config
+	// parse (same late-binding as DLL-created keywords). Warn only once.
+	if (!cachedAVInfo && !actorValueName.empty()) {
+		cachedAVInfo = RE::TESForm::GetFormByEditorID<RE::ActorValueInfo>(actorValueName);
+		if (!cachedAVInfo && !avInfoResolved) {
+			logger::warn("[OAR] CompareActorValue: failed to resolve AV '{}' (will keep retrying)", actorValueName);
 		}
+		avInfoResolved = true;
 	}
 	if (!cachedAVInfo) return false;
 	float actorVal = actor->GetActorValue(*cachedAVInfo);
@@ -946,15 +968,15 @@ void IsEquippedHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 			cachedKeyword = RE::TESForm::GetFormByEditorID<RE::BGSKeyword>(editorID);
 		}
 	}
-	if (cachedKeyword) {
+	if (auto* kwOk = cachedKeyword.load()) {
 		ImGui::SameLine();
-		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OK (0x%X)", cachedKeyword->GetFormID());
+		ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OK (0x%X)", kwOk->GetFormID());
 	}
 }
 
 bool IsEquippedHasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
-	if (!a_refr || !cachedKeyword) return false;
+	if (!a_refr || !LateResolveKeyword(cachedKeyword, editorID, "IsEquippedHasKeyword")) return false;
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor || !actor->currentProcess || !actor->currentProcess->middleHigh) return false;
 	auto* mh = actor->currentProcess->middleHigh;
@@ -1999,7 +2021,7 @@ void LocationHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 
 bool LocationHasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
-	if (!a_refr || !cachedKeyword) return false;
+	if (!a_refr || !LateResolveKeyword(cachedKeyword, editorID, "LocationHasKeyword")) return false;
 	auto* player = a_refr->As<RE::PlayerCharacter>();
 	if (!player || !player->currentLocation) return false;
 	return player->currentLocation->HasKeyword(cachedKeyword, nullptr);
@@ -2506,7 +2528,8 @@ void IsWornHasKeywordCondition::DrawEditWidgets(bool& a_dirty)
 
 bool IsWornHasKeywordCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
-	if (!a_refr || !cachedKeyword || !a_refr->inventoryList) return false;
+	if (!a_refr || !LateResolveKeyword(cachedKeyword, editorID, "IsWornHasKeyword") ||
+		!a_refr->inventoryList) return false;
 	for (auto& item : a_refr->inventoryList->data) {
 		if (!item.object) continue;
 		for (auto* stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {

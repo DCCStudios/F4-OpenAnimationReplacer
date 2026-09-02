@@ -6686,32 +6686,44 @@ namespace
 		// per-candidate GetCachedAnimation below returns null for a donor whose
 		// class the game has not shown yet (audit 2026-09-01).
 		auto* cache = AnimationCache::GetSingleton();
+		// Candidates are sorted priority-DESC, so the FIRST rejection belongs to
+		// the submod that should have played — report that one, not the last
+		// (lowest-priority) miss, which sent a field investigation the wrong way
+		// (peer report 2026-09-01). Verbose logs every candidate's reason.
 		std::string lastCandidateRejection = "no candidate was eligible";
+		bool haveCandidateRejection = false;
+		auto rejectCandidate = [&](std::string a_reason) {
+			OAR_VLOG("[OAR-TrackFilter-Standalone] candidate rejected: {}", a_reason);
+			if (!haveCandidateRejection) {
+				lastCandidateRejection = std::move(a_reason);
+				haveCandidateRejection = true;
+			}
+		};
 		for (auto& [suffix, info] : candidates) {
 			if (!info || !info->parentSubMod) {
-				lastCandidateRejection = "replacement candidate has no owning submod";
+				rejectCandidate("replacement candidate has no owning submod");
 				continue;
 			}
 			auto* subMod = info->parentSubMod;
 			auto& filter = subMod->trackFilter;
 			if (subMod->IsDisabled()) {
-				lastCandidateRejection = std::format("submod '{}' is disabled", subMod->GetName());
+				rejectCandidate(std::format("submod '{}' is disabled", subMod->GetName()));
 				continue;
 			}
 			if (!filter.enabled) {
-				lastCandidateRejection = std::format("submod '{}' has no track filter", subMod->GetName());
+				rejectCandidate(std::format("submod '{}' has no track filter", subMod->GetName()));
 				continue;
 			}
 			if (!filter.triggerOnlySpecialIdle) {
-				lastCandidateRejection = std::format(
-					"submod '{}' has filter-only special-idle playback disabled", subMod->GetName());
+				rejectCandidate(std::format(
+					"submod '{}' has filter-only special-idle playback disabled", subMod->GetName()));
 				continue;
 			}
 			// Preserve ordinary path semantics: a foreign folder is eligible only
 			// when this submod explicitly claims filenames through Leaf Matching.
 			if (suffix != rawSuffix && !subMod->GetLeafMatching()) {
-				lastCandidateRejection = std::format(
-					"submod '{}' matched the leaf but Leaf Matching is disabled", subMod->GetName());
+				rejectCandidate(std::format(
+					"submod '{}' matched the leaf but Leaf Matching is disabled", subMod->GetName()));
 				continue;
 			}
 
@@ -6719,13 +6731,13 @@ namespace
 			if (conditions && !conditions->IsEmpty()) {
 				try {
 					if (!subMod->EvaluateConditions(a_actor, nullptr)) {
-						lastCandidateRejection = std::format(
-							"submod '{}' conditions evaluated false", subMod->GetName());
+						rejectCandidate(std::format(
+							"submod '{}' conditions evaluated false", subMod->GetName()));
 						continue;
 					}
 				} catch (...) {
-					lastCandidateRejection = std::format(
-						"submod '{}' condition evaluation threw an exception", subMod->GetName());
+					rejectCandidate(std::format(
+						"submod '{}' condition evaluation threw an exception", subMod->GetName()));
 					continue;
 				}
 			}
@@ -6733,8 +6745,8 @@ namespace
 			auto* animation = cache->GetCachedAnimation(suffix, subMod);
 			if (!animation || reinterpret_cast<uintptr_t>(animation) < 0x10000 ||
 				IsBadReadPtr(animation, sizeof(RE::hkaAnimation))) {
-				lastCandidateRejection = std::format(
-					"submod '{}' has no valid cached donor animation", subMod->GetName());
+				rejectCandidate(std::format(
+					"submod '{}' has no valid cached donor animation", subMod->GetName()));
 				continue;
 			}
 			std::vector<int16_t> donorMap;
@@ -6744,8 +6756,8 @@ namespace
 				logger::warn(
 					"[OAR-TrackFilter-Standalone] '{}' matched '{}' but its donor binding has no track map; using vanilla SetupSpecialIdle",
 					subMod->GetName(), fileName);
-				lastCandidateRejection = std::format(
-					"submod '{}' donor binding has no track map", subMod->GetName());
+				rejectCandidate(std::format(
+					"submod '{}' donor binding has no track map", subMod->GetName()));
 				continue;
 			}
 

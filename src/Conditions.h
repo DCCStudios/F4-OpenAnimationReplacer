@@ -1,3 +1,4 @@
+#include <atomic>
 #pragma once
 
 #include "BaseConditions.h"
@@ -179,7 +180,9 @@ protected:
 private:
 	FormComponent keywordForm;
 	std::string editorID;
-	RE::BGSKeyword* cachedKeyword{ nullptr };
+	// Atomic: EvaluateImpl late-resolves from concurrent evaluation threads
+	// (relaxed is enough — all writers store the same pointer).
+	mutable std::atomic<RE::BGSKeyword*> cachedKeyword{ nullptr };
 };
 
 class IsInFactionCondition : public ConditionBase
@@ -401,7 +404,9 @@ protected:
 private:
 	FormComponent keywordForm;
 	std::string editorID;
-	RE::BGSKeyword* cachedKeyword{ nullptr };
+	// Atomic: EvaluateImpl late-resolves from concurrent evaluation threads
+	// (relaxed is enough — all writers store the same pointer).
+	mutable std::atomic<RE::BGSKeyword*> cachedKeyword{ nullptr };
 };
 
 class IsEquippedCondition : public ConditionBase
@@ -898,7 +903,9 @@ protected:
 	void SerializeImpl(nlohmann::json& a_json) const override;
 private:
 	std::string editorID;
-	RE::BGSKeyword* cachedKeyword{ nullptr };
+	// Atomic: EvaluateImpl late-resolves from concurrent evaluation threads
+	// (relaxed is enough — all writers store the same pointer).
+	mutable std::atomic<RE::BGSKeyword*> cachedKeyword{ nullptr };
 };
 
 class LocationClearedCondition : public ConditionBase
@@ -1272,7 +1279,9 @@ protected:
 	void SerializeImpl(nlohmann::json& a_json) const override;
 private:
 	std::string editorID;
-	RE::BGSKeyword* cachedKeyword{ nullptr };
+	// Atomic: EvaluateImpl late-resolves from concurrent evaluation threads
+	// (relaxed is enough — all writers store the same pointer).
+	mutable std::atomic<RE::BGSKeyword*> cachedKeyword{ nullptr };
 };
 
 class IsDoingFavorCondition : public ConditionBase

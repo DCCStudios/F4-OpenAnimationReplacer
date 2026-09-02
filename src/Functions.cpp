@@ -66,11 +66,10 @@ void ModActorValueFunction::Execute(RE::TESObjectREFR* a_refr, RE::hkbClipGenera
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return;
 
-	if (!resolved) {
-		resolved = true;
-		if (!actorValueName.empty()) {
-			cachedAVInfo = RE::TESForm::GetFormByEditorID<RE::ActorValueInfo>(actorValueName);
-		}
+	// Retry while unresolved: DLL-created ActorValues register after config
+	// parse (same late-binding as DLL-created keywords).
+	if (!cachedAVInfo && !actorValueName.empty()) {
+		cachedAVInfo = RE::TESForm::GetFormByEditorID<RE::ActorValueInfo>(actorValueName);
 	}
 	if (!cachedAVInfo) return;
 
