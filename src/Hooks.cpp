@@ -8222,7 +8222,10 @@ namespace
 		// This must run BEFORE the bypass early-out below: bypassed clips are
 		// typically the player's own weapon clips (failed pre-swap), and their
 		// activations must still reach the log.
-		{
+		// Only while the Animation Log is collecting: Activate inserts into
+		// s_pendingActivateLog only when the log is enabled, so with it off this
+		// map is empty and the lock + lookup per clip per frame buys nothing.
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
 			constexpr uint64_t kLogDeferGraceFrames = 10;
 
 			std::string pendingSuffix;
@@ -8295,17 +8298,26 @@ namespace
 			cache->CaptureGameVtable(currentAnim);
 		}
 
-		// Look up the cached suffix (cached during Activate when animationName is still valid)
+		// Look up the cached suffix (cached during Activate when animationName is still valid).
+		// The match memo lives under the same lock: when it already says "no
+		// registration" for this suffix at the current generation, skip copying
+		// the string (a heap allocation for most suffixes) — nothing between here
+		// and the negative fast path below reads it (phase 1b).
 		std::string suffix;
+		bool memoNoMatch = false;
 		{
+			const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
 			std::shared_lock lock(s_clipSuffixMutex);
 			auto it = s_clipSuffixCache.find(a_this);
 			if (it != s_clipSuffixCache.end()) {
-				suffix = it->second;
+				auto mit = s_clipMatchMemo.find(a_this);
+				memoNoMatch = mit != s_clipMatchMemo.end() && mit->second.generation == gen &&
+					mit->second.decision == MatchDecision::kNoRegistration;
+				if (!memoNoMatch) suffix = it->second;
 			}
 		}
 
-		if (suffix.empty()) {
+		if (!memoNoMatch && suffix.empty()) {
 			// Direct path matching first: the per-frame poll may have already
 			// resolved this clip's real path even though Activate was missed.
 			suffix = DirectSuffixFromCachedPath(a_this);
@@ -8325,7 +8337,7 @@ namespace
 			}
 		}
 
-		if (suffix.empty()) return;
+		if (!memoNoMatch && suffix.empty()) return;
 
 		// ===== Entry grace window =====
 		// The decisive condition evaluation at play entry can read racy game
@@ -8570,15 +8582,9 @@ namespace
 		// exists, and any suffix rewrite erased the memo), so skip the
 		// string-keyed lookups and the multi-match resolution entirely. The
 		// vtable capture and the vanilla-annotation contract above already ran.
-		{
-			const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
-			std::shared_lock mlock(s_clipSuffixMutex);
-			auto mit = s_clipMatchMemo.find(a_this);
-			if (mit != s_clipMatchMemo.end() && mit->second.generation == gen &&
-				mit->second.decision == MatchDecision::kNoRegistration) {
-				perfUpdate.Split(OARPerf::kUpdateNoMatch);
-				return;
-			}
+		if (memoNoMatch) {
+			perfUpdate.Split(OARPerf::kUpdateNoMatch);
+			return;
 		}
 
 		if (settings->bDirectPathMatching) {

@@ -119,6 +119,19 @@ Verify: the vault set, the P890 and pipe-gun frozen-arm cases, a leaf-matching d
 5. `MathStatementCondition`: parse once, but rebuild the parsed form from every site that mutates `expression` or `variables`, including `DrawEditWidgets` (invariant 10).
 6. `InventoryCountCondition` early break: only if the engine guarantees one `InventoryEntryData` per form in `inventoryList->data`. Unverified; if it cannot be established, leave the full walk (an early break would silently undercount).
 
+## After phases 1-3 + partial 6 (build e49e303, capture 19:33-19:40, same test scene)
+
+| Metric | Before (3a9a2d3) | After (e49e303) | Change |
+|---|---|---|---|
+| `Update.noMatch` per call | 0.62-0.70 µs | 0.46-0.52 µs | -25% |
+| `Update` per frame (~205 clips) | 0.14-0.17 ms | 0.12-0.14 ms | -15% |
+| `EventFeed` (OAR-only) | 0.001-0.002 ms | 0.000-0.002 ms | log off by default |
+| `TrackFilter` per call | 1.1-1.4 µs | 0.9-1.4 µs | unchanged (not targeted) |
+| TOTAL, filter idle | 0.15-0.19 ms | 0.17-0.19 ms | within noise |
+| TOTAL per wall second | 12-20 ms | 9-17 ms | -15 to -25% |
+
+Less than the estimate. The string-keyed table hashes are gone from the negative path, but the remaining ~0.5 µs is the set of contract blocks the review required us to keep, each carrying a shared lock and a pointer-keyed lookup: the pending-activate-log flush, the bypass set, the suffix cache (plus a heap-allocating string copy), the annotation-integrity stamp, then the memo itself. Phase 1b (below) folds the memo into the suffix-cache read so the negative path skips the string copy and one lock, and skips the pending-log block entirely while the log is disabled (its map is empty then). Realistic floor for the negative path with the contract blocks intact is about 0.3 µs per call.
+
 ## Status (2026-09-02)
 
 Implemented on `perf/frame-time` (commit e49e303), audited and deployed: Phase 1 (match memo, diagnostic removed, Settings hoisted), Phase 2 (log off until opened, exact armed counter plus sweep, attribution gated), Phase 3 (shared-lock fast paths), Phase 6 items 1, 3 and 4 (chunked BA2 loads with a reload epoch, byte cap, cam-carrier prune). Not implemented, by measurement or by the invariants above: Phase 4 (HealSkeleton measured at 3 µs per frame; the containment is not worth touching for that), Phase 5 (1.1-1.4 µs per filtered Generate; needs its own donor-swap trace first), Phase 6 items 2, 5 and 6 (parallel config parse, MathStatement cache, InventoryCount break). Post-change measurement pending; the instrumentation stays on until the after-numbers are in.
