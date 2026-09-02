@@ -32,9 +32,12 @@ First capture, 2026-09-02 18:39 (instrumented build fe27566), player test scene 
 | test scene, reload | 0.205 | 0.171 (230) | 0.002 | 0.077* | 0.003 | 0.020 | 0.338 | 12.5 |
 | test scene, filter starting | 0.178 | 0.149 (201) | 0.012 | 0.058* | 0.003 | 0.013 | 0.284 | 25.2 |
 | test scene, filter active | 0.175 | 0.145 (200) | 0.067 (TrackFilter 0.062, 45 calls) | 0.024* | 0.003 | 0.012 | 0.288 | 27.4 |
+| test scene, 27 blocks over 4.5 min (build 3a9a2d3, 70-84 fps, 190-215 clips/frame) | 0.14-0.17 | 0.12-0.14 (200-214, avg 0.62-0.70 µs) | 0.002 idle, 0.02-0.09 with filter (TF 1.1-1.4 µs/call, 11-47 calls) | 0.001-0.002 (OAR-only, 1.5-2 µs/event); engine handler 0.003-0.012 | 0.003 | 0.004-0.012 (max 1.08 ms once) | 0.15-0.27; 6-22 ms per wall second, 0.6-2.2% of one core | 70-84 |
 | quiet interior | | | | | | | | |
 | busy exterior | | | | | | | | |
 | combat | | | | | | | | |
+
+Second capture (build 3a9a2d3) is consistent with the first across 27 consecutive windows: every row is within a few percent block to block, `Update.noMatch` is 85-93 percent of Update, the EventFeed correction confirms the earlier 17 µs per event was the engine's handler (OAR-only is 1.5-2 µs), and the per-wall-second total is stable at 12-20 ms per second whether or not a filter is playing. Outliers: one 4.2 ms Activate and one 1.08 ms PollPlayerGraph in the first window after loading.
 
 \* EventFeed in build fe27566 wrapped the engine's own event handling (the `a_original` call in the vfunc hook), which is why it averaged 17-19 µs per event with 1.3 ms maxima; the next build measures the engine call separately and reports OAR-only time.
 
