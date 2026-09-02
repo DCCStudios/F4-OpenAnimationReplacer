@@ -119,6 +119,10 @@ Verify: the vault set, the P890 and pipe-gun frozen-arm cases, a leaf-matching d
 5. `MathStatementCondition`: parse once, but rebuild the parsed form from every site that mutates `expression` or `variables`, including `DrawEditWidgets` (invariant 10).
 6. `InventoryCountCondition` early break: only if the engine guarantees one `InventoryEntryData` per form in `inventoryList->data`. Unverified; if it cannot be established, leave the full walk (an early break would silently undercount).
 
+## Status (2026-09-02)
+
+Implemented on `perf/frame-time` (commit e49e303), audited and deployed: Phase 1 (match memo, diagnostic removed, Settings hoisted), Phase 2 (log off until opened, exact armed counter plus sweep, attribution gated), Phase 3 (shared-lock fast paths), Phase 6 items 1, 3 and 4 (chunked BA2 loads with a reload epoch, byte cap, cam-carrier prune). Not implemented, by measurement or by the invariants above: Phase 4 (HealSkeleton measured at 3 µs per frame; the containment is not worth touching for that), Phase 5 (1.1-1.4 µs per filtered Generate; needs its own donor-swap trace first), Phase 6 items 2, 5 and 6 (parallel config parse, MathStatement cache, InventoryCount break). Post-change measurement pending; the instrumentation stays on until the after-numbers are in.
+
 ## Order and gating
 
 Phase 2 first (smallest, safest, and it makes Phase 1's pending-log removal moot), then Phase 1, then Phase 3. Re-run the instrumented build after each phase and update the Baseline table; a phase that does not move its row is reverted, not kept on faith. Phases 4 and 5 touch the vault containment and the track filter, so each gets its own in-game pass on the known-bad weapons with NPCs present before it is committed. Phase 6 is independent and can be interleaved.
