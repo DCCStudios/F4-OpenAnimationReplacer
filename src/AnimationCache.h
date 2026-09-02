@@ -28,13 +28,33 @@ public:
 
 	struct CachedAnimation
 	{
+		// Which Havok class a serialized virtual-fixup slot belongs to. The
+		// packfile's class-name section names it, so this is authoritative, not
+		// guessed. Animation fixups receive the per-type game animation vtable;
+		// a hkaDefaultAnimatedReferenceFrame fixup receives the reference-frame
+		// vtable once that is resolved (any entry, so a stamped object is always
+		// correctly typed), and until then the animation vtable exactly as every
+		// earlier release did. The sibling hkaAnimatedReferenceFrame class is
+		// never preserved and keeps the legacy animation-vtable stamp.
+		enum class VtableFixupKind : uint8_t
+		{
+			kGameAnimation,
+			kAnimatedReferenceFrame,
+			kDefaultAnimatedReferenceFrame
+		};
+		struct VtableFixup
+		{
+			uint32_t offset{ 0 };
+			VtableFixupKind kind{ VtableFixupKind::kGameAnimation };
+		};
+
 		RE::hkaAnimation* animation{ nullptr };
 		std::vector<uint8_t> fileData;
 		std::string filePath;
 		float duration{ 0.f };
 		int32_t numTransformTracks{ 0 };
 		int32_t numFloatTracks{ 0 };
-		std::vector<uint32_t> vtableFixupOffsets;
+		std::vector<VtableFixup> vtableFixups;
 		// hkaAnimation::m_type of the file's animation object (3 = spline
 		// compressed). Selects WHICH game vtable the fixups receive: FO4 ships
 		// several hkaAnimation subclasses (spline, lossless, interleaved, ...)
@@ -93,6 +113,16 @@ public:
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
 
+		// Keep the replacement's extracted-motion reference frame when building
+		// the runtime clone (opt-in via the SubMod flag; see ReplacerMods.h).
+		bool preserveExtractedMotion{ false };
+		// The extracted-motion pointer is preserved only when the packfile
+		// identifies it as a supported hkaDefaultAnimatedReferenceFrame. Do not
+		// infer this from a non-null +0x20 pointer: weapon packfiles commonly
+		// carry other pointer-shaped data there.
+		VtableFixupKind extractedMotionKind{ VtableFixupKind::kGameAnimation };
+		bool hasExtractedMotionFixup{ false };
+
 		// Source identity at load time. A config reload recreates every SubMod,
 		// so `owner` always misses — the load functions match by filePath instead
 		// and rebind the entry to the new owner when source size and identity
@@ -124,9 +154,11 @@ public:
 	};
 
 	bool LoadAnimation(const std::string& a_suffix, const std::filesystem::path& a_absolutePath,
-		const void* a_owner = nullptr, int32_t a_priority = 0);
+		const void* a_owner = nullptr, int32_t a_priority = 0,
+		bool a_preserveExtractedMotion = false);
 	bool LoadAnimationResource(const std::string& a_suffix, const std::string& a_resourcePath,
-		const void* a_owner = nullptr, int32_t a_priority = 0);
+		const void* a_owner = nullptr, int32_t a_priority = 0,
+		bool a_preserveExtractedMotion = false);
 	// Read an archived (BSResource) text file fully into a_out via the same
 	// resource-stream idiom LoadAnimationResource uses. Intended for small OAR
 	// config.json / user.json files packaged inside a BA2. Returns false on any
@@ -207,16 +239,24 @@ private:
 	// violation during startup archive registration; an AV is SEH, not C++, so a
 	// try/catch cannot catch it — the wrapper must use __try/__except).
 	bool DoLoadAnimationResourceUnsafe(const std::string& a_suffix, const std::string& a_resourcePath,
-		const void* a_owner, int32_t a_priority);
+		const void* a_owner, int32_t a_priority, bool a_preserveExtractedMotion);
 	static bool DoReadArchiveTextFileUnsafe(const std::string& a_resourcePath, std::string& a_out);
 	bool TryRebindCached(const std::string& a_suffix, std::string_view a_sourceIdentity,
 		bool a_hasFileMTime, std::uint64_t a_sourceSize,
 		std::filesystem::file_time_type a_sourceMTime, const void* a_owner,
-		int32_t a_priority);
+		int32_t a_priority, bool a_preserveExtractedMotion);
 	bool LoadAnimationBytes(const std::string& a_suffix, std::string a_sourceIdentity,
 		std::vector<uint8_t>&& a_bytes, bool a_hasFileMTime, uint64_t a_sourceSize,
-		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority);
+		std::filesystem::file_time_type a_sourceMTime, const void* a_owner, int32_t a_priority,
+		bool a_preserveExtractedMotion);
 	RE::hkaAnimation* FindAnimationInBuffer(uint8_t* a_data, size_t a_size, uintptr_t a_vtable);
+	// Resolve the hkaDefaultAnimatedReferenceFrame vtable from CommonLib's
+	// Address Library (id 587967 — verified stable across OG/NG/AE), and, on
+	// first resolution, stamp already-parsed reference-frame fixups and retire
+	// preserve-enabled clones built before it was known. Resolved lazily, only
+	// for opt-in entries, so pose-only setups never depend on the id. Returns 0
+	// only when the resolved address fails post-resolution validation.
+	uintptr_t EnsureReferenceFrameVtable();
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 
 	// Caller must hold m_mutex (shared or unique).
@@ -297,6 +337,12 @@ private:
 	static constexpr int32_t kMaxAnimTypes = 16;
 	static constexpr int32_t kAnimType_SplineCompressed = 3;
 	std::array<std::atomic<uintptr_t>, kMaxAnimTypes> m_gameAnimVtableByType{};
+
+	// hkaDefaultAnimatedReferenceFrame vtable (extracted-motion preservation).
+	// Resolved lazily by EnsureReferenceFrameVtable; 0 until an opt-in entry
+	// needs it. Separate from the animation vtables: reference-frame fixups are
+	// a different Havok class and must never receive an animation vtable.
+	std::atomic<uintptr_t> m_referenceFrameVtable{ 0 };
 
 	// Stamp the entry's virtual fixups (and the animation object itself) with
 	// the game vtable for its animType, if known. Idempotent. Returns the number

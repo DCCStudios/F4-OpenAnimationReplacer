@@ -4535,6 +4535,7 @@ namespace
 			std::string resourcePath;
 			const void* owner;
 			int32_t priority;
+			bool preserveExtractedMotion;
 		};
 		std::vector<PreloadItem> looseWork;
 		std::vector<DeferredArchiveItem> archiveWork;
@@ -4558,7 +4559,8 @@ namespace
 				// archiveResource branch that used to run inside runWorker.
 				if (info.archiveResource) {
 					const auto priority = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
-					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority });
+					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority,
+						info.parentSubMod ? info.parentSubMod->GetPreserveExtractedMotion() : false });
 				} else {
 					looseWork.push_back({ suffix, &info });
 				}
@@ -4582,8 +4584,9 @@ namespace
 				if (i >= looseWork.size()) break;
 				const auto& item = looseWork[i];
 				const auto priority = item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0;
-				const bool loadedFromSource =
-					cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
+				const bool loadedFromSource = cache->LoadAnimation(
+					item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority,
+					item.info->parentSubMod ? item.info->parentSubMod->GetPreserveExtractedMotion() : false);
 				if (loadedFromSource) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {
@@ -4641,7 +4644,8 @@ namespace
 				int aLoaded = 0;
 				int aFailed = 0;
 				for (const auto& it : items) {
-					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority)) {
+					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority,
+						it.preserveExtractedMotion)) {
 						++aLoaded;
 					} else {
 						++aFailed;
