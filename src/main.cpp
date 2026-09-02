@@ -19,7 +19,10 @@ void OAR_InitializeLogging(std::string_view a_pluginName);
 namespace Plugin
 {
 	static constexpr auto NAME    = "OpenAnimationReplacer"sv;
-	static constexpr auto VERSION = REL::Version{ 1, 1, 11 };
+	// From CMake's project(VERSION ...) so the log header and the F4SE version
+	// data can never drift from the release number again (they sat at 1.1.11 /
+	// 1.1.10 through two releases).
+	static constexpr auto VERSION = REL::Version{ OAR_VERSION_MAJOR, OAR_VERSION_MINOR, OAR_VERSION_PATCH };
 }
 
 // Version data consumed by the NG/AE F4SE loaders (0.7.x reads the exported
@@ -29,7 +32,7 @@ namespace Plugin
 // load us. OG F4SE (0.6.23) ignores this export and uses F4SEPlugin_Query.
 F4SE_PLUGIN_VERSION = []() noexcept {
 	F4SE::PluginVersionData v{};
-	v.PluginVersion({ 1, 1, 10, 0 });
+	v.PluginVersion({ OAR_VERSION_MAJOR, OAR_VERSION_MINOR, OAR_VERSION_PATCH, 0 });
 	v.PluginName("OpenAnimationReplacer");
 	v.AuthorName("");
 	v.UsesAddressLibraryNG(true);  // 1.10.980 / 1.10.984

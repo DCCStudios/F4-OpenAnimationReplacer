@@ -1,4 +1,5 @@
 #include "Hooks.h"
+#include "PerfInstrumentation.h"
 #include "Offsets.h"
 #include "HavokTypes.h"
 #include "Settings.h"
@@ -3376,6 +3377,7 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			const char* evtStr = a_event.tag.c_str();
 			if (!evtStr || !evtStr[0]) return RE::BSEventNotifyControl::kContinue;
 
@@ -4535,6 +4537,7 @@ namespace
 			std::string resourcePath;
 			const void* owner;
 			int32_t priority;
+			bool preserveExtractedMotion;
 		};
 		std::vector<PreloadItem> looseWork;
 		std::vector<DeferredArchiveItem> archiveWork;
@@ -4558,7 +4561,8 @@ namespace
 				// archiveResource branch that used to run inside runWorker.
 				if (info.archiveResource) {
 					const auto priority = info.parentSubMod ? info.parentSubMod->GetPriority() : 0;
-					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority });
+					archiveWork.push_back({ suffix, info.resourcePath, info.parentSubMod, priority,
+						info.parentSubMod ? info.parentSubMod->GetPreserveExtractedMotion() : false });
 				} else {
 					looseWork.push_back({ suffix, &info });
 				}
@@ -4582,8 +4586,9 @@ namespace
 				if (i >= looseWork.size()) break;
 				const auto& item = looseWork[i];
 				const auto priority = item.info->parentSubMod ? item.info->parentSubMod->GetPriority() : 0;
-				const bool loadedFromSource =
-					cache->LoadAnimation(item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority);
+				const bool loadedFromSource = cache->LoadAnimation(
+					item.suffix, item.info->absoluteDiskPath, item.info->parentSubMod, priority,
+					item.info->parentSubMod ? item.info->parentSubMod->GetPreserveExtractedMotion() : false);
 				if (loadedFromSource) {
 					loaded.fetch_add(1, std::memory_order_relaxed);
 				} else {
@@ -4641,7 +4646,8 @@ namespace
 				int aLoaded = 0;
 				int aFailed = 0;
 				for (const auto& it : items) {
-					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority)) {
+					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority,
+						it.preserveExtractedMotion)) {
 						++aLoaded;
 					} else {
 						++aFailed;
@@ -5473,6 +5479,7 @@ namespace
 
 	static void PollPlayerGraphClips()
 	{
+		OAR_PERF_SCOPE(kPollPlayerGraph);
 		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
 		constexpr uintptr_t kBG_ActiveNodes = 0xE0;
 
@@ -7201,6 +7208,7 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		OAR_PERF_SCOPE(kActivate);
 		// A clip activation can reuse an active-node entry in place, so force the
 		// next stable player-graph poll even when the pointer fingerprint happens
 		// to remain unchanged.
@@ -8056,6 +8064,9 @@ namespace
 			return;
 		}
 
+		// Perf: OAR's own Update work only (the engine call above is excluded).
+		OAR_PERF_SCOPE_NAMED(perfUpdate, kUpdate);
+
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
 		}
@@ -8841,6 +8852,8 @@ namespace
 				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
 					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
+				// Perf: attribute this call to the "no replacement" negative path.
+				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
 			}
 			candidatesPtr = &infoIt->second;
@@ -10605,6 +10618,9 @@ namespace
 	{
 		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
 
+		// Perf: OAR's own Generate work only (the engine call above is excluded).
+		OAR_PERF_SCOPE(kGenerate);
+
 		// --- Full-body replacement blending ---
 		// One-shot _Generate captures the "other" pose on the first blend frame only.
 		// All subsequent frames use the frozen snapshot. Only ownerClip applies.
@@ -10738,6 +10754,7 @@ namespace
 
 		// Fast path: skip all locking if no track filter is active anywhere
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) <= 0) return;
+		OAR_PERF_SCOPE(kTrackFilter);
 
 		auto* character = a_context ? a_context->character : nullptr;
 		if (!character) return;
@@ -14725,6 +14742,9 @@ namespace Hooks
 					}
 				}
 			}
+			// Perf: the engine's own event handling, measured separately so the
+			// EventFeed row can be reported as OAR-only time.
+			OAR_PERF_SCOPE(kEventFeedEngine);
 			return a_original ? a_original(a_sinkThis, a_event, a_source) :
 				RE::BSEventNotifyControl::kContinue;
 		}
@@ -14733,6 +14753,7 @@ namespace Hooks
 			void* a_this, const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalActorProcess);
 		}
 
@@ -14740,6 +14761,7 @@ namespace Hooks
 			void* a_this, const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalPlayerProcess);
 		}
 
@@ -15719,7 +15741,12 @@ namespace Hooks
 				s_activeCameraEvaluation.store(0, std::memory_order_release);
 				ApplyCurrentContribution(a_player, evaluation);
 				ApplyCurrentBoneContribution(a_player, evaluation);
-				HealSkeletonRootNaN(a_player, "post-eval");
+				{
+					OAR_PERF_SCOPE(kHealSkeleton);
+					HealSkeletonRootNaN(a_player, "post-eval");
+				}
+				// Once per frame: perf report tick.
+				OARPerf::FrameTick();
 			}
 
 			static void Install()
@@ -15746,6 +15773,7 @@ namespace Hooks
 			static void Thunk(RE::PlayerCamera* a_camera)
 			{
 				Original(a_camera);
+				OAR_PERF_SCOPE(kHealSkeleton);
 				HealSkeletonRootNaN(RE::PlayerCharacter::GetSingleton(), "post-camera");
 			}
 

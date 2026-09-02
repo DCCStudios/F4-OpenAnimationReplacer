@@ -773,6 +773,18 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 			"events (weaponFire, etc.) still fire at their native timings.\n"
 			"Turn OFF for fire animations to prevent double-shots."));
 
+		bool preserveMotion = a_subMod->GetPreserveExtractedMotion();
+		if (ImGui::Checkbox(UICommon::T("Preserve Extracted Motion (?)"), &preserveMotion)) {
+			a_subMod->SetPreserveExtractedMotion(preserveMotion);
+			a_subMod->SetDirty(true);
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+			UICommon::T("Keep the replacement animation's root-motion reference frame\n"
+			"(hkaDefaultAnimatedReferenceFrame) when OAR builds its runtime clone.\n"
+			"Enable only for donors authored WITH root motion; pose-only replacements\n"
+			"should leave this off or the actor moves with the donor.\n"
+			"Takes effect after Reload All Configs (existing clones are rebuilt)."));
+
 		bool replOnLoop = a_subMod->GetReplaceOnLoop();
 		if (ImGui::Checkbox(UICommon::T("Replace on Loop (?)"), &replOnLoop)) {
 			a_subMod->SetReplaceOnLoop(replOnLoop);
@@ -1199,6 +1211,7 @@ void UIMain::DrawSubModDetails(SubMod* a_subMod)
 				json["keepRandomResultsOnLoop"] = a_subMod->GetKeepRandomResultsOnLoop();
 				json["shareRandomResults"] = a_subMod->GetShareRandomResults();
 				json["replaceAnnotations"] = a_subMod->GetReplaceAnnotations();
+			json["preserveExtractedMotion"] = a_subMod->GetPreserveExtractedMotion();
 			// Round-trip annotation suppression so a UI save can't drop it.
 			if (a_subMod->suppressAllAnnotations)
 				json["suppressAnnotations"] = true;
