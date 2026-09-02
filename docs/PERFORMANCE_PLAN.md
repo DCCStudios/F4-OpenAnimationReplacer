@@ -24,16 +24,21 @@ What to capture: at least one 10 s window in each of a quiet interior, a busy ex
 
 ## Baseline
 
-To be filled from the instrumented build.
+First capture, 2026-09-02 18:39 (instrumented build fe27566), player test scene with the P890, about 200-237 clip updates per frame. The frame counter is player UpdateAnimation ticks, which reported 12-27 fps for this window, so per-frame figures here may be overstated if the player was paused or in a menu for part of it; the next build also reports CPU ms per wall second, which does not have that problem.
 
 | Scene | Update ms | noMatch ms (calls) | Generate ms | EventFeed ms | Heal ms | Poll ms | TOTAL ms | fps |
 |---|---|---|---|---|---|---|---|---|
+| test scene, idle | 0.205 | 0.180 (231) | 0.002 | 0.044* | 0.003 | 0.023 | 0.337 | 12.7 |
+| test scene, reload | 0.205 | 0.171 (230) | 0.002 | 0.077* | 0.003 | 0.020 | 0.338 | 12.5 |
+| test scene, filter starting | 0.178 | 0.149 (201) | 0.012 | 0.058* | 0.003 | 0.013 | 0.284 | 25.2 |
+| test scene, filter active | 0.175 | 0.145 (200) | 0.067 (TrackFilter 0.062, 45 calls) | 0.024* | 0.003 | 0.012 | 0.288 | 27.4 |
 | quiet interior | | | | | | | | |
 | busy exterior | | | | | | | | |
 | combat | | | | | | | | |
-| vault (filter active) | | | | | | | | |
 
-Pre-measurement estimate for the busy case: 1 to 2 ms per frame, with `Update.noMatch` the largest share.
+\* EventFeed in build fe27566 wrapped the engine's own event handling (the `a_original` call in the vfunc hook), which is why it averaged 17-19 µs per event with 1.3 ms maxima; the next build measures the engine call separately and reports OAR-only time.
+
+What the first capture already confirms: the per-call cost of the no-op Update path is 0.73-0.78 µs, inside the 0.8-1.2 µs estimate, and 97 percent of Update calls end at "no replacement". At 200 clips per frame that is 0.15-0.18 ms per frame; a busy exterior at 1200 clips extrapolates to about 1 ms, as estimated. `HealSkeleton` is 3 µs per frame (both call sites), `PollPlayerGraph` 12-23 µs per frame with a 1.1 ms worst case, `Activate` 19-38 µs per activation including the engine's Activate with one 3.5 ms outlier (likely a clone build or an engine-side load), and the track filter costs 1.4 µs per filtered Generate, about 0.06 ms per frame while a filter plays.
 
 ## What must not change (verified against the code)
 

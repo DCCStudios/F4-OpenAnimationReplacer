@@ -14742,6 +14742,9 @@ namespace Hooks
 					}
 				}
 			}
+			// Perf: the engine's own event handling, measured separately so the
+			// EventFeed row can be reported as OAR-only time.
+			OAR_PERF_SCOPE(kEventFeedEngine);
 			return a_original ? a_original(a_sinkThis, a_event, a_source) :
 				RE::BSEventNotifyControl::kContinue;
 		}

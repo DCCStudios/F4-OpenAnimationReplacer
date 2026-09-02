@@ -27,7 +27,8 @@ namespace OARPerf
 		kGenerate,            // hkbClipGenerator_Generate, OAR work only (after the engine call)
 		kTrackFilter,         // sub: the track-filter block inside Generate
 		kActivate,            // hkbClipGenerator_Activate, whole hook incl. the engine's Activate
-		kEventFeed,           // animation-event sink (per event, all actors)
+		kEventFeed,           // animation-event vfunc hook + OG sink, INCLUDING the engine's handler
+		kEventFeedEngine,     // sub: the engine's original event handler inside the vfunc hook
 		kHealSkeleton,        // HealSkeletonRootNaN (both call sites)
 		kPollPlayerGraph,     // PollPlayerGraphClips (once per frame)
 		kCount
@@ -35,10 +36,10 @@ namespace OARPerf
 
 	inline constexpr const char* kNames[kCount] = {
 		"Update", "  Update.noMatch", "  Cache.getOrBuild", "Generate", "  TrackFilter",
-		"Activate", "EventFeed", "HealSkeleton", "PollPlayerGraph"
+		"Activate", "EventFeed", "  EventFeed.engine", "HealSkeleton", "PollPlayerGraph"
 	};
 	inline constexpr bool kIsSub[kCount] = {
-		false, true, true, false, true, false, false, false, false
+		false, true, true, false, true, false, false, true, false, false
 	};
 
 	inline std::atomic<bool> g_perfEnabled{ true };

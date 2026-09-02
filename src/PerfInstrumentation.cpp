@@ -61,18 +61,26 @@ namespace OARPerf
 
 		const double fps = frames / elapsed;
 		double totalMsPerFrame = 0.0;
+		double totalMs = 0.0;
 		std::string line = fmt::format("[OAR-Perf] {:.1f}s {} frames ({:.1f} fps). Summed CPU across threads, per frame:",
 			elapsed, frames, fps);
 		for (int i = 0; i < kCount; ++i) {
-			const double msPerFrame = TicksToMs(ticks[i]) / static_cast<double>(frames);
+			// EventFeed is reported OAR-only: subtract the engine handler measured inside it.
+			uint64_t rowTicks = ticks[i];
+			if (i == kEventFeed && rowTicks >= ticks[kEventFeedEngine]) rowTicks -= ticks[kEventFeedEngine];
+			const double msPerFrame = TicksToMs(rowTicks) / static_cast<double>(frames);
 			const double callsPerFrame = static_cast<double>(calls[i]) / static_cast<double>(frames);
-			const double avgUs = calls[i] ? TicksToMs(ticks[i]) * 1000.0 / static_cast<double>(calls[i]) : 0.0;
+			const double avgUs = calls[i] ? TicksToMs(rowTicks) * 1000.0 / static_cast<double>(calls[i]) : 0.0;
 			const double maxUs = TicksToMs(maxT[i]) * 1000.0;
-			if (!kIsSub[i]) totalMsPerFrame += msPerFrame;
-			line += fmt::format("\n    {:<20} {:>8.3f} ms  {:>8.1f} calls  avg {:>7.2f} us  max {:>8.1f} us",
-				kNames[i], msPerFrame, callsPerFrame, avgUs, maxUs);
+			if (!kIsSub[i]) { totalMsPerFrame += msPerFrame; totalMs += TicksToMs(rowTicks); }
+			line += fmt::format("\n    {:<20} {:>8.3f} ms  {:>8.1f} calls  avg {:>7.2f} us  max {:>8.1f} us{}",
+				kNames[i], msPerFrame, callsPerFrame, avgUs, maxUs,
+				i == kEventFeed ? "  (OAR-only; engine handler below)" : "");
 		}
-		line += fmt::format("\n    {:<20} {:>8.3f} ms/frame", "TOTAL (top-level)", totalMsPerFrame);
+		// Per wall second is independent of how many player ticks the window had
+		// (menus/pause suppress ticks and inflate the per-frame figures).
+		line += fmt::format("\n    {:<20} {:>8.3f} ms/frame   {:>8.2f} ms per wall second ({:.2f}% of one core)",
+			"TOTAL (top-level)", totalMsPerFrame, totalMs / elapsed, totalMs / elapsed / 10.0);
 		logger::info("{}", line);
 	}
 }
