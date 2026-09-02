@@ -300,6 +300,7 @@ bool AnimationCache::LoadAnimationBytes(const std::string& a_suffix, std::string
 	// its reference-frame fixups get stamped inline. Pose-only replacements never
 	// reach this and so never depend on the Address Library id.
 	if (a_preserveExtractedMotion) {
+		m_anyPreserveEntries.store(true, std::memory_order_relaxed);
 		EnsureReferenceFrameVtable();
 	}
 	const auto sourceSize = a_sourceSize != 0 ? a_sourceSize : static_cast<uint64_t>(a_bytes.size());
@@ -395,6 +396,7 @@ bool AnimationCache::TryRebindCached(const std::string& a_suffix,
 			: !existing->hasFileMTime;
 		if (existing->fileSize != a_sourceSize || !timestampMatches) continue;
 
+		if (a_preserveExtractedMotion) m_anyPreserveEntries.store(true, std::memory_order_relaxed);
 		if (existing->preserveExtractedMotion != a_preserveExtractedMotion) {
 			// A config reload flipped this policy without changing the file.
 			// Existing clones embed the old m_extractedMotion choice, so retire
@@ -597,7 +599,10 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 {
 	// Opt-in entries resolve the reference-frame vtable lazily, and outside the
 	// cache lock: EnsureReferenceFrameVtable takes it itself on first resolve.
-	{
+	// This is a per-clip per-frame path, so the peek only runs while the
+	// feature is in use AND still unresolved; otherwise it is one relaxed load.
+	if (m_anyPreserveEntries.load(std::memory_order_relaxed) &&
+		m_referenceFrameVtable.load(std::memory_order_relaxed) == 0) {
 		std::shared_lock peek(m_mutex);
 		const auto* peeked = SelectEntry(a_suffix, a_owner);
 		const bool wantsMotion = peeked && peeked->preserveExtractedMotion;
@@ -787,15 +792,28 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 			const auto rfVtbl = m_referenceFrameVtable.load(std::memory_order_acquire);
 			const bool supported = entry.hasExtractedMotionFixup &&
 				entry.extractedMotionKind == CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame;
+			// Rate-limited like every other clone-build warn: a permanently failing
+			// donor whose weapon churns clones would otherwise log on every rebuild.
+			static std::atomic<int> s_motionSkipLog{ 0 };
+			const bool logSkip = s_motionSkipLog.load(std::memory_order_relaxed) < 20;
 			if (!supported) {
-				logger::warn("[OAR-Motion] '{}': extracted motion skipped — donor object is not an identified hkaDefaultAnimatedReferenceFrame",
-					entry.filePath);
+				if (logSkip) {
+					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
+					logger::warn("[OAR-Motion] '{}': extracted motion skipped — donor object is not an identified hkaDefaultAnimatedReferenceFrame",
+						entry.filePath);
+				}
 			} else if (rfVtbl == 0) {
-				logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame vtable unavailable",
-					entry.filePath);
+				if (logSkip) {
+					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
+					logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame vtable unavailable",
+						entry.filePath);
+				}
 			} else if (!ValidateReferenceFrameObject(entry, motion)) {
-				logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame object failed validation",
-					entry.filePath);
+				if (logSkip) {
+					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
+					logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame object failed validation",
+						entry.filePath);
+				}
 			} else {
 				// Stamp the object's own vtable slot here as well: idempotent with
 				// the fixup patching, and authoritative if the heuristic locator

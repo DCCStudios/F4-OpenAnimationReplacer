@@ -343,6 +343,10 @@ private:
 	// needs it. Separate from the animation vtables: reference-frame fixups are
 	// a different Havok class and must never receive an animation vtable.
 	std::atomic<uintptr_t> m_referenceFrameVtable{ 0 };
+	// Set once any loaded entry opts into extracted motion. Lets the per-call
+	// hot path in GetOrBuildRuntimeAnim skip the lock-and-peek entirely when
+	// the feature is unused (one relaxed load instead of a shared_lock + lookup).
+	std::atomic<bool> m_anyPreserveEntries{ false };
 
 	// Stamp the entry's virtual fixups (and the animation object itself) with
 	// the game vtable for its animType, if known. Idempotent. Returns the number
