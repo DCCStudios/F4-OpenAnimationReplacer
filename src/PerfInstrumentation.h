@@ -74,5 +74,9 @@ namespace OARPerf
 	void FrameTick();
 }
 
-#define OAR_PERF_SCOPE(cat) ::OARPerf::Scope _oarPerfScope##__LINE__{ ::OARPerf::cat }
+// Two-level paste so __LINE__ expands before concatenation (unique names when
+// several scopes share a function).
+#define OAR_PERF_CAT2(a, b) a##b
+#define OAR_PERF_CAT(a, b) OAR_PERF_CAT2(a, b)
+#define OAR_PERF_SCOPE(cat) ::OARPerf::Scope OAR_PERF_CAT(_oarPerfScope, __LINE__){ ::OARPerf::cat }
 #define OAR_PERF_SCOPE_NAMED(var, cat) ::OARPerf::Scope var{ ::OARPerf::cat }
