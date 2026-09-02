@@ -1,5 +1,6 @@
 #include "AnimationCache.h"
 #include "OpenAnimationReplacer.h"
+#include "PerfInstrumentation.h"
 #include "Settings.h"
 #include "RE/B/BSResourceNiBinaryStream.h"
 
@@ -597,6 +598,7 @@ RE::hkaAnimation* AnimationCache::GetCachedAnimation(const std::string& a_suffix
 RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suffix, RE::hkaAnimation* a_gameAnim,
 	const void* a_owner)
 {
+	OAR_PERF_SCOPE(kCacheGetOrBuild);
 	// Opt-in entries resolve the reference-frame vtable lazily, and outside the
 	// cache lock: EnsureReferenceFrameVtable takes it itself on first resolve.
 	// This is a per-clip per-frame path, so the peek only runs while the

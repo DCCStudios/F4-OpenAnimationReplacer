@@ -1,4 +1,5 @@
 #include "Hooks.h"
+#include "PerfInstrumentation.h"
 #include "Offsets.h"
 #include "HavokTypes.h"
 #include "Settings.h"
@@ -3376,6 +3377,7 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			const char* evtStr = a_event.tag.c_str();
 			if (!evtStr || !evtStr[0]) return RE::BSEventNotifyControl::kContinue;
 
@@ -5477,6 +5479,7 @@ namespace
 
 	static void PollPlayerGraphClips()
 	{
+		OAR_PERF_SCOPE(kPollPlayerGraph);
 		constexpr uintptr_t kBShkb_HkRootGraph = 0x378;
 		constexpr uintptr_t kBG_ActiveNodes = 0xE0;
 
@@ -7205,6 +7208,7 @@ namespace
 
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		OAR_PERF_SCOPE(kActivate);
 		// A clip activation can reuse an active-node entry in place, so force the
 		// next stable player-graph poll even when the pointer fingerprint happens
 		// to remain unchanged.
@@ -8060,6 +8064,9 @@ namespace
 			return;
 		}
 
+		// Perf: OAR's own Update work only (the engine call above is excluded).
+		OAR_PERF_SCOPE_NAMED(perfUpdate, kUpdate);
+
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
 		}
@@ -8845,6 +8852,8 @@ namespace
 				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
 					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
+				// Perf: attribute this call to the "no replacement" negative path.
+				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
 			}
 			candidatesPtr = &infoIt->second;
@@ -10609,6 +10618,9 @@ namespace
 	{
 		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
 
+		// Perf: OAR's own Generate work only (the engine call above is excluded).
+		OAR_PERF_SCOPE(kGenerate);
+
 		// --- Full-body replacement blending ---
 		// One-shot _Generate captures the "other" pose on the first blend frame only.
 		// All subsequent frames use the frozen snapshot. Only ownerClip applies.
@@ -10742,6 +10754,7 @@ namespace
 
 		// Fast path: skip all locking if no track filter is active anywhere
 		if (s_trackFilterActiveCount.load(std::memory_order_relaxed) <= 0) return;
+		OAR_PERF_SCOPE(kTrackFilter);
 
 		auto* character = a_context ? a_context->character : nullptr;
 		if (!character) return;
@@ -14737,6 +14750,7 @@ namespace Hooks
 			void* a_this, const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalActorProcess);
 		}
 
@@ -14744,6 +14758,7 @@ namespace Hooks
 			void* a_this, const RE::BSAnimationGraphEvent& a_event,
 			RE::BSTEventSource<RE::BSAnimationGraphEvent>* a_source)
 		{
+			OAR_PERF_SCOPE(kEventFeed);
 			return HookedProcessEventImpl(a_this, a_event, a_source, _OriginalPlayerProcess);
 		}
 
@@ -15723,7 +15738,12 @@ namespace Hooks
 				s_activeCameraEvaluation.store(0, std::memory_order_release);
 				ApplyCurrentContribution(a_player, evaluation);
 				ApplyCurrentBoneContribution(a_player, evaluation);
-				HealSkeletonRootNaN(a_player, "post-eval");
+				{
+					OAR_PERF_SCOPE(kHealSkeleton);
+					HealSkeletonRootNaN(a_player, "post-eval");
+				}
+				// Once per frame: perf report tick.
+				OARPerf::FrameTick();
 			}
 
 			static void Install()
@@ -15750,6 +15770,7 @@ namespace Hooks
 			static void Thunk(RE::PlayerCamera* a_camera)
 			{
 				Original(a_camera);
+				OAR_PERF_SCOPE(kHealSkeleton);
 				HealSkeletonRootNaN(RE::PlayerCharacter::GetSingleton(), "post-camera");
 			}
 

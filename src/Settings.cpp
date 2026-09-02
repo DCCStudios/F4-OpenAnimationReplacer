@@ -1,4 +1,5 @@
 #include "Settings.h"
+#include "PerfInstrumentation.h"
 
 #include <filesystem>
 
@@ -68,6 +69,8 @@ void Settings::Load()
 	bExitInitInstant = getB("Debug", "bExitInitInstant", bExitInitInstant);
 	sPlainReplayWeapons = getS("Debug", "sPlainReplayWeapons", sPlainReplayWeapons.c_str());
 	bPlainReplayFastForward = getB("Debug", "bPlainReplayFastForward", bPlainReplayFastForward);
+	bPerfInstrumentation = getB("Debug", "bPerfInstrumentation", bPerfInstrumentation);
+	OARPerf::g_perfEnabled.store(bPerfInstrumentation, std::memory_order_relaxed);
 
 	const char* rvaStr = getS("Debug", "iLoadClipsAddressRVA", "0");
 	if (rvaStr) {

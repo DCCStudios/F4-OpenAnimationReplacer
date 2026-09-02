@@ -54,6 +54,7 @@ set(SOURCES
 	src/PCH.cpp
 	src/main.cpp
 	src/LogSetup.cpp
+	src/PerfInstrumentation.cpp
 	src/Settings.cpp
 	src/Offsets.h
 	src/HavokTypes.h

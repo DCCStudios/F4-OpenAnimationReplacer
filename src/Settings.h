@@ -106,6 +106,9 @@ public:
 	// fully loaded graph, fast-forward THROUGH the exit transition so it never
 	// renders in real time (no re-init => no subgraph reload => no async race).
 	bool  bPlainReplayFastForward{ true };
+	// Frame-time instrumentation of OAR's own hooks: one "[OAR-Perf]" summary
+	// line every 10s (see PerfInstrumentation.h). ON in the measurement build.
+	bool  bPerfInstrumentation{ true };
 
 	void AppendPlainReplayWeapon(std::uint64_t a_fp);
 
