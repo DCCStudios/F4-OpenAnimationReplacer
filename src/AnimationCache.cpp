@@ -612,6 +612,32 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		if (wantsMotion) EnsureReferenceFrameVtable();
 	}
 
+	// ===== Shared-lock fast path (perf plan phase 3) =====
+	// This runs per replaced clip per Update. In the steady state the clone
+	// already exists, so answer under a SHARED lock, keeping the same
+	// address-reuse re-validation (duration + track count against the LIVE
+	// original) the exclusive path performs — the engine frees originals and
+	// reuses their addresses, and no cache-side counter can observe that.
+	// Anything that must mutate (retire, build) falls through to the
+	// exclusive lock below, which re-selects and re-scans from scratch.
+	{
+		std::shared_lock rlock(m_mutex);
+		if (const auto* sel = SelectEntry(a_suffix, a_owner)) {
+			if (a_gameAnim) {
+				const auto* origBytes = reinterpret_cast<const uint8_t*>(a_gameAnim);
+				const float dur = *reinterpret_cast<const float*>(origBytes + 0x14);
+				const int32_t trk = *reinterpret_cast<const int32_t*>(origBytes + 0x18);
+				for (const auto& rc : sel->clones) {
+					if (rc.gameOriginal != a_gameAnim) continue;
+					if (dur == rc.originalDuration && trk == rc.originalNumTracks) return rc.clone;
+					break;  // stale: needs the exclusive path to retire + rebuild
+				}
+			} else if (!sel->clones.empty()) {
+				return sel->clones.back().clone;
+			}
+		}
+	}
+
 	std::unique_lock lock(m_mutex);
 	auto* selected = SelectEntry(a_suffix, a_owner);
 	if (!selected) return nullptr;
@@ -1016,13 +1042,7 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 	const auto clonePtr = rc.clone;
 	m_cloneLookup.erase(clonePtr);
 	if (!rc.structBuffer.empty()) {
-		constexpr size_t kMaxRetiredClones = 256;
-		if (m_retiredClones.size() >= kMaxRetiredClones) {
-			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
-				m_cloneLookup.erase(retiredPtr);
-			}
-			m_retiredClones.erase(m_retiredClones.begin());
-		}
+		EvictRetiredClonesLocked();
 		RetiredClone rec;
 		rec.buffer = std::move(rc.structBuffer);
 		rec.clonePtr = rc.clone;
@@ -1044,6 +1064,26 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 	a_entry.clones.erase(a_entry.clones.begin() + a_index);
 }
 
+// Keep the retired list bounded by COUNT and by BYTES (perf plan phase 6): a
+// retired record can carry a whole donor file (backingFileData, tens of KB to
+// MB), and repeated config reloads churn the list, so a count-only cap let the
+// retained bytes grow without limit. Oldest first. Retirements are rare
+// (weapon switch, reload), so summing the sizes here is fine.
+void AnimationCache::EvictRetiredClonesLocked()
+{
+	constexpr size_t kMaxRetiredClones = 256;
+	constexpr size_t kMaxRetiredBytes = 64u * 1024u * 1024u;
+	size_t bytes = 0;
+	for (const auto& rc : m_retiredClones) bytes += rc.buffer.size() + rc.backingFileData.size();
+	while (!m_retiredClones.empty() &&
+		(m_retiredClones.size() >= kMaxRetiredClones || bytes > kMaxRetiredBytes)) {
+		auto& front = m_retiredClones.front();
+		bytes -= std::min(bytes, front.buffer.size() + front.backingFileData.size());
+		if (front.clonePtr) m_cloneLookup.erase(front.clonePtr);
+		m_retiredClones.erase(m_retiredClones.begin());
+	}
+}
+
 void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData,
 	const std::string& a_suffix)
 {
@@ -1058,13 +1098,7 @@ void AnimationCache::RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBa
 	}
 	const bool retireData = a_retireBackingData && !a_entry.fileData.empty();
 	if (retireData) {
-		constexpr size_t kMaxRetiredClones = 256;
-		if (m_retiredClones.size() >= kMaxRetiredClones) {
-			if (const auto retiredPtr = m_retiredClones.front().clonePtr; retiredPtr) {
-				m_cloneLookup.erase(retiredPtr);
-			}
-			m_retiredClones.erase(m_retiredClones.begin());
-		}
+		EvictRetiredClonesLocked();
 		RetiredClone rec;
 		rec.suffix = a_suffix;
 		rec.owner = a_entry.owner;

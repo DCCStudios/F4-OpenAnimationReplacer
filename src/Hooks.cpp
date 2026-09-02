@@ -169,6 +169,12 @@ static constexpr float kPostFixSoundSuppressSec = 1.0f;
 static std::mutex s_soundSuppressMutex;
 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
 	s_soundSuppressUntilByActor;
+// Number of live entries in the map above (perf plan phase 2): the event hook
+// asks InSoundSuppressWindow for EVERY animation event on EVERY actor, and the
+// window is armed for one actor for ~1 s after an IdleStop fix. With this at 0
+// the query is one relaxed load instead of a mutex + map lookup + clock read.
+// Exact by construction: +1 only when a NEW key is inserted, -1 at every erase.
+static std::atomic<int> s_soundSuppressArmed{ 0 };
 
 // Post-exit CAMERA hold window: the exit transition's own clips (wpnequipfast)
 // carry camera animation which the fast-forward lands mid-motion — the pose
@@ -284,6 +290,15 @@ static void MarkLiveCamCarrierSeen(RE::TESObjectREFR* a_refr, uint64_t a_frame)
 	if (!a_refr) return;
 	std::lock_guard lock(s_liveCamCarrierMutex);
 	s_liveCamCarrierSeenFrame[a_refr] = a_frame;
+	// Entries are only ever read within 2 frames of being written; prune the
+	// map when it grows so a long session with actor churn cannot leak it
+	// (perf plan phase 6).
+	if (s_liveCamCarrierSeenFrame.size() > 64) {
+		for (auto it = s_liveCamCarrierSeenFrame.begin(); it != s_liveCamCarrierSeenFrame.end();) {
+			if (a_frame - it->second > 600) it = s_liveCamCarrierSeenFrame.erase(it);
+			else ++it;
+		}
+	}
 }
 
 static bool IsLiveCamCarrierFresh(RE::TESObjectREFR* a_refr, uint64_t a_frame)
@@ -297,23 +312,51 @@ static bool IsLiveCamCarrierFresh(RE::TESObjectREFR* a_refr, uint64_t a_frame)
 static void ArmSoundSuppressWindow(RE::TESObjectREFR* a_refr)
 {
 	if (!a_refr) return;
-	std::lock_guard lock(s_soundSuppressMutex);
-	s_soundSuppressUntilByActor[a_refr->GetFormID()] =
-		std::chrono::steady_clock::now() +
+	const auto until = std::chrono::steady_clock::now() +
 		std::chrono::milliseconds(static_cast<int>(kPostFixSoundSuppressSec * 1000.0f));
+	std::lock_guard lock(s_soundSuppressMutex);
+	auto [it, inserted] = s_soundSuppressUntilByActor.try_emplace(a_refr->GetFormID(), until);
+	if (inserted) {
+		s_soundSuppressArmed.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		it->second = until;  // re-arm a live window: no count change
+	}
 }
 
 static bool InSoundSuppressWindow(RE::TESObjectREFR* a_refr)
 {
 	if (!a_refr) return false;
+	if (s_soundSuppressArmed.load(std::memory_order_relaxed) <= 0) return false;
 	std::lock_guard lock(s_soundSuppressMutex);
 	auto it = s_soundSuppressUntilByActor.find(a_refr->GetFormID());
 	if (it == s_soundSuppressUntilByActor.end()) return false;
 	if (std::chrono::steady_clock::now() >= it->second) {
 		s_soundSuppressUntilByActor.erase(it);
+		s_soundSuppressArmed.fetch_sub(1, std::memory_order_relaxed);
 		return false;
 	}
 	return true;
+}
+
+// Expired windows are otherwise only reclaimed by the next event from that
+// actor, which may never come (e.g. an NPC that despawns), so the armed count
+// would drift upward over a session and defeat the fast path. Called once per
+// frame from the player update tail; cheap when nothing is armed.
+static void SweepSoundSuppressWindows()
+{
+	if (s_soundSuppressArmed.load(std::memory_order_relaxed) <= 0) return;
+	static uint32_t s_sweepCounter = 0;
+	if ((++s_sweepCounter % 60) != 0) return;  // ~once a second at 60 fps
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard lock(s_soundSuppressMutex);
+	for (auto it = s_soundSuppressUntilByActor.begin(); it != s_soundSuppressUntilByActor.end();) {
+		if (now >= it->second) {
+			it = s_soundSuppressUntilByActor.erase(it);
+			s_soundSuppressArmed.fetch_sub(1, std::memory_order_relaxed);
+		} else {
+			++it;
+		}
+	}
 }
 
 static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr,
@@ -2347,6 +2390,35 @@ namespace
 	// Cache clip suffixes from Activate (animationName may be cleared by Update time)
 	static std::shared_mutex s_clipSuffixMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipSuffixCache;
+
+	// Per-clip "does the cached suffix have ANY registered replacement" memo
+	// (perf plan phase 1). Guarded by s_clipSuffixMutex and bound to the suffix
+	// string: every site that writes s_clipSuffixCache for a clip erases its
+	// memo, so a suffix rewrite (Activate re-key, direct-path resolution from
+	// Update or the player poll) always re-decides. Stamped with
+	// s_lookupGeneration, which bumps whenever the name tables are rebuilt or
+	// re-sorted, so a config reload re-decides too. Only kNoRegistration is
+	// ever acted on: it lets Update skip the string-keyed table lookups and
+	// the multi-match resolution for the ~95% of clips OAR never replaces.
+	// The vtable capture and the vanilla-annotation contract run BEFORE the
+	// memo is consulted and are unaffected.
+	enum class MatchDecision : uint8_t { kUnknown, kNoRegistration, kHasRegistration };
+	struct MatchMemo { MatchDecision decision{ MatchDecision::kUnknown }; uint32_t generation{ 0 }; };
+	static std::unordered_map<RE::hkbClipGenerator*, MatchMemo> s_clipMatchMemo;
+	static std::atomic<uint32_t> s_lookupGeneration{ 1 };
+
+	// Epoch of the mod configuration for the chunked BA2 preload chain (perf
+	// plan phase 6). The chain runs across frames and captures SubMod owner
+	// pointers; a config reload destroys those SubMods, so the chain must stop
+	// when the epoch it was created under is gone (audit 2026-09-02).
+	static std::atomic<uint32_t> s_archiveLoadEpoch{ 0 };
+
+	static void RecordMatchDecision(RE::hkbClipGenerator* a_clip, MatchDecision a_decision)
+	{
+		const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
+		std::unique_lock lock(s_clipSuffixMutex);
+		s_clipMatchMemo[a_clip] = MatchMemo{ a_decision, gen };
+	}
 
 	// Full on-disk animation path per clip, from the subgraph swap-array resolution
 	// (Source S). Display-only: lets the Animation Log show the authoritative path
@@ -4488,6 +4560,9 @@ namespace
 	// be serialized with graph updates the same way the config reload is.
 	static void ResortNameLookupByPriority()
 	{
+		// Conservative: the tables' keys do not change on a re-sort, but bump
+		// the match-memo generation anyway so every clip re-decides (phase 1).
+		s_lookupGeneration.fetch_add(1, std::memory_order_acq_rel);
 		std::unique_lock lock(s_nameLookupMutex);
 		if (!s_lookupBuilt) return;
 		for (auto& [suffix, infoVec] : s_suffixToInfos) {
@@ -4641,33 +4716,71 @@ namespace
 			logger::info("[OAR-Preload] Deferring {} archive (BA2) animation(s) to a main-thread load pass",
 				archiveWork.size());
 
-			auto loadArchives = [items = std::move(archiveWork)]() {
+			// Chunked across frames (perf plan phase 6): every archive open ran
+			// in ONE task before, so the hitch scaled with the archive-donor
+			// count. Each task now loads kArchiveChunk items and re-queues the
+			// remainder for the next frame; the same main-thread guarantee
+			// holds for every open.
+			struct ArchiveLoadState
+			{
+				std::vector<DeferredArchiveItem> items;
+				size_t next{ 0 };
+				int loaded{ 0 };
+				int failed{ 0 };
+				uint32_t epoch{ 0 };
+			};
+			auto state = std::make_shared<ArchiveLoadState>();
+			state->items = std::move(archiveWork);
+			state->epoch = s_archiveLoadEpoch.load(std::memory_order_acquire);
+			constexpr size_t kArchiveChunk = 24;
+
+			auto loadArchives = std::make_shared<std::function<void()>>();
+			*loadArchives = [state, loadArchives]() {
+				// A config reload since this chain started destroyed the SubMods
+				// the captured owner pointers refer to; a late LoadAnimationResource
+				// would re-bind fresh entries to dead owners. Stop here.
+				if (state->epoch != s_archiveLoadEpoch.load(std::memory_order_acquire)) {
+					logger::info("[OAR-Preload] Archive (BA2) load pass abandoned after a config reload ({} of {} loaded before it)",
+						state->next, state->items.size());
+					*loadArchives = nullptr;  // break the self-capture cycle
+					return;
+				}
 				auto* cache = AnimationCache::GetSingleton();
-				int aLoaded = 0;
-				int aFailed = 0;
-				for (const auto& it : items) {
+				const size_t end = std::min(state->items.size(), state->next + kArchiveChunk);
+				for (; state->next < end; ++state->next) {
+					const auto& it = state->items[state->next];
 					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority,
 						it.preserveExtractedMotion)) {
-						++aLoaded;
+						++state->loaded;
 					} else {
-						++aFailed;
+						++state->failed;
 					}
 				}
+				if (state->next < state->items.size()) {
+					if (auto* tasks = F4SE::GetTaskInterface()) {
+						tasks->AddTask(*loadArchives);
+						return;
+					}
+					// No task interface: finish inline rather than lose the rest.
+					(*loadArchives)();
+					return;
+				}
 				logger::info("[OAR-Preload] Archive (BA2) load pass complete: {} loaded, {} failed, cache size: {}",
-					aLoaded, aFailed, cache->GetCacheSize());
+					state->loaded, state->failed, cache->GetCacheSize());
 				if (auto log = spdlog::default_logger()) {
 					log->flush();
 				}
+				*loadArchives = nullptr;  // break the self-capture cycle
 			};
 
 			if (auto* tasks = F4SE::GetTaskInterface()) {
-				tasks->AddTask(loadArchives);
+				tasks->AddTask(*loadArchives);
 			} else {
 				// No task interface (should not happen after F4SEPlugin_Load). Run
 				// inline as a last resort; LoadAnimationResource's SEH guard is the
 				// safety net if the registration race bites here.
 				logger::warn("[OAR-Preload] No F4SE task interface available; loading archives inline");
-				loadArchives();
+				(*loadArchives)();
 			}
 		}
 	}
@@ -4734,8 +4847,13 @@ namespace
 			s_leafToFullSuffixes.clear();
 			s_lookupBuilt = false;
 		}
+		// Per-clip match memos were decided against the OLD tables (perf plan
+		// phase 1): bump the generation so every clip re-decides after the reload.
+		s_lookupGeneration.fetch_add(1, std::memory_order_acq_rel);
 
-		// 3) Tear down and re-parse all mod configurations.
+		// 3) Tear down and re-parse all mod configurations. Any in-flight chunked
+		//    BA2 preload chain captured the OLD SubMods; retire it first.
+		s_archiveLoadEpoch.fetch_add(1, std::memory_order_acq_rel);
 		oar->ClearAllMods();
 		Parsing::ParseAllMods();
 
@@ -5408,6 +5526,24 @@ namespace
 	static SubMod* ValidatedActiveSubMod(RE::hkbClipGenerator* a_clip)
 	{
 		RE::hkaAnimation* currentBinding = GetBindingOriginalForClip(a_clip);
+		// Read path under a shared lock (perf plan phase 3): this runs per
+		// replaced clip per Update, and the stale-binding erase is rare.
+		SubMod* found = nullptr;
+		bool stale = false;
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto smIt = s_activeSubModMap.find(a_clip);
+			if (smIt == s_activeSubModMap.end() || !smIt->second) return nullptr;
+			found = smIt->second;
+			auto bit = s_activeSubModBinding.find(a_clip);
+			stale = bit != s_activeSubModBinding.end() && bit->second && currentBinding &&
+				bit->second != currentBinding;
+		}
+		if (!stale) return found;
+
+		// Upgrade: re-find under the exclusive lock (another thread may have
+		// erased or replaced the entries between the two locks; never reuse
+		// iterators across the lock change).
 		std::unique_lock smLock(s_activeSubModMutex);
 		auto smIt = s_activeSubModMap.find(a_clip);
 		if (smIt == s_activeSubModMap.end() || !smIt->second) return nullptr;
@@ -5469,6 +5605,7 @@ namespace
 			auto it = s_clipSuffixCache.find(a_clip);
 			if (it != s_clipSuffixCache.end()) oldSuffix = it->second;
 			s_clipSuffixCache[a_clip] = matchKey;
+			s_clipMatchMemo.erase(a_clip);  // suffix changed: re-decide
 		}
 		static std::atomic<int> s_rekeyLog{ 0 };
 		if (s_rekeyLog.fetch_add(1, std::memory_order_relaxed) < 40) {
@@ -7659,6 +7796,7 @@ namespace
 				if (it == s_clipSuffixCache.end() || it->second != suffix) {
 					suffixChanged = true;
 					s_clipSuffixCache[a_this] = suffix;
+					s_clipMatchMemo.erase(a_this);  // suffix changed: re-decide
 				}
 			}
 			// If the suffix changed for this clipGen pointer (engine reused the slot for a
@@ -7796,7 +7934,9 @@ namespace
 		if (!activateRefr) activateRefr = RE::PlayerCharacter::GetSingleton();
 		// Engine-fired events get attributed to this clip until the next activation
 		// on the same actor (see EventSourceAnimFor).
-		RecordLastActivatedClip(activateRefr, suffix);
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
+			RecordLastActivatedClip(activateRefr, suffix);
+		}
 		if (activateRefr && animSlot && *animSlot) {
 			auto* origAnim = *animSlot;
 			auto* origBytes = reinterpret_cast<uint8_t*>(origAnim);
@@ -8070,6 +8210,7 @@ namespace
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
 		}
+		auto* settings = Settings::GetSingleton();
 
 		// ===== Deferred kActivate anim-log flush =====
 		// Path resolution itself happens in PollPlayerGraphClips() (per-frame,
@@ -8120,7 +8261,7 @@ namespace
 		// catches stragglers that still hold our clone — e.g. a clip that
 		// swapped on the very frame of the toggle, or one whose original was
 		// unreadable during the bulk pass.
-		if (!Settings::GetSingleton()->bEnabled) {
+		if (!settings->bEnabled) {
 			auto** slot = a_this->GetAnimationSlot();
 			if (slot && *slot && AnimationCache::GetSingleton()->IsOurReplacement(*slot)) {
 				if (auto* orig = GetValidOriginal(a_this)) {
@@ -8180,6 +8321,7 @@ namespace
 			if (!suffix.empty()) {
 				std::unique_lock lock(s_clipSuffixMutex);
 				s_clipSuffixCache[a_this] = suffix;
+				s_clipMatchMemo.erase(a_this);  // suffix (re)set: re-decide
 			}
 		}
 
@@ -8420,7 +8562,26 @@ namespace
 		// running. Also skipped when no replacement is registered for the
 		// current guess — the match below exits as NoMatch anyway, so the
 		// attribution/resolution cost would buy nothing.
-		if (Settings::GetSingleton()->bDirectPathMatching) {
+		//
+		// ===== Negative fast path (perf plan phase 1) =====
+		// If this clip's CURRENT suffix was already found to have no registered
+		// replacement under the current name tables, nothing below can change
+		// that this frame (the direct-path gate only acts when a registration
+		// exists, and any suffix rewrite erased the memo), so skip the
+		// string-keyed lookups and the multi-match resolution entirely. The
+		// vtable capture and the vanilla-annotation contract above already ran.
+		{
+			const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
+			std::shared_lock mlock(s_clipSuffixMutex);
+			auto mit = s_clipMatchMemo.find(a_this);
+			if (mit != s_clipMatchMemo.end() && mit->second.generation == gen &&
+				mit->second.decision == MatchDecision::kNoRegistration) {
+				perfUpdate.Split(OARPerf::kUpdateNoMatch);
+				return;
+			}
+		}
+
+		if (settings->bDirectPathMatching) {
 			bool matchPossible = false;
 			{
 				std::shared_lock rlock(s_nameLookupMutex);
@@ -8528,22 +8689,6 @@ namespace
 			}
 		}
 
-		// Diagnostic: log unique suffixes
-		{
-			static std::unordered_set<std::string> s_loggedSuffixes;
-			static std::shared_mutex s_loggedSuffixMutex;
-			std::shared_lock slock(s_loggedSuffixMutex);
-			bool isNew = s_loggedSuffixes.find(suffix) == s_loggedSuffixes.end();
-			slock.unlock();
-			if (isNew) {
-				std::unique_lock ulock(s_loggedSuffixMutex);
-				if (s_loggedSuffixes.insert(suffix).second) {
-					bool found = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
-					OAR_VLOG("[OAR-Match] suffix='{}' match={}", suffix, found);
-				}
-			}
-		}
-
 		// Handle multi-match mode: suffix starts with "multi:" meaning multiple candidate
 		// suffixes share the same leaf name. We'll evaluate conditions for each.
 		bool isMultiMatch = (suffix.size() > 6 && suffix.substr(0, 6) == "multi:");
@@ -8575,6 +8720,8 @@ namespace
 			std::string leafName = suffix.substr(6);
 			auto leafIt = s_leafToFullSuffixes.find(leafName);
 			if (leafIt == s_leafToFullSuffixes.end() || leafIt->second.empty()) {
+				RecordMatchDecision(a_this, MatchDecision::kNoRegistration);
+				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
 			}
 
@@ -8852,6 +8999,9 @@ namespace
 				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
 					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
+				// Remember the negative decision for this suffix so subsequent
+				// frames take the fast path above (phase 1).
+				RecordMatchDecision(a_this, MatchDecision::kNoRegistration);
 				// Perf: attribute this call to the "no replacement" negative path.
 				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
@@ -15745,7 +15895,9 @@ namespace Hooks
 					OAR_PERF_SCOPE(kHealSkeleton);
 					HealSkeletonRootNaN(a_player, "post-eval");
 				}
-				// Once per frame: perf report tick.
+				// Once per frame: reclaim expired sound-suppression windows and
+				// tick the perf report.
+				SweepSoundSuppressWindows();
 				OARPerf::FrameTick();
 			}
 

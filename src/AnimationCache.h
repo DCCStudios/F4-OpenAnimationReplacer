@@ -285,6 +285,9 @@ private:
 	// until it deactivates.
 	void RetireCloneLocked(CachedAnimation& a_entry, bool a_retireBackingData = false,
 		const std::string& a_suffix = {});
+	// Drop the oldest retired records while the list exceeds its count or byte
+	// cap. Caller must hold m_mutex (unique).
+	void EvictRetiredClonesLocked();
 
 	mutable std::shared_mutex m_mutex;
 	// Retired clone buffers, kept alive because clips may still reference them

@@ -76,5 +76,9 @@ private:
 	std::deque<Entry> animEventEntries;
 
 	int maxEntries{ 500 };
-	bool enabled{ true };
+	// Off until a log window is opened (UIAnimationLog / UIAnimationEventLog
+	// OnOpen). Nothing functional reads the entries, and the event feed pays
+	// string construction + a mutex per animation event on every actor while
+	// this is on, so it is not worth paying for users who never open the logs.
+	bool enabled{ false };
 };
