@@ -10,14 +10,56 @@
 void UIWelcomeBanner::Show()
 {
 	if (!Settings::GetSingleton()->bShowWelcomeBanner) return;
+	if (active) return;  // already armed or showing
 	active = true;
-	startTime = std::chrono::steady_clock::now();
+	started = false;  // clock starts on the first frame the main menu is up
+	armTime = std::chrono::steady_clock::now();
+	startTime = {};
 	loggedDiag = false;
 }
 
-bool UIWelcomeBanner::ShouldDraw() const
+void UIWelcomeBanner::OnOpen()
 {
-	return active;
+	Show();
+}
+
+void UIWelcomeBanner::Finish() const
+{
+	active = false;
+	started = false;
+}
+
+bool UIWelcomeBanner::Tick() const
+{
+	if (!active) return false;
+
+	static const RE::BSFixedString kMainMenu("MainMenu");
+	auto* ui = RE::UI::GetSingleton();
+	const bool mainMenuOpen = ui && ui->GetMenuOpen(kMainMenu);
+	if (!mainMenuOpen) {
+		if (started) {
+			// The main menu was up and just closed (the player loaded in): done.
+			Finish();
+			return false;
+		}
+		// Still in the pre-menu load. Keep waiting, but not forever.
+		const float waited = std::chrono::duration<float>(std::chrono::steady_clock::now() - armTime).count();
+		if (waited > kMaxWaitForMainMenu) {
+			logger::info("[OAR-Banner] Main menu never appeared within {:.0f}s; banner cancelled", kMaxWaitForMainMenu);
+			Finish();
+		}
+		return false;
+	}
+
+	if (!started) {
+		started = true;
+		startTime = std::chrono::steady_clock::now();
+	}
+	if (ElapsedSeconds() >= kDisplayDuration) {
+		Finish();  // held its full duration on the main menu
+		return false;
+	}
+	return true;
 }
 
 ImGuiWindowFlags UIWelcomeBanner::GetWindowFlags() const
@@ -27,16 +69,9 @@ ImGuiWindowFlags UIWelcomeBanner::GetWindowFlags() const
 	       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
 }
 
-void UIWelcomeBanner::OnOpen()
-{
-	active = true;
-	startTime = std::chrono::steady_clock::now();
-	loggedDiag = false;
-}
-
 float UIWelcomeBanner::ElapsedSeconds() const
 {
-	if (startTime == std::chrono::steady_clock::time_point{}) {
+	if (!started || startTime == std::chrono::steady_clock::time_point{}) {
 		return 0.f;
 	}
 	return std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
@@ -44,7 +79,7 @@ float UIWelcomeBanner::ElapsedSeconds() const
 
 float UIWelcomeBanner::GetWindowAlpha() const
 {
-	if (!active) return 0.f;
+	if (!active || !started) return 0.f;
 	const float elapsed = ElapsedSeconds();
 	if (elapsed < kFadeInTime) {
 		return elapsed / kFadeInTime;
@@ -58,11 +93,9 @@ float UIWelcomeBanner::GetWindowAlpha() const
 
 void UIWelcomeBanner::DrawContents()
 {
+	// Tick() (via ShouldDraw) already gated on the main menu and the duration
+	// before Begin(); nothing to re-check here.
 	const float elapsed = ElapsedSeconds();
-	if (elapsed >= kDisplayDuration) {
-		active = false;
-		return;
-	}
 
 	auto viewport = ImGui::GetMainViewport();
 	ImGui::SetWindowPos(ImVec2(

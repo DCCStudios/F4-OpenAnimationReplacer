@@ -6,7 +6,7 @@ The numbers in "Baseline" get filled in from the instrumented build; everything 
 
 ## How to read the instrumentation
 
-The measurement build logs one `[OAR-Perf]` block every 10 seconds (`[Debug] bPerfInstrumentation`, default on in this build, will default off afterwards). Each row is summed CPU time across all threads per frame, because Havok updates clips from several job threads at once. Rows indented with two spaces are sub-scopes that run inside the row above them and are listed for attribution only; `TOTAL` sums the top-level rows.
+The measurement build logs one `[OAR-Perf]` block every 10 seconds (`[Debug] bPerfInstrumentation`, default off since v1.1.14; set to 1 to measure). Each row is summed CPU time across all threads per frame, because Havok updates clips from several job threads at once. Rows indented with two spaces are sub-scopes that run inside the row above them and are listed for attribution only; `TOTAL` sums the top-level rows.
 
 | Row | What it measures |
 |---|---|
