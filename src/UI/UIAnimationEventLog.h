@@ -1,6 +1,7 @@
 #pragma once
 
 #include "UI/UIWindow.h"
+#include "AnimationLog.h"
 
 class UIAnimationEventLog : public UIWindow
 {
@@ -8,6 +9,8 @@ public:
 	UIAnimationEventLog() : UIWindow(WindowID::kAnimationEventLog, "Animation Event Log") {}
 
 protected:
+	// See UIAnimationLog::OnOpen: the event feed is off until a log opens.
+	void OnOpen() override { AnimationLog::GetSingleton()->SetEnabled(true); }
 	void DrawContents() override;
 	ImVec2 GetDefaultSize() const override { return ImVec2(500, 350); }
 

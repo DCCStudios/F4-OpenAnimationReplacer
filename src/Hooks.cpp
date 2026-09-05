@@ -1,5 +1,9 @@
 #include "Hooks.h"
 #include "PerfInstrumentation.h"
+
+// Defined near the end of this file (global scope); used by the event-log
+// attribution helper to map an event tag back to trigger ids.
+size_t CollectGraphEventNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out);
 #include "Offsets.h"
 #include "HavokTypes.h"
 #include "Settings.h"
@@ -169,6 +173,12 @@ static constexpr float kPostFixSoundSuppressSec = 1.0f;
 static std::mutex s_soundSuppressMutex;
 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
 	s_soundSuppressUntilByActor;
+// Number of live entries in the map above (perf plan phase 2): the event hook
+// asks InSoundSuppressWindow for EVERY animation event on EVERY actor, and the
+// window is armed for one actor for ~1 s after an IdleStop fix. With this at 0
+// the query is one relaxed load instead of a mutex + map lookup + clock read.
+// Exact by construction: +1 only when a NEW key is inserted, -1 at every erase.
+static std::atomic<int> s_soundSuppressArmed{ 0 };
 
 // Post-exit CAMERA hold window: the exit transition's own clips (wpnequipfast)
 // carry camera animation which the fast-forward lands mid-motion — the pose
@@ -284,6 +294,15 @@ static void MarkLiveCamCarrierSeen(RE::TESObjectREFR* a_refr, uint64_t a_frame)
 	if (!a_refr) return;
 	std::lock_guard lock(s_liveCamCarrierMutex);
 	s_liveCamCarrierSeenFrame[a_refr] = a_frame;
+	// Entries are only ever read within 2 frames of being written; prune the
+	// map when it grows so a long session with actor churn cannot leak it
+	// (perf plan phase 6).
+	if (s_liveCamCarrierSeenFrame.size() > 64) {
+		for (auto it = s_liveCamCarrierSeenFrame.begin(); it != s_liveCamCarrierSeenFrame.end();) {
+			if (a_frame - it->second > 600) it = s_liveCamCarrierSeenFrame.erase(it);
+			else ++it;
+		}
+	}
 }
 
 static bool IsLiveCamCarrierFresh(RE::TESObjectREFR* a_refr, uint64_t a_frame)
@@ -297,23 +316,51 @@ static bool IsLiveCamCarrierFresh(RE::TESObjectREFR* a_refr, uint64_t a_frame)
 static void ArmSoundSuppressWindow(RE::TESObjectREFR* a_refr)
 {
 	if (!a_refr) return;
-	std::lock_guard lock(s_soundSuppressMutex);
-	s_soundSuppressUntilByActor[a_refr->GetFormID()] =
-		std::chrono::steady_clock::now() +
+	const auto until = std::chrono::steady_clock::now() +
 		std::chrono::milliseconds(static_cast<int>(kPostFixSoundSuppressSec * 1000.0f));
+	std::lock_guard lock(s_soundSuppressMutex);
+	auto [it, inserted] = s_soundSuppressUntilByActor.try_emplace(a_refr->GetFormID(), until);
+	if (inserted) {
+		s_soundSuppressArmed.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		it->second = until;  // re-arm a live window: no count change
+	}
 }
 
 static bool InSoundSuppressWindow(RE::TESObjectREFR* a_refr)
 {
 	if (!a_refr) return false;
+	if (s_soundSuppressArmed.load(std::memory_order_relaxed) <= 0) return false;
 	std::lock_guard lock(s_soundSuppressMutex);
 	auto it = s_soundSuppressUntilByActor.find(a_refr->GetFormID());
 	if (it == s_soundSuppressUntilByActor.end()) return false;
 	if (std::chrono::steady_clock::now() >= it->second) {
 		s_soundSuppressUntilByActor.erase(it);
+		s_soundSuppressArmed.fetch_sub(1, std::memory_order_relaxed);
 		return false;
 	}
 	return true;
+}
+
+// Expired windows are otherwise only reclaimed by the next event from that
+// actor, which may never come (e.g. an NPC that despawns), so the armed count
+// would drift upward over a session and defeat the fast path. Called once per
+// frame from the player update tail; cheap when nothing is armed.
+static void SweepSoundSuppressWindows()
+{
+	if (s_soundSuppressArmed.load(std::memory_order_relaxed) <= 0) return;
+	static uint32_t s_sweepCounter = 0;
+	if ((++s_sweepCounter % 60) != 0) return;  // ~once a second at 60 fps
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard lock(s_soundSuppressMutex);
+	for (auto it = s_soundSuppressUntilByActor.begin(); it != s_soundSuppressUntilByActor.end();) {
+		if (now >= it->second) {
+			it = s_soundSuppressUntilByActor.erase(it);
+			s_soundSuppressArmed.fetch_sub(1, std::memory_order_relaxed);
+		} else {
+			++it;
+		}
+	}
 }
 
 static void UpdateIdleStopSuppressionArm(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr,
@@ -420,6 +467,67 @@ bool HasActiveReplacements() { return s_hasActiveReplacements.load(); }
 static std::shared_mutex s_characterCacheMutex;
 static std::unordered_map<RE::hkbCharacter*, RE::TESObjectREFR*> s_characterCache;
 static std::unordered_set<RE::hkbCharacter*> s_mainBodyCharacters;
+
+// Deterministic hkbCharacter -> actor resolution (field bug 2026-09-03: NPC
+// reload replacements fired their annotations, incl. ReloadComplete, on the
+// PLAYER because the character cache only learns high-process actors every 30
+// frames and every miss fell back to the player). Each BShkbAnimationGraph
+// embeds its hkbCharacter at 0x1C8 and stores a pointer back to its
+// IAnimationGraphManagerHolder (the actor's base subobject). The holder's
+// offset inside the graph is not in our headers, so it is LEARNED at
+// RegisterActorCharacter time from (graph, actor) pairs we know, and only
+// trusted while every observation agrees. 0 = unknown, -1 = disagreement seen
+// (disabled). s_holderBaseDelta = offset of the IAnimationGraphManagerHolder
+// base inside TESObjectREFR, learned the same way.
+static std::atomic<intptr_t> s_graphHolderOffset{ 0 };
+static std::atomic<uintptr_t> s_holderBaseDelta{ 0 };
+static constexpr uintptr_t kGraphCharacterOffset = 0x1C8;  // see RE::BShkbAnimationGraph
+
+// Root-graph ownership registries (guarded by s_characterCacheMutex), filled
+// by RegisterActorCharacter for every registered actor: the BShkbAnimationGraph
+// roots and their root hkbBehaviorGraphs (+0x378). ResolveClipOwner tests a
+// clip's behavior graph against these exactly the way PlayerGraphIndexForClip
+// tests it against the player's, so NPC clips resolve to their NPC. The
+// hkbContext's character is a static dummy in this runtime (see the notes at
+// RefreshWeaponAnimFolder / PlayerGraphIndexForClip), which is why the
+// character cache alone could never attribute anything and every miss used to
+// fall back to the player.
+static std::unordered_map<uintptr_t, RE::TESObjectREFR*> s_rootGraphOwners;    // BShkbAnimationGraph* -> actor
+static std::unordered_map<uintptr_t, RE::TESObjectREFR*> s_rootHkGraphOwners;  // root hkbBehaviorGraph* -> actor
+static constexpr uintptr_t kBShkbRootHkGraphOffset = 0x378;
+
+// Per-clip owner memo: resolution runs once per activation, not per frame.
+// Erased at Activate (clip pointer reuse) and Deactivate. Misses are retried
+// after kOwnerMissRetryFrames so a clip whose actor registers late recovers.
+static std::shared_mutex s_clipOwnerMutex;
+static std::unordered_map<RE::hkbClipGenerator*, RE::TESObjectREFR*> s_clipOwnerCache;
+static std::unordered_map<RE::hkbClipGenerator*, uint64_t> s_clipOwnerMissFrame;
+static constexpr uint64_t kOwnerMissRetryFrames = 30;
+
+// Engine-event source attribution state for the Animation Event Log (see
+// RecordRecentClip / EventSourceAnimFor): per actor, the clips updated recently
+// with their suffix and local time, plus a cached event-name -> id map.
+struct RecentClip
+{
+	RE::hkbClipGenerator* clip{ nullptr };
+	std::string suffix;
+	float localTime{ 0.f };
+	uint64_t frame{ 0 };
+};
+static std::mutex s_recentClipsMutex;
+static std::unordered_map<uint32_t, std::vector<RecentClip>> s_recentClipsByActor;
+static std::unordered_map<uint32_t, std::unordered_map<std::string, int32_t>> s_eventIdsByActor;
+static constexpr size_t kMaxRecentClipsPerActor = 64;
+
+static void LogUnresolvedClipActor(const char* a_where, RE::hkbClipGenerator* a_clip)
+{
+	static std::atomic<int> s_count{ 0 };
+	const int n = s_count.fetch_add(1, std::memory_order_relaxed);
+	if (n < 20 || (n % 2000) == 0) {
+		logger::warn("[OAR] {}: clip {:X} has no resolvable actor — skipping (never attributed to the player) (#{})",
+			a_where, reinterpret_cast<uintptr_t>(a_clip), n + 1);
+	}
+}
 
 static RE::hkbCharacterStringData* s_capturedStringData{ nullptr };
 static std::string s_capturedAnimPath;
@@ -1961,21 +2069,82 @@ void RegisterActorCharacter(RE::TESObjectREFR* a_refr)
 	if (!a_refr) return;
 	RE::BSTSmartPointer<RE::BSAnimationGraphManager> manager;
 	if (!a_refr->GetAnimationGraphManagerImpl(manager) || !manager) return;
+
+	// Learn the graph's holder back-pointer offset from this known pair (see
+	// s_graphHolderOffset). The holder is the actor's IAnimationGraphManagerHolder
+	// base subobject, so its address is a_refr + the base offset.
+	const auto holderAddr = reinterpret_cast<uintptr_t>(
+		static_cast<RE::IAnimationGraphManagerHolder*>(a_refr));
+	const auto refrAddr = reinterpret_cast<uintptr_t>(a_refr);
+	if (s_holderBaseDelta.load(std::memory_order_relaxed) == 0 && holderAddr >= refrAddr) {
+		s_holderBaseDelta.store(holderAddr - refrAddr, std::memory_order_relaxed);
+	}
+	if (s_graphHolderOffset.load(std::memory_order_relaxed) == 0 && manager->graph.size() > 0) {
+		auto* graph = reinterpret_cast<const uint8_t*>(manager->graph[0].get());
+		if (graph && !IsBadReadPtr(graph, 0x400)) {
+			intptr_t found = 0;
+			for (uintptr_t off = kGraphCharacterOffset + 0x8; off + sizeof(uintptr_t) <= 0x400; off += 8) {
+				if (*reinterpret_cast<const uintptr_t*>(graph + off) == holderAddr) { found = static_cast<intptr_t>(off); break; }
+			}
+			if (found > 0) {
+				intptr_t expected = 0;
+				if (s_graphHolderOffset.compare_exchange_strong(expected, found, std::memory_order_acq_rel)) {
+					logger::info("[OAR] Learned BShkbAnimationGraph holder offset 0x{:X} (base delta 0x{:X}) from actor {:X}",
+						found, holderAddr - refrAddr, a_refr->GetFormID());
+				} else if (expected > 0 && expected != found) {
+					logger::warn("[OAR] BShkbAnimationGraph holder offset disagreement (0x{:X} vs 0x{:X}) — deterministic actor lookup disabled",
+						expected, found);
+					s_graphHolderOffset.store(-1, std::memory_order_release);
+				}
+			}
+		}
+	}
+
 	std::unique_lock lock(s_characterCacheMutex);
+	// Drop this actor's previous root-graph keys first: graphs are torn down and
+	// rebuilt (weapon change), and a freed graph address can be reused by another
+	// actor's new graph — a stale key would then misattribute that clip.
+	for (auto it = s_rootGraphOwners.begin(); it != s_rootGraphOwners.end();) {
+		if (it->second == a_refr) it = s_rootGraphOwners.erase(it); else ++it;
+	}
+	for (auto it = s_rootHkGraphOwners.begin(); it != s_rootHkGraphOwners.end();) {
+		if (it->second == a_refr) it = s_rootHkGraphOwners.erase(it); else ++it;
+	}
 	for (uint32_t i = 0; i < manager->graph.size(); i++) {
-		auto* character = &manager->graph[i]->character;
+		auto* graphObj = manager->graph[i].get();
+		if (!graphObj) continue;
+		auto* character = &graphObj->character;
 		s_characterCache[character] = a_refr;
 		if (i == 0) {
 			s_mainBodyCharacters.insert(character);
+		}
+		// Root-graph ownership for ResolveClipOwner.
+		const auto root = reinterpret_cast<uintptr_t>(graphObj);
+		s_rootGraphOwners[root] = a_refr;
+		if (!IsBadReadPtr(reinterpret_cast<const void*>(root + kBShkbRootHkGraphOffset), sizeof(uintptr_t))) {
+			const auto hkRoot = *reinterpret_cast<const uintptr_t*>(root + kBShkbRootHkGraphOffset);
+			if (hkRoot > 0x10000) s_rootHkGraphOwners[hkRoot] = a_refr;
 		}
 	}
 }
 
 void ClearCharacterCache()
 {
-	std::unique_lock lock(s_characterCacheMutex);
-	s_characterCache.clear();
-	s_mainBodyCharacters.clear();
+	{
+		std::unique_lock lock(s_characterCacheMutex);
+		s_characterCache.clear();
+		s_mainBodyCharacters.clear();
+		s_rootGraphOwners.clear();
+		s_rootHkGraphOwners.clear();
+	}
+	{
+		std::unique_lock olock(s_clipOwnerMutex);
+		s_clipOwnerCache.clear();
+		s_clipOwnerMissFrame.clear();
+	}
+	std::lock_guard rlock(s_recentClipsMutex);
+	s_recentClipsByActor.clear();
+	s_eventIdsByActor.clear();
 }
 
 void PopulateKnownStringData()
@@ -2347,6 +2516,35 @@ namespace
 	// Cache clip suffixes from Activate (animationName may be cleared by Update time)
 	static std::shared_mutex s_clipSuffixMutex;
 	static std::unordered_map<RE::hkbClipGenerator*, std::string> s_clipSuffixCache;
+
+	// Per-clip "does the cached suffix have ANY registered replacement" memo
+	// (perf plan phase 1). Guarded by s_clipSuffixMutex and bound to the suffix
+	// string: every site that writes s_clipSuffixCache for a clip erases its
+	// memo, so a suffix rewrite (Activate re-key, direct-path resolution from
+	// Update or the player poll) always re-decides. Stamped with
+	// s_lookupGeneration, which bumps whenever the name tables are rebuilt or
+	// re-sorted, so a config reload re-decides too. Only kNoRegistration is
+	// ever acted on: it lets Update skip the string-keyed table lookups and
+	// the multi-match resolution for the ~95% of clips OAR never replaces.
+	// The vtable capture and the vanilla-annotation contract run BEFORE the
+	// memo is consulted and are unaffected.
+	enum class MatchDecision : uint8_t { kUnknown, kNoRegistration, kHasRegistration };
+	struct MatchMemo { MatchDecision decision{ MatchDecision::kUnknown }; uint32_t generation{ 0 }; };
+	static std::unordered_map<RE::hkbClipGenerator*, MatchMemo> s_clipMatchMemo;
+	static std::atomic<uint32_t> s_lookupGeneration{ 1 };
+
+	// Epoch of the mod configuration for the chunked BA2 preload chain (perf
+	// plan phase 6). The chain runs across frames and captures SubMod owner
+	// pointers; a config reload destroys those SubMods, so the chain must stop
+	// when the epoch it was created under is gone (audit 2026-09-02).
+	static std::atomic<uint32_t> s_archiveLoadEpoch{ 0 };
+
+	static void RecordMatchDecision(RE::hkbClipGenerator* a_clip, MatchDecision a_decision)
+	{
+		const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
+		std::unique_lock lock(s_clipSuffixMutex);
+		s_clipMatchMemo[a_clip] = MatchMemo{ a_decision, gen };
+	}
 
 	// Full on-disk animation path per clip, from the subgraph swap-array resolution
 	// (Source S). Display-only: lets the Animation Log show the authoritative path
@@ -3070,7 +3268,7 @@ namespace
 			return;
 		}
 		auto* refr = a_refr;
-		if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+		if (!refr) return;  // never fire another actor's backup annotations on the player
 		std::vector<std::string> events;
 		for (int32_t i = backup.lastFired + 1; i < total; ++i) {
 			const auto& e = backup.entries[i];
@@ -3240,12 +3438,92 @@ namespace
 		s_lastActivatedClipByActor[a_refr->GetFormID()] = a_anim;
 	}
 
-	static std::string EventSourceAnimFor(RE::TESObjectREFR* a_refr)
+	// ===== Engine-event source attribution =====
+	// An engine-fired event carries no clip identity, but every event a clip
+	// fires comes from a trigger in that clip's trigger array (event id + local
+	// time). While the Animation Log is open, Update records each resolved
+	// clip's (actor, suffix, localTime) for the current frame; at event time we
+	// look up the tag's event id in the actor's graph string data and pick the
+	// recently-updated clip whose trigger array holds that id at a time the clip
+	// just passed. Exact when found; otherwise the '~' last-activated fallback.
+	// (RecentClip and its maps are declared at file scope next to the actor
+	// registries so ClearCharacterCache can reset them.)
+	static void RecordRecentClip(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clip,
+		const std::string& a_suffix, float a_localTime)
+	{
+		if (!a_refr || !a_clip || a_suffix.empty()) return;
+		const uint64_t frame = s_currentFrame.load(std::memory_order_relaxed);
+		std::lock_guard lock(s_recentClipsMutex);
+		auto& vec = s_recentClipsByActor[a_refr->GetFormID()];
+		for (auto& rc : vec) {
+			if (rc.clip == a_clip) { rc.localTime = a_localTime; rc.frame = frame; if (rc.suffix != a_suffix) rc.suffix = a_suffix; return; }
+		}
+		if (vec.size() >= kMaxRecentClipsPerActor) {
+			// Drop the stalest entry.
+			auto oldest = std::ranges::min_element(vec, {}, &RecentClip::frame);
+			vec.erase(oldest);
+		}
+		vec.push_back(RecentClip{ a_clip, a_suffix, a_localTime, frame });
+	}
+
+	static std::string EventSourceAnimFor(RE::TESObjectREFR* a_refr, const char* a_tag)
 	{
 		if (s_eventSourceAnim && !s_eventSourceAnim->empty()) return *s_eventSourceAnim;
 		if (!a_refr) return {};
+		const uint32_t actorID = a_refr->GetFormID();
+
+		// Engine event: find the clip whose trigger array fires this tag now.
+		if (a_tag && a_tag[0]) {
+			std::lock_guard lock(s_recentClipsMutex);
+			auto& ids = s_eventIdsByActor[actorID];
+			if (ids.empty()) {
+				// Root graph (0) names; for the player also the 1st-person graph (1).
+				std::vector<std::string> names;
+				for (uint32_t g = 0; g < 2; ++g) {
+					if (CollectGraphEventNames(a_refr, g, names) == 0) continue;
+					for (size_t i = 0; i < names.size(); ++i) {
+						if (!names[i].empty()) ids.emplace(names[i], static_cast<int32_t>(i));
+					}
+					if (a_refr != RE::PlayerCharacter::GetSingleton()) break;
+				}
+				if (ids.empty()) ids.emplace("", -1);  // remember the failed build
+			}
+			auto idIt = ids.find(a_tag);
+			if (idIt != ids.end() && idIt->second >= 0) {
+				const int32_t wantId = idIt->second;
+				const uint64_t frame = s_currentFrame.load(std::memory_order_relaxed);
+				auto rit = s_recentClipsByActor.find(actorID);
+				if (rit != s_recentClipsByActor.end()) {
+					const RecentClip* best = nullptr;
+					float bestDelta = 1e9f;
+					for (const auto& rc : rit->second) {
+						if (frame - rc.frame > 2 || !rc.clip) continue;
+						auto* arr = reinterpret_cast<const uint8_t*>(rc.clip->triggers._ptr);
+						if (!arr || reinterpret_cast<uintptr_t>(arr) < 0x10000 || IsBadReadPtr(arr, 0x20)) continue;
+						const auto* data = *reinterpret_cast<uint8_t* const*>(arr + 0x10);
+						const int32_t count = *reinterpret_cast<const int32_t*>(arr + 0x18);
+						constexpr size_t kTrig = 0x20;
+						if (!data || count <= 0 || count > 0x400 || IsBadReadPtr(data, static_cast<size_t>(count) * kTrig)) continue;
+						float duration = 0.f;
+						if (auto* anim = rc.clip->GetAnimation(); anim && !IsBadReadPtr(anim, 0x20)) duration = anim->duration;
+						for (int32_t i = 0; i < count; ++i) {
+							const uint8_t* trig = data + i * kTrig;
+							if (*reinterpret_cast<const int32_t*>(trig + 0x08) != wantId) continue;
+							float t = *reinterpret_cast<const float*>(trig);
+							if (trig[0x18] != 0 && duration > 0.f) t = duration + t;  // relativeToEndOfClip
+							const float delta = std::fabs(rc.localTime - t);
+							if (delta < bestDelta) { bestDelta = delta; best = &rc; }
+						}
+					}
+					// The clip's recorded localTime is from this frame's Update; a
+					// trigger it just crossed sits within one frame of it.
+					if (best && bestDelta <= 0.15f) return best->suffix;
+				}
+			}
+		}
+
 		std::lock_guard lock(s_lastActivatedClipMutex);
-		auto it = s_lastActivatedClipByActor.find(a_refr->GetFormID());
+		auto it = s_lastActivatedClipByActor.find(actorID);
 		if (it == s_lastActivatedClipByActor.end()) return {};
 		return "~" + it->second;
 	}
@@ -3394,7 +3672,7 @@ namespace
 					display += '.';
 					display += pay;
 				}
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr));
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr, evtStr));
 			}
 
 			return RE::BSEventNotifyControl::kContinue;
@@ -4027,6 +4305,45 @@ namespace
 			if (it != s_characterCache.end()) return it->second;
 		}
 
+		// Deterministic reverse lookup for everything else (NPCs, creatures,
+		// freshly rebuilt graphs): character -> owning BShkbAnimationGraph ->
+		// holder back-pointer -> actor. Every step is bounds/identity checked
+		// and the result must be an Actor whose graph manager really owns this
+		// character, so a dummy or foreign character resolves to nothing rather
+		// than to the wrong actor. On success the pair is cached.
+		const intptr_t holderOff = s_graphHolderOffset.load(std::memory_order_acquire);
+		const uintptr_t baseDelta = s_holderBaseDelta.load(std::memory_order_relaxed);
+		if (holderOff > 0) {
+			const auto graph = reinterpret_cast<const uint8_t*>(character) - kGraphCharacterOffset;
+			if (!IsBadReadPtr(graph + holderOff, sizeof(uintptr_t))) {
+				const uintptr_t holder = *reinterpret_cast<const uintptr_t*>(graph + holderOff);
+				if (holder > 0x10000 && holder >= baseDelta) {
+					auto* candidate = reinterpret_cast<RE::TESObjectREFR*>(holder - baseDelta);
+					// Exact vtable identity before any virtual call: FO4 actors are
+					// Actor or PlayerCharacter instances, nothing else.
+					static REL::Relocation<uintptr_t> s_actorVtbl{ RE::VTABLE::Actor[0] };
+					static REL::Relocation<uintptr_t> s_playerVtbl{ RE::VTABLE::PlayerCharacter[0] };
+					const uintptr_t candVtbl = IsBadReadPtr(candidate, 0x100)
+						? 0 : *reinterpret_cast<const uintptr_t*>(candidate);
+					if (candVtbl != 0 &&
+						(candVtbl == s_actorVtbl.address() || candVtbl == s_playerVtbl.address())) {
+						RE::BSTSmartPointer<RE::BSAnimationGraphManager> mgr;
+						bool owns = false;
+						if (candidate->GetAnimationGraphManagerImpl(mgr) && mgr) {
+							for (uint32_t i = 0; i < mgr->graph.size() && !owns; ++i) {
+								owns = mgr->graph[i] && &mgr->graph[i]->character == character;
+							}
+						}
+						if (owns) {
+							std::unique_lock lock(s_characterCacheMutex);
+							s_characterCache[character] = candidate;
+							return candidate;
+						}
+					}
+				}
+			}
+		}
+
 		return nullptr;
 	}
 
@@ -4488,6 +4805,9 @@ namespace
 	// be serialized with graph updates the same way the config reload is.
 	static void ResortNameLookupByPriority()
 	{
+		// Conservative: the tables' keys do not change on a re-sort, but bump
+		// the match-memo generation anyway so every clip re-decides (phase 1).
+		s_lookupGeneration.fetch_add(1, std::memory_order_acq_rel);
 		std::unique_lock lock(s_nameLookupMutex);
 		if (!s_lookupBuilt) return;
 		for (auto& [suffix, infoVec] : s_suffixToInfos) {
@@ -4641,33 +4961,71 @@ namespace
 			logger::info("[OAR-Preload] Deferring {} archive (BA2) animation(s) to a main-thread load pass",
 				archiveWork.size());
 
-			auto loadArchives = [items = std::move(archiveWork)]() {
+			// Chunked across frames (perf plan phase 6): every archive open ran
+			// in ONE task before, so the hitch scaled with the archive-donor
+			// count. Each task now loads kArchiveChunk items and re-queues the
+			// remainder for the next frame; the same main-thread guarantee
+			// holds for every open.
+			struct ArchiveLoadState
+			{
+				std::vector<DeferredArchiveItem> items;
+				size_t next{ 0 };
+				int loaded{ 0 };
+				int failed{ 0 };
+				uint32_t epoch{ 0 };
+			};
+			auto state = std::make_shared<ArchiveLoadState>();
+			state->items = std::move(archiveWork);
+			state->epoch = s_archiveLoadEpoch.load(std::memory_order_acquire);
+			constexpr size_t kArchiveChunk = 24;
+
+			auto loadArchives = std::make_shared<std::function<void()>>();
+			*loadArchives = [state, loadArchives]() {
+				// A config reload since this chain started destroyed the SubMods
+				// the captured owner pointers refer to; a late LoadAnimationResource
+				// would re-bind fresh entries to dead owners. Stop here.
+				if (state->epoch != s_archiveLoadEpoch.load(std::memory_order_acquire)) {
+					logger::info("[OAR-Preload] Archive (BA2) load pass abandoned after a config reload ({} of {} loaded before it)",
+						state->next, state->items.size());
+					*loadArchives = nullptr;  // break the self-capture cycle
+					return;
+				}
 				auto* cache = AnimationCache::GetSingleton();
-				int aLoaded = 0;
-				int aFailed = 0;
-				for (const auto& it : items) {
+				const size_t end = std::min(state->items.size(), state->next + kArchiveChunk);
+				for (; state->next < end; ++state->next) {
+					const auto& it = state->items[state->next];
 					if (cache->LoadAnimationResource(it.suffix, it.resourcePath, it.owner, it.priority,
 						it.preserveExtractedMotion)) {
-						++aLoaded;
+						++state->loaded;
 					} else {
-						++aFailed;
+						++state->failed;
 					}
 				}
+				if (state->next < state->items.size()) {
+					if (auto* tasks = F4SE::GetTaskInterface()) {
+						tasks->AddTask(*loadArchives);
+						return;
+					}
+					// No task interface: finish inline rather than lose the rest.
+					(*loadArchives)();
+					return;
+				}
 				logger::info("[OAR-Preload] Archive (BA2) load pass complete: {} loaded, {} failed, cache size: {}",
-					aLoaded, aFailed, cache->GetCacheSize());
+					state->loaded, state->failed, cache->GetCacheSize());
 				if (auto log = spdlog::default_logger()) {
 					log->flush();
 				}
+				*loadArchives = nullptr;  // break the self-capture cycle
 			};
 
 			if (auto* tasks = F4SE::GetTaskInterface()) {
-				tasks->AddTask(loadArchives);
+				tasks->AddTask(*loadArchives);
 			} else {
 				// No task interface (should not happen after F4SEPlugin_Load). Run
 				// inline as a last resort; LoadAnimationResource's SEH guard is the
 				// safety net if the registration race bites here.
 				logger::warn("[OAR-Preload] No F4SE task interface available; loading archives inline");
-				loadArchives();
+				(*loadArchives)();
 			}
 		}
 	}
@@ -4734,8 +5092,13 @@ namespace
 			s_leafToFullSuffixes.clear();
 			s_lookupBuilt = false;
 		}
+		// Per-clip match memos were decided against the OLD tables (perf plan
+		// phase 1): bump the generation so every clip re-decides after the reload.
+		s_lookupGeneration.fetch_add(1, std::memory_order_acq_rel);
 
-		// 3) Tear down and re-parse all mod configurations.
+		// 3) Tear down and re-parse all mod configurations. Any in-flight chunked
+		//    BA2 preload chain captured the OLD SubMods; retire it first.
+		s_archiveLoadEpoch.fetch_add(1, std::memory_order_acq_rel);
 		oar->ClearAllMods();
 		Parsing::ParseAllMods();
 
@@ -5408,6 +5771,24 @@ namespace
 	static SubMod* ValidatedActiveSubMod(RE::hkbClipGenerator* a_clip)
 	{
 		RE::hkaAnimation* currentBinding = GetBindingOriginalForClip(a_clip);
+		// Read path under a shared lock (perf plan phase 3): this runs per
+		// replaced clip per Update, and the stale-binding erase is rare.
+		SubMod* found = nullptr;
+		bool stale = false;
+		{
+			std::shared_lock smLock(s_activeSubModMutex);
+			auto smIt = s_activeSubModMap.find(a_clip);
+			if (smIt == s_activeSubModMap.end() || !smIt->second) return nullptr;
+			found = smIt->second;
+			auto bit = s_activeSubModBinding.find(a_clip);
+			stale = bit != s_activeSubModBinding.end() && bit->second && currentBinding &&
+				bit->second != currentBinding;
+		}
+		if (!stale) return found;
+
+		// Upgrade: re-find under the exclusive lock (another thread may have
+		// erased or replaced the entries between the two locks; never reuse
+		// iterators across the lock change).
 		std::unique_lock smLock(s_activeSubModMutex);
 		auto smIt = s_activeSubModMap.find(a_clip);
 		if (smIt == s_activeSubModMap.end() || !smIt->second) return nullptr;
@@ -5469,6 +5850,7 @@ namespace
 			auto it = s_clipSuffixCache.find(a_clip);
 			if (it != s_clipSuffixCache.end()) oldSuffix = it->second;
 			s_clipSuffixCache[a_clip] = matchKey;
+			s_clipMatchMemo.erase(a_clip);  // suffix changed: re-decide
 		}
 		static std::atomic<int> s_rekeyLog{ 0 };
 		if (s_rekeyLog.fetch_add(1, std::memory_order_relaxed) < 40) {
@@ -5878,6 +6260,79 @@ namespace
 		return -1;
 	}
 
+	// Owner of a clip for REPLACEMENT purposes (conditions, annotation delivery,
+	// per-actor state): the same behavior-graph identity tests
+	// PlayerGraphIndexForClip applies to the player's graphs, applied to EVERY
+	// registered actor's graphs, memoised per clip. Returns nullptr when the
+	// owner cannot be established — callers must then skip, never assume the
+	// player (field bug 2026-09-03: NPC reloads refilled the player's ammo).
+	static RE::TESObjectREFR* ResolveClipOwner(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context)
+	{
+		if (!a_clip) return nullptr;
+		const uint64_t frame = s_currentFrame.load(std::memory_order_relaxed);
+		{
+			std::shared_lock lock(s_clipOwnerMutex);
+			auto it = s_clipOwnerCache.find(a_clip);
+			if (it != s_clipOwnerCache.end()) return it->second;
+			auto mit = s_clipOwnerMissFrame.find(a_clip);
+			if (mit != s_clipOwnerMissFrame.end() && frame - mit->second < kOwnerMissRetryFrames) return nullptr;
+		}
+
+		RE::TESObjectREFR* owner = nullptr;
+		if (PlayerGraphIndexForClip(a_clip, a_context) >= 0) {
+			owner = RE::PlayerCharacter::GetSingleton();
+		} else {
+			// Behavior-graph candidates: context first, then the clip's nodeInfo.
+			uintptr_t candidates[2]{};
+			size_t candidateCount = 0;
+			if (a_context && reinterpret_cast<uintptr_t>(a_context) > 0x10000 &&
+				!IsBadReadPtr(a_context, kCtx_BehaviorGraph + 8)) {
+				const auto g = *reinterpret_cast<const uintptr_t*>(
+					reinterpret_cast<uintptr_t>(a_context) + kCtx_BehaviorGraph);
+				if (g > 0x10000) candidates[candidateCount++] = g;
+			}
+			if (a_clip->nodeInfo && reinterpret_cast<uintptr_t>(a_clip->nodeInfo) > 0x10000 &&
+				!IsBadReadPtr(a_clip->nodeInfo, 0x18)) {
+				const auto g = *reinterpret_cast<uintptr_t*>(
+					reinterpret_cast<uintptr_t>(a_clip->nodeInfo) + 0x10);
+				if (g > 0x10000 && g != candidates[0]) candidates[candidateCount++] = g;
+			}
+			if (candidateCount > 0) {
+				std::shared_lock lock(s_characterCacheMutex);
+				for (size_t c = 0; c < candidateCount && !owner; ++c) {
+					const auto nested = candidates[c];
+					// Test 1: top-level clip of a registered root graph.
+					if (auto it = s_rootHkGraphOwners.find(nested); it != s_rootHkGraphOwners.end()) {
+						owner = it->second;
+						break;
+					}
+					// Test 2: subgraph clip — its root id is a registered root, or is
+					// registered in one of the roots' swap arrays.
+					if (IsBadReadPtr(reinterpret_cast<void*>(nested), kBG_RootId + 8)) continue;
+					const auto rootId = *reinterpret_cast<uintptr_t*>(nested + kBG_RootId);
+					if (!rootId) continue;
+					if (auto it = s_rootGraphOwners.find(rootId); it != s_rootGraphOwners.end()) {
+						owner = it->second;
+						break;
+					}
+					for (const auto& [root, refr] : s_rootGraphOwners) {
+						if (SubgraphFindSwapData(root, rootId) != 0) { owner = refr; break; }
+					}
+				}
+			}
+			if (!owner) owner = GetRefrFromContext(a_context);
+		}
+
+		std::unique_lock lock(s_clipOwnerMutex);
+		if (owner) {
+			s_clipOwnerCache[a_clip] = owner;
+			s_clipOwnerMissFrame.erase(a_clip);
+		} else {
+			s_clipOwnerMissFrame[a_clip] = frame;
+		}
+		return owner;
+	}
+
 	// Actor attribution for anim-log entries. Player-graph membership (from the
 	// per-frame poll or from Activate-time context matching) is the primary
 	// player test; the embedded-character graph comparison covers clips the
@@ -5903,7 +6358,7 @@ namespace
 			}
 			return RE::PlayerCharacter::GetSingleton();
 		}
-		return GetRefrFromContext(a_context);
+		return ResolveClipOwner(a_clip, a_context);
 	}
 
 	// Display path for a log entry, validated against the entry's animation.
@@ -7209,6 +7664,12 @@ namespace
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		OAR_PERF_SCOPE(kActivate);
+		// A generator can be reused for a different graph/actor: forget the memoised owner.
+		{
+			std::unique_lock olock(s_clipOwnerMutex);
+			s_clipOwnerCache.erase(a_this);
+			s_clipOwnerMissFrame.erase(a_this);
+		}
 		// A clip activation can reuse an active-node entry in place, so force the
 		// next stable player-graph poll even when the pointer fingerprint happens
 		// to remain unchanged.
@@ -7328,8 +7789,11 @@ namespace
 							// original and native annotations work. If conditions flip true
 							// a few frames later, the Update hook installs the replacement
 							// (same path as a deferred direct-path resolve).
-							RE::TESObjectREFR* refrPre = GetRefrFromContext(a_context);
-							if (!refrPre) refrPre = RE::PlayerCharacter::GetSingleton();
+							RE::TESObjectREFR* refrPre = ResolveClipOwner(a_this, a_context);
+							// No player fallback: with a null refr every condition
+							// evaluates false, so an unresolved owner gets no pre-swap
+							// instead of a swap decided by the player's state.
+							if (!refrPre) LogUnresolvedClipActor("activate/pre-swap", a_this);
 
 							if (activeSuffix.size() > 6 && activeSuffix.substr(0, 6) == "multi:") {
 								std::string leafName = activeSuffix.substr(6);
@@ -7659,6 +8123,7 @@ namespace
 				if (it == s_clipSuffixCache.end() || it->second != suffix) {
 					suffixChanged = true;
 					s_clipSuffixCache[a_this] = suffix;
+					s_clipMatchMemo.erase(a_this);  // suffix changed: re-decide
 				}
 			}
 			// If the suffix changed for this clipGen pointer (engine reused the slot for a
@@ -7792,11 +8257,14 @@ namespace
 
 		// Cache original animation's annotation strings for suppression (Step 2).
 		// Parse the original hkaAnimation's annotationTracks and store event text per actor.
-		RE::TESObjectREFR* activateRefr = GetRefrFromContext(a_context);
-		if (!activateRefr) activateRefr = RE::PlayerCharacter::GetSingleton();
+		RE::TESObjectREFR* activateRefr = ResolveClipOwner(a_this, a_context);
+		// No player fallback: the per-actor annotation set and the event-log
+		// attribution must belong to the clip's real owner or to nobody.
 		// Engine-fired events get attributed to this clip until the next activation
 		// on the same actor (see EventSourceAnimFor).
-		RecordLastActivatedClip(activateRefr, suffix);
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
+			RecordLastActivatedClip(activateRefr, suffix);
+		}
 		if (activateRefr && animSlot && *animSlot) {
 			auto* origAnim = *animSlot;
 			auto* origBytes = reinterpret_cast<uint8_t*>(origAnim);
@@ -7996,8 +8464,7 @@ namespace
 
 		if (annotations && flushLastIdx + 1 < total && duration > 0.01f) {
 			if (flushPrevT >= duration - kEndFlushWindowSec) {
-				auto* flushRefr = a_refr;
-				if (!flushRefr) flushRefr = RE::PlayerCharacter::GetSingleton();
+				auto* flushRefr = a_refr;  // null = unknown owner: consumers below skip (never the player)
 				// Honor the winning submod's annotation suppression config.
 				SubMod* flushSubMod = nullptr;
 				{
@@ -8070,6 +8537,7 @@ namespace
 		if (!s_gameFullyLoaded.load() || !s_hasActiveReplacements.load() || !a_this || !s_lookupBuilt) {
 			return;
 		}
+		auto* settings = Settings::GetSingleton();
 
 		// ===== Deferred kActivate anim-log flush =====
 		// Path resolution itself happens in PollPlayerGraphClips() (per-frame,
@@ -8081,7 +8549,10 @@ namespace
 		// This must run BEFORE the bypass early-out below: bypassed clips are
 		// typically the player's own weapon clips (failed pre-swap), and their
 		// activations must still reach the log.
-		{
+		// Only while the Animation Log is collecting: Activate inserts into
+		// s_pendingActivateLog only when the log is enabled, so with it off this
+		// map is empty and the lock + lookup per clip per frame buys nothing.
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
 			constexpr uint64_t kLogDeferGraceFrames = 10;
 
 			std::string pendingSuffix;
@@ -8120,7 +8591,7 @@ namespace
 		// catches stragglers that still hold our clone — e.g. a clip that
 		// swapped on the very frame of the toggle, or one whose original was
 		// unreadable during the bulk pass.
-		if (!Settings::GetSingleton()->bEnabled) {
+		if (!settings->bEnabled) {
 			auto** slot = a_this->GetAnimationSlot();
 			if (slot && *slot && AnimationCache::GetSingleton()->IsOurReplacement(*slot)) {
 				if (auto* orig = GetValidOriginal(a_this)) {
@@ -8154,17 +8625,26 @@ namespace
 			cache->CaptureGameVtable(currentAnim);
 		}
 
-		// Look up the cached suffix (cached during Activate when animationName is still valid)
+		// Look up the cached suffix (cached during Activate when animationName is still valid).
+		// The match memo lives under the same lock: when it already says "no
+		// registration" for this suffix at the current generation, skip copying
+		// the string (a heap allocation for most suffixes) — nothing between here
+		// and the negative fast path below reads it (phase 1b).
 		std::string suffix;
+		bool memoNoMatch = false;
 		{
+			const uint32_t gen = s_lookupGeneration.load(std::memory_order_acquire);
 			std::shared_lock lock(s_clipSuffixMutex);
 			auto it = s_clipSuffixCache.find(a_this);
 			if (it != s_clipSuffixCache.end()) {
-				suffix = it->second;
+				auto mit = s_clipMatchMemo.find(a_this);
+				memoNoMatch = mit != s_clipMatchMemo.end() && mit->second.generation == gen &&
+					mit->second.decision == MatchDecision::kNoRegistration;
+				if (!memoNoMatch) suffix = it->second;
 			}
 		}
 
-		if (suffix.empty()) {
+		if (!memoNoMatch && suffix.empty()) {
 			// Direct path matching first: the per-frame poll may have already
 			// resolved this clip's real path even though Activate was missed.
 			suffix = DirectSuffixFromCachedPath(a_this);
@@ -8180,10 +8660,11 @@ namespace
 			if (!suffix.empty()) {
 				std::unique_lock lock(s_clipSuffixMutex);
 				s_clipSuffixCache[a_this] = suffix;
+				s_clipMatchMemo.erase(a_this);  // suffix (re)set: re-decide
 			}
 		}
 
-		if (suffix.empty()) return;
+		if (!memoNoMatch && suffix.empty()) return;
 
 		// ===== Entry grace window =====
 		// The decisive condition evaluation at play entry can read racy game
@@ -8277,8 +8758,8 @@ namespace
 						}
 					}
 					if (!vbSounds.empty() || !vbEvents.empty()) {
-						auto* vbRefr = GetRefrFromContext(a_context);
-						if (!vbRefr) vbRefr = RE::PlayerCharacter::GetSingleton();
+						auto* vbRefr = ResolveClipOwner(a_this, a_context);
+						if (!vbRefr) LogUnresolvedClipActor("vanilla-annotation backup", a_this);
 						if (vbRefr) {
 							for (auto& s : vbSounds) {
 								PlaySoundDirect(s.c_str() + 10, vbRefr);
@@ -8420,7 +8901,34 @@ namespace
 		// running. Also skipped when no replacement is registered for the
 		// current guess — the match below exits as NoMatch anyway, so the
 		// attribution/resolution cost would buy nothing.
-		if (Settings::GetSingleton()->bDirectPathMatching) {
+		//
+		// ===== Negative fast path (perf plan phase 1) =====
+		// If this clip's CURRENT suffix was already found to have no registered
+		// replacement under the current name tables, nothing below can change
+		// that this frame (the direct-path gate only acts when a registration
+		// exists, and any suffix rewrite erased the memo), so skip the
+		// string-keyed lookups and the multi-match resolution entirely. The
+		// vtable capture and the vanilla-annotation contract above already ran.
+		if (memoNoMatch) {
+			// Engine-event attribution needs unreplaced clips too (they fire most
+			// engine events). Only while a log window is open; the owner memo makes
+			// the resolution a map hit.
+			if (AnimationLog::GetSingleton()->IsEnabled()) {
+				std::string cachedSuffix;
+				{
+					std::shared_lock lock(s_clipSuffixMutex);
+					auto it = s_clipSuffixCache.find(a_this);
+					if (it != s_clipSuffixCache.end()) cachedSuffix = it->second;
+				}
+				if (auto* owner = ResolveClipOwner(a_this, a_context)) {
+					RecordRecentClip(owner, a_this, cachedSuffix, a_this->GetLocalTime());
+				}
+			}
+			perfUpdate.Split(OARPerf::kUpdateNoMatch);
+			return;
+		}
+
+		if (settings->bDirectPathMatching) {
 			bool matchPossible = false;
 			{
 				std::shared_lock rlock(s_nameLookupMutex);
@@ -8528,22 +9036,6 @@ namespace
 			}
 		}
 
-		// Diagnostic: log unique suffixes
-		{
-			static std::unordered_set<std::string> s_loggedSuffixes;
-			static std::shared_mutex s_loggedSuffixMutex;
-			std::shared_lock slock(s_loggedSuffixMutex);
-			bool isNew = s_loggedSuffixes.find(suffix) == s_loggedSuffixes.end();
-			slock.unlock();
-			if (isNew) {
-				std::unique_lock ulock(s_loggedSuffixMutex);
-				if (s_loggedSuffixes.insert(suffix).second) {
-					bool found = s_suffixToInfos.find(suffix) != s_suffixToInfos.end();
-					OAR_VLOG("[OAR-Match] suffix='{}' match={}", suffix, found);
-				}
-			}
-		}
-
 		// Handle multi-match mode: suffix starts with "multi:" meaning multiple candidate
 		// suffixes share the same leaf name. We'll evaluate conditions for each.
 		bool isMultiMatch = (suffix.size() > 6 && suffix.substr(0, 6) == "multi:");
@@ -8575,11 +9067,18 @@ namespace
 			std::string leafName = suffix.substr(6);
 			auto leafIt = s_leafToFullSuffixes.find(leafName);
 			if (leafIt == s_leafToFullSuffixes.end() || leafIt->second.empty()) {
+				RecordMatchDecision(a_this, MatchDecision::kNoRegistration);
+				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
 			}
 
-			RE::TESObjectREFR* multiRefr = GetRefrFromContext(a_context);
-			if (!multiRefr) multiRefr = RE::PlayerCharacter::GetSingleton();
+			RE::TESObjectREFR* multiRefr = ResolveClipOwner(a_this, a_context);
+			if (!multiRefr) {
+				// Conditions and annotations for this clip would run against the
+				// wrong actor. Skip this frame; the owner resolves on a later one.
+				LogUnresolvedClipActor("multi-match", a_this);
+				return;
+			}
 
 			// ===== Leaf Matching pre-pass =====
 			// Submods with the Leaf Matching flag match this clip by FILENAME
@@ -8832,8 +9331,7 @@ namespace
 				}
 
 				// Also clean up active replacement tracking
-				RE::TESObjectREFR* cleanRefr = GetRefrFromContext(a_context);
-				if (!cleanRefr) cleanRefr = RE::PlayerCharacter::GetSingleton();
+				RE::TESObjectREFR* cleanRefr = ResolveClipOwner(a_this, a_context);
 				uint32_t cleanActorID = cleanRefr ? cleanRefr->GetFormID() : 0;
 				ActiveReplacementTracker::GetSingleton()->Remove(cleanActorID, leafName);
 				return;
@@ -8852,6 +9350,9 @@ namespace
 				if (s_noMatchLogCount.fetch_add(1, std::memory_order_relaxed) < 30) {
 					logger::info("[OAR-NoMatch] suffix='{}' has no registered replacement", suffix);
 				}
+				// Remember the negative decision for this suffix so subsequent
+				// frames take the fast path above (phase 1).
+				RecordMatchDecision(a_this, MatchDecision::kNoRegistration);
 				// Perf: attribute this call to the "no replacement" negative path.
 				perfUpdate.Split(OARPerf::kUpdateNoMatch);
 				return;
@@ -8984,8 +9485,18 @@ namespace
 		}
 
 		// Evaluate conditions
-		RE::TESObjectREFR* refr = GetRefrFromContext(a_context);
-		if (!refr) refr = RE::PlayerCharacter::GetSingleton();
+		RE::TESObjectREFR* refr = ResolveClipOwner(a_this, a_context);
+		if (!refr) {
+			// Never substitute the player: this refr drives condition evaluation
+			// AND the delivery target of every fired annotation (sounds, graph
+			// events such as ReloadComplete). An unresolved owner means skip.
+			LogUnresolvedClipActor("update/replace", a_this);
+			return;
+		}
+		// Event-log attribution data (only while a log window is open).
+		if (AnimationLog::GetSingleton()->IsEnabled()) {
+			RecordRecentClip(refr, a_this, suffix, a_this->GetLocalTime());
+		}
 
 		{
 			static std::atomic<int> s_condEvalReachCount{ 0 };
@@ -9230,8 +9741,7 @@ namespace
 
 			// Reset variant state when conditions transition true→false for kWhileActive policy
 			if (prevKnown && prev && !shouldReplace) {
-				auto* transRefr = GetRefrFromContext(a_context);
-				if (!transRefr) transRefr = RE::PlayerCharacter::GetSingleton();
+				auto* transRefr = ResolveClipOwner(a_this, a_context);  // null = skip, never the player
 				if (transRefr) {
 					for (auto* info : candidates) {
 						if (!info || !info->parentSubMod) continue;
@@ -9389,7 +9899,6 @@ namespace
 			{
 				std::unique_lock tfLock(s_trackFilterMutex);
 				RE::TESObjectREFR* tfActor = refr;
-				if (!tfActor) tfActor = RE::PlayerCharacter::GetSingleton();
 				if (tfActor) {
 					// Per-filter state: each track-filtered submod active on this actor
 					// gets its own entry so concurrent filters never evict each other
@@ -10455,7 +10964,7 @@ namespace
 			// active-submod entry) and before the engine frees the clip (needs
 			// the clone still in the animation slot for the duration read).
 			{
-				auto* deactRefr = GetRefrFromContext(a_context);
+				auto* deactRefr = ResolveClipOwner(a_this, a_context);
 				FlushPendingEndAnnotations(a_this, deactRefr, "deactivate");
 				// Vanilla backup: fire whatever the un-replaced play still owed
 				// when the graph tore it down near its end (same end-window rule),
@@ -10524,6 +11033,11 @@ namespace
 			{
 				std::unique_lock lock(s_clipSuffixMutex);
 				s_clipSuffixCache.erase(a_this);
+				{
+					std::unique_lock olock(s_clipOwnerMutex);
+					s_clipOwnerCache.erase(a_this);
+					s_clipOwnerMissFrame.erase(a_this);
+				}
 			}
 			{
 				std::unique_lock lock(s_clipRealPathMutex);
@@ -10571,8 +11085,8 @@ namespace
 				std::shared_lock smLock(s_activeSubModMutex);
 				auto smIt = s_activeSubModMap.find(a_this);
 				if (smIt != s_activeSubModMap.end() && smIt->second) {
-					auto* deactRefr = GetRefrFromContext(a_context);
-					if (!deactRefr) deactRefr = RE::PlayerCharacter::GetSingleton();
+					auto* deactRefr = ResolveClipOwner(a_this, a_context);
+					if (!deactRefr) LogUnresolvedClipActor("deactivate/onEnd", a_this);
 					if (deactRefr) {
 						QueueCustomEvents(deactRefr, smIt->second->eventsOnEnd, "onEnd/deactivate");
 
@@ -10626,8 +11140,7 @@ namespace
 		// All subsequent frames use the frozen snapshot. Only ownerClip applies.
 		// All data is copied out under lock before use — no dangling pointers.
 		if (s_fullBodyBlendActiveCount.load(std::memory_order_relaxed) > 0) {
-			auto* fbActor = GetRefrFromContext(a_context);
-			if (!fbActor) fbActor = RE::PlayerCharacter::GetSingleton();
+			auto* fbActor = ResolveClipOwner(a_this, a_context);
 			if (fbActor) {
 				std::string clipSuffix;
 				{
@@ -10764,7 +11277,7 @@ namespace
 		// NPCs whose characters aren't in our cache — for those we MUST NOT
 		// fall back to "assume player", or we'd apply the player's filter to
 		// nearby NPCs' skeletons.
-		auto* actor = GetRefrFromContext(a_context);
+		auto* actor = ResolveClipOwner(a_this, a_context);
 		if (!actor) return;
 
 		// Get output pose pointers up-front (no lock needed).
@@ -14716,7 +15229,7 @@ namespace Hooks
 					display += '.';
 					display += pay;
 				}
-				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr));
+				AnimationLog::GetSingleton()->AddAnimEvent(refr, display, EventSourceAnimFor(refr, evtStr));
 			}
 			if (applyIdleStopFix) {
 				// Match fallout4-idlestopfix: force the animation manager past the
@@ -15745,7 +16258,9 @@ namespace Hooks
 					OAR_PERF_SCOPE(kHealSkeleton);
 					HealSkeletonRootNaN(a_player, "post-eval");
 				}
-				// Once per frame: perf report tick.
+				// Once per frame: reclaim expired sound-suppression windows and
+				// tick the perf report.
+				SweepSoundSuppressWindows();
 				OARPerf::FrameTick();
 			}
 

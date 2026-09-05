@@ -1,6 +1,7 @@
 #pragma once
 
 #include "UI/UIWindow.h"
+#include "AnimationLog.h"
 
 class UIAnimationLog : public UIWindow
 {
@@ -10,6 +11,10 @@ public:
 	}
 
 protected:
+	// The log collects only once a log window has been opened (perf: the
+	// feed costs per activation/event on every actor). Stays on afterwards
+	// so reopening shows history.
+	void OnOpen() override { AnimationLog::GetSingleton()->SetEnabled(true); }
 	void DrawContents() override;
 	ImVec2 GetDefaultSize() const override { return ImVec2(700, 400); }
 

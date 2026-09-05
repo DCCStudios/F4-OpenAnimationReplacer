@@ -20,13 +20,10 @@ public:
 	void Show();
 
 protected:
-	bool ShouldDraw() const override;
-	// Keep the render frame alive on our own while showing: UIManager::RenderFrame
-	// (since PR #8's c63cb079) skips the whole ImGui frame unless an independent
-	// window reports visible via IsOpen()/ShouldDrawOverlay(). Show() sets `active`
-	// but not `isOpen`, and without this override the base returns false, so the
-	// banner never rendered after that change. Mirror UIAnimationQueue's overlay.
-	bool ShouldDrawOverlay() const override { return active; }
+	// Both visibility queries run the main-menu gate (Tick) so the ImGui frame is
+	// only kept alive while the banner is actually on screen.
+	bool ShouldDraw() const override { return Tick(); }
+	bool ShouldDrawOverlay() const override { return Tick(); }
 	// The base fades the whole window (background + text) by this value, so the
 	// banner never renders as an opaque box with invisible text. Computed from a
 	// wall clock (NOT accumulated ImGui DeltaTime) so the fade is correct
@@ -41,10 +38,23 @@ private:
 	static constexpr float kDisplayDuration = 16.0f;
 	static constexpr float kFadeInTime = 0.5f;
 	static constexpr float kFadeOutTime = 2.0f;
+	// Give up waiting for the main menu after this long (a save launched straight
+	// from the command line never shows it). Bounds the per-frame menu query.
+	static constexpr float kMaxWaitForMainMenu = 300.0f;
 
+	// Main-menu gate, mirrors F4SE Menu Framework's WelcomeBanner: the banner is
+	// a title-screen hint. It draws ONLY while "MainMenu" is open, its clock
+	// starts on the first frame the menu is actually up (not at kGameDataReady,
+	// which is several seconds before the menu is visible), and it finishes the
+	// instant the menu closes so it never floats over the 3D world. Called from
+	// the const visibility queries on the render thread, hence the mutable state.
+	bool Tick() const;
+	void Finish() const;
 	float ElapsedSeconds() const;
 
-	std::chrono::steady_clock::time_point startTime{};
-	bool active{ false };
-	bool loggedDiag{ false };
+	mutable std::chrono::steady_clock::time_point armTime{};
+	mutable std::chrono::steady_clock::time_point startTime{};
+	mutable bool active{ false };
+	mutable bool started{ false };
+	mutable bool loggedDiag{ false };
 };

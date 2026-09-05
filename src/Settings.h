@@ -108,7 +108,7 @@ public:
 	bool  bPlainReplayFastForward{ true };
 	// Frame-time instrumentation of OAR's own hooks: one "[OAR-Perf]" summary
 	// line every 10s (see PerfInstrumentation.h). ON in the measurement build.
-	bool  bPerfInstrumentation{ true };
+	bool  bPerfInstrumentation{ false };
 
 	void AppendPlainReplayWeapon(std::uint64_t a_fp);
 
