@@ -3066,6 +3066,11 @@ namespace
 	// Defined later in this file; needed by the flush below.
 	static bool PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr);
 	static void QueueCustomEvents(RE::TESObjectREFR* a_refr, const std::vector<std::string>& a_events, const char* a_label);
+	// Per-graph opt-out of the vanilla annotation backup (Clips API v3).
+	// Defined after SubgraphFindSwapData. The count is the lock-free "nothing
+	// registered" fast path for the hot Update/Deactivate paths.
+	static std::atomic<int> s_annotBackupExcludeCount{ 0 };
+	static bool ClipOnAnnotBackupExcludedGraph(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context);
 
 	struct VanillaAnnotEntry
 	{
@@ -3142,9 +3147,16 @@ namespace
 	// untexted one survived). a_startTime = the clip's current localTime so a
 	// mid-play arm never replays earlier annotations.
 	static void ArmVanillaAnnotationBackup(RE::hkbClipGenerator* a_clip,
-		RE::hkaAnimation* a_original, float a_startTime)
+		RE::hkaAnimation* a_original, float a_startTime, const RE::hkbContext* a_context)
 	{
 		if (!a_clip || !a_original) return;
+		// A plugin that owns this clip's graph opted out (Clips API
+		// SetAnnotationBackupEnabled(graph, false)): its trigger array is
+		// authoritative, so a "missing" annotation is intentional, not damage.
+		if (s_annotBackupExcludeCount.load(std::memory_order_relaxed) > 0 &&
+			ClipOnAnnotBackupExcludedGraph(a_clip, a_context)) {
+			return;
+		}
 
 		std::vector<VanillaAnnotEntry> origAnnots;
 		CollectAnimAnnotationsTimed(a_original, origAnnots);
@@ -3250,7 +3262,8 @@ namespace
 	// got within 1.0s of the original's end (a genuine early cancel flushes
 	// nothing). Sounds fire immediately; graph events go through the deferred
 	// queue.
-	static void FlushVanillaAnnotBackup(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr, const char* a_reason)
+	static void FlushVanillaAnnotBackup(RE::hkbClipGenerator* a_clip, RE::TESObjectREFR* a_refr, const char* a_reason,
+		const RE::hkbContext* a_context)
 	{
 		VanillaAnnotBackup backup;
 		{
@@ -3260,6 +3273,11 @@ namespace
 			backup = std::move(it->second);
 			s_vanillaAnnotMap.erase(it);
 			s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+		}
+		// Graph opted out after arming (Clips API): nothing may fire.
+		if (s_annotBackupExcludeCount.load(std::memory_order_relaxed) > 0 &&
+			ClipOnAnnotBackupExcludedGraph(a_clip, a_context)) {
+			return;
 		}
 		const int32_t total = static_cast<int32_t>(backup.entries.size());
 		if (backup.lastFired + 1 >= total) return;
@@ -5373,6 +5391,72 @@ namespace
 			}
 		}
 		return 0;
+	}
+
+	// ===== Vanilla annotation backup: per-graph opt-out (Clips API v3) =====
+	// A plugin that drives its own animation graph (e.g. a display-only clone
+	// of the player's body) may strip events from that graph on purpose. The
+	// backup's integrity check cannot tell that from the engine bug it repairs,
+	// so the owner registers the graph here and OAR never arms or fires backup
+	// annotations for clips on it. Replacements on the graph are unaffected.
+	struct AnnotBackupExcludedGraph
+	{
+		uintptr_t graph;   // BShkbAnimationGraph* (registered pointer)
+		uintptr_t hkRoot;  // its root hkbBehaviorGraph (graph+0x378), 0 when unreadable
+	};
+	static std::shared_mutex s_annotBackupExcludeMutex;
+	static std::vector<AnnotBackupExcludedGraph> s_annotBackupExcluded;
+
+	// The graph-identity tests ResolveClipOwner uses, against the opted-out set:
+	// the clip's behavior graph (context first, then nodeInfo) IS an excluded
+	// root, its root id IS an excluded graph or root, or the root id sits in an
+	// excluded graph's swap array (subgraph clip). a_context may be null.
+	static bool ClipOnAnnotBackupExcludedGraph(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context)
+	{
+		if (!a_clip) return false;
+		uintptr_t candidates[2]{};
+		size_t candidateCount = 0;
+		if (a_context && reinterpret_cast<uintptr_t>(a_context) > 0x10000 &&
+			!IsBadReadPtr(a_context, kCtx_BehaviorGraph + 8)) {
+			const auto g = *reinterpret_cast<const uintptr_t*>(
+				reinterpret_cast<uintptr_t>(a_context) + kCtx_BehaviorGraph);
+			if (g > 0x10000) candidates[candidateCount++] = g;
+		}
+		if (a_clip->nodeInfo && reinterpret_cast<uintptr_t>(a_clip->nodeInfo) > 0x10000 &&
+			!IsBadReadPtr(a_clip->nodeInfo, 0x18)) {
+			const auto g = *reinterpret_cast<uintptr_t*>(
+				reinterpret_cast<uintptr_t>(a_clip->nodeInfo) + 0x10);
+			if (g > 0x10000 && g != candidates[0]) candidates[candidateCount++] = g;
+		}
+		if (candidateCount == 0) return false;
+
+		std::shared_lock lock(s_annotBackupExcludeMutex);
+		if (s_annotBackupExcluded.empty()) return false;
+		static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+		for (size_t c = 0; c < candidateCount; ++c) {
+			const auto nested = candidates[c];
+			uintptr_t rootId = 0;
+			if (!IsBadReadPtr(reinterpret_cast<void*>(nested), kBG_RootId + 8)) {
+				rootId = *reinterpret_cast<uintptr_t*>(nested + kBG_RootId);
+			}
+			for (const auto& ex : s_annotBackupExcluded) {
+				// Test 1 (top-level clip): the clip's behavior graph IS the
+				// registered graph's root hkbBehaviorGraph. A graph registered
+				// before its root existed stored 0; read it now, guarded.
+				uintptr_t hkRoot = ex.hkRoot;
+				if (!hkRoot &&
+					!IsBadReadPtr(reinterpret_cast<const void*>(ex.graph), kBShkbRootHkGraphOffset + sizeof(uintptr_t)) &&
+					*reinterpret_cast<const uintptr_t*>(ex.graph) == bshkbVtbl.address()) {
+					const auto r = *reinterpret_cast<const uintptr_t*>(ex.graph + kBShkbRootHkGraphOffset);
+					if (r > 0x10000) hkRoot = r;
+				}
+				if (hkRoot && nested == hkRoot) return true;
+				// Test 2 (subgraph clip): its root id is the registered
+				// BShkbAnimationGraph, or sits in that graph's swap array.
+				if (rootId && (rootId == ex.graph || SubgraphFindSwapData(ex.graph, rootId) != 0)) return true;
+			}
+		}
+		return false;
 	}
 
 	// Resolve one (owningGraph, nestedGraph) pair exactly like GunMover's
@@ -8713,6 +8797,16 @@ namespace
 					vbTotal = it->second.entries.size();
 				}
 			}
+			// Opt-out registered after this play armed (Clips API): drop the
+			// backup without firing anything.
+			if (vbFound && s_annotBackupExcludeCount.load(std::memory_order_relaxed) > 0 &&
+				ClipOnAnnotBackupExcludedGraph(a_this, a_context)) {
+				std::unique_lock lock(s_vanillaAnnotMutex);
+				if (s_vanillaAnnotMap.erase(a_this)) {
+					s_vanillaAnnotCount.fetch_sub(1, std::memory_order_relaxed);
+				}
+				vbFound = false;
+			}
 			if (vbFound) {
 				const float vbCurT = a_this->GetLocalTime();
 				if (vbCurT < vbPrevT - 0.01f) {
@@ -8863,7 +8957,7 @@ namespace
 							}
 						}
 						if (icSource) {
-							ArmVanillaAnnotationBackup(a_this, icSource, a_this->GetLocalTime());
+							ArmVanillaAnnotationBackup(a_this, icSource, a_this->GetLocalTime(), a_context);
 						}
 					}
 				}
@@ -10912,7 +11006,7 @@ namespace
 		if (s_gameFullyLoaded.load()) {
 			if (auto** vbSlot = a_this->GetAnimationSlot(); vbSlot && *vbSlot &&
 				!AnimationCache::GetSingleton()->IsOurReplacement(*vbSlot)) {
-				ArmVanillaAnnotationBackup(a_this, *vbSlot, a_this->GetLocalTime());
+				ArmVanillaAnnotationBackup(a_this, *vbSlot, a_this->GetLocalTime(), a_context);
 			}
 		}
 
@@ -10969,7 +11063,7 @@ namespace
 				// Vanilla backup: fire whatever the un-replaced play still owed
 				// when the graph tore it down near its end (same end-window rule),
 				// and always drop the entry — the clip is going away.
-				FlushVanillaAnnotBackup(a_this, deactRefr, "deactivate");
+				FlushVanillaAnnotBackup(a_this, deactRefr, "deactivate", a_context);
 			}
 			{
 				std::lock_guard icLock(s_annotIntegrityMutex);
@@ -17509,6 +17603,72 @@ size_t CollectGraphAnimationNames(RE::TESObjectREFR* a_refr, uint32_t a_graphInd
 	}
 
 	return a_out.size();
+}
+
+// Clips API v3: per-graph opt-out of the vanilla annotation backup. The pointer
+// is validated as a live BShkbAnimationGraph before anything is stored, so a
+// wrong pointer from a consumer is a logged no-op rather than a crash.
+bool SetGraphAnnotationBackupEnabled(const void* a_graph, bool a_enabled)
+{
+	const auto graph = reinterpret_cast<uintptr_t>(a_graph);
+	if (a_enabled) {
+		// Re-enabling is removal by address and must work on a graph that is
+		// already destroyed, or a missed teardown would pin the opt-out (and
+		// hand it to whatever graph is allocated at that address next).
+		bool removed = false;
+		{
+			std::unique_lock lock(s_annotBackupExcludeMutex);
+			auto it = std::find_if(s_annotBackupExcluded.begin(), s_annotBackupExcluded.end(),
+				[graph](const AnnotBackupExcludedGraph& e) { return e.graph == graph; });
+			if (it != s_annotBackupExcluded.end()) {
+				s_annotBackupExcluded.erase(it);
+				s_annotBackupExcludeCount.fetch_sub(1, std::memory_order_relaxed);
+				removed = true;
+			}
+		}
+		if (removed) logger::info("[OAR-API] Annotation backup re-enabled for graph {:X}", graph);
+		return true;
+	}
+	if (graph < 0x10000 || IsBadReadPtr(a_graph, kBShkbRootHkGraphOffset + sizeof(uintptr_t))) {
+		logger::warn("[OAR-API] SetAnnotationBackupEnabled: unreadable graph pointer {:X}", graph);
+		return false;
+	}
+	static REL::Relocation<uintptr_t> bshkbVtbl{ RE::VTABLE::BShkbAnimationGraph[0] };
+	if (*reinterpret_cast<const uintptr_t*>(graph) != bshkbVtbl.address()) {
+		logger::warn("[OAR-API] SetAnnotationBackupEnabled: {:X} is not a BShkbAnimationGraph", graph);
+		return false;
+	}
+	const auto hkRootRaw = *reinterpret_cast<const uintptr_t*>(graph + kBShkbRootHkGraphOffset);
+	const uintptr_t hkRoot = hkRootRaw > 0x10000 ? hkRootRaw : 0;
+
+	bool added = false;
+	{
+		std::unique_lock lock(s_annotBackupExcludeMutex);
+		auto it = std::find_if(s_annotBackupExcluded.begin(), s_annotBackupExcluded.end(),
+			[graph](const AnnotBackupExcludedGraph& e) { return e.graph == graph; });
+		if (it == s_annotBackupExcluded.end()) {
+			s_annotBackupExcluded.push_back({ graph, hkRoot });
+			s_annotBackupExcludeCount.fetch_add(1, std::memory_order_relaxed);
+			added = true;
+		} else {
+			it->hkRoot = hkRoot;  // re-registration after the root was (re)built
+		}
+	}
+	if (added) {
+		logger::info("[OAR-API] Annotation backup disabled for graph {:X} (root hkbBehaviorGraph {:X})", graph, hkRoot);
+		if (!hkRoot) {
+			logger::warn("[OAR-API] graph {:X} has no root behavior graph yet; it will be read when its clips first play", graph);
+		}
+	}
+	return true;
+}
+
+bool IsGraphAnnotationBackupEnabled(const void* a_graph)
+{
+	const auto graph = reinterpret_cast<uintptr_t>(a_graph);
+	std::shared_lock lock(s_annotBackupExcludeMutex);
+	return std::none_of(s_annotBackupExcluded.begin(), s_annotBackupExcluded.end(),
+		[graph](const AnnotBackupExcludedGraph& e) { return e.graph == graph; });
 }
 
 size_t CollectGraphEventNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out)

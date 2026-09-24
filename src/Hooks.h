@@ -116,6 +116,14 @@ size_t CollectGraphBones(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::
 size_t CollectGraphAnimationNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out);
 size_t CollectGraphEventNames(RE::TESObjectREFR* a_refr, uint32_t a_graphIndex, std::vector<std::string>& a_out);
 
+// Clips API v3: opt an animation graph out of the vanilla annotation backup
+// (OAR's once-per-play repair that fires annotations missing from a clip's
+// engine trigger array). a_graph is a BShkbAnimationGraph*; it is validated
+// before being stored. Returns false for a null/unreadable/wrong-type pointer.
+// Thread-safe (the hooks read the set under a shared lock).
+bool SetGraphAnnotationBackupEnabled(const void* a_graph, bool a_enabled);
+bool IsGraphAnnotationBackupEnabled(const void* a_graph);
+
 // Fills a_out with (time, text) annotations of the animation currently playing
 // on the given clip (replacement annotations when a replacement is installed).
 // a_clipHandle must come from CollectActorClipQueryData in the same frame.

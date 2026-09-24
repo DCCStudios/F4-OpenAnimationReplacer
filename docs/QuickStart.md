@@ -464,5 +464,8 @@ main `README.md`, section **Plugin API**):
   adds animation-graph queries: per-graph info (character name, project paths,
   1st-person flag, active node/clip counts), skeleton bone hierarchies (great for
   finding `trackFilter` bone names), registered animation paths, and behavior event
-  names. SDK header: `src/API/OpenAnimationReplacerAPI-Clips.h` (self-contained — no
-  CommonLibF4 or JSON dependency). Call from the game's main thread only.
+  names. Version 3 adds `SetAnnotationBackupEnabled(graph, false)` so a plugin that
+  runs its own animation graph can stop OAR from re-firing annotations it removed
+  on purpose (footsteps on a display-only body clone, for example). SDK header:
+  `src/API/OpenAnimationReplacerAPI-Clips.h` (self-contained — no CommonLibF4 or
+  JSON dependency). Call the query methods from the game's main thread only.

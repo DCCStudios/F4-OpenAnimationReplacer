@@ -209,7 +209,9 @@ namespace
 		virtual uint32_t GetActorGraphs(uint32_t a_actorFormID, GraphInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
 		virtual uint32_t GetGraphBones(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, BoneInfoPOD* a_outBuffer, uint32_t a_maxCount) = 0;
 		virtual uint32_t GetGraphAnimationNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) = 0;
-		virtual uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) = 0;
+		virtual uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntryPOD* a_outBuffer, uint32_t a_maxCount) = 0;		// v3 additions — appended, never reordered
+		virtual bool SetAnnotationBackupEnabled(const void* a_graph, bool a_enabled) = 0;
+		virtual bool IsAnnotationBackupEnabled(const void* a_graph) = 0;
 	};
 
 	// Truncating copy into a fixed buffer, always null-terminated.
@@ -285,7 +287,7 @@ namespace
 	public:
 		uint32_t GetAPIVersion() const override
 		{
-			return 2;
+			return 3;
 		}
 
 		uint32_t GetActorClips(uint32_t a_actorFormID, ClipInfoPOD* a_outBuffer, uint32_t a_maxCount) override
@@ -463,6 +465,17 @@ namespace
 			CollectGraphEventNames(refr, a_graphIndex, names);
 			return CopyNamePage(names, a_startIndex, a_outBuffer, a_maxCount);
 		}
+
+		// ===== v3 =====
+		bool SetAnnotationBackupEnabled(const void* a_graph, bool a_enabled) override
+		{
+			return SetGraphAnnotationBackupEnabled(a_graph, a_enabled);
+		}
+
+		bool IsAnnotationBackupEnabled(const void* a_graph) override
+		{
+			return IsGraphAnnotationBackupEnabled(a_graph);
+		}
 	};
 
 	static ClipsAPIImpl g_clipsAPI;
@@ -480,6 +493,6 @@ extern "C" OAR_API void* RequestPluginAPI_Conditions()
 
 extern "C" OAR_API void* RequestPluginAPI_Clips()
 {
-	OAR_VLOG("[OAR-API] Clips API requested (version 2)");
+	OAR_VLOG("[OAR-API] Clips API requested (version 3)");
 	return static_cast<IClipsAPIInternal*>(&g_clipsAPI);
 }

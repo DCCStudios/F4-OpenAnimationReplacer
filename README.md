@@ -689,7 +689,7 @@ nothing about the folder's current behavior changes until you edit it.
 OAR exposes two C++ APIs for other F4SE plugins:
 
 - **Conditions API** (`RequestPluginAPI_Conditions`) — register custom condition types at runtime, adding entirely new conditions without modifying OAR's source code.
-- **Clips API** (`RequestPluginAPI_Clips`) — query live data about the animation clips OAR handles: names, resolved file paths, durations, playback state, perspective, replacement attribution, annotations — plus the animation graphs themselves: skeleton bone hierarchies, registered animation paths, and behavior event names. See [Clips API](#clips-api--query-live-clip-data) below.
+- **Clips API** (`RequestPluginAPI_Clips`) — query live data about the animation clips OAR handles: names, resolved file paths, durations, playback state, perspective, replacement attribution, annotations — plus the animation graphs themselves: skeleton bone hierarchies, registered animation paths, and behavior event names. Version 3 lets a plugin opt its own animation graph out of OAR's vanilla annotation backup. See [Clips API](#clips-api--query-live-clip-data) below.
 
 ### Architecture
 
@@ -1064,7 +1064,28 @@ if (api->GetStats(&stats)) {
 - `clipHandle` values are only valid within the frame they were returned — don't store them.
 - `GetAPI()` works at `kPostLoad` or later; the returned pointer may be cached for the session.
 - Queries are on-demand walks, not cached — cheap enough per frame for one actor, but don't enumerate every loaded actor every frame.
-- Check `GetAPIVersion()` once after `GetAPI()` if you depend on fields added in later versions (current: 1).
+- Check `GetAPIVersion()` once after `GetAPI()` if you depend on methods added in later versions (current: 3).
+
+#### Opting a graph out of the vanilla annotation backup (v3)
+
+Once per play, OAR checks that an un-replaced clip's engine trigger array still carries every annotation authored in its animation. The engine sometimes builds that array wrong, so OAR fires the missing annotations itself: `SoundPlay.*` directly, everything else (`FootLeft`, `FootRight`, weapon events) through the owning actor's animation graph and event sinks. Replacements are untouched by this; it only runs on plays OAR is not replacing.
+
+If your plugin runs its own animation graph and removes events from it on purpose, that repair re-fires exactly what you removed. Typical case: a display-only clone of the player's body whose footsteps you have silenced. Register the graph and OAR leaves its events alone:
+
+```cpp
+auto* api = OAR::Clips::GetAPI();
+if (api && api->GetAPIVersion() >= 3) {
+    // myGraph is the BShkbAnimationGraph* you own (your manager's graph[i],
+    // or the graph you created). Call once the graph exists.
+    api->SetAnnotationBackupEnabled(myGraph, false);
+}
+
+// Before destroying the graph, restore the default so a later graph
+// allocated at the same address does not inherit the opt-out:
+api->SetAnnotationBackupEnabled(myGraph, true);
+```
+
+Disabling returns `false` (and stores nothing) when the pointer is null, unreadable, or not a `BShkbAnimationGraph`; OAR logs the reason. Re-enabling removes the registration by address without touching the pointer, so it also works after the graph has been destroyed. `IsAnnotationBackupEnabled(graph)` reads the current state. Call these from the game's main thread like the other Clips API methods. Animation replacements on the registered graph keep working; only the backup firing stops.
 
 ### Build Requirements for API Plugins
 

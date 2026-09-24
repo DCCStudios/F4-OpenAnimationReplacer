@@ -56,7 +56,10 @@ namespace OAR::Clips
 	// v2: added graph-level queries (GetActorGraphs, GetGraphBones,
 	//     GetGraphAnimationNames, GetGraphEventNames), appended to the vtable —
 	//     consumers compiled against v1 keep working.
-	inline constexpr uint32_t kAPIVersion = 2;
+	// v3: added SetAnnotationBackupEnabled / IsAnnotationBackupEnabled (opt an
+	//     animation graph you own out of OAR's vanilla annotation backup).
+	//     Appended; v1/v2 consumers keep working.
+	inline constexpr uint32_t kAPIVersion = 3;
 
 	// ClipInfo::perspective values
 	enum : uint8_t
@@ -237,6 +240,39 @@ namespace OAR::Clips
 		// you can send to the graph, e.g. "ReloadEnd", "SprintStop"). Paged
 		// via a_startIndex; returns the TOTAL count.
 		virtual uint32_t GetGraphEventNames(uint32_t a_actorFormID, uint32_t a_graphIndex, uint32_t a_startIndex, NameEntry* a_outBuffer, uint32_t a_maxCount) = 0;
+
+		// ===== v3 additions (check GetAPIVersion() >= 3 before calling) =====
+
+		// Opt an animation graph out of OAR's "vanilla annotation backup".
+		//
+		// Background: once per play, OAR checks that an UN-replaced clip's engine
+		// trigger array still carries every annotation authored in its animation
+		// (the engine sometimes builds that array wrong) and fires any missing
+		// ones itself: SoundPlay.* directly, everything else (FootLeft,
+		// FootRight, weapon events...) through the owning actor's animation
+		// graph and event sinks. If your plugin runs its own graph and removes
+		// events from it on purpose (a display-only body clone, for example),
+		// that repair re-fires exactly what you removed. Register the graph
+		// here and OAR leaves its events alone. Animation REPLACEMENTS on the
+		// graph keep working; only the backup firing is disabled.
+		//
+		// a_graph: the BShkbAnimationGraph* you own — the object your
+		//   BSAnimationGraphManager holds in graph[i], or the one you created.
+		//   Call right after the graph exists (its root behavior graph should be
+		//   built). OAR validates the pointer's vtable before storing it.
+		// a_enabled: false = disable the backup on this graph; true = restore
+		//   the default. Call with true BEFORE you destroy the graph: the
+		//   registration is keyed on the pointer, and a later graph allocated at
+		//   the same address would inherit the opt-out.
+		// Returns false when disabling with a null, unreadable, or non-
+		// BShkbAnimationGraph pointer (nothing is stored). Re-enabling never
+		// inspects the pointer, so it is safe to call after the graph is gone.
+		// Call from the game's main thread, like the rest of this API: disabling
+		// reads the live graph object.
+		virtual bool SetAnnotationBackupEnabled(const void* a_graph, bool a_enabled) = 0;
+
+		// True (the default) when OAR may fire backup annotations on that graph.
+		virtual bool IsAnnotationBackupEnabled(const void* a_graph) = 0;
 	};
 
 	// =========================================================================
