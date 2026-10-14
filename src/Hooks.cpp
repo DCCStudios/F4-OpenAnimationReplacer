@@ -3060,10 +3060,11 @@ namespace
 	// the clip's LIVE trigger array by time and manually fires only the
 	// MISSING ones at their authored times — the same dispatch the replacement
 	// annotation path uses on every tactical reload. On a healthy play nothing
-	// is missing and nothing is armed; double-firing is impossible by
-	// construction. Early state exits are covered by the Deactivate-side
-	// flush (same end-window rule as FlushPendingEndAnnotations).
-	// Defined later in this file; needed by the flush below.
+	// is missing and nothing is armed; animations with intentionally empty
+	// trigger array must skipped the annotation backup. Early state exits are
+	// covered by the Deactivate-side flush (same end-window rule as
+	// FlushPendingEndAnnotations). Defined later in this file; needed by the
+	// flush below.
 	static bool PlaySoundDirect(const char* a_soundName, RE::TESObjectREFR* a_refr);
 	static void QueueCustomEvents(RE::TESObjectREFR* a_refr, const std::vector<std::string>& a_events, const char* a_label);
 	// Per-graph opt-out of the vanilla annotation backup (Clips API v3).
@@ -3071,6 +3072,14 @@ namespace
 	// registered" fast path for the hot Update/Deactivate paths.
 	static std::atomic<int> s_annotBackupExcludeCount{ 0 };
 	static bool ClipOnAnnotBackupExcludedGraph(RE::hkbClipGenerator* a_clip, const RE::hkbContext* a_context);
+
+    // hkbClipGenerator::Flags (Havok 2014):
+    // FLAG_DONT_CONVERT_ANNOTATIONS_TO_TRIGGERS tells _Activate to leave a
+    // generator's annotations out on purpose: e.g. mt\...\walkforward runs on
+    // two generators at once and only the one without the flag lists (and
+    // fires) FootLeft/FootRight. Diffing the flagged one counted every
+    // footstep as missing and fired it a second time (issue #11).
+    constexpr uint8_t kClipFlagDontConvertAnnotationsToTriggers = 0x10;
 
 	struct VanillaAnnotEntry
 	{
@@ -3158,6 +3167,18 @@ namespace
 			return;
 		}
 
+		// skipping animation flagged by engine to not have annotation triggers such as locomotion
+        if (static_cast<uint8_t>(a_clip->flags) & kClipFlagDontConvertAnnotationsToTriggers) {
+            static std::atomic<int> s_noConvertLog{0};
+            if (s_noConvertLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+                OAR_VLOG("[OAR-VanillaBackup] clipGen={:X} has FLAG_DONT_CONVERT_ANNOTATIONS_TO_TRIGGERS "
+                         "(flags={:#x}) — no backup",
+                         reinterpret_cast<uintptr_t>(a_clip),
+                         static_cast<uint8_t>(a_clip->flags));
+            }
+            return;
+        }
+
 		std::vector<VanillaAnnotEntry> origAnnots;
 		CollectAnimAnnotationsTimed(a_original, origAnnots);
 		if (origAnnots.empty()) return;
@@ -3218,8 +3239,8 @@ namespace
 		static std::atomic<int> s_armLog{ 0 };
 		if (backup.entries.empty()) {
 			if (s_armLog.fetch_add(1, std::memory_order_relaxed) < 30) {
-				OAR_VLOG("[OAR-VanillaBackup] engine trigger array complete for clipGen={:X} ({} triggers, {} annots) — no backup needed",
-					reinterpret_cast<uintptr_t>(a_clip), liveCount, origAnnots.size());
+				OAR_VLOG("[OAR-VanillaBackup] engine trigger array complete for clipGen={:X} ({} triggers, {} annots, flags={:#x}) — no backup needed",
+					reinterpret_cast<uintptr_t>(a_clip), liveCount, origAnnots.size(), static_cast<uint8_t>(a_clip->flags));
 			}
 			return;
 		}
@@ -3245,9 +3266,9 @@ namespace
 				if (!names.empty()) names += ", ";
 				names += std::format("'{}'@{:.3f}", e.text, e.time);
 			}
-			OAR_VLOG("[OAR-VanillaBackup] armed {} missing annotation(s) for clipGen={:X} (live triggers={}, original annots={}, from t={:.3f}): {}",
+			OAR_VLOG("[OAR-VanillaBackup] armed {} missing annotation(s) for clipGen={:X} (live triggers={}, original annots={}, flags={:#x}, from t={:.3f}): {}",
 				backup.entries.size(), reinterpret_cast<uintptr_t>(a_clip),
-				liveCount, origAnnots.size(), a_startTime, names);
+				liveCount, origAnnots.size(), static_cast<uint8_t>(a_clip->flags), a_startTime, names);
 		}
 
 		{
